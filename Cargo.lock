@@ -2347,7 +2347,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "serde",
  "smallvec",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -2367,7 +2367,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "tauri-plugin-shell",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "xxhash-rust",
 ]
@@ -2394,7 +2394,7 @@ dependencies = [
  "rayon",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2458,7 +2458,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "serde",
  "serde-wasm-bindgen",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
