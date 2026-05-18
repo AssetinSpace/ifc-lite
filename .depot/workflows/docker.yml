@@ -33,7 +33,7 @@ env:
 jobs:
   docker:
     name: Build & Push Docker Image
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — docker build needs RAM headroom.
     permissions:
       contents: read
       packages: write

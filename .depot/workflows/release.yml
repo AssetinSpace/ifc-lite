@@ -31,7 +31,7 @@ permissions:
 jobs:
   release:
     name: Release
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — pnpm build matches viewer memory profile.
     environment: release-publish
     permissions:
       contents: write
@@ -161,7 +161,7 @@ jobs:
     name: Verify npm publish
     needs: release
     if: needs.release.outputs.published == 'true'
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — pnpm build matches viewer memory profile.
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

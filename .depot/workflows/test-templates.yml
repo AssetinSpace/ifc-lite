@@ -19,7 +19,7 @@ permissions:
 jobs:
   test-templates:
     name: Scaffold & verify (${{ matrix.template }})
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — scaffolds each template, needs build RAM.
     strategy:
       fail-fast: false
       matrix:

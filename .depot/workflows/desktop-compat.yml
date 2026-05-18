@@ -34,7 +34,7 @@ permissions:
 jobs:
   desktop-frontend-build:
     name: Desktop frontend build
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — viewer build OOMs at 2vCPU/8GB.
     timeout-minutes: 10
     steps:
       - name: Checkout ifc-lite (PR branch)
@@ -74,7 +74,7 @@ jobs:
         run: node scripts/check-desktop-contract.mjs
   desktop-override-audit:
     name: Desktop override audit
-    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    runs-on: depot-ubuntu-24.04-4 # was: ubuntu-latest. 4vCPU/16GB — viewer build OOMs at 2vCPU/8GB.
     timeout-minutes: 5
     steps:
       - name: Checkout ifc-lite (PR branch)
