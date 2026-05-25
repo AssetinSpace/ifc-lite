@@ -40,6 +40,7 @@ import { useGeometryStreaming } from './useGeometryStreaming.js';
 import { usePointCloudSync } from './usePointCloudSync.js';
 import { usePointCloudLifecycle } from './usePointCloudLifecycle.js';
 import { useRenderUpdates } from './useRenderUpdates.js';
+import { useSymbolicAnnotations, useSymbolicAnnotationsRichData } from '../../hooks/useSymbolicAnnotations.js';
 
 interface ViewportProps {
   geometry: MeshData[] | null;
@@ -778,6 +779,77 @@ export function Viewport({
   const drawing2D = useViewerStore((s) => s.drawing2D);
   const show3DOverlay = useViewerStore((s) => s.drawing2DDisplayOptions.show3DOverlay);
   const showHiddenLines = useViewerStore((s) => s.drawing2DDisplayOptions.showHiddenLines);
+
+  // ===== IfcAnnotation symbolic overlay =====
+  // Renders IfcAnnotation 2D drawing curves as a standalone 3D line overlay
+  // that's visible regardless of whether a section cut is active. Each
+  // segment is lifted to its containing storey's elevation, so a multi-
+  // storey model shows all storeys' annotations layered correctly in 3D
+  // (issue #653). Parsing is lazy and only runs while the toggle is on.
+  const ifcAnnotationsVisible = useViewerStore((s) => s.typeVisibility.ifcAnnotations);
+  // For annotations whose storey can't be resolved (or whose authored
+  // elevation is 0 because the storey Z lives on the placement instead),
+  // lift to the middle of the model's vertical span so they don't end up
+  // buried inside ground-floor geometry.
+  const annotationFallbackY = useMemo(() => {
+    const bounds = coordinateInfo?.shiftedBounds;
+    if (!bounds) return 0;
+    const min = bounds.min.y;
+    const max = bounds.max.y;
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 0;
+    return (min + max) * 0.5;
+  }, [coordinateInfo]);
+  const annotationVertices3D = useSymbolicAnnotations({
+    enabled: ifcAnnotationsVisible,
+    fallbackY: annotationFallbackY,
+  });
+  const { texts: annotationTexts3D, fills: annotationFills3D } = useSymbolicAnnotationsRichData({
+    enabled: ifcAnnotationsVisible,
+    fallbackY: annotationFallbackY,
+  });
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    if (annotationVertices3D.length === 0) {
+      renderer.clearAnnotationLines3D();
+    } else {
+      renderer.uploadAnnotationLines3D(annotationVertices3D);
+    }
+  }, [annotationVertices3D, isInitialized]);
+
+  // Upload IfcAnnotation text + fill data for the WebGPU symbolic overlay
+  // pipelines. Map the hook's per-annotation records into the SymbolicFillInput
+  // / SymbolicTextInput shape the renderer expects. Empty arrays clear cleanly.
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    renderer.uploadAnnotationFills3D(
+      annotationFills3D.map((f) => ({
+        points: f.points,
+        holesOffsets: f.holesOffsets,
+        worldY: f.worldY,
+        color: f.color,
+      })),
+    );
+  }, [annotationFills3D, isInitialized]);
+
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    renderer.uploadAnnotationTexts3D(
+      annotationTexts3D.map((t) => ({
+        worldPos: t.worldPos,
+        dirX: t.dirX,
+        dirZ: t.dirZ,
+        height: t.height,
+        content: t.content,
+        alignment: t.alignment,
+        billboard: t.billboard,
+        color: t.color,
+        targetPx: t.targetPx,
+      })),
+    );
+  }, [annotationTexts3D, isInitialized]);
 
   // ===== Streaming progress =====
   const isStreaming = useViewerStore((state) => state.geometryStreamingActive);

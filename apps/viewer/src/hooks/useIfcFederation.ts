@@ -908,7 +908,13 @@ export function useIfcFederation() {
       // top-level fields. When subsequent models are added, activeModelId
       // stays on the first model — writing here would alias the new model's
       // data into the active (first) model's per-model entry and cause both
-      // viewport slots to render the same mesh (issue #661).
+      // viewport slots to render the same mesh (issue #661, PR #792).
+      //
+      // An earlier draft of this branch called `setActiveModel(modelId)`
+      // here, which also fixed #661 but had the side-effect of stealing
+      // focus to every added model — confusing UX. The main-branch fix
+      // (drop the legacy calls; keep activeModelId on the first model)
+      // is preferred and was kept on merge.
 
       setProgress({ phase: 'Complete', percent: 100 });
       setLoading(false);
