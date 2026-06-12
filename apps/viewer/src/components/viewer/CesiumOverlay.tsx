@@ -30,6 +30,8 @@ import {
   shouldPreferOrthometricTerrain,
 } from '@/lib/geo/cesium-placement';
 import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from '@/lib/geo/geo-scale';
+import { applySolarScene, SunPathDome } from '@/lib/geo/cesium-sun';
+import { sunPosition, sunTimes } from '@ifc-lite/solar';
 
 // Lazy-loaded Cesium module and CSS
 let cesiumPromise: Promise<typeof import('cesium')> | null = null;
@@ -253,9 +255,33 @@ export function CesiumOverlay({
   const setCesiumTerrainClipY = useViewerStore((s) => s.setCesiumTerrainClipY);
   const setCesiumGlbLoaded = useViewerStore((s) => s.setCesiumGlbLoaded);
 
+  // Solar study state — drives the sun-path dome + shadow study.
+  const solarEnabled = useViewerStore((s) => s.solarEnabled);
+  const solarDateMs = useViewerStore((s) => s.solarDateMs);
+  const solarShowSunPath = useViewerStore((s) => s.solarShowSunPath);
+  const solarShowShadows = useViewerStore((s) => s.solarShowShadows);
+  const setSolarSunInfo = useViewerStore((s) => s.setSolarSunInfo);
+  // Environment sky toggle — atmosphere + sun + fog in geo mode.
+  const envSkyEnabled = useViewerStore((s) => s.envSkyEnabled);
+  // Re-run the solar effect once the deferred GLB load completes, so the IFC
+  // model's shadow mode is applied even when the study was enabled before the
+  // model finished loading into Cesium.
+  const cesiumGlbLoaded = useViewerStore((s) => s.cesiumGlbLoaded);
+
   // Track the Cesium model (IFC geometry loaded as glTF for correct world positioning)
-  const cesiumModelRef = useRef<{ modelMatrix: any; destroy?: () => void } | null>(null);
+  const cesiumModelRef = useRef<{ modelMatrix: any; shadows?: any; destroy?: () => void } | null>(null);
   const glbCacheRef = useRef<{ meshCount: number; glb: Uint8Array } | null>(null);
+  // Active 3D context tileset (Google Photorealistic / OSM buildings) — kept so
+  // solar mode can toggle its shadow casting/receiving.
+  const tilesetRef = useRef<{ shadows?: any } | null>(null);
+  // Active sun-path dome entity collection (null when solar study is off).
+  const sunPathDomeRef = useRef<SunPathDome | null>(null);
+  // UTC calendar day the dome's static geometry (day-arc, analemmas) was built
+  // for. Intra-day time scrubs only move the sun marker; a new day rebuilds.
+  const sunPathDomeDayRef = useRef<string | null>(null);
+  // Whether the solar study has ever touched Cesium scene state. Guards us
+  // from mutating the default (non-solar) lighting on plain mount.
+  const solarTouchedSceneRef = useRef(false);
 
   // Last-known placement altitude (in metres) used to keep the user's WORLD
   // camera position stable across bridge rebuilds. When the user toggles the
@@ -337,7 +363,9 @@ export function CesiumOverlay({
           bottomContainer.style.right = 'auto';
         }
 
-        // Disable skybox/atmosphere/fog for transparent compositing
+        // Disable skybox/atmosphere/fog for transparent compositing.
+        // (The Sun & Sky panel's Sky toggle re-enables atmosphere/sun/fog
+        // via Effect 4b.)
         if (scene.skyBox) (scene.skyBox as any).show = false;
         if (scene.sun) scene.sun.show = false;
         if (scene.moon) scene.moon.show = false;
@@ -346,7 +374,22 @@ export function CesiumOverlay({
         scene.globe.showGroundAtmosphere = false;
         scene.backgroundColor = Cesium.Color.TRANSPARENT;
         scene.globe.baseColor = Cesium.Color.TRANSPARENT;
-        scene.globe.show = false;
+        if (dataSource === 'osm-buildings') {
+          // OSM massing context: keep the globe with the satellite base map —
+          // the extruded buildings sit ON TOP of the imagery, and the globe
+          // is what receives their cast shadows during a sun study.
+          scene.globe.show = true;
+          scene.globe.shadows = Cesium.ShadowMode.RECEIVE_ONLY;
+          try {
+            const imagery = await Cesium.createWorldImageryAsync();
+            if (!cancelled) viewer.imageryLayers.addImageryProvider(imagery);
+          } catch { /* imagery unavailable — buildings still render */ }
+        } else {
+          // Photorealistic tiles bring their own ground; the globe would
+          // z-fight underneath them.
+          scene.globe.show = false;
+        }
+        if (cancelled) { viewer.destroy(); return; }
 
         // Add terrain
         if (terrainEnabled && ionToken) {
@@ -357,7 +400,7 @@ export function CesiumOverlay({
         }
 
         // Add data source layer
-        await addDataSourceLayer(Cesium, viewer, dataSource, ionToken);
+        tilesetRef.current = await addDataSourceLayer(Cesium, viewer, dataSource, ionToken);
 
         if (cancelled) { viewer.destroy(); return; }
 
@@ -386,6 +429,11 @@ export function CesiumOverlay({
       // so Effect 2c must re-load the GLB into the next viewer instance.
       cesiumModelRef.current = null;
       bridgeRef.current = null;
+      // The destroyed viewer also took the tileset + sun-path entities.
+      tilesetRef.current = null;
+      sunPathDomeRef.current = null;
+      sunPathDomeDayRef.current = null;
+      solarTouchedSceneRef.current = false;
       setStatus('idle');
     };
   }, [cesiumEnabled, ionToken, terrainEnabled, dataSource]);
@@ -664,6 +712,133 @@ export function CesiumOverlay({
     // bridge.modelOrigin.height by Effect 2.
   }, [mapConversion, projectedCRS, coordinateInfo, lengthUnitScale, bridgeVersion]);
 
+  // ─── Effect 4: Solar study — sun-path dome + shadows ────────────────────
+  // Drives Cesium's sun/lighting/shadow map from the studied instant, builds
+  // (and live-updates) the 3D sun-path dome anchored at the model origin, and
+  // publishes the resolved sun position/times back to the store for the panel.
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    const bridge = bridgeRef.current;
+    const Cesium = cesiumModule;
+    if (status !== 'ready' || !viewer || !bridge || !Cesium) return;
+
+    // Never mutate the default Cesium lighting until the study is first
+    // enabled — a plain georeferenced model shouldn't have its context
+    // re-lit just because this effect mounts with solar off.
+    if (!solarEnabled && !solarTouchedSceneRef.current) return;
+    solarTouchedSceneRef.current = true;
+
+    const date = new Date(solarDateMs);
+    const { latitude, longitude, height } = bridge.modelOrigin;
+
+    // Cast/receive shadows on the IFC model and the context tileset.
+    const shadowMode = solarEnabled && solarShowShadows
+      ? Cesium.ShadowMode.ENABLED
+      : Cesium.ShadowMode.DISABLED;
+    if (cesiumModelRef.current) cesiumModelRef.current.shadows = shadowMode;
+    if (tilesetRef.current) tilesetRef.current.shadows = shadowMode;
+
+    applySolarScene(Cesium, viewer, {
+      date,
+      enabled: solarEnabled,
+      shadows: solarShowShadows,
+      showSun: envSkyEnabled,
+    });
+
+    if (solarEnabled) {
+      // Publish the readout for the panel.
+      const times = sunTimes(date, latitude, longitude);
+      const sp = sunPosition(date, latitude, longitude);
+      setSolarSunInfo({
+        latitude,
+        longitude,
+        azimuth: sp.azimuth,
+        altitude: sp.altitude,
+        sunriseMs: times.sunrise ? times.sunrise.getTime() : null,
+        sunsetMs: times.sunset ? times.sunset.getTime() : null,
+        solarNoonMs: times.solarNoon.getTime(),
+      });
+
+      if (solarShowSunPath) {
+        const dayKey = `${date.getUTCFullYear()}-${date.getUTCMonth()}-${date.getUTCDate()}:${latitude.toFixed(4)},${longitude.toFixed(4)}`;
+        try {
+          if (!sunPathDomeRef.current || sunPathDomeDayRef.current !== dayKey) {
+            // New day or site → rebuild static geometry (day arc + analemmas).
+            sunPathDomeRef.current?.destroy();
+            const bounds = coordinateInfo?.originalBounds;
+            // Size the dome to roughly the model footprint, but clamp to an
+            // architectural scale: with many federated models the combined
+            // bounds can span kilometres, which would push the dome arcs so
+            // far out they read as nothing. Half-diagonal ≈ bounding radius.
+            const rawRadius = bounds
+              ? 0.5 * Math.hypot(
+                  bounds.max.x - bounds.min.x,
+                  bounds.max.y - bounds.min.y,
+                  bounds.max.z - bounds.min.z,
+                )
+              : 80;
+            const radius = Math.min(250, Math.max(40, rawRadius));
+            sunPathDomeRef.current = new SunPathDome(Cesium, viewer, {
+              origin: { latitude, longitude, height },
+              radius,
+              date,
+              showAnalemmas: true,
+            });
+            sunPathDomeDayRef.current = dayKey;
+          } else {
+            // Same day, new time → just move the sun marker + beam.
+            sunPathDomeRef.current.update(date);
+          }
+        } catch (err) {
+          console.warn('[CesiumOverlay] sun-path dome build/update failed:', err);
+        }
+      } else if (sunPathDomeRef.current) {
+        sunPathDomeRef.current.destroy();
+        sunPathDomeRef.current = null;
+        sunPathDomeDayRef.current = null;
+      }
+    } else if (sunPathDomeRef.current) {
+      sunPathDomeRef.current.destroy();
+      sunPathDomeRef.current = null;
+      sunPathDomeDayRef.current = null;
+    }
+
+    viewer.scene.requestRender();
+  }, [
+    status,
+    bridgeVersion,
+    cesiumGlbLoaded,
+    solarEnabled,
+    solarDateMs,
+    solarShowSunPath,
+    solarShowShadows,
+    envSkyEnabled,
+    coordinateInfo,
+    setSolarSunInfo,
+  ]);
+
+  // ─── Effect 4b: Sky — atmosphere + sun + fog ────────────────────────────
+  // The environment panel's Sky toggle. Init disables all of these for
+  // transparent compositing; this effect re-enables them on demand. The
+  // area outside the atmosphere stays transparent (skyBox off), so space
+  // composites over the app background like the rest of the overlay.
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    const Cesium = cesiumModule;
+    if (status !== 'ready' || !viewer || !Cesium) return;
+    const scene = viewer.scene;
+    if (scene.skyAtmosphere) scene.skyAtmosphere.show = envSkyEnabled;
+    scene.fog.enabled = envSkyEnabled;
+    // Haze on the satellite base map (no-op while the globe is hidden).
+    scene.globe.showGroundAtmosphere = envSkyEnabled && scene.globe.show;
+    // Sun billboard only when the solar effect isn't already managing it
+    // (applySolarScene runs with showSun and wins on solar state changes).
+    if (scene.sun && !solarTouchedSceneRef.current) {
+      scene.sun.show = envSkyEnabled;
+    }
+    scene.requestRender();
+  }, [status, envSkyEnabled]);
+
   // ─── Effect 3: Camera sync loop ─────────────────────────────────────────
   useEffect(() => {
     if (status !== 'ready') return;
@@ -745,31 +920,43 @@ export function CesiumOverlay({
 }
 
 /**
- * Add the Google Photorealistic 3D Tiles layer to the Cesium viewer.
+ * Add the selected 3D context layer to the Cesium viewer. Returns the created
+ * tileset so callers can toggle its shadow casting/receiving for solar
+ * studies (`null` if none could be created).
  */
 async function addDataSourceLayer(
   Cesium: typeof import('cesium'),
   viewer: InstanceType<typeof import('cesium').Viewer>,
   dataSource: string,
   ionToken: string,
-) {
+): Promise<InstanceType<typeof import('cesium').Cesium3DTileset> | null> {
   try {
     switch (dataSource) {
+      case 'osm-buildings': {
+        // OpenStreetMap Buildings — flat-shaded extruded footprints, the grey
+        // massing context used for sun-path / overshadowing studies.
+        const tileset = await Cesium.createOsmBuildingsAsync();
+        viewer.scene.primitives.add(tileset);
+        return tileset;
+      }
       case 'google-photorealistic':
       default: {
         try {
           const tileset = await Cesium.createGooglePhotorealistic3DTileset();
-        viewer.scene.primitives.add(tileset);
+          viewer.scene.primitives.add(tileset);
+          return tileset;
         } catch {
           if (ionToken) {
             const tileset = await Cesium.Cesium3DTileset.fromIonAssetId(2275207);
             viewer.scene.primitives.add(tileset);
+            return tileset;
           }
+          return null;
         }
-        break;
       }
     }
   } catch (err) {
     console.warn('[CesiumOverlay] Failed to add data source:', dataSource, err);
+    return null;
   }
 }

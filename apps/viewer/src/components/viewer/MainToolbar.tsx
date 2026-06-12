@@ -43,6 +43,7 @@ import {
   FileCode2,
   CalendarClock,
   Globe2,
+  Sun,
   Move,
   PenLine,
   Layers3,
@@ -515,6 +516,12 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   const toggleCesium = useViewerStore((state) => state.toggleCesium);
   const cesiumPlacementEditMode = useViewerStore((state) => state.cesiumPlacementEditMode);
   const setCesiumPlacementEditMode = useViewerStore((state) => state.setCesiumPlacementEditMode);
+  // Sun & Sky panel state (sky, lighting presets, sun-path study)
+  const solarEnabled = useViewerStore((state) => state.solarEnabled);
+  const envPanelOpen = useViewerStore((state) => state.envPanelOpen);
+  const toggleEnvPanel = useViewerStore((state) => state.toggleEnvPanel);
+  const envSkyEnabled = useViewerStore((state) => state.envSkyEnabled);
+  const envPreset = useViewerStore((state) => state.envPreset);
   const storeModels = useViewerStore((state) => state.models);
   const analysisExtensionState = useSyncExternalStore(
     subscribeAnalysisExtensions,
@@ -1623,6 +1630,30 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           )}
         </>
       )}
+
+      {/* Sun & Sky panel — sky, lighting presets and the sun-path study.
+          Available for every model, georeferenced or not. */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant={envPanelOpen ? 'default' : 'ghost'}
+            size="icon-sm"
+            aria-label={envPanelOpen ? 'Close Sun & Sky panel' : 'Open Sun & Sky panel'}
+            aria-pressed={envPanelOpen}
+            onClick={(e) => {
+              (e.currentTarget as HTMLButtonElement).blur();
+              toggleEnvPanel();
+            }}
+            className={cn(
+              (envPanelOpen || solarEnabled || envSkyEnabled || envPreset !== 'default')
+                && 'bg-amber-500 text-zinc-950 hover:bg-amber-400',
+            )}
+          >
+            <Sun className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Sun &amp; sky</TooltipContent>
+      </Tooltip>
 
       {/*
         Consolidated View dropdown — holds projection toggle, preset

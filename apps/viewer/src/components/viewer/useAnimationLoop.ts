@@ -17,7 +17,7 @@
  */
 
 import { useEffect, type MutableRefObject, type RefObject } from 'react';
-import type { Renderer, VisualEnhancementOptions } from '@ifc-lite/renderer';
+import type { Renderer, VisualEnhancementOptions, LightingEnvironment } from '@ifc-lite/renderer';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import type { SectionPlane } from '@/store';
 
@@ -37,6 +37,8 @@ export interface UseAnimationLoopParams {
   selectedModelIndexRef: MutableRefObject<number | undefined>;
   clearColorRef: MutableRefObject<[number, number, number, number]>;
   visualEnhancementRef: MutableRefObject<VisualEnhancementOptions>;
+  /** Lighting environment (sun, hemisphere ambient, exposure, sky pass). */
+  environmentRef: MutableRefObject<LightingEnvironment>;
   sectionPlaneRef: MutableRefObject<SectionPlane>;
   sectionRangeRef: MutableRefObject<{ min: number; max: number } | null>;
   /**
@@ -77,6 +79,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     selectedModelIndexRef,
     clearColorRef,
     visualEnhancementRef,
+    environmentRef,
     sectionPlaneRef,
     sectionRangeRef,
     modelBoundsRef,
@@ -185,6 +188,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
           selectedModelIndex: selectedModelIndexRef.current,
           clearColor: clearColorRef.current,
           visualEnhancement: visualEnhancementRef.current,
+          environment: environmentRef.current,
           isInteracting: isInteractingRef.current || isAnimating,
           // Let the effects governor judge missed frames against the
           // intentional large-model throttle instead of display refresh.

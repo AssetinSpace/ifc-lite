@@ -38,6 +38,8 @@ import { createCompareSlice, type CompareSlice } from './slices/compareSlice.js'
 import { createScriptSlice, type ScriptSlice } from './slices/scriptSlice.js';
 import { createChatSlice, type ChatSlice } from './slices/chatSlice.js';
 import { createCesiumSlice, type CesiumSlice } from './slices/cesiumSlice.js';
+import { createSolarSlice, type SolarSlice } from './slices/solarSlice.js';
+import { createEnvironmentSlice, type EnvironmentSlice } from './slices/environmentSlice.js';
 import { createScheduleSlice, type ScheduleSlice } from './slices/scheduleSlice.js';
 import { createPlaybackSlice, type PlaybackSlice } from './slices/playbackSlice.js';
 import { createOverlaySlice, type OverlaySlice } from './slices/overlaySlice.js';
@@ -137,6 +139,8 @@ export type ViewerState = LoadingSlice &
   ScriptSlice &
   ChatSlice &
   CesiumSlice &
+  SolarSlice &
+  EnvironmentSlice &
   ScheduleSlice &
   PlaybackSlice &
   OverlaySlice &
@@ -188,6 +192,8 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createScriptSlice(...args),
   ...createChatSlice(...args),
   ...createCesiumSlice(...args),
+  ...createSolarSlice(...args),
+  ...createEnvironmentSlice(...args),
   ...createScheduleSlice(...args),
   ...createPlaybackSlice(...args),
   ...createOverlaySlice(...args),
