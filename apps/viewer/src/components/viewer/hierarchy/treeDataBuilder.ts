@@ -20,11 +20,51 @@ import {
   getAggregatedChildren,
   type AggregationRelationships,
 } from '@/utils/aggregation';
-import type { TreeNode, NodeType, StoreyData, UnifiedStorey } from './types';
+import type { TreeNode, NodeType, StoreyData, UnifiedStorey, HierarchySortMode } from './types';
+import { DEFAULT_HIERARCHY_SORT } from './types';
 
 /** Helper to create elevation key (with 0.5m tolerance for matching) */
 export function elevationKey(elevation: number): string {
   return (Math.round(elevation * 2) / 2).toFixed(2);
+}
+
+/** "Level" rows the browser sorts: building storeys plus their IFC4.3
+ *  facility-part equivalents (facility / bridge / road / railway parts). These
+ *  are the elevation-bearing leaf containers under a building or facility, so
+ *  they share the storey sort; other spatial children (Site, Building, Space)
+ *  keep their document order. `isStoreyLikeSpatialType` covers only
+ *  IfcBuildingStorey, hence the explicit part types here. */
+function isLevelLikeSpatialType(type: IfcTypeEnum): boolean {
+  return (
+    isStoreyLikeSpatialType(type) ||
+    type === IfcTypeEnum.IfcFacilityPart ||
+    type === IfcTypeEnum.IfcBridgePart ||
+    type === IfcTypeEnum.IfcRoadPart ||
+    type === IfcTypeEnum.IfcRailwayPart
+  );
+}
+
+/** Natural, case-insensitive name collation so "Level 2" sorts before "Level 10". */
+const storeyNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+/** Order two storey-like entries (unified storeys or spatial nodes) by the
+ *  browser sort mode chosen in the hierarchy panel (issue #1296). */
+export function compareStoreyEntries(
+  a: { name: string; elevation?: number },
+  b: { name: string; elevation?: number },
+  mode: HierarchySortMode,
+): number {
+  switch (mode) {
+    case 'elevation-asc':
+      return (a.elevation ?? 0) - (b.elevation ?? 0);
+    case 'name-asc':
+      return storeyNameCollator.compare(a.name, b.name);
+    case 'name-desc':
+      return storeyNameCollator.compare(b.name, a.name);
+    case 'elevation-desc':
+    default:
+      return (b.elevation ?? 0) - (a.elevation ?? 0);
+  }
 }
 
 /** Convert IfcTypeEnum to NodeType string */
@@ -122,7 +162,10 @@ function getSpatialNodeElements(
 }
 
 /** Build unified storey data for multi-model mode */
-export function buildUnifiedStoreys(models: Map<string, FederatedModel>): UnifiedStorey[] {
+export function buildUnifiedStoreys(
+  models: Map<string, FederatedModel>,
+  sortMode: HierarchySortMode = DEFAULT_HIERARCHY_SORT,
+): UnifiedStorey[] {
   if (models.size <= 1) return [];
 
   const storeysByElevation = new Map<string, UnifiedStorey>();
@@ -167,7 +210,7 @@ export function buildUnifiedStoreys(models: Map<string, FederatedModel>): Unifie
   }
 
   return Array.from(storeysByElevation.values())
-    .sort((a, b) => b.elevation - a.elevation);
+    .sort((a, b) => compareStoreyEntries(a, b, sortMode));
 }
 
 /** Get all element IDs for a unified storey (as global IDs) - optimized to avoid spread operator */
@@ -267,7 +310,8 @@ function buildSpatialNodes(
   idOffset: number,
   expandedNodes: Set<string>,
   nodes: TreeNode[],
-  descendantSpaceCache: Map<number, Set<number>>
+  descendantSpaceCache: Map<number, Set<number>>,
+  sortMode: HierarchySortMode
 ): void {
   const nodeId = `${parentNodeId}-${spatialNode.expressId}`;
   const nodeType = getNodeType(spatialNode.type);
@@ -310,11 +354,19 @@ function buildSpatialNodes(
   });
 
   if (isNodeExpanded) {
-    // Sort storeys by elevation descending
-    const shouldSortByElevation = (spatialNode.children || []).some((child) => isStoreyLikeSpatialType(child.type));
-    const sortedChildren = shouldSortByElevation
-      ? [...(spatialNode.children || [])].sort((a, b) => (b.elevation || 0) - (a.elevation || 0))
-      : spatialNode.children || [];
+    // Reorder the level-like children (storeys + facility parts) by the chosen
+    // browser sort mode (#1296), sorting only those rows IN PLACE so non-level
+    // siblings (Site, Building, Space) keep their document position.
+    const children = spatialNode.children || [];
+    const levelChildren = children.filter((child) => isLevelLikeSpatialType(child.type));
+    let sortedChildren = children;
+    if (levelChildren.length > 1) {
+      const sortedLevels = [...levelChildren].sort((a, b) => compareStoreyEntries(a, b, sortMode));
+      let li = 0;
+      sortedChildren = children.map((child) =>
+        isLevelLikeSpatialType(child.type) ? sortedLevels[li++] : child,
+      );
+    }
 
     for (const child of sortedChildren) {
       buildSpatialNodes(
@@ -328,7 +380,8 @@ function buildSpatialNodes(
         idOffset,
         expandedNodes,
         nodes,
-        descendantSpaceCache
+        descendantSpaceCache,
+        sortMode
       );
     }
 
@@ -348,7 +401,8 @@ export function buildTreeData(
   ifcDataStore: IfcDataStore | null | undefined,
   expandedNodes: Set<string>,
   isMultiModel: boolean,
-  unifiedStoreys: UnifiedStorey[]
+  unifiedStoreys: UnifiedStorey[],
+  sortMode: HierarchySortMode = DEFAULT_HIERARCHY_SORT
 ): TreeNode[] {
   const nodes: TreeNode[] = [];
 
@@ -460,7 +514,8 @@ export function buildTreeData(
           model.idOffset ?? 0,
           expandedNodes,
           nodes,
-          descendantSpaceCache
+          descendantSpaceCache,
+          sortMode
         );
       }
     }
@@ -480,7 +535,8 @@ export function buildTreeData(
         model.idOffset ?? 0,
         expandedNodes,
         nodes,
-        descendantSpaceCache
+        descendantSpaceCache,
+        sortMode
       );
     }
   } else if (ifcDataStore?.spatialHierarchy?.project) {
@@ -497,7 +553,8 @@ export function buildTreeData(
       0,
       expandedNodes,
       nodes,
-      descendantSpaceCache
+      descendantSpaceCache,
+      sortMode
     );
   }
 
