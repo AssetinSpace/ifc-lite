@@ -344,6 +344,10 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
             id: entry.model.id,
             name: entry.model.name,
             dataStore: entry.dataStore,
+            // Pass each model's pending edits so federated export round-trips
+            // mutations like single-model export. Gated by the Apply Mutations
+            // toggle; models without edits resolve to undefined (no bake cost).
+            mutationView: applyMutations ? (getMutationView(entry.model.id) ?? undefined) : undefined,
           });
         }
 
@@ -676,7 +680,7 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
             </div>
           )}
 
-          {exportScope === 'single' && (
+          {(exportScope === 'single' || exportScope === 'merged') && (
             <div className="flex items-center justify-between">
               <Label>Apply Property Changes</Label>
               <Switch checked={applyMutations} onCheckedChange={setApplyMutations} />
