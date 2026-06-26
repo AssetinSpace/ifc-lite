@@ -87,9 +87,22 @@ export class SnapDetector {
 
   // Cache for processed mesh geometry (vertices and edges).
   // Invalidated via clearCache(), which is called by Renderer.destroy() and
-  // RaycastEngine.clearCaches(). Callers must invoke clearCaches() when models
-  // are loaded/unloaded to prevent stale entries from accumulating.
-  private geometryCache = new Map<number, MeshGeometryCache>();
+  // RaycastEngine.clearCaches(). The cache holds WORLD-space geometry, and both
+  // keys below stay stable across an in-place geometry edit (a flat mesh's
+  // positions or an instanced occurrence's matrix being mutated by
+  // translateMeshesForEntity / translateInstancedEntity). So callers must invoke
+  // clearCaches() not only on model load/unload but also after any in-place
+  // mutation (gizmo move, numeric move, exploded view) — otherwise snap keeps
+  // serving the pre-edit geometry. This is identical for flat and instanced
+  // meshes; instancing adds no new staleness window.
+  //
+  // Keyed by `mesh.occurrenceKey ?? mesh.expressId`: flat meshes (one per
+  // expressId) key on the numeric id, but GPU-instanced occurrences share one
+  // expressId across many world-space placements, so they must key on their
+  // per-occurrence string key (issue #1405) — keying on expressId alone served
+  // the first occurrence's edges/vertices for every later one, so snap lit up
+  // on a single instance.
+  private geometryCache = new Map<string | number, MeshGeometryCache>();
 
   /**
    * Detect best snap target near cursor
@@ -535,13 +548,16 @@ export class SnapDetector {
    * Get or compute geometry cache for a mesh
    */
   private getGeometryCache(mesh: MeshData): MeshGeometryCache {
-    const cached = this.geometryCache.get(mesh.expressId);
+    // Instanced occurrences share an expressId but hold distinct world-space
+    // positions, so key on the per-occurrence key when present (issue #1405).
+    const key = mesh.occurrenceKey ?? mesh.expressId;
+    const cached = this.geometryCache.get(key);
     if (cached) {
       return cached;
     }
 
     const cache = buildGeometryCache(mesh);
-    this.geometryCache.set(mesh.expressId, cache);
+    this.geometryCache.set(key, cache);
     return cache;
   }
 
