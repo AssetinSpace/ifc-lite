@@ -20,6 +20,7 @@ mod gpu_meshes;
 mod grid_lines;
 mod mesh_outline;
 mod parsing;
+mod pipeline_diagnostics;
 mod space_plate;
 pub(crate) mod styling;
 mod symbolic;
@@ -197,6 +198,15 @@ pub struct IfcAPI {
             )>,
         )>,
     >,
+
+    /// Per-load structured pipeline diagnostics (`PipelineDiagnostics`
+    /// contract, see `api::pipeline_diagnostics`): every
+    /// `processGeometryBatch*` call folds one batch record in — cheap
+    /// counters plus per-batch JS wall time, so it is always on. Read by JS
+    /// via `getPipelineDiagnostics`; reset by `clearPrePassCache` and
+    /// `setEntityIndex` (a new load on a reused IfcAPI), like the other
+    /// content-scoped state.
+    pipeline_diagnostics: std::sync::Mutex<ifc_lite_processing::PipelineDiagnostics>,
 }
 
 #[wasm_bindgen]
@@ -226,6 +236,9 @@ impl IfcAPI {
             skip_small_cuts: std::sync::atomic::AtomicBool::new(false),
             cached_plane_angle_to_radians: std::sync::Mutex::new(None),
             cached_geometry_styles: std::sync::Mutex::new(None),
+            pipeline_diagnostics: std::sync::Mutex::new(
+                ifc_lite_processing::PipelineDiagnostics::default(),
+            ),
         }
     }
 
@@ -307,6 +320,13 @@ impl IfcAPI {
             .lock()
             .expect("ifc-lite cached_item_dedup Mutex poisoned")
             .take();
+        // NB: do NOT reset pipeline_diagnostics here. clearPrePassCache runs in
+        // the JS load wrapper's `finally` AFTER the last processGeometryBatch
+        // (packages/geometry/src/index.ts), i.e. end-of-load cleanup; resetting
+        // here would erase the just-completed load's diagnostics before a host
+        // can read getPipelineDiagnostics(). Diagnostics are an accumulator, not
+        // a cache, so they reset only at load START (set_entity_index), unlike
+        // cached_item_dedup which is safe to drop on every clear.
     }
 
     /// Populate `cached_entity_index` from pre-extracted column arrays.
@@ -395,6 +415,9 @@ impl IfcAPI {
             .lock()
             .expect("ifc-lite cached_item_dedup Mutex poisoned")
             .take();
+        // A new entity index means a new file — the pipeline diagnostics
+        // describe the previous load, so start fresh.
+        self.reset_pipeline_diagnostics();
     }
 
     /// Get WASM memory for zero-copy access
