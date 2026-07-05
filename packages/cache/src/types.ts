@@ -101,6 +101,15 @@ export enum HeaderFlags {
   Compressed = 1 << 0,
   HasGeometry = 1 << 1,
   HasSpatial = 1 << 2,
+  /**
+   * The `sourceHash` field is NOT a full-file `xxhash64` — it is unset (0) and
+   * must not be used to validate the source. Set by writers that validate the
+   * source by another means (see `omitSourceHash`), so `reader.validate()` /
+   * `read({ sourceBuffer })` can fail LOUD (or skip) instead of silently
+   * fail-closing on a real match. Backward-compatible: entries written before
+   * this flag existed have it unset, so their `sourceHash` stays a real hash.
+   */
+  SourceHashUnset = 1 << 3,
 }
 
 /** Section flags */
@@ -146,6 +155,17 @@ export interface CacheWriteOptions {
   includeSpatialHierarchy?: boolean;
   /** Compress sections (default: false, future feature) */
   compress?: boolean;
+  /**
+   * Skip the header's full-file `xxhash64(sourceBuffer)`: store `sourceHash = 0n`
+   * and set {@link HeaderFlags.SourceHashUnset}. Use when the caller validates
+   * the source by another means (e.g. an application-layer content hash), so a
+   * large source pays NO full-file main-thread hash on write. Consumers that
+   * would validate against the header (`reader.validate()` / `read({
+   * sourceBuffer })`) can then detect the absence via {@link
+   * CacheHeaderInfo.hasSourceHash} instead of silently fail-closing. Default
+   * `false` (the writer hashes the whole `sourceBuffer`, unchanged).
+   */
+  omitSourceHash?: boolean;
 }
 
 /**
@@ -166,7 +186,14 @@ export interface CacheReadOptions {
 export interface CacheHeaderInfo {
   version: number;
   schema: SchemaVersion;
+  /**
+   * Full-file `xxhash64` of the source — VALID only when {@link hasSourceHash}
+   * is true. When false it is `0n` and carries no meaning (see
+   * {@link HeaderFlags.SourceHashUnset}).
+   */
   sourceHash: bigint;
+  /** Is {@link sourceHash} a real full-file hash (vs. an unset `0n`)? */
+  hasSourceHash: boolean;
   entityCount: number;
   totalVertices: number;
   totalTriangles: number;
