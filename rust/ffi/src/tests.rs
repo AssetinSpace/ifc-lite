@@ -281,3 +281,36 @@ fn free_tolerates_null_and_zero_len() {
         ifc_lite_free(ptr::null_mut(), 16);
     }
 }
+
+/// This crate pins `mimalloc` as the global allocator by default (#1623): the
+/// platform system heap's global lock dominated native geometry self-time (~70%)
+/// and capped rayon scaling. Guard that the geometry pipeline stays SOUND and
+/// run-to-run DETERMINISTIC under the swapped allocator — a corrupt or racy
+/// allocator would surface as empty/garbled meshes, or as two runs of the same
+/// input disagreeing. The whole test binary runs under the crate's global
+/// allocator (mimalloc unless built `--no-default-features`), so this doubles as
+/// the guard that the allocator swap never alters geometry output.
+#[test]
+fn geometry_is_sound_and_deterministic_under_the_global_allocator() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../geometry/tests/fixtures/bath_csg_solid.ifc"
+    );
+    // Committed in-tree fixture (not a fetched `tests/models/` model), so it is
+    // always present in a normal checkout — a read failure is a real error, not a
+    // skip. Silently skipping would let this guard "pass" without exercising the
+    // allocator at all.
+    let ifc = std::fs::read_to_string(fixture)
+        .unwrap_or_else(|e| panic!("read committed fixture {fixture}: {e}"));
+
+    let a = ifc_lite_processing::process_geometry(&ifc);
+    let b = ifc_lite_processing::process_geometry(&ifc);
+
+    let tris: usize = a.meshes.iter().map(|m| m.indices.len() / 3).sum();
+    assert!(tris > 0, "fixture must produce geometry under the global allocator");
+    assert_eq!(a.meshes.len(), b.meshes.len(), "mesh count must be stable run-to-run");
+    for (x, y) in a.meshes.iter().zip(&b.meshes) {
+        assert_eq!(x.positions, y.positions, "positions must be deterministic");
+        assert_eq!(x.indices, y.indices, "indices must be deterministic");
+    }
+}
