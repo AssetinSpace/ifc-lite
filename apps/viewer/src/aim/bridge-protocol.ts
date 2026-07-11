@@ -18,6 +18,9 @@ export const SOURCE = 'aim-bridge' as const;
 /** Blue-400 — matches the old FILTER_COLOR in the AIM three.js viewer. */
 export const FILTER_COLOR = '#60a5fa';
 
+/** Orange-500 — matches the old HIGHLIGHT_COLOR (focus/pick) in the AIM viewer. */
+export const FOCUS_COLOR = '#f97316';
+
 export type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }

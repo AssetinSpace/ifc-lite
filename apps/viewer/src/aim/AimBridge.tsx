@@ -24,6 +24,7 @@ import { useViewerStore } from '../store/index.js';
 import {
   SOURCE,
   FILTER_COLOR,
+  FOCUS_COLOR,
   isInboundMessage,
   resolveGuids,
   guidForEntity,
@@ -34,6 +35,9 @@ export function AimBridge() {
   const bim = useBim();
   const parentOriginRef = useRef<string | null>(null);
   const embeddedRef = useRef(false);
+  // Prvky ofarbené posledným FOCUS-om — ďalší FOCUS ich vráti do pôvodných
+  // farieb (partial resetColors), aby sa oranžová nehromadila po scéne.
+  const focusedRef = useRef<ReturnType<typeof resolveGuids>>([]);
 
   useEffect(() => {
     // No parent frame (e.g. a standalone viewer tab) — nothing to bridge.
@@ -56,18 +60,29 @@ export function AimBridge() {
         case 'FOCUS': {
           const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length === 0) return;
+          // Explicitné ofarbenie (oranžová ako v pôvodnom AIM three.js
+          // vieweri): multi-select cez SDK plní iba selectedEntitiesSet a
+          // renderer highlight (selectedEntityIds sync) necháva na callerovi
+          // — pozri addEntityToSelection v selectionSlice — takže samotný
+          // select() by v 3D nebol vidieť.
+          if (focusedRef.current.length > 0) bim.viewer.resetColors(focusedRef.current);
+          bim.viewer.colorize(refs, FOCUS_COLOR);
+          focusedRef.current = refs;
           bim.viewer.select(refs);
           bim.viewer.flyTo(refs);
           break;
         }
         case 'HIGHLIGHT_FILTER': {
+          // Plný reset zhodí aj focus ofarbenie — filter ho nahrádza.
           bim.viewer.resetColors();
+          focusedRef.current = [];
           const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.colorize(refs, FILTER_COLOR);
           break;
         }
         case 'CLEAR_FILTER':
           bim.viewer.resetColors();
+          focusedRef.current = [];
           break;
       }
     }
