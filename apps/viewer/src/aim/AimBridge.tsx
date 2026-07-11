@@ -34,6 +34,7 @@ type InboundMessage =
 
 type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
+  | { source: typeof SOURCE; type: 'MODELS_LOADED'; count: number }
   | { source: typeof SOURCE; type: 'ENTITY_SELECTED'; guid: string }
   | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' };
 
@@ -118,6 +119,22 @@ export function AimBridge() {
     post({ source: SOURCE, type: 'READY' });
     return () => window.removeEventListener('message', onMessage);
   }, [bim]);
+
+  // Signal the host once models finish loading (the `?models=` autoload is
+  // async, so READY fires well before geometry/data exist). The host defers
+  // the initial deep-link focus (?focus=<guid>) until this event so
+  // resolveGuids can actually find the entity. Fires on the 0 -> N transition.
+  const modelCount = useViewerStore((s) => s.models.size);
+  const modelsAnnouncedRef = useRef(false);
+  useEffect(() => {
+    if (!embeddedRef.current) return;
+    if (modelCount === 0 || modelsAnnouncedRef.current) return;
+    modelsAnnouncedRef.current = true;
+    window.parent.postMessage(
+      { source: SOURCE, type: 'MODELS_LOADED', count: modelCount } satisfies OutboundMessage,
+      parentOriginRef.current ?? '*',
+    );
+  }, [modelCount]);
 
   // 3D -> DB: forward native selection changes to the host. The host
   // resolves guid -> objects.id via its own guidMap (see lib/data/ifc.ts
