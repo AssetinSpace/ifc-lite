@@ -9,11 +9,12 @@
  * expressId bridge when the path resolves to a meshed entity.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { StackDiff } from '@ifc-lite/merge';
 import { useViewerStore } from '@/store';
 import type { LayerStackEntry } from '@/store/slices/layerStackSlice';
 import { pathTail } from '@/lib/layers/stack';
+import { Ghost } from 'lucide-react';
 
 type ChangeKind = 'added' | 'deleted' | 'modified';
 
@@ -51,6 +52,10 @@ const ROW_LIMIT = 200;
 
 export function LayerDiffView({ entry, diff }: { entry: LayerStackEntry; diff: StackDiff }) {
   const [kindFilter, setKindFilter] = useState<ChangeKind | null>(null);
+  const [ghosting, setGhosting] = useState(false);
+  // The exact Set THIS view installed — the ghost channel is shared with
+  // other features (clash focus etc.), so cleanup must only remove ours.
+  const ownedGhostSet = useRef<Set<number> | null>(null);
 
   const rows = useMemo<DiffRow[]>(() => {
     const out: DiffRow[] = [];
@@ -63,6 +68,45 @@ export function LayerDiffView({ entry, diff }: { entry: LayerStackEntry; diff: S
   }, [diff]);
 
   const visible = kindFilter ? rows.filter((r) => r.kind === kindFilter) : rows;
+
+  // 3D isolation (08-review.md diff mode): ghost everything this layer
+  // did not touch. Deleted paths have no mesh; added/modified resolve
+  // through the composition bridge. Cleared on unmount / diff change.
+  const toggleGhost = useCallback(() => {
+    const state = useViewerStore.getState();
+    setGhosting((prev) => {
+      if (prev) {
+        if (state.ghostExceptEntities === ownedGhostSet.current) {
+          state.setGhostExceptEntities(null);
+        }
+        ownedGhostSet.current = null;
+        return false;
+      }
+      const ids = new Set<number>();
+      for (const path of [...diff.added, ...diff.modified.map((m) => m.path)]) {
+        const id = state.layerStackPathToId?.get(path);
+        if (id !== undefined) ids.add(id);
+      }
+      if (ids.size === 0) return false;
+      ownedGhostSet.current = ids;
+      state.setGhostExceptEntities(ids);
+      return true;
+    });
+  }, [diff]);
+
+  useEffect(() => {
+    // Leaving the diff (or swapping layers) drops OUR isolation only —
+    // never a ghost set some other panel installed — and resyncs the
+    // toggle so the button never claims ghosting that no longer exists.
+    return () => {
+      const state = useViewerStore.getState();
+      if (ownedGhostSet.current !== null && state.ghostExceptEntities === ownedGhostSet.current) {
+        state.setGhostExceptEntities(null);
+      }
+      ownedGhostSet.current = null;
+      setGhosting(false);
+    };
+  }, [diff]);
 
   const selectPath = useCallback((path: string) => {
     const state = useViewerStore.getState();
@@ -82,6 +126,19 @@ export function LayerDiffView({ entry, diff }: { entry: LayerStackEntry; diff: S
         <span className="truncate text-[11px] font-medium" title={entry.name}>
           Changes by {entry.name}
         </span>
+        <button
+          type="button"
+          onClick={toggleGhost}
+          aria-pressed={ghosting}
+          className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none transition-colors ${
+            ghosting
+              ? 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300'
+              : 'border-border text-muted-foreground hover:bg-muted/60'
+          }`}
+        >
+          <Ghost className="size-2.5" aria-hidden />
+          {ghosting ? 'Ghosting others' : 'Ghost others'}
+        </button>
       </div>
       <div className="flex items-center gap-1 pb-1.5">
         {counts.map(({ kind, count }) => {
