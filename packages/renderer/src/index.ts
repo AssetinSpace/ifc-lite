@@ -62,7 +62,7 @@ export type { ContributionCullOptions, CullCameraState } from './contribution-cu
 export { chunkCellKey, bucketBaseKeyFor, DEFAULT_CHUNK_CELL_SIZE } from './chunk-grid.js';
 export type { SpatialChunkingConfig, ChunkAnchorSource } from './chunk-grid.js';
 export { selectEvictions, MIN_EVICTION_AGE_FRAMES } from './residency.js';
-export type { ResidencyShell } from './residency.js';
+export type { ResidencyShell, ColdGeometryProvider } from './residency.js';
 export { sumResidentGpuBytes } from './render-stats.js';
 export type { FrameStats, ResidentGpuBytes } from './render-stats.js';
 export { RaycastEngine } from './raycast-engine.js';
@@ -1873,6 +1873,13 @@ export class Renderer {
                             }
                             if (visibleIds.size > 0) {
                                 pushVisibleAsPartial(batch, visibleIds, nativelyTransparent);
+                            }
+                            // A COLD parent has no CPU meshData, so the partial
+                            // sub-batch above comes back empty — queue the
+                            // residency restore or the visible subset would
+                            // stay missing under hide/isolate forever.
+                            if (batch.gpuResident === false) {
+                                this.scene.requestBatchResidency(batch);
                             }
                             continue; // Don't add batch to render list
                         }
