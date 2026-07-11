@@ -20,6 +20,7 @@ import {
 } from './scene-raycaster.js';
 import { mergeGeometry, splitMeshDataForBufferLimit, colorSaltByte, packEntityLane } from './scene-geometry.js';
 import { sumResidentGpuBytes, type ResidentGpuBytes } from './render-stats.js';
+import { simplifyIndicesByClustering, lodCellSizeForBounds, LOD_MIN_TRIANGLES } from './lod-simplify.js';
 import { bucketBaseKeyFor, type SpatialChunkingConfig } from './chunk-grid.js';
 import { selectEvictions, type ResidencyShell, type ColdGeometryProvider } from './residency.js';
 import { OPAQUE_ALPHA_CUTOFF } from './overlay-routing.js';
@@ -69,11 +70,12 @@ export interface TexturedMesh {
 }
 
 function destroyGpuResources(
-  m: { vertexBuffer: GPUBuffer; indexBuffer: GPUBuffer; uniformBuffer?: GPUBuffer },
+  m: { vertexBuffer: GPUBuffer; indexBuffer: GPUBuffer; uniformBuffer?: GPUBuffer; lod1IndexBuffer?: GPUBuffer },
 ): void {
   m.vertexBuffer.destroy();
   m.indexBuffer.destroy();
   if (m.uniformBuffer) m.uniformBuffer.destroy();
+  if (m.lod1IndexBuffer) m.lod1IndexBuffer.destroy();
 }
 
 /**
@@ -167,6 +169,13 @@ export class Scene {
   private coldRestoresInFlight: Map<string, Promise<void>> = new Map();
   private hostOverBudgetWarned = false;
   private hostEnforceCountdown = 0;
+  // LOD1 builds (issue #1682 phase 5): off unless the app enables them.
+  private lodBuildsEnabled = false;
+  // True while a (possibly time-sliced) finalize rebuild is running. The
+  // preamble clears streamingFragments synchronously, so hasStreamingFragments
+  // alone under-reports "still settling" — settle-sensitive consumers
+  // (post-load telemetry) must also check this.
+  private finalizeInProgress = false;
   private nextSplitId: number = 0; // Monotonic counter for sub-bucket keys
   private nextBatchId: number = 0; // Monotonic counter for unique batch identifiers
   // Shared local-frame origin for ALL batches (set from the first batch's world
@@ -359,6 +368,16 @@ export class Scene {
   /** Wire the cold-storage source (v13 cache chunks). Null disables the tier. */
   setColdGeometryProvider(provider: ColdGeometryProvider | null): void {
     this.coldProvider = provider;
+  }
+
+  /**
+   * Enable LOD1 builds (issue #1682 phase 5): bucket batches built from now
+   * on (finalize, rebuild, residency restore) get a simplified second index
+   * range when it pays. Set BEFORE geometry loads; streaming fragments and
+   * partial/overlay sub-batches never build LOD.
+   */
+  setLodBuildsEnabled(enabled: boolean): void {
+    this.lodBuildsEnabled = enabled;
   }
 
   /** Set (or clear) the HOST budget in bytes for bucket CPU geometry. */
@@ -578,7 +597,8 @@ export class Scene {
     for (const bucket of this.buckets.values()) {
       const b = bucket.batchedMesh;
       if (!b || b.gpuResident === false) continue;
-      const bytes = b.vertexBuffer.size + b.indexBuffer.size + (b.uniformBuffer?.size ?? 0);
+      const bytes = b.vertexBuffer.size + b.indexBuffer.size + (b.uniformBuffer?.size ?? 0)
+        + (b.lod1IndexBuffer?.size ?? 0);
       residentBytes += bytes;
       const lastDrawn = this.lastDrawnFrame.get(b.id) ?? -1;
       if (lastDrawn === this.residencyFrame) continue;      // drawn this frame: not evictable
@@ -595,7 +615,8 @@ export class Scene {
       if (!bucket || !batch || batch.gpuResident === false) continue;
       destroyGpuResources(batch);
       batch.gpuResident = false;
-      evictedBytes += batch.vertexBuffer.size + batch.indexBuffer.size + (batch.uniformBuffer?.size ?? 0);
+      evictedBytes += batch.vertexBuffer.size + batch.indexBuffer.size + (batch.uniformBuffer?.size ?? 0)
+        + (batch.lod1IndexBuffer?.size ?? 0);
       this.lastDrawnFrame.delete(batch.id);
       this.dropPartialCacheForBatch(batch);
     }
@@ -1569,6 +1590,13 @@ export class Scene {
     return this.streamingFragments.length > 0;
   }
 
+  /** True while a finalize rebuild (sync or time-sliced) is mid-flight —
+   *  the fragment list is already cleared then, so settle-sensitive callers
+   *  must check BOTH this and hasStreamingFragments(). */
+  isFinalizeInProgress(): boolean {
+    return this.finalizeInProgress;
+  }
+
   /** True when streaming runs in ephemeral mode (huge files) — fragments render
    *  directly from GPU and geometry is NOT retained for re-batch, so callers
    *  must NOT finalize (there's nothing to rebuild the batches from). */
@@ -1760,7 +1788,15 @@ export class Scene {
    */
   finalizeStreaming(device: GPUDevice, pipeline: RenderPipeline): void {
     if (this.streamingFragments.length === 0) return;
+    this.finalizeInProgress = true;
+    try {
+      this.finalizeStreamingInner(device, pipeline);
+    } finally {
+      this.finalizeInProgress = false;
+    }
+  }
 
+  private finalizeStreamingInner(device: GPUDevice, pipeline: RenderPipeline): void {
     // Save references to old fragments/batches — keep them rendering
     // until the new proper batches are fully built (no visual gap).
     const oldFragments = this.streamingFragments;
@@ -1850,6 +1886,10 @@ export class Scene {
       return Promise.resolve();
     }
     if (this.streamingFragments.length === 0) return Promise.resolve();
+    // Mark the rebuild as in-flight: the preamble empties streamingFragments
+    // synchronously, so settle-sensitive consumers need this flag until the
+    // time-sliced rebuild swaps the new batch array in.
+    this.finalizeInProgress = true;
 
     // --- Synchronous preamble (fast O(N) bookkeeping) ---
 
@@ -1945,6 +1985,7 @@ export class Scene {
         for (const batch of oldBatches) {
           if (!fragmentSet.has(batch)) destroyGpuResources(batch);
         }
+        scene.finalizeInProgress = false;
         resolve();
       }
       // Start first chunk immediately (no setTimeout delay)
@@ -2288,6 +2329,39 @@ export class Scene {
       ],
     });
 
+    // LOD1 (issue #1682 phase 5): simplified second index range over the SAME
+    // vertex buffer. Bucket-owned batches only (`bucketKey` present) — the
+    // transient streaming fragments and partial/overlay sub-batches never pay
+    // the build. Positions in `merged.vertexData` are relative to the batch
+    // origin, which is fine: clustering is translation-invariant as long as
+    // the cell size comes from the same-space bounds extent.
+    let lod1IndexBuffer: GPUBuffer | undefined;
+    let lod1IndexCount: number | undefined;
+    if (
+      this.lodBuildsEnabled &&
+      bucketKey !== undefined &&
+      merged.bounds &&
+      merged.indices.length >= LOD_MIN_TRIANGLES * 3
+    ) {
+      const cellSize = lodCellSizeForBounds(merged.bounds.min, merged.bounds.max);
+      const lodIndices = simplifyIndicesByClustering(
+        merged.vertexData,
+        BATCH_CONSTANTS.BYTES_PER_VERTEX / 4,
+        merged.indices,
+        cellSize,
+      );
+      if (lodIndices) {
+        lod1IndexBuffer = device.createBuffer({
+          size: lodIndices.byteLength,
+          usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Uint32Array(lod1IndexBuffer.getMappedRange()).set(lodIndices);
+        lod1IndexBuffer.unmap();
+        lod1IndexCount = lodIndices.length;
+      }
+    }
+
     return {
       id: this.nextBatchId++,
       colorKey: bucketKey ?? this.colorKey(color),
@@ -2302,6 +2376,7 @@ export class Scene {
       // Per-batch local frame: positions are stored relative to this; the draw
       // loop applies model = translate(origin) so they land in world space.
       origin: merged.origin,
+      ...(lod1IndexBuffer ? { lod1IndexBuffer, lod1IndexCount } : {}),
     };
   }
 
