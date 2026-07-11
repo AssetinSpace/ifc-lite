@@ -83,29 +83,41 @@ export function ViewerLayout() {
   usePrivacyDisclosure();
   const shortcutsDialog = useKeyboardShortcutsDialog();
 
-  // Auto-load a model from ?model=<URL>. Used by the landing-page iframe to drop a
-  // sample IFC into the viewer on first mount. Same-origin or CORS-friendly URLs only.
+  // Auto-load model(s) from the URL. `?model=<URL>` loads a single IFC (the
+  // original landing-page-iframe behaviour). `?models=<URL>,<URL>,…` loads a
+  // federation (AIM: ASR + VZT) — the URLs load sequentially through addModel so
+  // every model shares the first model's RTC origin + georef anchor (see
+  // useIfcFederation: shared RTC + alignGeometryToReference). Same-origin or
+  // CORS-friendly URLs only.
   const { addModel: autoloadAddModel } = useIfc();
   const autoloadDoneRef = useRef(false);
   useEffect(() => {
     if (autoloadDoneRef.current) return;
     const params = new URLSearchParams(window.location.search);
-    const modelUrl = params.get('model');
-    if (!modelUrl) return;
+    const multi = params.get('models');
+    const single = params.get('model');
+    const urls = (multi ? multi.split(',') : single ? [single] : [])
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length === 0) return;
     autoloadDoneRef.current = true;
     (async () => {
-      try {
-        const res = await fetch(modelUrl);
-        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        const blob = await res.blob();
-        const filename = (() => {
-          try { return new URL(modelUrl, window.location.href).pathname.split('/').pop() || 'model.ifc'; }
-          catch { return 'model.ifc'; }
-        })();
-        const file = new File([blob], filename, { type: blob.type || 'application/x-step' });
-        await autoloadAddModel(file);
-      } catch (err) {
-        console.error('[viewer] autoload from ?model=… failed:', err);
+      // Sequential: the WASM parser isn't re-entrant, and federated adds must
+      // observe the earlier model's RTC/anchor before they finalize.
+      for (const modelUrl of urls) {
+        try {
+          const res = await fetch(modelUrl);
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          const blob = await res.blob();
+          const filename = (() => {
+            try { return new URL(modelUrl, window.location.href).pathname.split('/').pop() || 'model.ifc'; }
+            catch { return 'model.ifc'; }
+          })();
+          const file = new File([blob], filename, { type: blob.type || 'application/x-step' });
+          await autoloadAddModel(file);
+        } catch (err) {
+          console.error('[viewer] autoload failed for', modelUrl, err);
+        }
       }
     })();
   }, [autoloadAddModel]);
