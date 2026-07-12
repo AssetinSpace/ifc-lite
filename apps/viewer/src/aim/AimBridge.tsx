@@ -28,9 +28,12 @@ import {
   FOCUS_COLOR,
   isInboundMessage,
   resolveGuids,
+  resolveSelector,
   guidForEntity,
+  type OpsSelector,
   type OutboundMessage,
 } from './bridge-protocol.js';
+import { useAimPanelStore } from './aimPanelStore.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -52,9 +55,19 @@ export function AimBridge() {
     // This app is only ever embedded by the AIM host, so the referrer at
     // mount time IS the trusted origin — no build-time config needed.
     parentOriginRef.current = document.referrer ? new URL(document.referrer).origin : null;
+    useAimPanelStore.getState().setEmbedded(true, parentOriginRef.current);
 
     function post(msg: OutboundMessage) {
       window.parent.postMessage(msg, parentOriginRef.current ?? '*');
+    }
+
+    // Ops berú buď explicitné GUIDy, alebo množinový selektor (typy/model)
+    // rozkladaný viewer-side — „celý VZT.ifc" tak necestuje ako zoznam GUIDov.
+    function refsForOp(msg: { guids?: string[]; selector?: OpsSelector }) {
+      const models = useViewerStore.getState().models;
+      if (msg.guids?.length) return resolveGuids(models, msg.guids);
+      if (msg.selector) return resolveSelector(models, msg.selector);
+      return [];
     }
 
     function onMessage(e: MessageEvent) {
@@ -92,6 +105,39 @@ export function AimBridge() {
         case 'CLEAR_FILTER':
           bim.viewer.resetColors();
           focusedRef.current = [];
+          break;
+        case 'COLORIZE': {
+          const refs = refsForOp(e.data);
+          if (refs.length > 0) bim.viewer.colorize(refs, e.data.color);
+          break;
+        }
+        case 'HIDE': {
+          const refs = refsForOp(e.data);
+          if (refs.length > 0) bim.viewer.hide(refs);
+          break;
+        }
+        case 'SHOW': {
+          const refs = refsForOp(e.data);
+          if (refs.length > 0) bim.viewer.show(refs);
+          break;
+        }
+        case 'ISOLATE': {
+          const refs = refsForOp(e.data);
+          if (refs.length > 0) bim.viewer.isolate(refs);
+          break;
+        }
+        case 'SHOW_ALL':
+          bim.viewer.resetVisibility();
+          break;
+        case 'RESET_COLORS':
+          bim.viewer.resetColors();
+          focusedRef.current = [];
+          break;
+        case 'AIM_PANEL_DATA':
+          useAimPanelStore.getState().resolve(e.data.guid, { data: e.data.data });
+          break;
+        case 'AIM_PANEL_EMPTY':
+          useAimPanelStore.getState().resolve(e.data.guid, { reason: e.data.reason });
           break;
       }
     }
@@ -165,6 +211,7 @@ export function AimBridge() {
       // po skutočnej selekcii, inak host dostane šum hneď po READY.
       if (!hadSelectionRef.current) return;
       hadSelectionRef.current = false;
+      useAimPanelStore.getState().clear();
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_DESELECTED' } satisfies OutboundMessage, targetOrigin);
       return;
     }
@@ -177,7 +224,12 @@ export function AimBridge() {
     programmaticSelectionRef.current = null;
     const guid = guidForEntity(useViewerStore.getState().models, selectedEntity);
     if (guid) {
+      // AimCard shows its skeleton immediately; the host answers with
+      // AIM_PANEL_DATA / AIM_PANEL_EMPTY (or the store times out quietly).
+      useAimPanelStore.getState().beginLoading(guid);
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_SELECTED', guid } satisfies OutboundMessage, targetOrigin);
+    } else {
+      useAimPanelStore.getState().clear();
     }
   }, [selectedEntity]);
 

@@ -98,6 +98,9 @@ export function FloatingPanel({
     onRect({ x: startX, y: startY, w, h });
 
     const move = (ev: MouseEvent) => {
+      // Mouseup outside this document (iframe embedding) never arrives —
+      // end the stuck drag on the first buttonless move.
+      if (ev.buttons === 0) { up(); return; }
       const x = Math.max(0, Math.min(maxX, startX + ev.clientX - px));
       const y = Math.max(0, Math.min(maxY, startY + ev.clientY - py));
       onRect({ x, y });
@@ -137,6 +140,8 @@ export function FloatingPanel({
       : Math.max(MIN_H, bounds?.height ?? window.innerHeight);
 
     const move = (ev: MouseEvent) => {
+      // Same stuck-drag guard as onDragStart above.
+      if (ev.buttons === 0) { up(); return; }
       const dx = ev.clientX - px;
       const dy = ev.clientY - py;
       if (snap === 'bottom') {

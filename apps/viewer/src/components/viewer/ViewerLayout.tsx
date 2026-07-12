@@ -267,6 +267,9 @@ export function ViewerLayout() {
 
     const onMouseMove = (moveEvent: MouseEvent) => {
       if (!isDraggingRef.current) return;
+      // A mouseup released outside this document (iframe embedding) never
+      // reaches us — end the stuck drag on the first buttonless move.
+      if (moveEvent.buttons === 0) { cleanup(); return; }
       const container = containerRef.current;
       if (!container) return;
 

@@ -21,16 +21,68 @@ export const FILTER_COLOR = '#60a5fa';
 /** Orange-500 — matches the old HIGHLIGHT_COLOR (focus/pick) in the AIM viewer. */
 export const FOCUS_COLOR = '#f97316';
 
+/**
+ * AIM card render schema — host-driven: the AIM app decides labels, rows,
+ * sections and links; AimCard.tsx renders it generically, so new AIM fields
+ * never require a viewer redeploy. All `href`s are host-relative paths
+ * (e.g. /node/{id}) bounced back via AIM_NAVIGATE — never navigated here.
+ */
+export interface AimPanelData {
+  version: 1;
+  /** Echo of the requested element's GlobalId — used to drop stale responses. */
+  guid: string;
+  title: string;
+  subtitle?: string;
+  badges?: { label: string; tone?: 'default' | 'accent' }[];
+  sections?: {
+    label: string;
+    rows: { label: string; value: string; href?: string; mono?: boolean }[];
+  }[];
+  documents?: { name: string; href: string; badge?: string }[];
+  actions?: { label: string; href: string; primary?: boolean }[];
+}
+
+/**
+ * Množinový výber pre viewer ops (D-066 rozšírenie): namiesto vymenovania
+ * GUIDov popíše CELÚ triedu prvkov a viewer ju rozloží sám z entity tables —
+ * „celý VZT.ifc", „všetko HVAC", „steny + stropy naraz". Obrovské množiny tak
+ * necestujú ako GUID zoznamy v URL/postMessage.
+ */
+export interface OpsSelector {
+  /**
+   * IFC triedy (case-insensitive, napr. "IfcDuctSegment"); StandardCase /
+   * ElementedCase varianty sa priraďujú k základnej triede automaticky.
+   */
+  types?: string[];
+  /** Model federácie — case-insensitive zhoda s názvom súboru ("VZT" ~ "VZT.ifc"). */
+  model?: string;
+}
+
 export type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
-  | { source: typeof SOURCE; type: 'CLEAR_FILTER' };
+  | { source: typeof SOURCE; type: 'CLEAR_FILTER' }
+  // AI dock viewer ops (D-066 in the AIM repo) — colorize/visibility over
+  // explicit GUIDs, or over an OpsSelector resolved viewer-side.
+  | { source: typeof SOURCE; type: 'COLORIZE'; guids?: string[]; selector?: OpsSelector; color: string }
+  | { source: typeof SOURCE; type: 'HIDE'; guids?: string[]; selector?: OpsSelector }
+  | { source: typeof SOURCE; type: 'SHOW'; guids?: string[]; selector?: OpsSelector }
+  | { source: typeof SOURCE; type: 'ISOLATE'; guids?: string[]; selector?: OpsSelector }
+  | { source: typeof SOURCE; type: 'SHOW_ALL' }
+  | { source: typeof SOURCE; type: 'RESET_COLORS' }
+  // AIM panel data for the selected element (host DB → AimCard in the
+  // PropertiesPanel). Guid-stamped so stale answers are dropped store-side.
+  | { source: typeof SOURCE; type: 'AIM_PANEL_DATA'; guid: string; data: AimPanelData }
+  | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string };
 
 export type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
   | { source: typeof SOURCE; type: 'MODELS_LOADED'; count: number }
   | { source: typeof SOURCE; type: 'ENTITY_SELECTED'; guid: string }
-  | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' };
+  | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' }
+  // Click on a link inside the AimCard — the parent app performs the
+  // navigation (href is a host-relative path, e.g. /node/{id}).
+  | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string };
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.
@@ -39,16 +91,61 @@ export type OutboundMessage =
  * throw iterating `undefined` on every malformed message. Also guards against
  * the noise every window sees — React DevTools, Vite HMR, wallet extensions.
  */
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((s) => typeof s === 'string');
+}
+
+function isOpsSelector(v: unknown): v is OpsSelector {
+  if (!v || typeof v !== 'object') return false;
+  const sel = v as { types?: unknown; model?: unknown };
+  if (sel.types !== undefined && !isStringArray(sel.types)) return false;
+  if (sel.model !== undefined && typeof sel.model !== 'string') return false;
+  return true;
+}
+
+/**
+ * A viewer op (COLORIZE/HIDE/SHOW/ISOLATE) targets explicit `guids` or a
+ * `selector`; both are optional (refsForOp resolves the empty case to []),
+ * but when present they must be well-formed.
+ */
+function hasValidOpTarget(msg: { guids?: unknown; selector?: unknown }): boolean {
+  if (msg.guids !== undefined && !isStringArray(msg.guids)) return false;
+  if (msg.selector !== undefined && !isOpsSelector(msg.selector)) return false;
+  return true;
+}
+
 export function isInboundMessage(data: unknown): data is InboundMessage {
   if (!data || typeof data !== 'object') return false;
-  const msg = data as { source?: unknown; type?: unknown; guids?: unknown };
+  const msg = data as {
+    source?: unknown;
+    type?: unknown;
+    guids?: unknown;
+    selector?: unknown;
+    color?: unknown;
+    guid?: unknown;
+    data?: unknown;
+    reason?: unknown;
+  };
   if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
   switch (msg.type) {
     case 'FOCUS':
     case 'HIGHLIGHT_FILTER':
-      return Array.isArray(msg.guids) && msg.guids.every((g) => typeof g === 'string');
+      return isStringArray(msg.guids);
     case 'CLEAR_FILTER':
+    case 'SHOW_ALL':
+    case 'RESET_COLORS':
       return true;
+    case 'COLORIZE':
+      // COLORIZE navyše potrebuje farbu; guids/selector kontrola je spoločná.
+      return typeof msg.color === 'string' && hasValidOpTarget(msg);
+    case 'HIDE':
+    case 'SHOW':
+    case 'ISOLATE':
+      return hasValidOpTarget(msg);
+    case 'AIM_PANEL_DATA':
+      return typeof msg.guid === 'string' && !!msg.data && typeof msg.data === 'object';
+    case 'AIM_PANEL_EMPTY':
+      return typeof msg.guid === 'string' && typeof msg.reason === 'string';
     default:
       // Unknown type — not a message this bridge version handles.
       return false;
@@ -97,4 +194,63 @@ export function guidForEntity(
 ): string | undefined {
   const model = models.get(ref.modelId);
   return model?.ifcDataStore?.entities.getGlobalId(ref.expressId) || undefined;
+}
+
+/** Minimal structural view of an entity table for selector resolution. */
+export interface SelectorEntityTable {
+  count: number;
+  expressId: Uint32Array;
+  getTypeName(expressId: number): string;
+  hasGeometry(expressId: number): boolean;
+}
+
+/** Minimal structural view of a federated model — satisfied by FederatedModel. */
+export interface SelectorResolvableModel {
+  name?: string;
+  ifcDataStore?: { entities: SelectorEntityTable } | null;
+}
+
+/** StandardCase/ElementedCase varianty patria k základnej triede (IfcWallStandardCase → IfcWall). */
+const SUBTYPE_SUFFIX_RE = /(STANDARDCASE|ELEMENTEDCASE)$/;
+
+/**
+ * OpsSelector -> EntityRef[] pre viewer ops. Model sa vyberá case-insensitive
+ * zhodou s názvom súboru (presná, bez prípony, alebo substring — "vzt" nájde
+ * "VZT.ifc"); triedy sa porovnávajú cez getTypeName (rawTypeName fallback,
+ * takže funguje aj pre triedy mimo IfcTypeEnum) so zložením StandardCase
+ * variantov. Len prvky s geometriou — ops (farba/viditeľnosť) inde nemajú
+ * účinok a type-objekty by len nafukovali payload. Prázdny selektor = [].
+ */
+export function resolveSelector(
+  models: ReadonlyMap<string, SelectorResolvableModel>,
+  selector: OpsSelector,
+): EntityRef[] {
+  const wantedModel = selector.model?.trim().toLowerCase();
+  const wantedTypes = selector.types?.length
+    ? new Set(selector.types.map((t) => t.trim().toUpperCase()).filter(Boolean))
+    : null;
+  if (!wantedModel && (!wantedTypes || wantedTypes.size === 0)) return [];
+
+  const refs: EntityRef[] = [];
+  for (const [modelId, model] of models) {
+    if (wantedModel) {
+      const name = (model.name ?? '').toLowerCase();
+      const base = name.replace(/\.[^.]+$/, '');
+      if (name !== wantedModel && base !== wantedModel && !name.includes(wantedModel)) continue;
+    }
+    const table = model.ifcDataStore?.entities;
+    if (!table) continue;
+    for (let i = 0; i < table.count; i++) {
+      const expressId = table.expressId[i];
+      if (!table.hasGeometry(expressId)) continue;
+      if (wantedTypes) {
+        const type = table.getTypeName(expressId).toUpperCase();
+        if (!wantedTypes.has(type) && !wantedTypes.has(type.replace(SUBTYPE_SUFFIX_RE, ''))) {
+          continue;
+        }
+      }
+      refs.push({ modelId, expressId });
+    }
+  }
+  return refs;
 }

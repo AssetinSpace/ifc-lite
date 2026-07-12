@@ -81,6 +81,9 @@ export function useDraggablePanel(
       const maxTop = Math.max(0, (parent?.clientHeight ?? window.innerHeight) - el.offsetHeight);
 
       const move = (ev: MouseEvent) => {
+        // Mouseup outside this document (iframe embedding) never arrives —
+        // end the stuck drag on the first buttonless move.
+        if (ev.buttons === 0) { up(); return; }
         const left = Math.max(0, Math.min(maxLeft, startRef.current.left + ev.clientX - startRef.current.x));
         const top = Math.max(0, Math.min(maxTop, startRef.current.top + ev.clientY - startRef.current.y));
         setPosition({ top, left });

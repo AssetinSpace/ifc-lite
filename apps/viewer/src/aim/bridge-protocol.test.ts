@@ -9,8 +9,10 @@ import {
   SOURCE,
   isInboundMessage,
   resolveGuids,
+  resolveSelector,
   guidForEntity,
   type GuidResolvableModel,
+  type SelectorResolvableModel,
 } from './bridge-protocol.js';
 
 /**
@@ -61,6 +63,31 @@ describe('isInboundMessage', () => {
 
   it('rejects unknown message types (forward-compat: ignore, not crash)', () => {
     assert.equal(isInboundMessage({ source: SOURCE, type: 'SELF_DESTRUCT' }), false);
+  });
+
+  it('accepts viewer ops (D-066) with guids, selector, or neither', () => {
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'COLORIZE', guids: ['a'], color: '#ef4444' }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'COLORIZE', selector: { types: ['IfcDoor'] }, color: '#ef4444' }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'HIDE', selector: { model: 'VZT' } }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'ISOLATE', guids: [] }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'SHOW' })); // refsForOp resolves to []
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'SHOW_ALL' }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'RESET_COLORS' }));
+  });
+
+  it('rejects malformed viewer ops payloads', () => {
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'COLORIZE', guids: ['a'] }), false); // no color
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'COLORIZE', color: 42, guids: ['a'] }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'HIDE', guids: 'IfcDoor' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'HIDE', selector: { types: [1] } }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'ISOLATE', selector: 'VZT' }), false);
+  });
+
+  it('accepts and validates AIM panel responses', () => {
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_DATA', guid: 'g', data: { version: 1, guid: 'g', title: 'Dvere' } }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_EMPTY', guid: 'g', reason: 'not-found' }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_DATA', guid: 'g' }), false); // no data
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_EMPTY', guid: 'g' }), false); // no reason
   });
 });
 
@@ -133,5 +160,90 @@ describe('guidForEntity', () => {
   it('returns undefined when the data store has not loaded', () => {
     const loading = new Map<string, GuidResolvableModel>([['asr', { ifcDataStore: null }]]);
     assert.equal(guidForEntity(loading, { modelId: 'asr', expressId: 10 }), undefined);
+  });
+});
+
+/**
+ * Fake model for selector resolution: rows of [expressId, typeName, hasGeometry].
+ */
+function fakeSelectorModel(
+  name: string,
+  rows: [number, string, boolean][],
+): SelectorResolvableModel {
+  const byId = new Map(rows.map(([id, type, geo]) => [id, { type, geo }]));
+  return {
+    name,
+    ifcDataStore: {
+      entities: {
+        count: rows.length,
+        expressId: Uint32Array.from(rows.map(([id]) => id)),
+        getTypeName: (id: number) => byId.get(id)?.type ?? 'Unknown',
+        hasGeometry: (id: number) => byId.get(id)?.geo ?? false,
+      },
+    },
+  };
+}
+
+describe('resolveSelector', () => {
+  const federation = new Map<string, SelectorResolvableModel>([
+    ['m-asr', fakeSelectorModel('ASR.ifc', [
+      [1, 'IfcWallStandardCase', true],
+      [2, 'IfcDoor', true],
+      [3, 'IfcDoorType', false], // type object without geometry
+      [4, 'IfcSlab', true],
+    ])],
+    ['m-vzt', fakeSelectorModel('VZT.ifc', [
+      [10, 'IfcDuctSegment', true],
+      [11, 'IfcFan', true],
+      [12, 'IfcAirTerminal', true],
+    ])],
+  ]);
+
+  it('selects a whole model by name, case-insensitive, with or without extension', () => {
+    for (const model of ['VZT', 'vzt', 'VZT.ifc', 'vzt.IFC']) {
+      assert.deepEqual(resolveSelector(federation, { model }), [
+        { modelId: 'm-vzt', expressId: 10 },
+        { modelId: 'm-vzt', expressId: 11 },
+        { modelId: 'm-vzt', expressId: 12 },
+      ], `model selector "${model}"`);
+    }
+  });
+
+  it('selects multiple IFC classes across all models (case-insensitive)', () => {
+    assert.deepEqual(resolveSelector(federation, { types: ['ifcdoor', 'IfcDuctSegment'] }), [
+      { modelId: 'm-asr', expressId: 2 },
+      { modelId: 'm-vzt', expressId: 10 },
+    ]);
+  });
+
+  it('maps StandardCase variants to their base class', () => {
+    assert.deepEqual(resolveSelector(federation, { types: ['IfcWall'] }), [
+      { modelId: 'm-asr', expressId: 1 },
+    ]);
+  });
+
+  it('combines types with a model scope', () => {
+    assert.deepEqual(
+      resolveSelector(federation, { types: ['IfcDoor', 'IfcFan'], model: 'VZT' }),
+      [{ modelId: 'm-vzt', expressId: 11 }],
+    );
+  });
+
+  it('skips entities without geometry (type objects)', () => {
+    const doors = resolveSelector(federation, { types: ['IfcDoor'] });
+    assert.deepEqual(doors, [{ modelId: 'm-asr', expressId: 2 }]);
+  });
+
+  it('returns [] for an empty selector, unknown model, or unknown type', () => {
+    assert.deepEqual(resolveSelector(federation, {}), []);
+    assert.deepEqual(resolveSelector(federation, { model: 'ELEKTRO' }), []);
+    assert.deepEqual(resolveSelector(federation, { types: ['IfcSpaceship'] }), []);
+  });
+
+  it('skips models whose data store has not loaded yet', () => {
+    const loading = new Map<string, SelectorResolvableModel>([
+      ['x', { name: 'VZT.ifc', ifcDataStore: null }],
+    ]);
+    assert.deepEqual(resolveSelector(loading, { model: 'VZT' }), []);
   });
 });
