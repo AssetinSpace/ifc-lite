@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * Parsing + validation for the `?model=` / `?models=` autoload query params
+ * (ViewerLayout). Pure so it can be unit-tested: the viewer will fetch these
+ * URLs on the user's behalf, so they get a basic sanity gate — http(s) only
+ * (no `data:`/`blob:`/`javascript:` smuggling) and a hard count cap so a
+ * crafted link can't queue dozens of multi-GB parses into one tab.
+ */
+
+/** Max models a single link may autoload; anything beyond is dropped (logged). */
+export const AUTOLOAD_MAX_MODELS = 16;
+
+/**
+ * Extract the list of model URLs to autoload from a query string.
+ * `models` (comma-separated, entries URL-encoded by the host) wins over the
+ * legacy single `model`. Relative URLs are allowed (same-origin fetch) —
+ * they're resolved against `baseUrl` for validation only; the original
+ * entry is returned untouched for the actual fetch.
+ */
+export function parseAutoloadUrls(search: string, baseUrl: string): string[] {
+  const params = new URLSearchParams(search);
+  const multi = params.get('models');
+  const single = params.get('model');
+  const entries = (multi ? multi.split(',') : single ? [single] : [])
+    .map((u) => u.trim())
+    .filter(Boolean);
+
+  const valid = entries.filter((entry) => {
+    try {
+      const proto = new URL(entry, baseUrl).protocol;
+      if (proto === 'http:' || proto === 'https:') return true;
+      console.warn('[viewer] autoload: skipping non-http(s) model URL', entry);
+      return false;
+    } catch {
+      console.warn('[viewer] autoload: skipping unparseable model URL', entry);
+      return false;
+    }
+  });
+
+  if (valid.length > AUTOLOAD_MAX_MODELS) {
+    console.warn(
+      `[viewer] autoload: ${valid.length} models requested, loading first ${AUTOLOAD_MAX_MODELS}`,
+    );
+    return valid.slice(0, AUTOLOAD_MAX_MODELS);
+  }
+  return valid;
+}

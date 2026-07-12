@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { parseAutoloadUrls } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
 import { MobileToolbar } from './MobileToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
@@ -93,12 +94,10 @@ export function ViewerLayout() {
   const autoloadDoneRef = useRef(false);
   useEffect(() => {
     if (autoloadDoneRef.current) return;
-    const params = new URLSearchParams(window.location.search);
-    const multi = params.get('models');
-    const single = params.get('model');
-    const urls = (multi ? multi.split(',') : single ? [single] : [])
-      .map((u) => u.trim())
-      .filter(Boolean);
+    // http(s)-only + count cap — the viewer fetches these on the user's
+    // behalf, so a crafted link must not smuggle data:/blob: URLs or queue
+    // dozens of parses (see lib/autoload.ts).
+    const urls = parseAutoloadUrls(window.location.search, window.location.href);
     if (urls.length === 0) return;
     autoloadDoneRef.current = true;
     (async () => {
