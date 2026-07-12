@@ -12,6 +12,11 @@ import { useWebGPU } from '@/hooks/useWebGPU';
 import { FlavorIndicator } from '@/components/extensions/FlavorIndicator';
 import { FlavorDialog } from '@/components/extensions/FlavorDialog';
 
+/** Chrome-only, non-standard `performance.memory` (absent in Firefox/Safari). */
+interface PerformanceWithMemory extends Performance {
+  memory?: { usedJSHeapSize: number };
+}
+
 export function StatusBar() {
   const { loading, geometryResult, ifcDataStore } = useIfc();
   const progress = useViewerStore((s) => s.progress);
@@ -59,8 +64,9 @@ export function StatusBar() {
   // Memory usage (if available)
   useEffect(() => {
     const updateMemory = () => {
-      if ((performance as any).memory) {
-        setMemory((performance as any).memory.usedJSHeapSize);
+      const memoryInfo = (performance as PerformanceWithMemory).memory;
+      if (memoryInfo) {
+        setMemory(memoryInfo.usedJSHeapSize);
       }
     };
 
