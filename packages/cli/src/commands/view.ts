@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * ifc-lite view <file.ifc> [--port N] [--no-open]
+ * ifc-lite view <file.ifc> [--port N] [--host H] [--no-open]
  *
  * Thin CLI wrapper around @ifc-lite/viewer — launches the viewer server
  * and wires up arg parsing, stdin interaction, and browser opening.
@@ -24,6 +24,9 @@ export async function viewCommand(args: string[]): Promise<void> {
   const noOpen = hasFlag(args, '--no-open');
   const portStr = getFlag(args, '--port');
   const requestedPort = portStr ? parseInt(portStr, 10) : 0;
+  // Default loopback: the server is unauthenticated (full model download +
+  // live command API), so network exposure must be an explicit opt-in.
+  const host = getFlag(args, '--host') ?? '127.0.0.1';
 
   // Check for --send mode: send a command to an already-running viewer
   const sendPayload = getFlag(args, '--send');
@@ -51,9 +54,9 @@ export async function viewCommand(args: string[]): Promise<void> {
 
   // Find the IFC file argument (optional with --empty)
   const emptyMode = hasFlag(args, '--empty');
-  const positional = args.filter(a => !a.startsWith('-') && !['--port', '--send'].includes(args[args.indexOf(a) - 1] ?? ''));
+  const positional = args.filter(a => !a.startsWith('-') && !['--port', '--send', '--host'].includes(args[args.indexOf(a) - 1] ?? ''));
   if (positional.length === 0 && !emptyMode) {
-    fatal('Usage: ifc-lite view <file.ifc> [--port N] [--no-open]\n       ifc-lite view --empty --port N');
+    fatal('Usage: ifc-lite view <file.ifc> [--port N] [--host H] [--no-open]\n       ifc-lite view --empty --port N');
   }
   const filePath = emptyMode ? null : positional[0];
   const fileName = filePath ? basename(filePath) : 'Empty Scene';
@@ -87,10 +90,15 @@ export async function viewCommand(args: string[]): Promise<void> {
       filePath,
       fileName,
       port: requestedPort,
+      host,
       createHandler,
       onReady: (port, url) => {
         process.stderr.write(`\n  3D Viewer started → ${url}\n`);
         process.stderr.write(`  Model: ${fileName}\n`);
+        if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+          process.stderr.write(`  ⚠ Exposed on ${host} — the model and command API are\n`);
+          process.stderr.write(`    reachable by anyone on that network (no authentication).\n`);
+        }
         process.stderr.write(`\n  Send commands via REST API:\n`);
         process.stderr.write(`    curl -X POST ${url}/api/command -H 'Content-Type: application/json' \\\n`);
         process.stderr.write(`      -d '{"action":"colorize","type":"IfcWall","color":[1,0,0,1]}'\n`);

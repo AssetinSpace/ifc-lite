@@ -56,6 +56,14 @@ export interface ViewerServerOptions {
   fileName: string;
   /** Port to listen on (0 = auto) */
   port: number;
+  /**
+   * Interface to bind. Defaults to loopback (`127.0.0.1`): the server is
+   * unauthenticated (`/model.ifc` is the full model, `/api/*` drives the
+   * session), so it must not be reachable from the network unless the user
+   * opts in explicitly (CLI `--host`). Non-loopback binds skip the Host-header
+   * check — exposure is then a deliberate choice.
+   */
+  host?: string;
   /** Optional handler for /api/create endpoint */
   createHandler?: CreateHandler;
   /** Callback when server is ready */
@@ -112,6 +120,31 @@ async function resolveWasmDir(): Promise<string> {
   }
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+/** True when the bind address only accepts connections from this machine. */
+export function isLoopbackBind(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host) || host.startsWith('127.');
+}
+
+/**
+ * DNS-rebinding guard: a malicious page can point `evil.example` at
+ * 127.0.0.1 and read the model / drive `/api/*` from the victim's browser —
+ * same-origin policy doesn't help because the *resolved* address is local.
+ * On a loopback bind we therefore only accept requests whose Host header is a
+ * loopback name. A deliberate non-loopback bind (`--host`) skips the check:
+ * the user chose network exposure, and any LAN hostname may then be in play.
+ */
+export function isAllowedRequestHost(hostHeader: string | undefined, boundHost: string): boolean {
+  if (!isLoopbackBind(boundHost)) return true;
+  if (!hostHeader) return false;
+  // Strip the port: `localhost:3456`, `127.0.0.1:3456`, `[::1]:3456`.
+  const hostname = hostHeader.startsWith('[')
+    ? hostHeader.slice(0, hostHeader.indexOf(']') + 1)
+    : hostHeader.split(':')[0];
+  return LOOPBACK_HOSTS.has(hostname) || hostname.startsWith('127.');
+}
+
 /** Read full request body as string */
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -124,6 +157,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 export async function startViewerServer(opts: ViewerServerOptions): Promise<ViewerServer> {
   const { filePath, fileName, port: requestedPort, createHandler } = opts;
+  const boundHost = opts.host ?? '127.0.0.1';
 
   // Validate file exists (size is re-stat'd per /model.ifc request)
   if (filePath) {
@@ -156,6 +190,13 @@ export async function startViewerServer(opts: ViewerServerOptions): Promise<View
   const createdSegments: string[] = [];
 
   const server = createServer(async (req, res) => {
+    // DNS-rebinding guard — see isAllowedRequestHost.
+    if (!isAllowedRequestHost(req.headers.host, boundHost)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden: invalid Host header');
+      return;
+    }
+
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
     const path = url.pathname;
 
@@ -358,10 +399,14 @@ export async function startViewerServer(opts: ViewerServerOptions): Promise<View
   });
 
   return new Promise((promiseResolve) => {
-    server.listen(requestedPort, () => {
+    server.listen(requestedPort, boundHost, () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : requestedPort;
-      const url = `http://localhost:${port}`;
+      // 0.0.0.0/:: bind → advertise localhost (connectable); otherwise the bound host.
+      const urlHost = isLoopbackBind(boundHost) || boundHost === '0.0.0.0' || boundHost === '::'
+        ? 'localhost'
+        : boundHost;
+      const url = `http://${urlHost}:${port}`;
 
       if (opts.onReady) {
         opts.onReady(port, url);

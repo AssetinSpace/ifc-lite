@@ -105,6 +105,7 @@ The viewer exposes a REST API for external tool integration (`/api/command`, `/a
 | Flag | Description |
 |------|-------------|
 | `--port <N>` | Listen on a specific port (default: random) |
+| `--host <addr>` | Bind address (default: `127.0.0.1`). The server is unauthenticated, so network exposure (e.g. `--host 0.0.0.0`) is an explicit opt-in |
 | `--no-open` | Don't auto-open the browser |
 | `--empty` | Start with an empty scene |
 | `--send <json>` | Send a command to an already-running viewer |
@@ -1132,7 +1133,7 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `mutate` | Modify properties/attributes and save |
 | `generate-spaces` | Derive IfcSpace from walls (slab/roof-aware height) |
 | `ask` | Natural language BIM queries |
-| `view` | Interactive 3D viewer in browser |
+| `view` | Interactive 3D viewer in browser (default bind 127.0.0.1) |
 | `analyze` | Query + visualize analysis results |
 | `lod` | Generate lightweight LOD artifacts |
 | `mcp` | Start an MCP server bound to one or more IFC files |

@@ -20,12 +20,14 @@ Odhady: S < 1 h, M = 1–4 h, L = deň+.
 
 ## Stredné (bezpečnostné hardening)
 
-2. **`ifc-lite view` server počúva na 0.0.0.0 bez auth** (S–M) —
-   `packages/viewer/src/server.ts:361` bez host argumentu; `/model.ifc`,
-   `/api/create`, `/api/export` sú neautentifikované. CORS chráni len
-   prehliadače — DNS rebinding (Host header sa nevaliduje) alebo ktokoľvek
-   na LAN vie stiahnuť model / tlačiť príkazy. Fix: default `127.0.0.1`
-   + `--host` flag (zmena CLI surface = changeset) + validácia Host headera.
+2. ~~**`ifc-lite view` server počúva na 0.0.0.0 bez auth**~~ — **VYRIEŠENÉ**
+   (commit v tejto vetve, changeset `viewer-loopback-default`, minor
+   @ifc-lite/viewer-core + @ifc-lite/cli): default bind `127.0.0.1`; na
+   loopback binde sa validuje Host header (403 pre cudzie mená = DNS
+   rebinding guard); sieťové vystavenie je explicitný opt-in cez nový
+   `--host` flag (preskočí Host check + vypíše varovanie). Pokryté unit
+   testami helperov aj integračným testom (skip bez wasm bundlu). Docs
+   (cli.md flags tabuľka + HELP) aktualizované, `docs:check-generated` zelený.
 
 3. **collab-server bez `COLLAB_TOKEN_SECRET` = svetu zapisovateľný** (S–M) —
    `packages/collab-server/src/bin.ts`: chýbajúci env var ⇒ anonymný editor,

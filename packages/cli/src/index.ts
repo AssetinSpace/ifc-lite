@@ -88,7 +88,7 @@ const HELP = `
     mutate    <file.ifc> --id N --set P=V --out F  Modify properties/attributes and save
     generate-spaces <file.ifc> --out F           Derive IfcSpace from walls (slab/roof-aware height)
     ask       <file.ifc> "<question>"            Natural language BIM queries
-    view      <file.ifc> [--port N]              Interactive 3D viewer in browser
+    view      <file.ifc> [--port N] [--host H]   Interactive 3D viewer in browser (default bind 127.0.0.1)
     analyze   <file.ifc> --viewer <port>        Query + visualize analysis results
     lod       <file.ifc> --level 0|1            Generate lightweight LOD artifacts
     mcp       <file.ifc> [--transport stdio|http] Start an MCP server bound to one or more IFC files
