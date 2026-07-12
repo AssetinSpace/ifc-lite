@@ -29,6 +29,8 @@ Environment variables:
 | `COLLAB_HOST` | `0.0.0.0` | Listen host |
 | `COLLAB_DATA_DIR` | `./.collab-data` | Persistence root for room logs |
 | `COLLAB_MAX_ROOMS` | `1024` | Soft cap on simultaneous rooms |
+| `COLLAB_TOKEN_SECRET` | _(unset)_ | Enables signed room tokens (access control). Unset = anonymous editor, allowed only on a loopback bind |
+| `COLLAB_ALLOW_ANONYMOUS` | _(unset)_ | `1` = explicitly allow anonymous mode on a non-loopback bind (world-writable — trusted networks only) |
 
 ## Programmatic use
 

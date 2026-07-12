@@ -11,6 +11,7 @@ import { FilePersistence, startCollabServer, type StartCollabServerOptions } fro
 import { FsBlobStorage } from './blob-route.js';
 import { createRoomTokenAuthenticator, verifyRoomToken } from './room-token.js';
 import { type Role } from './auth.js';
+import { checkStartupPosture } from './startup-guard.js';
 
 // `PORT` is the convention most hosts inject (Railway, Render, Fly, …).
 const port = Number(process.env.COLLAB_PORT ?? process.env.PORT ?? 1234);
@@ -18,8 +19,11 @@ const host = process.env.COLLAB_HOST ?? '0.0.0.0';
 const dataDir = process.env.COLLAB_DATA_DIR ?? './.collab-data';
 const maxRooms = Number(process.env.COLLAB_MAX_ROOMS ?? 1024);
 // Link-based access control is enabled by setting a signing secret. Without it
-// the server stays open (anonymous editor) — fine for local/dev, see auth.ts.
+// the server runs anonymous-editor — allowed on loopback (local dev), but a
+// network bind then refuses to start unless COLLAB_ALLOW_ANONYMOUS=1 is set
+// explicitly (see startup-guard.ts; audit 2026-07-12).
 const tokenSecret = process.env.COLLAB_TOKEN_SECRET;
+const allowAnonymous = process.env.COLLAB_ALLOW_ANONYMOUS === '1';
 
 /**
  * Accountless room access control:
@@ -109,6 +113,17 @@ function tokenOptions(secret: string, dir: string): Partial<StartCollabServerOpt
 }
 
 async function main() {
+  const posture = checkStartupPosture({ host, hasTokenSecret: !!tokenSecret, allowAnonymous });
+  if (!posture.ok) {
+    // eslint-disable-next-line no-console
+    console.error(`[collab-server] ${posture.error}`);
+    process.exit(1);
+  }
+  if (posture.warning) {
+    // eslint-disable-next-line no-console
+    console.warn(`[collab-server] ⚠ ${posture.warning}`);
+  }
+
   const handle = await startCollabServer({
     port,
     host,

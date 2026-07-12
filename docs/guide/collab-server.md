@@ -33,12 +33,15 @@ There's also a one-command demo that boots the server plus a tiny client:
 | `COLLAB_HOST` | `0.0.0.0` | Bind address. |
 | `COLLAB_DATA_DIR` | `./.collab-data` | Directory for durable Y.Doc persistence (`FilePersistence`). |
 | `COLLAB_MAX_ROOMS` | `1024` | Hard cap on concurrently loaded rooms. |
-| `COLLAB_TOKEN_SECRET` | _(unset)_ | **Enables signed-link access control.** Unset = anonymous (open). See [Access control](#access-control). |
+| `COLLAB_TOKEN_SECRET` | _(unset)_ | **Enables signed-link access control.** Unset = anonymous, allowed only on a loopback bind. See [Access control](#access-control). |
+| `COLLAB_ALLOW_ANONYMOUS` | _(unset)_ | Set to `1` to explicitly allow anonymous (world-writable) mode on a **non-loopback** bind. Without it, a network bind with no `COLLAB_TOKEN_SECRET` refuses to start. |
 
-!!! warning "Blob storage is in-memory in the CLI"
-    The CLI server keeps geometry blobs **in memory** (lost on restart) and the
-    Y.Doc on disk. For production, run the server [programmatically](#programmatic-embedding)
-    and pass a durable `blobStorage` (S3, GCS, filesystem).
+!!! warning "Anonymous mode on a network bind is an explicit opt-in"
+    Without `COLLAB_TOKEN_SECRET`, every client is an anonymous *editor* —
+    rooms and blob storage are world-writable. On `COLLAB_HOST=0.0.0.0` (the
+    default, required by most hosts) the server therefore **exits at startup**
+    unless you either set a token secret, bind loopback, or acknowledge the
+    exposure with `COLLAB_ALLOW_ANONYMOUS=1`.
 
 ### Viewer (build environment)
 
@@ -49,8 +52,10 @@ There's also a one-command demo that boots the server plus a tiny client:
 
 ## Access control
 
-By default (no `COLLAB_TOKEN_SECRET`) the server accepts **anonymous** connections
-as *editor* — fine for a laptop or a trusted network, not for the public internet.
+Without `COLLAB_TOKEN_SECRET` the server accepts **anonymous** connections as
+*editor* — fine for a laptop, never for the public internet. Anonymous mode is
+therefore restricted to loopback binds; a network bind without a secret exits at
+startup unless `COLLAB_ALLOW_ANONYMOUS=1` acknowledges the exposure.
 
 Set `COLLAB_TOKEN_SECRET` to switch on **signed room tokens**:
 

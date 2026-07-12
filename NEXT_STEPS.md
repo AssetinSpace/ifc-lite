@@ -29,12 +29,15 @@ Odhady: S < 1 h, M = 1–4 h, L = deň+.
    testami helperov aj integračným testom (skip bez wasm bundlu). Docs
    (cli.md flags tabuľka + HELP) aktualizované, `docs:check-generated` zelený.
 
-3. **collab-server bez `COLLAB_TOKEN_SECRET` = svetu zapisovateľný** (S–M) —
-   `packages/collab-server/src/bin.ts`: chýbajúci env var ⇒ anonymný editor,
-   bind 0.0.0.0, CORS reflektuje každý Origin, blob PUT 100 MB bez celkového
-   capu. Dev default je zdokumentovaný zámer, ale prod deploy s vynechaným
-   env varom je tiché zlyhanie. Návrh: odmietnuť non-loopback bind bez secretu
-   (opt-out `COLLAB_ALLOW_ANONYMOUS=1`) — zmena runtime defaultu, tvoje rozhodnutie.
+3. ~~**collab-server bez `COLLAB_TOKEN_SECRET` = svetu zapisovateľný**~~ —
+   **VYRIEŠENÉ** (commit v tejto vetve, changeset `collab-server-anonymous-guard`,
+   minor @ifc-lite/collab-server): bin pri non-loopback binde bez secretu
+   odmietne štart s jasnou hláškou; vedomé anonymné nasadenie na dôveryhodnej
+   sieti = `COLLAB_ALLOW_ANONYMOUS=1` (s varovaním); loopback dev beží bez
+   trenia ako doteraz. Guard je čisto CLI záležitosť (`src/startup-guard.ts`
+   + testy) — library default `startCollabServer` sa nemení, embedderov sa
+   netýka. Docs (guide + README + AGENTS) aktualizované. Zostáva ako nice-to-have:
+   celkový disk cap na blob storage (100 MB je len per-blob limit).
 
 4. **AIM bridge trust model = „ver tomu, kto ma embedne"** (M, produktové) —
    origin sa berie z `document.referrer` pri mounte (`AimBridge.tsx`), takže
