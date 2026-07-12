@@ -33,6 +33,11 @@ permissions:
 jobs:
   release:
     name: Release
+    # >>> AIM-FORK: publishing (npm/crates + changesets version PR) is upstream-only.
+    # Our fork lacks the release env/secrets (RELEASE_PAT, OIDC trusted publishers),
+    # so this job errors on checkout ("token not supplied") — see docs/FORK_MAINTENANCE.md.
+    if: github.repository == 'LTplus-AG/ifc-lite'
+    # <<< AIM-FORK
     runs-on: ubuntu-latest
     environment: release-publish
     permissions:

@@ -22,6 +22,10 @@ concurrency:
 
 jobs:
   build:
+    # >>> AIM-FORK: docs deploy to GitHub Pages is upstream-only. Our fork has no
+    # Pages site enabled, so configure-pages/deploy 404s (see docs/FORK_MAINTENANCE.md).
+    if: github.repository == 'LTplus-AG/ifc-lite'
+    # <<< AIM-FORK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -112,6 +116,9 @@ jobs:
           path: site
 
   deploy:
+    # >>> AIM-FORK: upstream-only (GitHub Pages) — see docs/FORK_MAINTENANCE.md
+    if: github.repository == 'LTplus-AG/ifc-lite'
+    # <<< AIM-FORK
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
