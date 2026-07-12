@@ -59,6 +59,11 @@ export function SidebarDock() {
       if (!parent) return;
       const rect = parent.getBoundingClientRect();
       const move = (ev: MouseEvent) => {
+        // A mouseup released outside this document (e.g. over the embedding
+        // host when the viewer runs in an iframe) never reaches us — end the
+        // drag on the first move without a pressed button instead of letting
+        // the pane chase the cursor forever.
+        if (ev.buttons === 0) { up(); return; }
         // The content pane's right edge is fixed against the activity bar;
         // dragging its left edge sets the width. Clamp live to the same range
         // the store enforces so the pane doesn't rubber-band past the limits.

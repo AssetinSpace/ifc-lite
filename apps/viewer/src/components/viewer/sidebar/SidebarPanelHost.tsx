@@ -237,6 +237,9 @@ export function SidebarPanelHost() {
       if (!el) return;
       const rect = el.getBoundingClientRect();
       const move = (ev: MouseEvent) => {
+        // Mouseup outside this document (iframe embedding) never arrives —
+        // end the stuck drag on the first buttonless move.
+        if (ev.buttons === 0) { teardown(); return; }
         if (rect.height <= 0) return;
         setSplitRatio((ev.clientY - rect.top) / rect.height);
       };

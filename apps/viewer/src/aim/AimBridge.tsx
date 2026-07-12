@@ -30,6 +30,7 @@ import {
   guidForEntity,
   type OutboundMessage,
 } from './bridge-protocol.js';
+import { useAimPanelStore } from './aimPanelStore.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -47,6 +48,7 @@ export function AimBridge() {
     // This app is only ever embedded by the AIM host, so the referrer at
     // mount time IS the trusted origin — no build-time config needed.
     parentOriginRef.current = document.referrer ? new URL(document.referrer).origin : null;
+    useAimPanelStore.getState().setEmbedded(true, parentOriginRef.current);
 
     function post(msg: OutboundMessage) {
       window.parent.postMessage(msg, parentOriginRef.current ?? '*');
@@ -84,6 +86,39 @@ export function AimBridge() {
           bim.viewer.resetColors();
           focusedRef.current = [];
           break;
+        case 'COLORIZE': {
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          if (refs.length > 0) bim.viewer.colorize(refs, e.data.color);
+          break;
+        }
+        case 'HIDE': {
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          if (refs.length > 0) bim.viewer.hide(refs);
+          break;
+        }
+        case 'SHOW': {
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          if (refs.length > 0) bim.viewer.show(refs);
+          break;
+        }
+        case 'ISOLATE': {
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          if (refs.length > 0) bim.viewer.isolate(refs);
+          break;
+        }
+        case 'SHOW_ALL':
+          bim.viewer.resetVisibility();
+          break;
+        case 'RESET_COLORS':
+          bim.viewer.resetColors();
+          focusedRef.current = [];
+          break;
+        case 'AIM_PANEL_DATA':
+          useAimPanelStore.getState().resolve(e.data.guid, { data: e.data.data });
+          break;
+        case 'AIM_PANEL_EMPTY':
+          useAimPanelStore.getState().resolve(e.data.guid, { reason: e.data.reason });
+          break;
       }
     }
 
@@ -116,12 +151,18 @@ export function AimBridge() {
     if (!embeddedRef.current) return;
     const targetOrigin = parentOriginRef.current ?? '*';
     if (!selectedEntity) {
+      useAimPanelStore.getState().clear();
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_DESELECTED' } satisfies OutboundMessage, targetOrigin);
       return;
     }
     const guid = guidForEntity(useViewerStore.getState().models, selectedEntity);
     if (guid) {
+      // AimCard shows its skeleton immediately; the host answers with
+      // AIM_PANEL_DATA / AIM_PANEL_EMPTY (or the store times out quietly).
+      useAimPanelStore.getState().beginLoading(guid);
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_SELECTED', guid } satisfies OutboundMessage, targetOrigin);
+    } else {
+      useAimPanelStore.getState().clear();
     }
   }, [selectedEntity]);
 
