@@ -21,6 +21,7 @@
 import { useEffect, useRef } from 'react';
 import { useBim } from '../sdk/BimProvider.js';
 import { useViewerStore, type EntityRef } from '../store/index.js';
+import { useAimPanelStore, type AimPanelData } from './aimPanelStore.js';
 
 const SOURCE = 'aim-bridge' as const;
 
@@ -30,13 +31,27 @@ const FILTER_COLOR = '#60a5fa';
 type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
-  | { source: typeof SOURCE; type: 'CLEAR_FILTER' };
+  | { source: typeof SOURCE; type: 'CLEAR_FILTER' }
+  // AI dock viewer ops (D-066 in the AIM repo) — colorize/visibility over GUIDs.
+  | { source: typeof SOURCE; type: 'COLORIZE'; guids: string[]; color: string }
+  | { source: typeof SOURCE; type: 'HIDE'; guids: string[] }
+  | { source: typeof SOURCE; type: 'SHOW'; guids: string[] }
+  | { source: typeof SOURCE; type: 'ISOLATE'; guids: string[] }
+  | { source: typeof SOURCE; type: 'SHOW_ALL' }
+  | { source: typeof SOURCE; type: 'RESET_COLORS' }
+  // AIM panel data for the selected element (host DB → AimCard in the
+  // PropertiesPanel). Guid-stamped so stale answers are dropped store-side.
+  | { source: typeof SOURCE; type: 'AIM_PANEL_DATA'; guid: string; data: AimPanelData }
+  | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string };
 
 type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
   | { source: typeof SOURCE; type: 'MODELS_LOADED'; count: number }
   | { source: typeof SOURCE; type: 'ENTITY_SELECTED'; guid: string }
-  | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' };
+  | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' }
+  // Click on a link inside the AimCard — the parent app performs the
+  // navigation (href is a host-relative path, e.g. /node/{id}).
+  | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string };
 
 function isInboundMessage(data: unknown): data is InboundMessage {
   return (
@@ -86,6 +101,7 @@ export function AimBridge() {
     // This app is only ever embedded by the AIM host, so the referrer at
     // mount time IS the trusted origin — no build-time config needed.
     parentOriginRef.current = document.referrer ? new URL(document.referrer).origin : null;
+    useAimPanelStore.getState().setEmbedded(true, parentOriginRef.current);
 
     function post(msg: OutboundMessage) {
       window.parent.postMessage(msg, parentOriginRef.current ?? '*');
@@ -111,6 +127,38 @@ export function AimBridge() {
         }
         case 'CLEAR_FILTER':
           bim.viewer.resetColors();
+          break;
+        case 'COLORIZE': {
+          const refs = resolveGuids(e.data.guids);
+          if (refs.length > 0) bim.viewer.colorize(refs, e.data.color);
+          break;
+        }
+        case 'HIDE': {
+          const refs = resolveGuids(e.data.guids);
+          if (refs.length > 0) bim.viewer.hide(refs);
+          break;
+        }
+        case 'SHOW': {
+          const refs = resolveGuids(e.data.guids);
+          if (refs.length > 0) bim.viewer.show(refs);
+          break;
+        }
+        case 'ISOLATE': {
+          const refs = resolveGuids(e.data.guids);
+          if (refs.length > 0) bim.viewer.isolate(refs);
+          break;
+        }
+        case 'SHOW_ALL':
+          bim.viewer.resetVisibility();
+          break;
+        case 'RESET_COLORS':
+          bim.viewer.resetColors();
+          break;
+        case 'AIM_PANEL_DATA':
+          useAimPanelStore.getState().resolve(e.data.guid, { data: e.data.data });
+          break;
+        case 'AIM_PANEL_EMPTY':
+          useAimPanelStore.getState().resolve(e.data.guid, { reason: e.data.reason });
           break;
       }
     }
@@ -144,12 +192,18 @@ export function AimBridge() {
     if (!embeddedRef.current) return;
     const targetOrigin = parentOriginRef.current ?? '*';
     if (!selectedEntity) {
+      useAimPanelStore.getState().clear();
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_DESELECTED' } satisfies OutboundMessage, targetOrigin);
       return;
     }
     const guid = guidForEntity(selectedEntity);
     if (guid) {
+      // AimCard shows its skeleton immediately; the host answers with
+      // AIM_PANEL_DATA / AIM_PANEL_EMPTY (or the store times out quietly).
+      useAimPanelStore.getState().beginLoading(guid);
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_SELECTED', guid } satisfies OutboundMessage, targetOrigin);
+    } else {
+      useAimPanelStore.getState().clear();
     }
   }, [selectedEntity]);
 
