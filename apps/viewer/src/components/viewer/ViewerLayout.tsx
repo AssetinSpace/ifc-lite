@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { parseAutoloadUrls } from '@/lib/autoload';
+import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
 import { MobileToolbar } from './MobileToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
@@ -118,6 +118,9 @@ export function ViewerLayout() {
           console.error('[viewer] autoload failed for', modelUrl, err);
         }
       }
+      // Always fires — even if some (or all) URLs failed — so listeners
+      // (AimBridge MODELS_LOADED) can't wait forever on a broken model URL.
+      window.dispatchEvent(new Event(AUTOLOAD_COMPLETE_EVENT));
     })();
   }, [autoloadAddModel]);
 

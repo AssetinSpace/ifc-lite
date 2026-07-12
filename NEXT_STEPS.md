@@ -50,12 +50,13 @@ Odhady: S < 1 h, M = 1–4 h, L = deň+.
    Allowlist storage originov = produktové rozhodnutie (rozbilo by generické
    demá), preto neopravené autonómne.
 
-6. **MODELS_LOADED sa vystrelí po PRVOM z N federovaných modelov** (S–M) —
-   `AimBridge.tsx` latchuje na prechode 0→N, ale autoload je sekvenčný —
-   deep-link focus na prvok z druhého modelu (VZT) sa vyhodnotí do prázdna.
-   Najčistejšie: signál presunúť na koniec autoload slučky vo ViewerLayout
-   (pozná `urls.length`), alebo emitovať pri každom náraste a host si matchne
-   count. Zmena wire kontraktu — koordinovať s AIM repo stranou.
+6. ~~**MODELS_LOADED sa vystrelí po PRVOM z N federovaných modelov**~~ —
+   **VYRIEŠENÉ** (commit v tejto vetve). Autoload slučka vo ViewerLayout po
+   dokončení VŠETKÝCH URL (aj zlyhaných — host nesmie čakať navždy) dispatchne
+   `AUTOLOAD_COMPLETE_EVENT`; AimBridge pri autoloade ohlasuje MODELS_LOADED
+   až na tento event, bez autoload parametrov ostáva pôvodný 0→N latch.
+   Wire kontrakt sa nemení (stále jedna správa MODELS_LOADED s count) —
+   host strana v AIMviewer nepotrebuje zmenu, len signál príde v správny čas.
 
 ## Kozmetické
 

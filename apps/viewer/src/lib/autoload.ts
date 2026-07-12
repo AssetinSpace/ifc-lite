@@ -14,6 +14,17 @@
 export const AUTOLOAD_MAX_MODELS = 16;
 
 /**
+ * Window event dispatched by the ViewerLayout autoload loop after EVERY
+ * requested model has been attempted (loaded or failed — it always fires, so
+ * listeners can't deadlock on a broken URL). The AIM bridge keys its
+ * MODELS_LOADED announcement on this instead of the store's first 0→N size
+ * transition: the sequential `?models=` autoload would otherwise announce
+ * after the FIRST model, and a deep-link focus targeting an entity in a later
+ * model (e.g. VZT in an ASR+VZT federation) would resolve to nothing.
+ */
+export const AUTOLOAD_COMPLETE_EVENT = 'ifc-lite:autoload-complete';
+
+/**
  * Extract the list of model URLs to autoload from a query string.
  * `models` (comma-separated, entries URL-encoded by the host) wins over the
  * legacy single `model`. Relative URLs are allowed (same-origin fetch) —

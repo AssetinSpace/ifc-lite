@@ -21,6 +21,7 @@
 import { useEffect, useRef } from 'react';
 import { useBim } from '../sdk/BimProvider.js';
 import { useViewerStore } from '../store/index.js';
+import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '../lib/autoload.js';
 import {
   SOURCE,
   FILTER_COLOR,
@@ -103,9 +104,41 @@ export function AimBridge() {
   // Signal the host once models finish loading (the `?models=` autoload is
   // async, so READY fires well before geometry/data exist). The host defers
   // the initial deep-link focus (?focus=<guid>) until this event so
-  // resolveGuids can actually find the entity. Fires on the 0 -> N transition.
+  // resolveGuids can actually find the entity.
+  //
+  // Autoload je SEKVENČNÝ — latch na prvom náraste models.size by ohlásil
+  // MODELS_LOADED po PRVOM modeli a deep-link focus na prvok z neskoršieho
+  // modelu (VZT vo federácii ASR+VZT) by sa vyhodnotil do prázdna. Pri
+  // autoloade preto čakáme na AUTOLOAD_COMPLETE_EVENT z ViewerLayout (fire-uje
+  // vždy, aj pri zlyhaní URL — host nesmie čakať navždy); bez autoload
+  // parametrov ostáva pôvodný 0 → N latch (manuálny load v embede).
   const modelCount = useViewerStore((s) => s.models.size);
   const modelsAnnouncedRef = useRef(false);
+  const announceModels = () => {
+    const count = useViewerStore.getState().models.size;
+    if (count === 0 || modelsAnnouncedRef.current) return;
+    modelsAnnouncedRef.current = true;
+    window.parent.postMessage(
+      { source: SOURCE, type: 'MODELS_LOADED', count } satisfies OutboundMessage,
+      parentOriginRef.current ?? '*',
+    );
+  };
+  const autoloadingRef = useRef(false);
+  useEffect(() => {
+    if (!embeddedRef.current) return;
+    autoloadingRef.current =
+      parseAutoloadUrls(window.location.search, window.location.href).length > 0;
+    if (!autoloadingRef.current) return;
+    const onAutoloadComplete = () => {
+      // Autoload skončil — od tejto chvíle prípadné ďalšie (manuálne) loady
+      // ohlasuje štandardný 0 → N latch nižšie.
+      autoloadingRef.current = false;
+      announceModels();
+    };
+    window.addEventListener(AUTOLOAD_COMPLETE_EVENT, onAutoloadComplete);
+    return () => window.removeEventListener(AUTOLOAD_COMPLETE_EVENT, onAutoloadComplete);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   useEffect(() => {
     if (!embeddedRef.current) return;
     if (modelCount === 0) {
@@ -113,12 +146,10 @@ export function AimBridge() {
       modelsAnnouncedRef.current = false;
       return;
     }
-    if (modelsAnnouncedRef.current) return;
-    modelsAnnouncedRef.current = true;
-    window.parent.postMessage(
-      { source: SOURCE, type: 'MODELS_LOADED', count: modelCount } satisfies OutboundMessage,
-      parentOriginRef.current ?? '*',
-    );
+    // Počas autoloadu ohlasuje completion event vyššie, nie prvý nárast size.
+    if (autoloadingRef.current) return;
+    announceModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modelCount]);
 
   // 3D -> DB: forward native selection changes to the host. The host
