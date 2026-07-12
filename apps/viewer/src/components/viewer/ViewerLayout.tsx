@@ -84,6 +84,11 @@ export function ViewerLayout() {
   usePrivacyDisclosure();
   const shortcutsDialog = useKeyboardShortcutsDialog();
 
+  // >>> AIM-FORK: extends upstream's single `?model=<URL>` autoload to a
+  // comma-separated `?models=<URL>,…` federation (AIM: ASR + VZT). If upstream
+  // rewrites its autoload effect this block will conflict — keep the `?models=`
+  // multi-URL branch and the sequential loop (see docs/FORK_MAINTENANCE.md).
+  //
   // Auto-load model(s) from the URL. `?model=<URL>` loads a single IFC (the
   // original landing-page-iframe behaviour). `?models=<URL>,<URL>,…` loads a
   // federation (AIM: ASR + VZT) — the URLs load sequentially through addModel so
@@ -123,6 +128,7 @@ export function ViewerLayout() {
       window.dispatchEvent(new Event(AUTOLOAD_COMPLETE_EVENT));
     })();
   }, [autoloadAddModel]);
+  // <<< AIM-FORK
 
   // Deep-link collaboration join: a share link is `?room=…&t=…`. The
   // recipient joins the room; with seed-into-room the model hydrates from the
