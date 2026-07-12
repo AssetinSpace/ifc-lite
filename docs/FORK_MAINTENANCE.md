@@ -97,6 +97,22 @@ FOCUS colorize, iframe postMessage bridge). Confirm we didn't overwrite upstream
 git diff upstream/main..HEAD -- apps/viewer/src/aim   # should show only our layer
 ```
 
+## Upstream-only workflows (disabled on this fork)
+
+Some upstream CI publishes/deploys to infrastructure the fork doesn't have. These jobs
+are guarded with `if: github.repository == 'LTplus-AG/ifc-lite'` (bracketed `AIM-FORK`)
+so they **skip** on our fork instead of failing red:
+
+| Workflow | Job(s) | Why it can't run here |
+|---|---|---|
+| `.github/workflows/release.yml` | `release` | Publishes to npm/crates + opens the changesets version PR; needs `RELEASE_PAT` + OIDC trusted publishers the fork lacks (fails at checkout: "token not supplied"). |
+| `.github/workflows/docs.yml` | `build`, `deploy` | Deploys docs to GitHub Pages; the fork has no Pages site (`configure-pages` → 404 "Get Pages site failed"). |
+
+If we ever want these on the fork: for docs, enable GitHub Pages (Settings → Pages → build
+from Actions) and drop the guard; for releases, set up our own publish targets first.
+`.github/workflows/docker.yml` is left as-is — it pushes to the fork's own GHCR namespace
+with the default `GITHUB_TOKEN`, so it works without extra secrets.
+
 ## Conventions (don't drift)
 
 - **New custom code → `apps/viewer/src/aim/`**, not scattered into upstream files.
