@@ -7,16 +7,16 @@ Odhady: S < 1 h, M = 1–4 h, L = deň+.
 
 ## Kritické (funkčné)
 
-1. **`bim.viewer.flyTo` je no-op → FOCUS nikdy nepohne kamerou** (M, architektonické) —
-   `apps/viewer/src/sdk/adapters/viewer-adapter.ts` má `flyTo() {}` s nepravdivým
-   komentárom „wired via useBimHost" (nie je). Reálne framovanie je
-   `cameraCallbacks.frameSelection` (Viewport), ktoré číta globalId kanál
-   `selectedEntityIds` — a ten SDK `select()` zámerne neplní (viď
-   `apps/viewer/AGENTS.md` bod 1). Claim commitu #2 „flew to the entities" je
-   nedosiahnuteľný. Dve cesty: (a) selection-adapter začne syncovať
-   `setSelectedEntityId` (zladí sa s AGENTS pravidlom, ale zmení správanie SDK
-   select pre skripty/extensiony), alebo (b) adapter flyTo si sám nastaví
-   globalId kanál + zavolá `frameSelection`. Vyžaduje tvoje rozhodnutie.
+1. ~~**`bim.viewer.flyTo` je no-op → FOCUS nikdy nepohne kamerou**~~ — **VYRIEŠENÉ**
+   (commit v tejto vetve). Zvolená cesta: pridaný kamera callback
+   `frameEntities(globalIds)` (Viewport zdieľa bounds-frame logiku s
+   `frameSelection`), `flyTo` v adaptéri konvertuje refs→globalId a zavolá ho.
+   flyTo tak ostáva čistá kamera-operácia — **nemutuje selekciu**, takže
+   neriskuje stale-ref race so `selectedEntityIdsRef` ani echo ENTITY_SELECTED
+   naspäť hostovi. Odmietnutá alternatíva „select() nech plní globalId kanál":
+   `bim.selection.set` je publikované SDK API (MCP/sandbox/skripty) a AGENTS.md
+   ho zámerne drží bez highlightu — menil by som správanie mimo AIM.
+   Opravuje aj MCP `viewer_flyto` tool (bol rovnako mŕtvy). Pokryté testami.
 
 ## Stredné (bezpečnostné hardening)
 

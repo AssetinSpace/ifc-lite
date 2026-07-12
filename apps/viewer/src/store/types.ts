@@ -251,6 +251,16 @@ export interface CameraCallbacks {
   zoomOut?: () => void;
   frameSelection?: () => void;
   /**
+   * Frame the camera to the union of the given entities' world AABBs, keeping
+   * the current view direction (same fit as `frameSelection`, but for an
+   * explicit id list instead of the current selection). Drives the SDK
+   * `viewer.flyTo(refs)` path — the ids are renderer/global ids, so callers
+   * convert `EntityRef`s via `toGlobalIdForRef` first. Kept separate from
+   * `frameSelection` so flyTo stays a pure camera op that never mutates the
+   * selection channels (which would race the ref sync and echo back to hosts).
+   */
+  frameEntities?: (globalIds: number[]) => void;
+  /**
    * Frame an explicit world-space box (min/max corners) from the canonical
    * isometric view, animating there. Used to frame a focused clash's contact
    * region head-on (#1466) rather than `frameSelection`, which unions the

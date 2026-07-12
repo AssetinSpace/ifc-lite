@@ -66,8 +66,20 @@ export function createViewerAdapter(store: StoreApi): ViewerBackendMethods {
       state.setPendingColorUpdates(new Map(applied));
       return undefined;
     },
-    flyTo() {
-      // flyTo requires renderer access — wired via useBimHost
+    flyTo(refs: EntityRef[]) {
+      // Frame the camera to the refs via the renderer's frameEntities callback
+      // (registered by Viewport). Pure camera op — does NOT mutate selection,
+      // so it can't race the selection-ref sync or echo an ENTITY_SELECTED back
+      // to an embedding host. No-op until the viewport has registered callbacks.
+      const state = store.getState();
+      const globalIds: number[] = [];
+      for (const ref of refs) {
+        if (!getModelForRef(state, ref.modelId)) continue;
+        globalIds.push(toGlobalIdForRef(state.models, ref));
+      }
+      if (globalIds.length > 0) {
+        state.cameraCallbacks?.frameEntities?.(globalIds);
+      }
       return undefined;
     },
     setSection(section: SectionPlane | null) {

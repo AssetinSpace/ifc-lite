@@ -771,6 +771,44 @@ export function Viewport({
         renderer.requestRender();
       };
 
+      // Union the world AABBs of the given global ids and frame the camera to
+      // them (current view direction preserved). Shared by frameSelection (the
+      // current selection) and frameEntities (an explicit id list from the SDK
+      // viewer.flyTo path) so both frame identically.
+      const frameEntityIds = (ids: number[]) => {
+        const geom = geometryRef.current;
+        if (!geom || ids.length === 0) {
+          console.warn('[Viewport] frameEntityIds: No entities or geometry');
+          return;
+        }
+        let min: { x: number; y: number; z: number } | null = null;
+        let max: { x: number; y: number; z: number } | null = null;
+        const scene = rendererRef.current?.getScene();
+        for (const id of ids) {
+          // GPU-instanced occurrences aren't in geometryResult.meshes; fall back to
+          // the renderer's per-occurrence world AABB so framing them still works.
+          const b = getEntityBounds(geom, id) ?? scene?.getInstancedEntityBounds(id) ?? null;
+          if (!b) continue;
+          if (!min || !max) {
+            min = { x: b.min.x, y: b.min.y, z: b.min.z };
+            max = { x: b.max.x, y: b.max.y, z: b.max.z };
+          } else {
+            min.x = Math.min(min.x, b.min.x);
+            min.y = Math.min(min.y, b.min.y);
+            min.z = Math.min(min.z, b.min.z);
+            max.x = Math.max(max.x, b.max.x);
+            max.y = Math.max(max.y, b.max.y);
+            max.z = Math.max(max.z, b.max.z);
+          }
+        }
+        if (min && max) {
+          camera.frameBounds(min, max, 300);
+          calculateScale();
+        } else {
+          console.warn('[Viewport] frameEntityIds: Could not get bounds for entities');
+        }
+      };
+
       // Register camera callbacks for ViewCube and other controls
       setCameraCallbacks({
         setPresetView: (view) => {
@@ -827,7 +865,6 @@ export function Viewport({
           // selected element; fall back to the single primary id. The set is
           // kept in sync with selection (cleared on a plain click), so the
           // union is always an accurate frame of what's highlighted.
-          const geom = geometryRef.current;
           const set = selectedEntityIdsRef.current;
           const single = selectedEntityIdRef.current;
           // A focused clash glows its pair via the clash-highlight channel WITHOUT
@@ -838,37 +875,10 @@ export function Viewport({
             : hl && hl.size > 0
               ? Array.from(hl.keys())
               : single !== null ? [single] : [];
-          if (!geom || ids.length === 0) {
-            console.warn('[Viewport] frameSelection: No selection or geometry');
-            return;
-          }
-          let min: { x: number; y: number; z: number } | null = null;
-          let max: { x: number; y: number; z: number } | null = null;
-          const scene = rendererRef.current?.getScene();
-          for (const id of ids) {
-            // GPU-instanced occurrences aren't in geometryResult.meshes; fall back to
-            // the renderer's per-occurrence world AABB so framing them still works.
-            const b = getEntityBounds(geom, id) ?? scene?.getInstancedEntityBounds(id) ?? null;
-            if (!b) continue;
-            if (!min || !max) {
-              min = { x: b.min.x, y: b.min.y, z: b.min.z };
-              max = { x: b.max.x, y: b.max.y, z: b.max.z };
-            } else {
-              min.x = Math.min(min.x, b.min.x);
-              min.y = Math.min(min.y, b.min.y);
-              min.z = Math.min(min.z, b.min.z);
-              max.x = Math.max(max.x, b.max.x);
-              max.y = Math.max(max.y, b.max.y);
-              max.z = Math.max(max.z, b.max.z);
-            }
-          }
-          if (min && max) {
-            camera.frameBounds(min, max, 300);
-            calculateScale();
-          } else {
-            console.warn('[Viewport] frameSelection: Could not get bounds for selected element');
-          }
+          frameEntityIds(ids);
         },
+        // Frame an explicit id list (SDK viewer.flyTo) without touching selection.
+        frameEntities: (ids) => frameEntityIds(ids),
         frameClashRegion: (min, max) => {
           // Frame the clash's (already context-padded) contact box from the
           // canonical isometric pose so the penetration is read at a 3/4 angle,
