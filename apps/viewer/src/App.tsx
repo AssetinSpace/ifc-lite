@@ -17,7 +17,9 @@ import { McpLanding } from './components/mcp/McpLanding';
 import { McpPlayground } from './components/mcp/McpPlayground';
 import { BimProvider } from './sdk/BimProvider';
 import { ExtensionHostProvider } from './sdk/ExtensionHostProvider';
+// >>> AIM-FORK: mount the AIM iframe-bridge layer (see apps/viewer/src/aim/, docs/FORK_MAINTENANCE.md)
 import { AimBridge } from './aim/AimBridge';
+// <<< AIM-FORK
 import { Toaster } from './components/ui/toast';
 import { useEffect, useState } from 'react';
 import { Analytics } from '@vercel/analytics/react';
@@ -65,7 +67,9 @@ export function App() {
   return (
     <BimProvider>
       <ExtensionHostProvider>
+        {/* >>> AIM-FORK: postMessage bridge for iframe embedding (no-op outside an AIM host) */}
         <AimBridge />
+        {/* <<< AIM-FORK */}
         <ViewerLayout />
         <Toaster />
         <Analytics />

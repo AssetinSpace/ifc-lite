@@ -57,7 +57,9 @@ import { GeoreferencingPanel } from './properties/GeoreferencingPanel';
 import { RawStepCard } from './properties/RawStepCard';
 import { UnitDisplayControl } from './properties/UnitDisplayControl';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
+// >>> AIM-FORK: AIM asset card, rendered only inside the AIM host (see docs/FORK_MAINTENANCE.md)
 import { AimCard } from '@/aim/AimCard';
+// <<< AIM-FORK
 
 /** IFC material *definition* classes selectable from the Materials tab. */
 const MATERIAL_DEF_TYPES = new Set([
@@ -1435,8 +1437,9 @@ export function PropertiesPanel() {
         )}
       </div>
 
-      {/* AIM platform data (embedded in the AIM host only) */}
+      {/* >>> AIM-FORK: AIM platform data (embedded in the AIM host only) */}
       <AimCard />
+      {/* <<< AIM-FORK */}
 
       {/* IFC Attributes */}
       {renderedAttributes.length > 0 && (

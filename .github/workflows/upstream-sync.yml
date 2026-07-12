@@ -1,0 +1,109 @@
+# Periodically merge upstream LTplus-AG/ifc-lite into our fork and open a PR.
+#
+# This runs entirely inside AssetinSpace/ifc-lite. It only READS from upstream —
+# nothing is ever pushed to LTplus-AG/ifc-lite. On a clean merge it opens a PR
+# against `main`; on conflicts it commits the conflict markers and opens the PR
+# anyway, labelled so a human finishes the merge (see docs/FORK_MAINTENANCE.md).
+name: Upstream sync
+
+on:
+  schedule:
+    # 06:00 UTC every Monday. Adjust cadence as needed.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/LTplus-AG/ifc-lite
+  UPSTREAM_BRANCH: main
+  BASE_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "aim-upstream-sync[bot]"
+          git config user.email "aim-upstream-sync@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Compute sync branch name
+        id: vars
+        run: |
+          echo "branch=sync/upstream-$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse --short upstream/$UPSTREAM_BRANCH)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already up to date
+        id: check
+        run: |
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream/$UPSTREAM_BRANCH — nothing to sync."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          git switch -c "${{ steps.vars.outputs.branch }}"
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            # Commit the conflicted tree as-is so the PR shows the markers.
+            git add -A
+            git commit --no-edit -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }} (CONFLICTS — needs manual resolution)"
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.up_to_date == 'false'
+        run: git push -u origin "${{ steps.vars.outputs.branch }}" --force-with-lease
+
+      - name: Ensure labels exist
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create upstream-sync --color 1d76db --description "Automated merge from upstream LTplus-AG/ifc-lite" || true
+          gh label create needs-manual-merge --color d93f0b --description "Merge conflicts require manual resolution" || true
+
+      - name: Open pull request
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
+            TITLE="⚠️ Upstream sync ${{ steps.vars.outputs.upstream_sha }} — CONFLICTS, needs manual merge"
+            LABELS="upstream-sync,needs-manual-merge"
+            BODY=$'Automated merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\n**Merge conflicts were committed as-is.** Resolve them (keep our \`AIM-FORK\` blocks — see `docs/FORK_MAINTENANCE.md`), then let CI run.\n\n\x60\x60\x60\ngit grep -n "<<<<<<<"\ngit grep -n "AIM-FORK"\n\x60\x60\x60'
+          else
+            TITLE="Upstream sync ${{ steps.vars.outputs.upstream_sha }}"
+            LABELS="upstream-sync"
+            BODY=$'Automated clean merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\nCI gates this PR. Review the diff, then merge → Vercel deploys. See `docs/FORK_MAINTENANCE.md`.'
+          fi
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "${{ steps.vars.outputs.branch }}" \
+            --title "$TITLE" \
+            --label "$LABELS" \
+            --body "$BODY" || echo "PR may already exist for this branch."

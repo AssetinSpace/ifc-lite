@@ -5,6 +5,12 @@ Project-specific gotchas and guardrails: the things that bite you *here* and tha
 ## What this is
 Browser-first IFC toolkit: a WebGPU web viewer plus a headless CLI/MCP/server. No first-party desktop app. Domain logic (decode, geometry, styling, export) lives in Rust crates under `rust/*` and is the source of truth for the server, CLI, SDK, and wasm; TypeScript packages under `packages/*` and apps under `apps/*` consume it (TS mostly does GPU upload and UI). Architecture docs: `docs/architecture/overview.md`.
 
+## Fork & upstream sync
+This repo (`AssetinSpace/ifc-lite`) is a **fork** of upstream [`LTplus-AG/ifc-lite`](https://github.com/LTplus-AG/ifc-lite). We periodically **merge** (never rebase — `main` is deployed via Vercel) upstream into our fork; fetching is read-only on their side. Full recipe in [`docs/FORK_MAINTENANCE.md`](docs/FORK_MAINTENANCE.md).
+- **Keep custom code as a layer.** New AIM-specific code goes in `apps/viewer/src/aim/` (upstream has no such files → zero conflicts), not scattered into upstream files.
+- **Bracket every edit inside an upstream file** with `// >>> AIM-FORK: <why>` … `// <<< AIM-FORK` so merge conflicts are obvious and you know to keep our side. Current wiring touchpoints: `apps/viewer/src/App.tsx`, `apps/viewer/src/components/viewer/ViewerLayout.tsx`, `apps/viewer/src/components/viewer/PropertiesPanel.tsx`.
+- Automated `sync/upstream-*` PRs come from `.github/workflows/upstream-sync.yml`.
+
 ## Commands
 - Install: `corepack enable && pnpm install` (Node 22.x, `pnpm@10.8.1` pinned via `packageManager`).
 - Build: `pnpm build` (turbo). WASM: `pnpm build:wasm` (needs Rust nightly + `wasm-pack`); `pnpm build:wasm:fetch` pulls the prebuilt wasm from npm when Rust is unavailable (e.g. Windows without WSL).
