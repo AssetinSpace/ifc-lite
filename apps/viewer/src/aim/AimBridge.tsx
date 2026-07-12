@@ -27,7 +27,9 @@ import {
   FOCUS_COLOR,
   isInboundMessage,
   resolveGuids,
+  resolveSelector,
   guidForEntity,
+  type OpsSelector,
   type OutboundMessage,
 } from './bridge-protocol.js';
 import { useAimPanelStore } from './aimPanelStore.js';
@@ -52,6 +54,15 @@ export function AimBridge() {
 
     function post(msg: OutboundMessage) {
       window.parent.postMessage(msg, parentOriginRef.current ?? '*');
+    }
+
+    // Ops berú buď explicitné GUIDy, alebo množinový selektor (typy/model)
+    // rozkladaný viewer-side — „celý VZT.ifc" tak necestuje ako zoznam GUIDov.
+    function refsForOp(msg: { guids?: string[]; selector?: OpsSelector }) {
+      const models = useViewerStore.getState().models;
+      if (msg.guids?.length) return resolveGuids(models, msg.guids);
+      if (msg.selector) return resolveSelector(models, msg.selector);
+      return [];
     }
 
     function onMessage(e: MessageEvent) {
@@ -87,22 +98,22 @@ export function AimBridge() {
           focusedRef.current = [];
           break;
         case 'COLORIZE': {
-          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          const refs = refsForOp(e.data);
           if (refs.length > 0) bim.viewer.colorize(refs, e.data.color);
           break;
         }
         case 'HIDE': {
-          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          const refs = refsForOp(e.data);
           if (refs.length > 0) bim.viewer.hide(refs);
           break;
         }
         case 'SHOW': {
-          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          const refs = refsForOp(e.data);
           if (refs.length > 0) bim.viewer.show(refs);
           break;
         }
         case 'ISOLATE': {
-          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
+          const refs = refsForOp(e.data);
           if (refs.length > 0) bim.viewer.isolate(refs);
           break;
         }
