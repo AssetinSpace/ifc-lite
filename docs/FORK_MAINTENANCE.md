@@ -107,11 +107,25 @@ so they **skip** on our fork instead of failing red:
 |---|---|---|
 | `.github/workflows/release.yml` | `release` | Publishes to npm/crates + opens the changesets version PR; needs `RELEASE_PAT` + OIDC trusted publishers the fork lacks (fails at checkout: "token not supplied"). |
 | `.github/workflows/docs.yml` | `build`, `deploy` | Deploys docs to GitHub Pages; the fork has no Pages site (`configure-pages` → 404 "Get Pages site failed"). |
+| `.github/workflows/docker.yml` | `docker` | Publishes the server container; the fork embeds the viewer via Vercel and doesn't ship it (also wants a Depot runner). |
 
 If we ever want these on the fork: for docs, enable GitHub Pages (Settings → Pages → build
-from Actions) and drop the guard; for releases, set up our own publish targets first.
-`.github/workflows/docker.yml` is left as-is — it pushes to the fork's own GHCR namespace
-with the default `GITHUB_TOKEN`, so it works without extra secrets.
+from Actions) and drop the guard; for releases/docker, set up our own publish targets first.
+
+## Depot runners → ubuntu-latest on the fork
+
+Upstream runs the heavy CI jobs on **Depot** managed runners (`depot-ubuntu-24.04-4`), which
+don't exist on the fork — so those jobs sit **queued forever** (`runner_id 0`). The affected
+jobs in `.github/workflows/test.yml` (`Build packages + WASM`, `Rust tests`) select their
+runner by repository:
+
+```
+runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
+```
+
+The from-source wasm compile additionally forces **thin LTO** on the fork
+(`CARGO_PROFILE_RELEASE_LTO`) so FAT-LTO doesn't OOM the smaller `ubuntu-latest` runner —
+same fix as `scripts/vercel-build.sh`. Upstream keeps Depot + FAT LTO unchanged.
 
 ## Conventions (don't drift)
 

@@ -121,7 +121,12 @@ jobs:
     # paid Depot runner (needs the cores + the uncapped cargo cache), exactly as
     # before. This is the CI twin of the scripts/vercel-install.sh fast path and
     # attacks the single largest Depot line — the wasm32 compile on ~2/3 of PRs.
-    runs-on: ${{ needs.changes.outputs.wasm_prebuilt == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    # >>> AIM-FORK: Depot runners exist only on the upstream repo. On the fork,
+    # the from-source wasm compile falls back to a free ubuntu-latest runner
+    # (thin LTO on the Build WASM step keeps it under the RAM ceiling). See
+    # docs/FORK_MAINTENANCE.md.
+    runs-on: ${{ needs.changes.outputs.wasm_prebuilt == 'true' && 'ubuntu-latest' || (github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest') }}
+    # <<< AIM-FORK
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -209,6 +214,12 @@ jobs:
       # can't have changed the committed .d.ts.
       - name: Build WASM
         if: needs.changes.outputs.wasm_prebuilt != 'true'
+        # >>> AIM-FORK: on the fork's ubuntu-latest runner, FAT LTO OOMs the wasm
+        # compile (same failure mode as the Vercel container — see vercel-build.sh).
+        # thin LTO removes the whole-program link and fits; upstream Depot keeps FAT.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'fat' || 'thin' }}
+        # <<< AIM-FORK
         run: bash scripts/build-wasm.sh
 
       # Guard the wasm-free typecheck lane (#952): the committed
@@ -421,7 +432,10 @@ jobs:
     # cores: Depot bills minutes × (vCPU/2), so -8 is 4× and -4 is 2× the
     # base rate — halving per-minute cost for ~1.5× wall-clock. Timeout
     # bumped to absorb the slower wall-clock.
-    runs-on: depot-ubuntu-24.04-4
+    # >>> AIM-FORK: Depot is upstream-only; the fork runs cargo test on ubuntu-latest
+    # (test/dev profile — no LTO — so no OOM). See docs/FORK_MAINTENANCE.md.
+    runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
+    # <<< AIM-FORK
     timeout-minutes: 28
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
