@@ -42,15 +42,32 @@ export interface AimPanelData {
   actions?: { label: string; href: string; primary?: boolean }[];
 }
 
+/**
+ * Množinový výber pre viewer ops (D-066 rozšírenie): namiesto vymenovania
+ * GUIDov popíše CELÚ triedu prvkov a viewer ju rozloží sám z entity tables —
+ * „celý VZT.ifc", „všetko HVAC", „steny + stropy naraz". Obrovské množiny tak
+ * necestujú ako GUID zoznamy v URL/postMessage.
+ */
+export interface OpsSelector {
+  /**
+   * IFC triedy (case-insensitive, napr. "IfcDuctSegment"); StandardCase /
+   * ElementedCase varianty sa priraďujú k základnej triede automaticky.
+   */
+  types?: string[];
+  /** Model federácie — case-insensitive zhoda s názvom súboru ("VZT" ~ "VZT.ifc"). */
+  model?: string;
+}
+
 export type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
   | { source: typeof SOURCE; type: 'CLEAR_FILTER' }
-  // AI dock viewer ops (D-066 in the AIM repo) — colorize/visibility over GUIDs.
-  | { source: typeof SOURCE; type: 'COLORIZE'; guids: string[]; color: string }
-  | { source: typeof SOURCE; type: 'HIDE'; guids: string[] }
-  | { source: typeof SOURCE; type: 'SHOW'; guids: string[] }
-  | { source: typeof SOURCE; type: 'ISOLATE'; guids: string[] }
+  // AI dock viewer ops (D-066 in the AIM repo) — colorize/visibility over
+  // explicit GUIDs, or over an OpsSelector resolved viewer-side.
+  | { source: typeof SOURCE; type: 'COLORIZE'; guids?: string[]; selector?: OpsSelector; color: string }
+  | { source: typeof SOURCE; type: 'HIDE'; guids?: string[]; selector?: OpsSelector }
+  | { source: typeof SOURCE; type: 'SHOW'; guids?: string[]; selector?: OpsSelector }
+  | { source: typeof SOURCE; type: 'ISOLATE'; guids?: string[]; selector?: OpsSelector }
   | { source: typeof SOURCE; type: 'SHOW_ALL' }
   | { source: typeof SOURCE; type: 'RESET_COLORS' }
   // AIM panel data for the selected element (host DB → AimCard in the
@@ -124,4 +141,63 @@ export function guidForEntity(
 ): string | undefined {
   const model = models.get(ref.modelId);
   return model?.ifcDataStore?.entities.getGlobalId(ref.expressId) || undefined;
+}
+
+/** Minimal structural view of an entity table for selector resolution. */
+export interface SelectorEntityTable {
+  count: number;
+  expressId: Uint32Array;
+  getTypeName(expressId: number): string;
+  hasGeometry(expressId: number): boolean;
+}
+
+/** Minimal structural view of a federated model — satisfied by FederatedModel. */
+export interface SelectorResolvableModel {
+  name?: string;
+  ifcDataStore?: { entities: SelectorEntityTable } | null;
+}
+
+/** StandardCase/ElementedCase varianty patria k základnej triede (IfcWallStandardCase → IfcWall). */
+const SUBTYPE_SUFFIX_RE = /(STANDARDCASE|ELEMENTEDCASE)$/;
+
+/**
+ * OpsSelector -> EntityRef[] pre viewer ops. Model sa vyberá case-insensitive
+ * zhodou s názvom súboru (presná, bez prípony, alebo substring — "vzt" nájde
+ * "VZT.ifc"); triedy sa porovnávajú cez getTypeName (rawTypeName fallback,
+ * takže funguje aj pre triedy mimo IfcTypeEnum) so zložením StandardCase
+ * variantov. Len prvky s geometriou — ops (farba/viditeľnosť) inde nemajú
+ * účinok a type-objekty by len nafukovali payload. Prázdny selektor = [].
+ */
+export function resolveSelector(
+  models: ReadonlyMap<string, SelectorResolvableModel>,
+  selector: OpsSelector,
+): EntityRef[] {
+  const wantedModel = selector.model?.trim().toLowerCase();
+  const wantedTypes = selector.types?.length
+    ? new Set(selector.types.map((t) => t.trim().toUpperCase()).filter(Boolean))
+    : null;
+  if (!wantedModel && (!wantedTypes || wantedTypes.size === 0)) return [];
+
+  const refs: EntityRef[] = [];
+  for (const [modelId, model] of models) {
+    if (wantedModel) {
+      const name = (model.name ?? '').toLowerCase();
+      const base = name.replace(/\.[^.]+$/, '');
+      if (name !== wantedModel && base !== wantedModel && !name.includes(wantedModel)) continue;
+    }
+    const table = model.ifcDataStore?.entities;
+    if (!table) continue;
+    for (let i = 0; i < table.count; i++) {
+      const expressId = table.expressId[i];
+      if (!table.hasGeometry(expressId)) continue;
+      if (wantedTypes) {
+        const type = table.getTypeName(expressId).toUpperCase();
+        if (!wantedTypes.has(type) && !wantedTypes.has(type.replace(SUBTYPE_SUFFIX_RE, ''))) {
+          continue;
+        }
+      }
+      refs.push({ modelId, expressId });
+    }
+  }
+  return refs;
 }
