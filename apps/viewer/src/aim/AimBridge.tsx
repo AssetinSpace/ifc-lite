@@ -38,6 +38,10 @@ export function AimBridge() {
   // Prvky ofarbené posledným FOCUS-om — ďalší FOCUS ich vráti do pôvodných
   // farieb (partial resetColors), aby sa oranžová nehromadila po scéne.
   const focusedRef = useRef<ReturnType<typeof resolveGuids>>([]);
+  // Selekcie nastavené hostovým FOCUS-om — tie sa hostovi NEposielajú späť
+  // ako ENTITY_SELECTED (echo by z jeho vlastného príkazu spravilo "user
+  // pick" a prirodzená host implementácia by sa zacyklila FOCUS→SELECTED).
+  const programmaticSelectionRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     // No parent frame (e.g. a standalone viewer tab) — nothing to bridge.
@@ -53,6 +57,9 @@ export function AimBridge() {
     }
 
     function onMessage(e: MessageEvent) {
+      // Len priamy rodič — iné okná (popupy, vnorené iframy) nemajú čo
+      // posielať bridge príkazy, ani keby trafili origin.
+      if (e.source !== window.parent) return;
       if (parentOriginRef.current && e.origin !== parentOriginRef.current) return;
       if (!isInboundMessage(e.data)) return;
 
@@ -68,6 +75,7 @@ export function AimBridge() {
           if (focusedRef.current.length > 0) bim.viewer.resetColors(focusedRef.current);
           bim.viewer.colorize(refs, FOCUS_COLOR);
           focusedRef.current = refs;
+          programmaticSelectionRef.current = new Set(refs.map((r) => `${r.modelId}:${r.expressId}`));
           bim.viewer.select(refs);
           bim.viewer.flyTo(refs);
           break;
@@ -100,7 +108,12 @@ export function AimBridge() {
   const modelsAnnouncedRef = useRef(false);
   useEffect(() => {
     if (!embeddedRef.current) return;
-    if (modelCount === 0 || modelsAnnouncedRef.current) return;
+    if (modelCount === 0) {
+      // Všetky modely odstránené — odlatchni, nech ďalší load ohlási znova.
+      modelsAnnouncedRef.current = false;
+      return;
+    }
+    if (modelsAnnouncedRef.current) return;
     modelsAnnouncedRef.current = true;
     window.parent.postMessage(
       { source: SOURCE, type: 'MODELS_LOADED', count: modelCount } satisfies OutboundMessage,
@@ -112,13 +125,25 @@ export function AimBridge() {
   // resolves guid -> objects.id via its own guidMap (see lib/data/ifc.ts
   // in the AIM repo) and drives ElementInfoPanel / space-siblings from there.
   const selectedEntity = useViewerStore((s) => s.selectedEntity);
+  const hadSelectionRef = useRef(false);
   useEffect(() => {
     if (!embeddedRef.current) return;
     const targetOrigin = parentOriginRef.current ?? '*';
     if (!selectedEntity) {
+      // Úvodný render má selectedEntity === null — DESELECTED posielaj až
+      // po skutočnej selekcii, inak host dostane šum hneď po READY.
+      if (!hadSelectionRef.current) return;
+      hadSelectionRef.current = false;
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_DESELECTED' } satisfies OutboundMessage, targetOrigin);
       return;
     }
+    hadSelectionRef.current = true;
+    // Selekcia vyvolaná hostovým FOCUS-om sa neechuje späť (viď ref vyššie).
+    if (programmaticSelectionRef.current?.has(`${selectedEntity.modelId}:${selectedEntity.expressId}`)) {
+      programmaticSelectionRef.current = null;
+      return;
+    }
+    programmaticSelectionRef.current = null;
     const guid = guidForEntity(useViewerStore.getState().models, selectedEntity);
     if (guid) {
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_SELECTED', guid } satisfies OutboundMessage, targetOrigin);

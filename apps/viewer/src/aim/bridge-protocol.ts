@@ -34,17 +34,25 @@ export type OutboundMessage =
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.
- * Only checks the envelope (source + a string type); the per-type payload
- * (e.g. `guids`) is validated where it's consumed. Guards against the noise
- * every window sees — React DevTools, Vite HMR, wallet extensions, etc.
+ * Checks the envelope (source + type) AND the per-type payload: FOCUS and
+ * HIGHLIGHT_FILTER must carry `guids: string[]`, otherwise the handler would
+ * throw iterating `undefined` on every malformed message. Also guards against
+ * the noise every window sees — React DevTools, Vite HMR, wallet extensions.
  */
 export function isInboundMessage(data: unknown): data is InboundMessage {
-  return (
-    !!data &&
-    typeof data === 'object' &&
-    (data as { source?: unknown }).source === SOURCE &&
-    typeof (data as { type?: unknown }).type === 'string'
-  );
+  if (!data || typeof data !== 'object') return false;
+  const msg = data as { source?: unknown; type?: unknown; guids?: unknown };
+  if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
+  switch (msg.type) {
+    case 'FOCUS':
+    case 'HIGHLIGHT_FILTER':
+      return Array.isArray(msg.guids) && msg.guids.every((g) => typeof g === 'string');
+    case 'CLEAR_FILTER':
+      return true;
+    default:
+      // Unknown type — not a message this bridge version handles.
+      return false;
+  }
 }
 
 /** Minimal structural view of a model's GlobalId index. */

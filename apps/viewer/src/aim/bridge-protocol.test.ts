@@ -48,6 +48,20 @@ describe('isInboundMessage', () => {
     assert.equal(isInboundMessage(undefined), false);
     assert.equal(isInboundMessage('FOCUS'), false);
   });
+
+  it('rejects FOCUS/HIGHLIGHT_FILTER with a missing or malformed guids payload', () => {
+    // Regression: the envelope-only guard let `{type:'FOCUS'}` through and the
+    // handler threw a TypeError iterating `undefined` — remotely pokeable noise.
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'FOCUS' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'HIGHLIGHT_FILTER' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'FOCUS', guids: 'guid-a' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'FOCUS', guids: ['a', 42] }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'FOCUS', guids: [null] }), false);
+  });
+
+  it('rejects unknown message types (forward-compat: ignore, not crash)', () => {
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'SELF_DESTRUCT' }), false);
+  });
 });
 
 describe('resolveGuids', () => {
