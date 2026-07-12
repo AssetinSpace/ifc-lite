@@ -19,37 +19,51 @@ const STORE_TO_AXIS: Record<string, 'x' | 'y' | 'z'> = {
 };
 
 export function createViewerAdapter(store: StoreApi): ViewerBackendMethods {
+  // Authoritative view of the colour overrides applied through this adapter.
+  // `pendingColorUpdates` is a one-shot channel (consumed then nulled by
+  // useGeometryStreaming) and `scene.setColorOverrides` replaces the whole
+  // override set on every call, so partial resets and cross-tick colorize
+  // accumulation can't be derived from the store — they're tracked here.
+  const applied = new Map<number, [number, number, number, number]>();
   return {
     colorize(refs: EntityRef[], color: [number, number, number, number]) {
       const state = store.getState();
-      // Merge with existing pending colors (supports multiple colorize calls per script)
-      const existing = state.pendingColorUpdates;
-      const colorMap = existing ? new Map(existing) : new Map<number, [number, number, number, number]>();
       for (const ref of refs) {
         if (!getModelForRef(state, ref.modelId)) continue;
-        colorMap.set(toGlobalIdForRef(state.models, ref), color);
+        applied.set(toGlobalIdForRef(state.models, ref), color);
       }
-      state.setPendingColorUpdates(colorMap);
+      state.setPendingColorUpdates(new Map(applied));
       return undefined;
     },
     colorizeAll(batches: Array<{ refs: EntityRef[]; color: [number, number, number, number] }>) {
       const state = store.getState();
       // Batch colorize: build the complete color map in a single call.
       // Avoids accumulation issues when React effects fire between calls.
-      const batchMap = new Map<number, [number, number, number, number]>();
+      applied.clear();
       for (const batch of batches) {
         for (const ref of batch.refs) {
           if (!getModelForRef(state, ref.modelId)) continue;
-          batchMap.set(toGlobalIdForRef(state.models, ref), batch.color);
+          applied.set(toGlobalIdForRef(state.models, ref), batch.color);
         }
       }
-      state.setPendingColorUpdates(batchMap);
+      state.setPendingColorUpdates(new Map(applied));
       return undefined;
     },
-    resetColors() {
+    resetColors(refs?: EntityRef[]) {
       const state = store.getState();
-      // Set empty map to trigger scene.clearColorOverrides() (null skips the effect)
-      state.setPendingColorUpdates(new Map());
+      if (refs && refs.length > 0) {
+        // Partial reset per the SDK contract (resetColors(refs?)): only the
+        // given refs lose their override. Ignoring `refs` cleared the whole
+        // scene — e.g. an active HIGHLIGHT_FILTER — whenever the AIM bridge
+        // restored the previous FOCUS set.
+        for (const ref of refs) {
+          applied.delete(toGlobalIdForRef(state.models, ref));
+        }
+      } else {
+        applied.clear();
+      }
+      // An empty map triggers scene.clearColorOverrides() (null skips the effect).
+      state.setPendingColorUpdates(new Map(applied));
       return undefined;
     },
     flyTo() {
