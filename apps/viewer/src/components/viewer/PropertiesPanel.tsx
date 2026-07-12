@@ -57,6 +57,7 @@ import { GeoreferencingPanel } from './properties/GeoreferencingPanel';
 import { RawStepCard } from './properties/RawStepCard';
 import { UnitDisplayControl } from './properties/UnitDisplayControl';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
+import { AimCard } from '@/aim/AimCard';
 
 /** IFC material *definition* classes selectable from the Materials tab. */
 const MATERIAL_DEF_TYPES = new Set([
@@ -1433,6 +1434,9 @@ export function PropertiesPanel() {
           </div>
         )}
       </div>
+
+      {/* AIM platform data (embedded in the AIM host only) */}
+      <AimCard />
 
       {/* IFC Attributes */}
       {renderedAttributes.length > 0 && (
