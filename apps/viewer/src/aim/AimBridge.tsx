@@ -20,73 +20,16 @@
 
 import { useEffect, useRef } from 'react';
 import { useBim } from '../sdk/BimProvider.js';
-import { useViewerStore, type EntityRef } from '../store/index.js';
-import { useAimPanelStore, type AimPanelData } from './aimPanelStore.js';
-
-const SOURCE = 'aim-bridge' as const;
-
-/** Blue-400 — matches the old FILTER_COLOR in the AIM three.js viewer. */
-const FILTER_COLOR = '#60a5fa';
-
-type InboundMessage =
-  | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
-  | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
-  | { source: typeof SOURCE; type: 'CLEAR_FILTER' }
-  // AI dock viewer ops (D-066 in the AIM repo) — colorize/visibility over GUIDs.
-  | { source: typeof SOURCE; type: 'COLORIZE'; guids: string[]; color: string }
-  | { source: typeof SOURCE; type: 'HIDE'; guids: string[] }
-  | { source: typeof SOURCE; type: 'SHOW'; guids: string[] }
-  | { source: typeof SOURCE; type: 'ISOLATE'; guids: string[] }
-  | { source: typeof SOURCE; type: 'SHOW_ALL' }
-  | { source: typeof SOURCE; type: 'RESET_COLORS' }
-  // AIM panel data for the selected element (host DB → AimCard in the
-  // PropertiesPanel). Guid-stamped so stale answers are dropped store-side.
-  | { source: typeof SOURCE; type: 'AIM_PANEL_DATA'; guid: string; data: AimPanelData }
-  | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string };
-
-type OutboundMessage =
-  | { source: typeof SOURCE; type: 'READY' }
-  | { source: typeof SOURCE; type: 'MODELS_LOADED'; count: number }
-  | { source: typeof SOURCE; type: 'ENTITY_SELECTED'; guid: string }
-  | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' }
-  // Click on a link inside the AimCard — the parent app performs the
-  // navigation (href is a host-relative path, e.g. /node/{id}).
-  | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string };
-
-function isInboundMessage(data: unknown): data is InboundMessage {
-  return (
-    !!data &&
-    typeof data === 'object' &&
-    (data as { source?: unknown }).source === SOURCE &&
-    typeof (data as { type?: unknown }).type === 'string'
-  );
-}
-
-/**
- * GUID -> EntityRef across every federated model. Uses the pre-built
- * GlobalId index on each model's entity table (O(1) per model, no scan) —
- * see `getExpressIdByGlobalId` in packages/data/src/entity-table.ts.
- */
-function resolveGuids(guids: string[]): EntityRef[] {
-  const models = useViewerStore.getState().models;
-  const refs: EntityRef[] = [];
-  for (const guid of guids) {
-    for (const [modelId, model] of models) {
-      const expressId = model.ifcDataStore?.entities.getExpressIdByGlobalId(guid) ?? -1;
-      if (expressId !== -1) {
-        refs.push({ modelId, expressId });
-        break;
-      }
-    }
-  }
-  return refs;
-}
-
-/** GUID for the entity currently sitting in `selectedEntity`, if any. */
-function guidForEntity(ref: EntityRef): string | undefined {
-  const model = useViewerStore.getState().models.get(ref.modelId);
-  return model?.ifcDataStore?.entities.getGlobalId(ref.expressId) || undefined;
-}
+import { useViewerStore } from '../store/index.js';
+import {
+  SOURCE,
+  FILTER_COLOR,
+  isInboundMessage,
+  resolveGuids,
+  guidForEntity,
+  type OutboundMessage,
+} from './bridge-protocol.js';
+import { useAimPanelStore } from './aimPanelStore.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -113,7 +56,7 @@ export function AimBridge() {
 
       switch (e.data.type) {
         case 'FOCUS': {
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length === 0) return;
           bim.viewer.select(refs);
           bim.viewer.flyTo(refs);
@@ -121,7 +64,7 @@ export function AimBridge() {
         }
         case 'HIGHLIGHT_FILTER': {
           bim.viewer.resetColors();
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.colorize(refs, FILTER_COLOR);
           break;
         }
@@ -129,22 +72,22 @@ export function AimBridge() {
           bim.viewer.resetColors();
           break;
         case 'COLORIZE': {
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.colorize(refs, e.data.color);
           break;
         }
         case 'HIDE': {
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.hide(refs);
           break;
         }
         case 'SHOW': {
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.show(refs);
           break;
         }
         case 'ISOLATE': {
-          const refs = resolveGuids(e.data.guids);
+          const refs = resolveGuids(useViewerStore.getState().models, e.data.guids);
           if (refs.length > 0) bim.viewer.isolate(refs);
           break;
         }
@@ -196,7 +139,7 @@ export function AimBridge() {
       window.parent.postMessage({ source: SOURCE, type: 'ENTITY_DESELECTED' } satisfies OutboundMessage, targetOrigin);
       return;
     }
-    const guid = guidForEntity(selectedEntity);
+    const guid = guidForEntity(useViewerStore.getState().models, selectedEntity);
     if (guid) {
       // AimCard shows its skeleton immediately; the host answers with
       // AIM_PANEL_DATA / AIM_PANEL_EMPTY (or the store times out quietly).

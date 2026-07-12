@@ -15,20 +15,9 @@
 
 import { create } from 'zustand';
 
-export interface AimPanelData {
-  version: 1;
-  /** Echo of the requested element's GlobalId — used to drop stale responses. */
-  guid: string;
-  title: string;
-  subtitle?: string;
-  badges?: { label: string; tone?: 'default' | 'accent' }[];
-  sections?: {
-    label: string;
-    rows: { label: string; value: string; href?: string; mono?: boolean }[];
-  }[];
-  documents?: { name: string; href: string; badge?: string }[];
-  actions?: { label: string; href: string; primary?: boolean }[];
-}
+import { SOURCE, type AimPanelData, type OutboundMessage } from './bridge-protocol.js';
+
+export type { AimPanelData };
 
 export type AimPanelState =
   | { status: 'idle' }
@@ -94,7 +83,7 @@ export const useAimPanelStore = create<AimPanelStore>((set, get) => ({
 export function postAimNavigate(href: string) {
   const { parentOrigin } = useAimPanelStore.getState();
   window.parent.postMessage(
-    { source: 'aim-bridge', type: 'AIM_NAVIGATE', href },
+    { source: SOURCE, type: 'AIM_NAVIGATE', href } satisfies OutboundMessage,
     parentOrigin ?? '*',
   );
 }
