@@ -31,7 +31,33 @@ export interface RegistryMergeOutcome {
 export interface RegistryResolutionInput {
   path: string;
   component_key?: string;
-  choice: 'ours' | 'theirs';
+  choice: 'ours' | 'theirs' | 'edited';
+  /** Replacement component attributes; required when `choice === 'edited'`. */
+  attributes?: Record<string, unknown>;
+}
+
+/** A review comment as a BCF topic bound to (review, entity, componentKey?). */
+export interface RegistryReviewTopic {
+  guid: string;
+  title: string;
+  description?: string;
+  entity: string;
+  componentKey?: string;
+  author?: string;
+  createdAt: string;
+  viewpoint?: Record<string, unknown>;
+}
+
+export interface RegistryReviewSummary {
+  id: string;
+  layerId: string;
+  into: string;
+  reviewers: string[];
+  status: 'open' | 'changes-requested' | 'approved';
+  topics?: RegistryReviewTopic[];
+  openedBy?: string;
+  openedAt: string;
+  approvedBy?: string;
 }
 
 export class RegistryError extends Error {
@@ -110,8 +136,59 @@ export class LayerRegistryClient {
 
   mergeRef(
     name: string,
-    init: { candidate: string; preview?: boolean; resolutions?: RegistryResolutionInput[] },
+    init: {
+      candidate: string;
+      preview?: boolean;
+      resolutions?: RegistryResolutionInput[];
+      waivers?: Array<{ spec: string; reason: string }>;
+    },
   ): Promise<RegistryMergeOutcome> {
     return this.request('POST', `/refs/${encodeURIComponent(name)}/merge`, init);
+  }
+
+  // ----- reviews (PR objects) + BCF-bound comments (08-review.md §8.6) -----
+
+  listReviews(): Promise<{ reviews: RegistryReviewSummary[] }> {
+    return this.request('GET', '/reviews');
+  }
+
+  openReview(init: { layer_id: string; into: string; reviewers?: string[] }): Promise<{ id: string }> {
+    return this.request('POST', '/reviews', init);
+  }
+
+  getReview(id: string): Promise<RegistryReviewSummary> {
+    return this.request('GET', `/reviews/${encodeURIComponent(id)}`);
+  }
+
+  listTopics(reviewId: string): Promise<{ topics: RegistryReviewTopic[] }> {
+    return this.request('GET', `/reviews/${encodeURIComponent(reviewId)}/topics`);
+  }
+
+  postTopic(
+    reviewId: string,
+    topic: {
+      title: string;
+      description?: string;
+      entity: string;
+      component_key?: string;
+      viewpoint?: Record<string, unknown>;
+    },
+  ): Promise<{ guid: string }> {
+    return this.request('POST', `/reviews/${encodeURIComponent(reviewId)}/topics`, topic);
+  }
+
+  /**
+   * Fetch check-evidence bytes behind a manifest check's `report` /
+   * `specDigest` (08-review.md §8.4). Evidence is raw text (IDS XML or
+   * report JSON), not a JSON envelope — bypasses the JSON request path.
+   * Null when the registry has no such report.
+   */
+  async getReport(digest: string): Promise<string | null> {
+    const res = await fetch(`${this.base}/reports/${encodeURIComponent(digest)}`, {
+      headers: this.token ? { authorization: `Bearer ${this.token}` } : {},
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new RegistryError(res.status, `evidence fetch failed (${res.status})`);
+    return res.text();
   }
 }

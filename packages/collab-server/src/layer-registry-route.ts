@@ -42,8 +42,10 @@ import {
   LayerPushError,
   type LayerRegistryStore,
   type RegistryReview,
+  type RegistryReviewTopic,
   type RegistryReviewDecision,
 } from './layer-registry.js';
+import { emitRegistryEvent, type RegistryWebhook } from './registry-webhooks.js';
 
 /** Resolve the acting principal, or null to reject with 401. */
 export type RegistryAuthorizeFn = (
@@ -57,6 +59,8 @@ export interface LayerRegistryRouteOptions {
   maxBytes?: number;
   /** When omitted, traffic is anonymous (dev/tests) — matches the blob route. */
   authorize?: RegistryAuthorizeFn;
+  /** Event consumers (08-review.md §8.7); empty = no emission. */
+  webhooks?: readonly RegistryWebhook[];
 }
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -133,7 +137,76 @@ function parseRefPolicy(value: unknown): RefPolicy | undefined {
     }
     policy.requiredChecks = raw.requiredChecks;
   }
+  if (raw.autoMerge !== undefined) {
+    if (typeof raw.autoMerge !== 'boolean') return undefined;
+    policy.autoMerge = raw.autoMerge;
+  }
   return policy;
+}
+
+/**
+ * Auto-merge (10-registry.md §10.4): after a push, conflict-free +
+ * all-green candidates merge unattended into every `autoMerge` ref.
+ * Fail-closed by construction:
+ *  - `requireHumanApproval` refs never auto-merge (an unattended merge
+ *    cannot satisfy an approval).
+ *  - Baseless candidates never auto-merge (three-way against an empty
+ *    ancestor reads every op as "new" — a disjoint layer would land on
+ *    every auto-merge ref).
+ *  - `conflicts` / `policy-failure` / `unrelated-base` outcomes have no
+ *    side effects in the shared flow, and any throw is contained — an
+ *    auto-merge can never fail the push that triggered it.
+ */
+function runAutoMerges(
+  registry: LayerRegistryStore,
+  pushedId: string,
+  webhooks: readonly RegistryWebhook[]
+): void {
+  let manifest;
+  try {
+    manifest = getProvenance(registry.loadLayer(pushedId));
+  } catch {
+    return;
+  }
+  if (!manifest?.base) return;
+  // "All-green" is the whole candidate manifest, not just the ref's
+  // required checks: a failing check the policy forgot to require must
+  // still keep the merge attended.
+  if ((manifest.checks ?? []).some((check) => check.result !== 'pass')) return;
+  for (const [name, entry] of Object.entries(registry.listRefs())) {
+    const policy = entry.policy;
+    if (!policy?.autoMerge || policy.requireHumanApproval) continue;
+    if (entry.layers.includes(pushedId)) continue;
+    // Idempotency: a candidate that already landed via a three-way merge
+    // is represented by its MERGE layer, not its own id — re-merging it
+    // would append a duplicate (usually empty) merge layer per re-push.
+    const alreadyMerged = entry.layers.some((layerId) => {
+      try {
+        return getProvenance(registry.loadLayer(layerId))?.merge?.candidate === pushedId;
+      } catch {
+        return false;
+      }
+    });
+    if (alreadyMerged) continue;
+    try {
+      const outcome = mergeIntoRef(registry, {
+        candidateId: pushedId,
+        into: name,
+        principal: 'registry-automerge',
+      });
+      if (outcome.status === 'fast-forward' || outcome.status === 'merged') {
+        emitRegistryEvent(webhooks, 'ref.merged', {
+          ref: name,
+          candidate: pushedId,
+          status: outcome.status,
+          auto: true,
+          ...(outcome.status === 'merged' ? { merge_layer: outcome.mergeLayerId } : {}),
+        });
+      }
+    } catch {
+      // Contained by contract (see above).
+    }
+  }
 }
 
 /** Runtime shape validation for review decisions; undefined = invalid. */
@@ -168,7 +241,7 @@ export async function handleLayerRegistryRequest(
   if (!url.pathname.startsWith(BASE)) return false;
   const rawSegments = url.pathname.slice(BASE.length).split('/').filter(Boolean);
   const [head] = rawSegments;
-  if (head !== 'layers' && head !== 'refs' && head !== 'reviews') return false;
+  if (head !== 'layers' && head !== 'refs' && head !== 'reviews' && head !== 'reports') return false;
   let segments: string[];
   try {
     segments = rawSegments.map(decodeURIComponent);
@@ -187,6 +260,7 @@ export async function handleLayerRegistryRequest(
   }
   const registry = opts.registry;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  const webhooks = opts.webhooks ?? [];
 
   // ----- layers ------------------------------------------------------------
   if (head === 'layers') {
@@ -230,7 +304,10 @@ export async function handleLayerRegistryRequest(
         }
       }
       try {
-        return json(res, 201, { id: registry.push(file) });
+        const id = registry.push(file);
+        emitRegistryEvent(webhooks, 'layer.pushed', { id });
+        runAutoMerges(registry, id, webhooks);
+        return json(res, 201, { id });
       } catch (err) {
         const handled = handlePushError(res, err);
         if (handled) return handled;
@@ -243,6 +320,45 @@ export async function handleLayerRegistryRequest(
       }
     }
     return json(res, 405, { error: `unsupported ${method} on layers` });
+  }
+
+  // ----- reports (check evidence, 08-review.md §8.4) ------------------------
+  // The IDS spec/report files whose digests provenance `checks` entries
+  // carry. Content-addressed under the digest the manifest already names,
+  // digest-verified on write, immutable. Evidence is text (IDS XML, report
+  // JSON), so the utf-8 body path is safe.
+  if (head === 'reports') {
+    if (segments.length !== 2) {
+      return json(res, method === 'GET' || method === 'PUT' ? 404 : 405, {
+        error: `reports are addressed by digest: ${method} /api/v1/reports/<blake3:hex>`,
+      });
+    }
+    const digest = segments[1].startsWith('blake3:') ? segments[1] : `blake3:${segments[1]}`;
+    if (method === 'GET') {
+      if (!registry.getReport) return json(res, 501, { error: 'this registry store does not persist check evidence' });
+      const bytes = registry.getReport(digest);
+      if (bytes === undefined) return json(res, 404, { error: `no report ${digest}` });
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': String(bytes.byteLength),
+        'x-report-digest': digest,
+      });
+      res.end(Buffer.from(bytes));
+      return true;
+    }
+    if (method === 'PUT') {
+      if (!registry.putReport) return json(res, 501, { error: 'this registry store does not persist check evidence' });
+      const text = await readBody(req, maxBytes);
+      if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
+      try {
+        return json(res, 201, { digest: registry.putReport(digest, Buffer.from(text, 'utf-8')) });
+      } catch (err) {
+        const handled = handlePushError(res, err);
+        if (handled) return handled;
+        throw err;
+      }
+    }
+    return json(res, 405, { error: `unsupported ${method} on reports` });
   }
 
   // ----- refs --------------------------------------------------------------
@@ -307,6 +423,9 @@ export async function handleLayerRegistryRequest(
         if (handled) return handled;
         throw err;
       }
+      if (body?.layers !== undefined) {
+        emitRegistryEvent(webhooks, 'ref.moved', { ref: name, layers: entry.layers });
+      }
       return json(res, existing ? 200 : 201, { ref: name, ...entry });
     }
     if (method === 'GET' && segments.length === 2) {
@@ -337,7 +456,9 @@ export async function handleLayerRegistryRequest(
       if (body.preview) init.preview = true;
       if (body.resolve === 'ours' || body.resolve === 'theirs') init.resolve = body.resolve;
       // Per-conflict resolutions from the review UI: strictly-shaped
-      // ours/theirs decisions ('edited' stays a local-flow feature).
+      // ours/theirs decisions, or edit-in-place with the replacement
+      // attributes (08-review.md §8.3). The engine re-validates edited
+      // targets (componentKey-scoped, non-relation) when applying.
       if (body.resolutions !== undefined) {
         if (!Array.isArray(body.resolutions)) {
           return json(res, 400, { error: 'resolutions must be an array of { path, component_key?, choice }' });
@@ -345,20 +466,35 @@ export async function handleLayerRegistryRequest(
         const parsedResolutions: NonNullable<MergeInit['resolutions']> = [];
         for (const item of body.resolutions) {
           if (typeof item !== 'object' || item === null) {
-            return json(res, 400, { error: 'each resolution must be { path, component_key?, choice: "ours" | "theirs" }' });
+            return json(res, 400, { error: 'each resolution must be { path, component_key?, choice: "ours" | "theirs" | "edited" }' });
           }
           const raw = item as Record<string, unknown>;
           const choice = raw.choice;
-          if (typeof raw.path !== 'string' || (choice !== 'ours' && choice !== 'theirs')) {
-            return json(res, 400, { error: 'each resolution must be { path, component_key?, choice: "ours" | "theirs" }' });
+          if (typeof raw.path !== 'string' || (choice !== 'ours' && choice !== 'theirs' && choice !== 'edited')) {
+            return json(res, 400, { error: 'each resolution must be { path, component_key?, choice: "ours" | "theirs" | "edited" }' });
           }
           if (raw.component_key !== undefined && typeof raw.component_key !== 'string') {
             return json(res, 400, { error: 'component_key must be a string when present' });
+          }
+          if (choice === 'edited') {
+            if (
+              typeof raw.component_key !== 'string' ||
+              typeof raw.attributes !== 'object' ||
+              raw.attributes === null ||
+              Array.isArray(raw.attributes)
+            ) {
+              return json(res, 400, {
+                error: 'an edited resolution must be { path, component_key, choice: "edited", attributes: { ... } }',
+              });
+            }
           }
           parsedResolutions.push({
             path: raw.path,
             choice,
             ...(raw.component_key !== undefined ? { componentKey: raw.component_key as string } : {}),
+            ...(choice === 'edited'
+              ? { attributes: raw.attributes as Record<string, unknown> }
+              : {}),
           });
         }
         init.resolutions = parsedResolutions;
@@ -422,12 +558,30 @@ export async function handleLayerRegistryRequest(
       } catch (err) {
         const handled = handlePushError(res, err);
         if (handled) return handled;
+        // The engine refuses malformed edited resolutions (entity-level
+        // conflict, relation pseudo-component): a client error, not 500.
+        if (err instanceof Error && err.message.includes('edited resolution')) {
+          return json(res, 400, { error: err.message });
+        }
         throw err;
       }
       switch (outcome.status) {
         case 'fast-forward':
+          emitRegistryEvent(webhooks, 'ref.merged', {
+            ref: segments[1],
+            candidate: body.candidate,
+            status: outcome.status,
+            auto: false,
+          });
           return json(res, 200, { status: outcome.status, layers: outcome.refLayers });
         case 'merged':
+          emitRegistryEvent(webhooks, 'ref.merged', {
+            ref: segments[1],
+            candidate: body.candidate,
+            status: outcome.status,
+            auto: false,
+            merge_layer: outcome.mergeLayerId,
+          });
           return json(res, 200, {
             status: outcome.status,
             merge_layer: outcome.mergeLayerId,
@@ -486,7 +640,68 @@ export async function handleLayerRegistryRequest(
       if (handled) return handled;
       throw err;
     }
+    emitRegistryEvent(webhooks, 'review.opened', { id: review.id, layer_id: review.layerId, into: review.into });
     return json(res, 201, { id: review.id });
+  }
+  // Review comments as BCF topics bound to (review, entity, componentKey?)
+  // per 08-review.md §8.6. Reads are open to any authenticated principal
+  // (agents consume them via get_review_feedback); writes follow the same
+  // named-reviewers gate as decisions.
+  if (segments.length === 3 && segments[2] === 'topics') {
+    const review = registry.getReview(segments[1]);
+    if (!review) return json(res, 404, { error: `no review ${segments[1]}` });
+    if (method === 'GET') {
+      return json(res, 200, { topics: review.topics ?? [] });
+    }
+    if (method === 'POST') {
+      const actor = principal?.userId ?? 'anonymous';
+      if (review.reviewers.length > 0 && !review.reviewers.includes(actor)) {
+        return json(res, 403, { error: `only the named reviewers may act on review ${review.id}` });
+      }
+      const text = await readBody(req, maxBytes);
+      if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
+      const parsed = parseJson(text);
+      if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+      const body = parsed.value as
+        | { title?: unknown; description?: unknown; entity?: unknown; component_key?: unknown; viewpoint?: unknown }
+        | undefined;
+      if (!body || typeof body.title !== 'string' || body.title.trim().length === 0 || typeof body.entity !== 'string') {
+        return json(res, 400, { error: 'body must include { title: string, entity: string }' });
+      }
+      if (body.description !== undefined && typeof body.description !== 'string') {
+        return json(res, 400, { error: 'description must be a string when present' });
+      }
+      if (body.component_key !== undefined && typeof body.component_key !== 'string') {
+        return json(res, 400, { error: 'component_key must be a string when present' });
+      }
+      if (
+        body.viewpoint !== undefined &&
+        (typeof body.viewpoint !== 'object' || body.viewpoint === null || Array.isArray(body.viewpoint))
+      ) {
+        return json(res, 400, { error: 'viewpoint must be an object when present' });
+      }
+      const topic: RegistryReviewTopic = {
+        guid: crypto.randomUUID(),
+        title: body.title.trim(),
+        entity: body.entity,
+        ...(body.description !== undefined ? { description: body.description } : {}),
+        ...(body.component_key !== undefined ? { componentKey: body.component_key } : {}),
+        ...(principal ? { author: principal.userId } : {}),
+        createdAt: new Date().toISOString(),
+        ...(body.viewpoint !== undefined ? { viewpoint: body.viewpoint as Record<string, unknown> } : {}),
+      };
+      review.topics = [...(review.topics ?? []), topic];
+      try {
+        registry.putReview(review);
+      } catch (err) {
+        const handled = handlePushError(res, err);
+        if (handled) return handled;
+        throw err;
+      }
+      emitRegistryEvent(webhooks, 'review.commented', { id: review.id, guid: topic.guid, entity: topic.entity });
+      return json(res, 201, { guid: topic.guid, topic_count: review.topics.length });
+    }
+    return json(res, 405, { error: `unsupported ${method} on review topics` });
   }
   if (method === 'POST' && segments.length === 3 && segments[2] === 'feedback') {
     const review = registry.getReview(segments[1]);
@@ -540,6 +755,11 @@ export async function handleLayerRegistryRequest(
       else delete review.approvedBy;
     }
     registry.putReview(review);
+    emitRegistryEvent(webhooks, 'review.updated', {
+      id: review.id,
+      status: review.status,
+      decision_count: review.feedback.length,
+    });
     return json(res, 200, { id: review.id, status: review.status, decision_count: review.feedback.length });
   }
   return json(res, 405, { error: `unsupported ${method} on reviews` });

@@ -27,10 +27,16 @@ Environment variables:
 |---|---|---|
 | `COLLAB_PORT` | `1234` | Listen port |
 | `COLLAB_HOST` | `0.0.0.0` | Listen host |
-| `COLLAB_DATA_DIR` | `./.collab-data` | Persistence root for room logs |
+| `COLLAB_DATA_DIR` | `./.collab-data` | Persistence root for room logs, blobs, and the layer registry |
 | `COLLAB_MAX_ROOMS` | `1024` | Soft cap on simultaneous rooms |
+<<<<<<< HEAD
 | `COLLAB_TOKEN_SECRET` | _(unset)_ | Enables signed room tokens (access control). Unset = anonymous editor, allowed only on a loopback bind |
 | `COLLAB_ALLOW_ANONYMOUS` | _(unset)_ | `1` = explicitly allow anonymous mode on a non-loopback bind (world-writable — trusted networks only) |
+=======
+| `COLLAB_LAYER_REGISTRY` | off | `1`/`true` mounts the layer registry (`/api/v1/layers\|refs\|reviews`), disk-backed under `COLLAB_DATA_DIR/layer-registry` |
+| `COLLAB_REGISTRY_WEBHOOK_URL` | off | POST registry events (layer pushed, ref moved/merged, review opened/updated/commented) to this URL |
+| `COLLAB_REGISTRY_WEBHOOK_SECRET` | none | HMAC-SHA256 signing secret for webhook payloads (`x-ifclite-signature`) |
+>>>>>>> upstream/main
 
 ## Programmatic use
 
