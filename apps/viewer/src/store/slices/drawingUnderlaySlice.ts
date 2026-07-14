@@ -52,6 +52,19 @@ export interface DrawingUnderlaySlice {
   /** Calibration in progress, or null. */
   underlayCalibration: UnderlayCalibrationDraft | null;
   /**
+   * Horizontal cut for the drawing view (world Y, metres) — applied by the
+   * animation loop independently of the Section tool, so the storey cut
+   * survives tool switches. Null = no cut.
+   */
+  underlayCut: number | null;
+  /**
+   * Camera lock for the drawing view: orbit disabled (pan/zoom stay live) so
+   * the top-down orientation can't be lost by an errant drag.
+   */
+  underlayViewLocked: boolean;
+  /** Storey GUID the drawing view is locked to (drives the 2D pane). */
+  underlayActiveStoreyGuid: string | null;
+  /**
    * Host persistence hook (e.g. the AIM bridge). Called after a placement
    * is created or its presentation fields change. Null = session-only.
    */
@@ -67,6 +80,13 @@ export interface DrawingUnderlaySlice {
   setUnderlayOpacity: (id: string, opacity: number) => void;
   setUnderlayVisible: (id: string, visible: boolean) => void;
   setUnderlayPanelVisible: (visible: boolean) => void;
+
+  /** Set/clear the drawing-view cut (world Y). */
+  setUnderlayCut: (y: number | null) => void;
+  /** Move the cut by a delta (no-op when no cut is active). */
+  nudgeUnderlayCut: (deltaY: number) => void;
+  setUnderlayViewLocked: (locked: boolean) => void;
+  setUnderlayActiveStoreyGuid: (guid: string | null) => void;
 
   startUnderlayCalibration: (drawingId: string, page: number) => void;
   setUnderlayCalibrationPageSize: (pageSize: [number, number]) => void;
@@ -101,6 +121,9 @@ export const createDrawingUnderlaySlice: StateCreator<
   underlayDrawings: new Map(),
   underlayPanelVisible: false,
   underlayCalibration: null,
+  underlayCut: null,
+  underlayViewLocked: false,
+  underlayActiveStoreyGuid: null,
   underlaySaveHandler: null,
 
   setUnderlayDrawings: (drawings) => {
@@ -164,6 +187,17 @@ export const createDrawingUnderlaySlice: StateCreator<
   },
 
   setUnderlayPanelVisible: (visible) => set({ underlayPanelVisible: visible }),
+
+  setUnderlayCut: (y) => set({ underlayCut: y }),
+
+  nudgeUnderlayCut: (deltaY) =>
+    set((state) =>
+      state.underlayCut === null ? state : { underlayCut: state.underlayCut + deltaY },
+    ),
+
+  setUnderlayViewLocked: (locked) => set({ underlayViewLocked: locked }),
+
+  setUnderlayActiveStoreyGuid: (guid) => set({ underlayActiveStoreyGuid: guid }),
 
   startUnderlayCalibration: (drawingId, page) =>
     set({

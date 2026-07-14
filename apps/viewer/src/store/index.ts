@@ -398,6 +398,9 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       underlayDrawings: new Map(),
       underlayCalibration: null,
       underlayPanelVisible: false,
+      underlayCut: null,
+      underlayViewLocked: false,
+      underlayActiveStoreyGuid: null,
 
       // Drawing 2D
       drawing2D: null,

@@ -531,6 +531,9 @@ export function Viewport({
   const sectionPlaneRef = useLatestRef(sectionPlane);
   const sectionRangeRef = useLatestRef(sectionRange);
   const sectionPickModeRef = useLatestRef(sectionPickMode);
+  // Drawing-view storey cut (D-072) — applied while the Section tool is off.
+  const underlayCut = useViewerStore((s) => s.underlayCut);
+  const underlayCutRef = useLatestRef(underlayCut);
   const visualEnhancementRef = useLatestRef(visualEnhancement);
   // Renderer model bounds, kept fresh per-render. The face-pick handler
   // forwards these to the slice so the cardinal-fallback `position` % is
@@ -1311,6 +1314,7 @@ export function Viewport({
     clearColorRef,
     sectionPlaneRef,
     sectionRangeRef,
+    underlayCutRef,
     modelBoundsRef,
     visualEnhancementRef,
     environmentRef,

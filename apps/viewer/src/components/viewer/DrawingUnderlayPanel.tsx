@@ -72,7 +72,8 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const removeDrawing = useViewerStore((s) => s.removeUnderlayDrawing);
 
   const { models, ifcDataStore } = useIfc();
-  const { availableStoreys } = useFloorplanView();
+  const { availableStoreys, enterDrawingView, exitDrawingView } = useFloorplanView();
+  const viewLocked = useViewerStore((s) => s.underlayViewLocked);
 
   // Storeys with resolved GlobalIds — placements are keyed to the storey GUID
   // (stable across loads), never the session-scoped expressId.
@@ -297,6 +298,25 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
             </option>
           ))}
         </select>
+        <Button
+          variant={viewLocked ? 'default' : 'outline'}
+          size="sm"
+          className="h-6 shrink-0 px-2 text-[11px]"
+          disabled={!selectedStorey && !viewLocked}
+          onClick={() => {
+            if (viewLocked) {
+              exitDrawingView();
+              return;
+            }
+            const storey = availableStoreys.find(
+              (s) => `${s.modelId}:${s.expressId}` === selectedStorey?.key,
+            );
+            if (storey) enterDrawingView(storey);
+          }}
+          title="Level-locked top-down view with the storey cut (Ctrl+scroll moves the cut)"
+        >
+          {viewLocked ? 'Exit view' : 'Drawing view'}
+        </Button>
       </div>
 
       <ScrollArea className="min-h-0 flex-1">

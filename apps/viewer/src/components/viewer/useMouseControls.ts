@@ -668,6 +668,10 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         } else if (tool === 'walk') {
           // Walk mode: mouse drag looks around (full orbit)
           camera.orbit(dx, dy, false);
+        } else if (useViewerStore.getState().underlayViewLocked) {
+          // Drawing view (D-072): camera is locked top-down — a drag pans
+          // instead of orbiting so the 2D orientation can't be lost.
+          camera.pan(dx, dy, false);
         } else {
           camera.orbit(dx, dy, false);
         }
@@ -808,6 +812,33 @@ export function useMouseControls(params: UseMouseControlsParams): void {
 
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
+
+      // Ctrl/Cmd+scroll moves the active horizontal cut up/down (D-072):
+      // the drawing-view cut when set, else the Section tool's plane. The
+      // binding was previously unused, so plain zoom is untouched.
+      if (e.ctrlKey || e.metaKey) {
+        const state = useViewerStore.getState();
+        // ~0.25 m per wheel notch (deltaY ≈ ±100); trackpads scale down.
+        const step = -e.deltaY * 0.0025;
+        if (state.underlayCut !== null) {
+          state.nudgeUnderlayCut(step);
+          renderer.requestRender();
+          return;
+        }
+        if (activeToolRef.current === 'section' && state.sectionPlane.enabled) {
+          const range = sectionRangeRef.current;
+          const span = range ? range.max - range.min : 0;
+          if (span > 0) {
+            const deltaPct = (step / span) * 100;
+            state.setSectionPlanePosition(
+              Math.max(0, Math.min(100, state.sectionPlane.position + deltaPct)),
+            );
+            renderer.requestRender();
+            return;
+          }
+        }
+      }
+
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
       wheelIdleTimer = setTimeout(() => {
         isInteractingRef.current = false;

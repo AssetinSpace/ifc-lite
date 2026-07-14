@@ -19,6 +19,7 @@ import { ToolOverlays } from './ToolOverlays';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
 import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { Section2DPanel } from './Section2DPanel';
+import { DrawingViewPane } from './DrawingViewPane';
 import { BasketPresentationDock } from './BasketPresentationDock';
 import { BCFOverlay } from './bcf/BCFOverlay';
 import { CesiumOverlay } from './CesiumOverlay';
@@ -1377,6 +1378,9 @@ export function ViewportContainer() {
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}
       />
+      {/* Drawing-view 2D pane (D-072): split view with click-to-jump +
+          camera marker while the level-locked drawing view is active. */}
+      <DrawingViewPane />
     </div>
   );
 }

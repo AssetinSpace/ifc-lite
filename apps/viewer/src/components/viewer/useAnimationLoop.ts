@@ -24,6 +24,25 @@ import { projectToCssScreen } from '../../utils/projectScreen.js';
 import { getContributionCullConfig } from '../../utils/renderCullConfig.js';
 import { getLodScreenPx } from '../../utils/lodConfig.js';
 
+/**
+ * Drawing-view cut (D-072) → the renderer's axis/percent section form.
+ * A horizontal cut at world-Y `cutY`, expressed like the Section tool's
+ * `axis: 'down'` plane so the same clip + cap machinery applies. Returns
+ * undefined when there is no cut or no bounds yet (first frames).
+ */
+function underlayCutPlane(
+  cutY: number | null,
+  bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null,
+):
+  | { axis: 'down'; position: number; enabled: true; flipped: false; showCap: true; showOutlines: true }
+  | undefined {
+  if (cutY === null || !bounds) return undefined;
+  const range = bounds.max.y - bounds.min.y;
+  if (!(range > 0)) return undefined;
+  const position = Math.max(0, Math.min(100, ((cutY - bounds.min.y) / range) * 100));
+  return { axis: 'down', position, enabled: true, flipped: false, showCap: true, showOutlines: true };
+}
+
 export interface UseAnimationLoopParams {
   canvasRef: RefObject<HTMLCanvasElement | null>;
   rendererRef: MutableRefObject<Renderer | null>;
@@ -46,6 +65,12 @@ export interface UseAnimationLoopParams {
   environmentRef: MutableRefObject<LightingEnvironment>;
   sectionPlaneRef: MutableRefObject<SectionPlane>;
   sectionRangeRef: MutableRefObject<{ min: number; max: number } | null>;
+  /**
+   * Drawing-view horizontal cut (D-072): world-Y of the storey cut, applied
+   * whenever the Section tool is NOT active, so the drawing view keeps its
+   * clip while other tools are in use. Null = no cut.
+   */
+  underlayCutRef?: MutableRefObject<number | null>;
   /**
    * Mirror of the renderer's model bounds, written each frame after
    * render. Read by the section face-pick handler so the cardinal-
@@ -90,6 +115,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     environmentRef,
     sectionPlaneRef,
     sectionRangeRef,
+    underlayCutRef,
     modelBoundsRef,
     selectedEntityIdsRef,
     clashHighlightColorsRef,
@@ -269,7 +295,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
             // basis so the silhouette lands on the tilted plane.
             normal:   sectionPlaneRef.current.custom?.normal,
             distance: sectionPlaneRef.current.custom?.distance,
-          } : undefined,
+          } : underlayCutPlane(underlayCutRef?.current ?? null, renderer.getModelBounds()),
           terrainClipY: terrainClipYRef.current ?? undefined,
         });
         updateThrottle(performance.now() - renderStart);
