@@ -20,9 +20,21 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Crosshair, Eye, EyeOff, FilePlus2, Map as MapIcon, Trash2, X } from 'lucide-react';
+import {
+  Crosshair,
+  Eye,
+  EyeOff,
+  FilePlus2,
+  Map as MapIcon,
+  Trash2,
+  Undo2,
+  X,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
 import {
   createDrawingPlacement,
+  similarityRotation,
   solveSimilarityFromCalibration,
   type CalibrationPair,
   type Point2,
@@ -63,6 +75,7 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const calibration = useViewerStore((s) => s.underlayCalibration);
   const startCalibration = useViewerStore((s) => s.startUnderlayCalibration);
   const cancelCalibration = useViewerStore((s) => s.cancelUnderlayCalibration);
+  const undoCalibrationPoint = useViewerStore((s) => s.undoUnderlayCalibrationPoint);
   const setCalibrationPageSize = useViewerStore((s) => s.setUnderlayCalibrationPageSize);
   const addPagePoint = useViewerStore((s) => s.addUnderlayCalibrationPagePoint);
   const setPlacement = useViewerStore((s) => s.setUnderlayPlacement);
@@ -123,6 +136,46 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const previewHostRef = useRef<HTMLDivElement>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // Preview zoom/pan for precise picking. Buttons zoom (mobile-friendly, no
+  // passive-wheel headaches); dragging pans; a sub-threshold pointer-up is a
+  // pick. Markers/click math live inside the transformed box, and
+  // getBoundingClientRect is post-transform, so the % mapping needs no
+  // special-casing.
+  const [pdfZoom, setPdfZoom] = useState(1);
+  const [pdfPan, setPdfPan] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    panX: number;
+    panY: number;
+    moved: boolean;
+  } | null>(null);
+  useEffect(() => {
+    setPdfZoom(1);
+    setPdfPan({ x: 0, y: 0 });
+  }, [calibration?.drawingId, calibration?.page]);
+
+  const previewClipRef = useRef<HTMLDivElement>(null);
+  const zoomTo = useCallback((next: number) => {
+    const clamped = Math.min(6, Math.max(1, next));
+    setPdfZoom((prev) => {
+      if (clamped === 1) {
+        setPdfPan({ x: 0, y: 0 });
+        return 1;
+      }
+      // Keep the visible centre stable while zooming.
+      const clip = previewClipRef.current;
+      const cw = (clip?.clientWidth ?? 0) / 2;
+      const ch = (clip?.clientHeight ?? 0) / 2;
+      setPdfPan((pan) => ({
+        x: cw - ((cw - pan.x) * clamped) / prev,
+        y: ch - ((ch - pan.y) * clamped) / prev,
+      }));
+      return clamped;
+    });
+  }, []);
 
   useEffect(() => {
     setPreview(null);
@@ -189,16 +242,21 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
         ? 'page'
         : 'done';
 
-  const onPreviewClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
+  const pickPagePoint = useCallback(
+    (clientX: number, clientY: number) => {
       if (!calibration || !preview || awaiting !== 'page') return;
       const host = previewHostRef.current;
       if (!host) return;
+      // getBoundingClientRect is post-transform, so zoom/pan need no
+      // special-casing here.
       const rect = host.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
+      const nx = (clientX - rect.left) / rect.width;
+      const ny = (clientY - rect.top) / rect.height;
+      if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
       // CSS px → raster px → PDF page points (bottom-left origin, y up).
-      const rasterX = ((e.clientX - rect.left) / rect.width) * preview.canvas.width;
-      const rasterY = ((e.clientY - rect.top) / rect.height) * preview.canvas.height;
+      const rasterX = nx * preview.canvas.width;
+      const rasterY = ny * preview.canvas.height;
       const pagePt: Point2 = {
         x: rasterX / preview.pixelsPerPoint,
         y: (preview.canvas.height - rasterY) / preview.pixelsPerPoint,
@@ -208,24 +266,89 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
     [calibration, preview, awaiting, addPagePoint],
   );
 
+  // Drag-to-pan vs click-to-pick, distinguished by a 6px movement threshold.
+  const onPreviewPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    dragRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      panX: pdfPan.x,
+      panY: pdfPan.y,
+      moved: false,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, [pdfPan]);
+
+  const onPreviewPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+    drag.moved = true;
+    setPdfPan({ x: drag.panX + dx, y: drag.panY + dy });
+  }, []);
+
+  const onPreviewPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = dragRef.current;
+      dragRef.current = null;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (!drag.moved) pickPagePoint(e.clientX, e.clientY);
+    },
+    [pickPagePoint],
+  );
+
   const canSave =
     !!calibration &&
     calibration.pagePoints.length === 2 &&
     calibration.modelPoints.length === 2 &&
-    !!calibration.pageSize &&
-    !!selectedStorey;
+    !!calibration.pageSize;
 
-  const onSave = useCallback(() => {
-    if (!calibration || !calibration.pageSize || !selectedStorey || !calibratingDrawing) return;
+  /**
+   * Dalux-style precision feedback for the picked A–B span: model distance,
+   * distance on paper, the implied drawing scale, and rotation. Null until
+   * both pairs are picked (or when the picks are degenerate).
+   */
+  const metrics = useMemo(() => {
+    if (!canSave || !calibration) return null;
     const pairs: [CalibrationPair, CalibrationPair] = [
       { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
       { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
     ];
     try {
       const affine = solveSimilarityFromCalibration(pairs);
+      const modelDistM = Math.hypot(
+        pairs[1].model.x - pairs[0].model.x,
+        pairs[1].model.y - pairs[0].model.y,
+      );
+      // PDF points → millimetres on paper (1 pt = 25.4/72 mm).
+      const pageDistMm =
+        Math.hypot(pairs[1].page.x - pairs[0].page.x, pairs[1].page.y - pairs[0].page.y) *
+        (25.4 / 72);
+      const scaleDenominator = (modelDistM * 1000) / pageDistMm;
+      const rotationDeg = (similarityRotation(affine) * 180) / Math.PI;
+      // Short spans amplify pick error into scale/rotation error.
+      const weak = modelDistM < 2;
+      return { modelDistM, pageDistMm, scaleDenominator, rotationDeg, weak };
+    } catch {
+      return null; // coincident points
+    }
+  }, [canSave, calibration]);
+
+  const onSave = useCallback(() => {
+    if (!calibration || !calibration.pageSize || !calibratingDrawing) return;
+    const pairs: [CalibrationPair, CalibrationPair] = [
+      { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
+      { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
+    ];
+    try {
+      const affine = solveSimilarityFromCalibration(pairs);
+      // Storey comes from the draft — fixed when the calibration started,
+      // immune to later dropdown changes.
       const placement = createDrawingPlacement({
-        storeyGuid: selectedStorey.guid,
-        storeyZ: selectedStorey.elevation,
+        storeyGuid: calibration.storeyGuid,
+        storeyZ: calibration.storeyZ,
         page: calibration.page,
         pageSize: calibration.pageSize,
         affine,
@@ -233,11 +356,11 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
         calibratedAt: new Date().toISOString(),
       });
       setPlacement(calibration.drawingId, placement);
-      toast.success(`"${calibratingDrawing.name}" placed on ${selectedStorey.name}`);
+      toast.success(`"${calibratingDrawing.name}" placed`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Calibration failed');
     }
-  }, [calibration, selectedStorey, calibratingDrawing, setPlacement]);
+  }, [calibration, calibratingDrawing, setPlacement]);
 
   /** Marker position (CSS %) for a picked page point on the preview. */
   const markerStyle = useCallback(
@@ -338,30 +461,120 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
               {awaiting === 'done' && 'Both point pairs picked — save to place the drawing.'}
             </p>
             {previewError && <p className="mb-2 text-[11px] text-destructive">{previewError}</p>}
-            <div className="relative">
+            <div
+              ref={previewClipRef}
+              className={`relative overflow-hidden rounded border ${awaiting === 'page' ? 'cursor-crosshair ring-1 ring-primary/50' : pdfZoom > 1 ? 'cursor-grab' : ''}`}
+              style={{ touchAction: 'none' }}
+              onPointerDown={onPreviewPointerDown}
+              onPointerMove={onPreviewPointerMove}
+              onPointerUp={onPreviewPointerUp}
+              onPointerCancel={() => (dragRef.current = null)}
+            >
               <div
-                ref={previewHostRef}
-                onClick={onPreviewClick}
-                className={`relative overflow-hidden rounded border ${awaiting === 'page' ? 'cursor-crosshair ring-1 ring-primary/50' : ''}`}
-              />
-              {preview &&
-                calibration.pagePoints.map((p, i) => {
-                  const style = markerStyle(p);
-                  return style ? (
-                    <span
-                      key={i}
-                      className="pointer-events-none absolute z-10 flex size-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-primary text-[9px] font-bold text-primary-foreground ring-2 ring-background"
-                      style={style}
+                className="relative"
+                style={{
+                  transform: `translate(${pdfPan.x}px, ${pdfPan.y}px) scale(${pdfZoom})`,
+                  transformOrigin: '0 0',
+                }}
+              >
+                <div ref={previewHostRef} />
+                {/* A–B line between the picked drawing points (Dalux-style). */}
+                {preview && calibration.pagePoints.length === 2 && (() => {
+                  const a = markerStyle(calibration.pagePoints[0]);
+                  const b = markerStyle(calibration.pagePoints[1]);
+                  if (!a || !b) return null;
+                  return (
+                    <svg
+                      viewBox="0 0 100 100"
+                      preserveAspectRatio="none"
+                      className="pointer-events-none absolute inset-0 z-10 h-full w-full"
                     >
-                      {i + 1}
-                    </span>
-                  ) : null;
-                })}
+                      <line
+                        x1={parseFloat(String(a.left))}
+                        y1={parseFloat(String(a.top))}
+                        x2={parseFloat(String(b.left))}
+                        y2={parseFloat(String(b.top))}
+                        stroke="#10b981"
+                        strokeWidth="2"
+                        strokeDasharray="6 4"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    </svg>
+                  );
+                })()}
+                {preview &&
+                  calibration.pagePoints.map((p, i) => {
+                    const style = markerStyle(p);
+                    return style ? (
+                      <span
+                        key={i}
+                        className="pointer-events-none absolute z-20 flex size-4 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-bold text-white ring-2 ring-background"
+                        style={{
+                          ...style,
+                          transform: `translate(-50%, -50%) scale(${1 / pdfZoom})`,
+                        }}
+                      >
+                        {i === 0 ? 'A' : 'B'}
+                      </span>
+                    ) : null;
+                  })}
+              </div>
             </div>
-            <div className="mt-2 flex items-center gap-2">
-              <span className="flex-1 text-[10px] text-muted-foreground">
+            <div className="mt-1.5 flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => zoomTo(pdfZoom + 1)}
+                disabled={pdfZoom >= 6}
+                aria-label="Zoom in drawing preview"
+              >
+                <ZoomIn className="size-3.5" aria-hidden />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => zoomTo(pdfZoom - 1)}
+                disabled={pdfZoom <= 1}
+                aria-label="Zoom out drawing preview"
+              >
+                <ZoomOut className="size-3.5" aria-hidden />
+              </Button>
+              {pdfZoom > 1 && (
+                <button
+                  className="rounded px-1 text-[10px] text-muted-foreground hover:bg-muted"
+                  onClick={() => zoomTo(1)}
+                >
+                  {pdfZoom}× reset
+                </button>
+              )}
+              <span className="flex-1 text-right text-[10px] text-muted-foreground">
                 PDF {calibration.pagePoints.length}/2 · model {calibration.modelPoints.length}/2
               </span>
+            </div>
+            {metrics && (
+              <div
+                className={`mt-1.5 rounded border px-2 py-1 text-[10px] ${metrics.weak ? 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300' : 'text-muted-foreground'}`}
+              >
+                A–B: {metrics.modelDistM.toFixed(2)} m in model · {metrics.pageDistMm.toFixed(1)} mm
+                on paper · scale ≈ 1:{Math.round(metrics.scaleDenominator)} · rotation{' '}
+                {metrics.rotationDeg.toFixed(1)}°
+                {metrics.weak && ' — points are close together; pick a longer span for accuracy'}
+              </div>
+            )}
+            <div className="mt-2 flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                onClick={undoCalibrationPoint}
+                disabled={calibration.pagePoints.length === 0}
+                title="Remove the last picked point"
+              >
+                <Undo2 className="mr-1 size-3" aria-hidden /> Undo
+              </Button>
+              <span className="flex-1" />
               <Button variant="ghost" size="sm" className="h-6 px-2 text-[11px]" onClick={cancelCalibration}>
                 Cancel
               </Button>
@@ -401,13 +614,18 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
                 // ortho top-down, so the matching model points can be picked
                 // precisely on the exposed floor plan (vertical rays = exact
                 // plan XY, no slanted-view raycast error).
-                if (target) {
-                  const storey = availableStoreys.find(
-                    (s) => `${s.modelId}:${s.expressId}` === target.key,
-                  );
-                  if (storey) enterDrawingView(storey);
+                if (!target) {
+                  toast.error('Load a model first — calibration needs a storey to bind to');
+                  return;
                 }
-                startCalibration(d.id, d.placement?.page ?? 1);
+                const storey = availableStoreys.find(
+                  (s) => `${s.modelId}:${s.expressId}` === target.key,
+                );
+                if (storey) enterDrawingView(storey);
+                startCalibration(d.id, d.placement?.page ?? 1, {
+                  guid: target.guid,
+                  z: target.elevation,
+                });
               }}
               onOpacity={(v) => setOpacity(d.id, v)}
               onOpacityCommit={() => commitPlacement(d.id)}
