@@ -22,8 +22,10 @@
 import { useEffect, useRef, type MutableRefObject } from 'react';
 import type { Renderer } from '@ifc-lite/renderer';
 import {
+  createDrawingPlacement,
   PdfPlanePipeline,
   placementWorldCorners,
+  solveSimilarityFromCalibration,
   type DrawingPlacement,
 } from '@ifc-lite/drawing-underlay';
 import { useViewerStore } from '@/store';
@@ -52,9 +54,22 @@ function placementKey(p: DrawingPlacement): string {
   return `${p.storeyZ}|${p.affine.join(',')}|${p.pageSize.join(',')}|${p.opacity}|${p.visible}`;
 }
 
+/** One plane to render: a saved placement or the live calibration ghost. */
+interface RenderEntry {
+  /** Plane id — the drawing id, or `preview:` + drawing id for the ghost. */
+  id: string;
+  pdfUrl: string;
+  name: string;
+  placement: DrawingPlacement;
+}
+
+/** Ghost preview opacity while calibrating (before Save). */
+const PREVIEW_OPACITY = 0.45;
+
 export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnderlayParams): void {
   const drawings = useViewerStore((s) => s.underlayDrawings);
   const models = useViewerStore((s) => s.models);
+  const calibration = useViewerStore((s) => s.underlayCalibration);
 
   const pipelineRef = useRef<PdfPlanePipeline | null>(null);
   /** drawingId → texture signature of the raster currently on the GPU. */
@@ -71,10 +86,49 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
 
     const token = ++syncTokenRef.current;
 
-    const calibrated = [...drawings.values()].filter((d) => d.placement !== null);
+    const entries: RenderEntry[] = [...drawings.values()]
+      .filter((d) => d.placement !== null)
+      .map((d) => ({ id: d.id, pdfUrl: d.pdfUrl, name: d.name, placement: d.placement! }));
 
-    // Nothing calibrated → tear the pipeline down entirely.
-    if (calibrated.length === 0) {
+    // Live ghost preview (Dalux-style "combined view"): once both point
+    // pairs are picked, the drawing shows up immediately as a translucent
+    // plane so the fit can be judged BEFORE saving. Degenerate picks
+    // (coincident points) simply produce no ghost.
+    if (
+      calibration &&
+      calibration.pageSize &&
+      calibration.pagePoints.length === 2 &&
+      calibration.modelPoints.length === 2
+    ) {
+      const drawing = drawings.get(calibration.drawingId);
+      if (drawing) {
+        try {
+          const affine = solveSimilarityFromCalibration([
+            { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
+            { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
+          ]);
+          entries.push({
+            id: `preview:${drawing.id}`,
+            pdfUrl: drawing.pdfUrl,
+            name: drawing.name,
+            placement: createDrawingPlacement({
+              storeyGuid: calibration.storeyGuid,
+              storeyZ: calibration.storeyZ,
+              page: calibration.page,
+              pageSize: calibration.pageSize,
+              affine,
+              calibration: [],
+              opacity: PREVIEW_OPACITY,
+            }),
+          });
+        } catch {
+          // Coincident points — solver refuses; no ghost until picks differ.
+        }
+      }
+    }
+
+    // Nothing to render → tear the pipeline down entirely.
+    if (entries.length === 0) {
       if (pipelineRef.current) {
         renderer.unregisterExternalOverlay(UNDERLAY_OVERLAY_ID);
         pipelineRef.current.destroy();
@@ -100,8 +154,9 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
     const firstModel = [...models.values()].find((m) => m.geometryResult?.coordinateInfo);
     const offset = totalYupOffset(firstModel?.geometryResult?.coordinateInfo);
 
-    // Drop planes whose drawing disappeared or lost its placement.
-    const liveIds = new Set(calibrated.map((d) => d.id));
+    // Drop planes whose drawing disappeared, lost its placement, or whose
+    // calibration ghost ended.
+    const liveIds = new Set(entries.map((e) => e.id));
     for (const id of pipeline.planeIds()) {
       if (!liveIds.has(id)) {
         pipeline.removePlane(id);
@@ -110,8 +165,8 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
       }
     }
 
-    for (const drawing of calibrated) {
-      const placement = drawing.placement!;
+    for (const drawing of entries) {
+      const placement = drawing.placement;
       const texKey = textureKey(drawing.id, drawing.pdfUrl, placement.page);
       const posKey = placementKey(placement);
       const hasTexture = uploadedTexturesRef.current.get(drawing.id) === texKey;
@@ -165,7 +220,7 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
         }
       })();
     }
-  }, [drawings, models, isInitialized, rendererRef]);
+  }, [drawings, models, calibration, isInitialized, rendererRef]);
 
   // Teardown on unmount / renderer swap.
   useEffect(() => {

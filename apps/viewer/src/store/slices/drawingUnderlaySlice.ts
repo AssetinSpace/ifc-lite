@@ -37,6 +37,14 @@ export interface UnderlayCalibrationDraft {
   drawingId: string;
   /** 1-based page being calibrated. */
   page: number;
+  /**
+   * Target storey, fixed at calibration start — carried in the draft so the
+   * live ghost preview and Save use the storey the flow was started for
+   * (not whatever the dropdown shows later).
+   */
+  storeyGuid: string;
+  /** Target storey elevation in metres (IFC Z). */
+  storeyZ: number;
   /** Page size [w, h] in PDF points — known once the page is rendered. */
   pageSize: [number, number] | null;
   /** Picked drawing points, PDF page points (bottom-left, y up). Max 2. */
@@ -96,10 +104,16 @@ export interface DrawingUnderlaySlice {
   setUnderlayViewLocked: (locked: boolean) => void;
   setUnderlayActiveStoreyGuid: (guid: string | null) => void;
 
-  startUnderlayCalibration: (drawingId: string, page: number) => void;
+  startUnderlayCalibration: (
+    drawingId: string,
+    page: number,
+    storey: { guid: string; z: number },
+  ) => void;
   setUnderlayCalibrationPageSize: (pageSize: [number, number]) => void;
   addUnderlayCalibrationPagePoint: (p: Point2) => void;
   addUnderlayCalibrationModelPoint: (p: Point2) => void;
+  /** Remove the most recently picked point (model before its page pair). */
+  undoUnderlayCalibrationPoint: () => void;
   cancelUnderlayCalibration: () => void;
 
   setUnderlaySaveHandler: (
@@ -220,11 +234,13 @@ export const createDrawingUnderlaySlice: StateCreator<
 
   setUnderlayActiveStoreyGuid: (guid) => set({ underlayActiveStoreyGuid: guid }),
 
-  startUnderlayCalibration: (drawingId, page) =>
+  startUnderlayCalibration: (drawingId, page, storey) =>
     set({
       underlayCalibration: {
         drawingId,
         page,
+        storeyGuid: storey.guid,
+        storeyZ: storey.z,
         pageSize: null,
         pagePoints: [],
         modelPoints: [],
@@ -253,6 +269,21 @@ export const createDrawingUnderlaySlice: StateCreator<
         return state;
       }
       return { underlayCalibration: { ...c, modelPoints: [...c.modelPoints, p] } };
+    }),
+
+  undoUnderlayCalibrationPoint: () =>
+    set((state) => {
+      const c = state.underlayCalibration;
+      if (!c) return state;
+      // Picks alternate page → model, so the last one is a model point
+      // whenever the counts are equal (and non-zero).
+      if (c.modelPoints.length > 0 && c.modelPoints.length === c.pagePoints.length) {
+        return { underlayCalibration: { ...c, modelPoints: c.modelPoints.slice(0, -1) } };
+      }
+      if (c.pagePoints.length > 0) {
+        return { underlayCalibration: { ...c, pagePoints: c.pagePoints.slice(0, -1) } };
+      }
+      return state;
     }),
 
   cancelUnderlayCalibration: () => set({ underlayCalibration: null }),
