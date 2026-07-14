@@ -44,10 +44,10 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
 
   // Drawing-underlay calibration (D-072): while a 2-point calibration is
   // waiting for a model point (page point already picked in the panel), a
-  // click picks the matching model coordinate. Surface hit preferred;
-  // empty-space clicks fall back to the storey floor plane so the two
-  // points can straddle open areas. Intercepted BEFORE the generic select
-  // path so the pick doesn't also flip the selection.
+  // click picks the matching model coordinate — from the cut plane in the
+  // locked drawing view, else surface hit with a floor-plane fallback (see
+  // the branch below). Intercepted BEFORE the generic select path so the
+  // pick doesn't also flip the selection.
   {
     const state = useViewerStore.getState();
     const calibration = state.underlayCalibration;
@@ -56,11 +56,22 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
       calibration.modelPoints.length < calibration.pagePoints.length &&
       calibration.modelPoints.length < 2
     ) {
-      const hit = renderer.raycastScene(x, y, {
-        hiddenIds: ctx.hiddenEntitiesRef.current,
-        isolatedIds: ctx.isolatedEntitiesRef.current,
-      });
-      const world = hit?.intersection?.point ?? raycastStoreyFloor(ctx, x, y);
+      // In the locked drawing view (ortho top-down + storey cut) the pick
+      // comes from the horizontal cut plane: the GPU section clip does NOT
+      // apply to the CPU raycaster, so a scene hit could land on invisible
+      // geometry above the cut — and with vertical rays the plane intersect
+      // IS the exact plan XY the user clicked. Free (perspective) views keep
+      // the surface raycast with a floor-plane fallback.
+      let world: { x: number; y: number; z: number } | null;
+      if (state.underlayViewLocked) {
+        world = raycastStoreyFloor(ctx, x, y, state.underlayCut ?? undefined);
+      } else {
+        const hit = renderer.raycastScene(x, y, {
+          hiddenIds: ctx.hiddenEntitiesRef.current,
+          isolatedIds: ctx.isolatedEntitiesRef.current,
+        });
+        world = hit?.intersection?.point ?? raycastStoreyFloor(ctx, x, y);
+      }
       if (!world) {
         toast.error("Couldn't read a model point here — click on geometry or the floor");
         return;

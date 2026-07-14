@@ -392,9 +392,20 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
                 // Recalibration edits the drawing's OWN storey — preselect it
                 // so Save can't silently move the drawing to whatever level
                 // happened to be picked in the dropdown.
-                if (d.placement) {
-                  const own = storeyOptions.find((s) => s.guid === d.placement!.storeyGuid);
-                  if (own) setStoreyKey(own.key);
+                const own = d.placement
+                  ? storeyOptions.find((s) => s.guid === d.placement!.storeyGuid)
+                  : undefined;
+                const target = own ?? selectedStorey ?? undefined;
+                if (own) setStoreyKey(own.key);
+                // Prepare the 3D side automatically: storey cut + locked
+                // ortho top-down, so the matching model points can be picked
+                // precisely on the exposed floor plan (vertical rays = exact
+                // plan XY, no slanted-view raycast error).
+                if (target) {
+                  const storey = availableStoreys.find(
+                    (s) => `${s.modelId}:${s.expressId}` === target.key,
+                  );
+                  if (storey) enterDrawingView(storey);
                 }
                 startCalibration(d.id, d.placement?.page ?? 1);
               }}
