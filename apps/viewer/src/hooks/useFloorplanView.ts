@@ -9,6 +9,7 @@
 
 import { useCallback, useMemo } from 'react';
 import { useViewerStore } from '@/store';
+import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { useIfc } from './useIfc';
 
 interface StoreyInfo {
@@ -63,11 +64,25 @@ export function useFloorplanView() {
     return Array.from(seen.values()).sort((a, b) => b.elevation - a.elevation);
   }, [models, ifcDataStore]);
 
+  // Recentering offset of the shared (anchor) frame. Storey elevations are
+  // IFC Z metres; the renderer works in recentered viewer-Y metres. Every
+  // consumer of a "cut Y" expects the recentered value, so convert here.
+  const worldCutY = useCallback(
+    (storey: StoreyInfo): number => {
+      const first = [...models.values()].find((m) => m.geometryResult?.coordinateInfo);
+      const off = totalYupOffset(first?.geometryResult?.coordinateInfo);
+      // Cut 1.2 m above the floor (standard architectural plan-cut height).
+      return storey.elevation + 1.2 - off.y;
+    },
+    [models],
+  );
+
   // Activate a floorplan view at the given storey elevation
   const activateFloorplan = useCallback((storey: StoreyInfo) => {
-    // 1. Calculate section position as percentage of Y bounds
-    // Section cut at 1.2m above floor level (standard architectural practice)
-    const cutHeight = storey.elevation + 1.2;
+    // 1. Calculate section position as percentage of Y bounds.
+    // Cut 1.2 m above the floor, in the recentered viewer-Y frame (bounds
+    // below are shiftedBounds, so cutHeight must be shifted too).
+    const cutHeight = worldCutY(storey);
 
     // Find Y bounds from all models using coordinateInfo (pre-computed AABB)
     let yMin = Infinity;
@@ -102,7 +117,7 @@ export function useFloorplanView() {
 
     // 4. Set camera to top-down view
     cameraCallbacks.setPresetView?.('top');
-  }, [models, setSectionPlaneAxis, setSectionPlanePosition, setActiveTool, setProjectionMode, cameraCallbacks]);
+  }, [models, worldCutY, setSectionPlaneAxis, setSectionPlanePosition, setActiveTool, setProjectionMode, cameraCallbacks]);
 
   /**
    * Drawing view (D-072): level-locked ortho top-down with an always-on
@@ -110,20 +125,24 @@ export function useFloorplanView() {
    * `activateFloorplan`, the camera is locked (drag pans instead of
    * orbiting) and the cut survives tool switches; Ctrl/Cmd+scroll moves it.
    */
+  const storeyGuidFor = useCallback(
+    (storey: StoreyInfo): string | null => {
+      const store =
+        storey.modelId === 'legacy' ? ifcDataStore : models.get(storey.modelId)?.ifcDataStore;
+      return store?.entities.getGlobalId(storey.expressId) || null;
+    },
+    [models, ifcDataStore],
+  );
+
   const enterDrawingView = useCallback((storey: StoreyInfo) => {
     const state = useViewerStore.getState();
-    // Cut at 1.2 m above the floor (standard architectural practice) —
-    // storey elevation maps directly to renderer Y (see lib/level-offsets).
-    state.setUnderlayCut(storey.elevation + 1.2);
+    state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayViewLocked(true);
-    const store =
-      storey.modelId === 'legacy'
-        ? ifcDataStore
-        : models.get(storey.modelId)?.ifcDataStore;
-    state.setUnderlayActiveStoreyGuid(store?.entities.getGlobalId(storey.expressId) || null);
+    state.setUnderlaySplitView(false);
+    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
     setProjectionMode('orthographic');
     cameraCallbacks.setPresetView?.('top');
-  }, [models, ifcDataStore, setProjectionMode, cameraCallbacks]);
+  }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
 
   /** Leave the drawing view: remove the cut, unlock the camera. */
   const exitDrawingView = useCallback(() => {
@@ -134,5 +153,36 @@ export function useFloorplanView() {
     setProjectionMode('perspective');
   }, [setProjectionMode]);
 
-  return { availableStoreys, activateFloorplan, enterDrawingView, exitDrawingView };
+  /**
+   * Split view (D-072): real 2D plan | 3D layout with a FREELY navigable 3D
+   * pane (Dalux-style). Unlike the calibration drawing view, the camera is
+   * NOT locked — the storey cut is on so the level reads clearly, and the 2D
+   * pane is the position minimap. Starts from a pleasant 3/4 home view.
+   */
+  const enterSplitView = useCallback((storey: StoreyInfo) => {
+    const state = useViewerStore.getState();
+    state.setUnderlayCut(worldCutY(storey));
+    state.setUnderlayViewLocked(false);
+    state.setUnderlaySplitView(true);
+    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+    setProjectionMode('perspective');
+    cameraCallbacks.home?.();
+  }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
+
+  /** Leave split view: close the 2D pane, remove the cut. */
+  const exitSplitView = useCallback(() => {
+    const state = useViewerStore.getState();
+    state.setUnderlaySplitView(false);
+    state.setUnderlayCut(null);
+    state.setUnderlayActiveStoreyGuid(null);
+  }, []);
+
+  return {
+    availableStoreys,
+    activateFloorplan,
+    enterDrawingView,
+    exitDrawingView,
+    enterSplitView,
+    exitSplitView,
+  };
 }

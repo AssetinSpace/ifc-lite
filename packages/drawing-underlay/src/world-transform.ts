@@ -32,9 +32,11 @@ export const ZERO_OFFSET: Vec3 = { x: 0, y: 0, z: 0 };
 /**
  * Default lift of the underlay plane above the storey elevation (metres).
  * Keeps the drawing from z-fighting with the slab top surface while staying
- * visually "on the floor".
+ * visually "on the floor". 5 cm survives grazing-angle rotation in a
+ * depth-tested pass without visibly floating; the plane also switches to a
+ * non-occluding pass while a storey cut is active (see PdfPlanePipeline).
  */
-export const DEFAULT_PLANE_LIFT = 0.02;
+export const DEFAULT_PLANE_LIFT = 0.05;
 
 /** Page point → IFC plan metres through the placement affine. */
 export function pageToIfcMetres(affine: Affine2x3, p: Point2): Point2 {

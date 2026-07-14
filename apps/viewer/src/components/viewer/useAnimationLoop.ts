@@ -276,7 +276,12 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
           contributionCull,
           lod,
           buildingRotation: coordinateInfoRef.current?.buildingRotation,
-          sectionPlane: activeToolRef.current === 'section' ? {
+          // The drawing-view storey cut (D-072) takes precedence: it must
+          // survive whatever tool is active, otherwise selecting the Section
+          // tool would silently drop the floor-plan cut.
+          sectionPlane: (underlayCutRef?.current ?? null) !== null
+            ? underlayCutPlane(underlayCutRef?.current ?? null, renderer.getModelBounds())
+            : activeToolRef.current === 'section' ? {
             axis: sectionPlaneRef.current.axis,
             position: sectionPlaneRef.current.position,
             enabled: sectionPlaneRef.current.enabled,
@@ -295,7 +300,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
             // basis so the silhouette lands on the tilted plane.
             normal:   sectionPlaneRef.current.custom?.normal,
             distance: sectionPlaneRef.current.custom?.distance,
-          } : underlayCutPlane(underlayCutRef?.current ?? null, renderer.getModelBounds()),
+          } : undefined,
           terrainClipY: terrainClipYRef.current ?? undefined,
         });
         updateThrottle(performance.now() - renderStart);

@@ -400,6 +400,8 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       underlayPanelVisible: false,
       underlayCut: null,
       underlayViewLocked: false,
+      underlaySplitView: false,
+      underlayCalibrationExpanded: false,
       underlayActiveStoreyGuid: null,
 
       // Drawing 2D
