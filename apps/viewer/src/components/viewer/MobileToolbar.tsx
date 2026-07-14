@@ -20,6 +20,7 @@ import {
   Maximize2,
   Crosshair,
   Loader2,
+  Map as MapIcon,
   MoreHorizontal,
   Plus,
   Download,
@@ -75,6 +76,11 @@ export function MobileToolbar() {
   const resetViewerState = useViewerStore((state) => state.resetViewerState);
   const clearAllModels = useViewerStore((state) => state.clearAllModels);
   const projectionMode = useViewerStore((state) => state.projectionMode);
+  // Drawing underlays (D-072) — mobile entry point; the panel body renders
+  // in the mobile bottom sheet (see ViewerLayout's right-sheet branches).
+  const underlayPanelVisible = useViewerStore((state) => state.underlayPanelVisible);
+  const setUnderlayPanelVisible = useViewerStore((state) => state.setUnderlayPanelVisible);
+  const setRightPanelCollapsed = useViewerStore((state) => state.setRightPanelCollapsed);
   const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
   const theme = useViewerStore((state) => state.theme);
   const toggleTheme = useViewerStore((state) => state.toggleTheme);
@@ -282,6 +288,20 @@ export function MobileToolbar() {
               Frame Selection
             </DropdownMenuItem>
           )}
+
+          <DropdownMenuSeparator />
+
+          {/* Drawing underlays (D-072): opens as a mobile bottom sheet. */}
+          <DropdownMenuCheckboxItem
+            checked={underlayPanelVisible}
+            onCheckedChange={(checked) => {
+              setUnderlayPanelVisible(checked === true);
+              setRightPanelCollapsed(checked !== true);
+            }}
+          >
+            <MapIcon className="h-4 w-4 mr-2" />
+            Drawing Underlays
+          </DropdownMenuCheckboxItem>
 
           <DropdownMenuSeparator />
 
