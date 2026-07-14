@@ -668,6 +668,10 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         } else if (tool === 'walk') {
           // Walk mode: mouse drag looks around (full orbit)
           camera.orbit(dx, dy, false);
+        } else if (useViewerStore.getState().underlayViewLocked) {
+          // Drawing view (D-072): camera is locked top-down — a drag pans
+          // instead of orbiting so the 2D orientation can't be lost.
+          camera.pan(dx, dy, false);
         } else {
           camera.orbit(dx, dy, false);
         }
@@ -806,8 +810,51 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // Debounce: clear isInteracting 150ms after the last wheel event
     let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // Physical Ctrl-key state for the cut-move gesture (D-072). Browsers
+    // synthesize wheel events with ctrlKey=true for TRACKPAD PINCH, so
+    // gating on e.ctrlKey would hijack pinch-zoom into cut movement.
+    // Tracking real keydown/keyup distinguishes a held Ctrl from a pinch
+    // (Cmd/metaKey is never synthesized, so it can pass through directly).
+    let physicalCtrlHeld = false;
+    const handleModifierDown = (e: KeyboardEvent) => {
+      if (e.key === 'Control') physicalCtrlHeld = true;
+    };
+    const handleModifierUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control') physicalCtrlHeld = false;
+    };
+    const handleWindowBlur = () => {
+      physicalCtrlHeld = false;
+    };
+
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
+
+      // Ctrl/Cmd+scroll moves the active horizontal cut up/down (D-072):
+      // the drawing-view cut when set, else the Section tool's plane. The
+      // binding was previously unused, so plain zoom is untouched.
+      if (physicalCtrlHeld || e.metaKey) {
+        const state = useViewerStore.getState();
+        // ~0.25 m per wheel notch (deltaY ≈ ±100); trackpads scale down.
+        const step = -e.deltaY * 0.0025;
+        if (state.underlayCut !== null) {
+          state.nudgeUnderlayCut(step);
+          renderer.requestRender();
+          return;
+        }
+        if (activeToolRef.current === 'section' && state.sectionPlane.enabled) {
+          const range = sectionRangeRef.current;
+          const span = range ? range.max - range.min : 0;
+          if (span > 0) {
+            const deltaPct = (step / span) * 100;
+            state.setSectionPlanePosition(
+              Math.max(0, Math.min(100, state.sectionPlane.position + deltaPct)),
+            );
+            renderer.requestRender();
+            return;
+          }
+        }
+      }
+
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
       wheelIdleTimer = setTimeout(() => {
         isInteractingRef.current = false;
@@ -844,6 +891,9 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     canvas.addEventListener('contextmenu', handleContextMenu);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     canvas.addEventListener('click', handleClick);
+    window.addEventListener('keydown', handleModifierDown);
+    window.addEventListener('keyup', handleModifierUp);
+    window.addEventListener('blur', handleWindowBlur);
 
     return () => {
       canvas.removeEventListener('pointerdown', handleMouseDown);
@@ -853,6 +903,9 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       canvas.removeEventListener('contextmenu', handleContextMenu);
       canvas.removeEventListener('wheel', handleWheel);
       canvas.removeEventListener('click', handleClick);
+      window.removeEventListener('keydown', handleModifierDown);
+      window.removeEventListener('keyup', handleModifierUp);
+      window.removeEventListener('blur', handleWindowBlur);
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
 
       // Cancel pending raycast requests

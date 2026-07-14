@@ -39,6 +39,7 @@ import {
   ClipboardCheck,
   Puzzle,
   Palette,
+  Map as MapIcon,
   Orbit,
   Layout,
   LayoutTemplate,
@@ -1290,6 +1291,13 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           >
             <Puzzle className="h-4 w-4 mr-2" />
             Extensions
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('drawing-underlay')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('drawing-underlay')}
+          >
+            <MapIcon className="h-4 w-4 mr-2" />
+            Drawing Underlays
           </DropdownMenuCheckboxItem>
           {(rightAnalysisExtensions.length > 0 || bottomAnalysisExtensions.length > 0) && (
             <>

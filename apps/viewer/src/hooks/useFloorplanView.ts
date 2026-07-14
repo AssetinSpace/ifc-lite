@@ -104,5 +104,35 @@ export function useFloorplanView() {
     cameraCallbacks.setPresetView?.('top');
   }, [models, setSectionPlaneAxis, setSectionPlanePosition, setActiveTool, setProjectionMode, cameraCallbacks]);
 
-  return { availableStoreys, activateFloorplan };
+  /**
+   * Drawing view (D-072): level-locked ortho top-down with an always-on
+   * horizontal cut, independent of the Section tool. Unlike
+   * `activateFloorplan`, the camera is locked (drag pans instead of
+   * orbiting) and the cut survives tool switches; Ctrl/Cmd+scroll moves it.
+   */
+  const enterDrawingView = useCallback((storey: StoreyInfo) => {
+    const state = useViewerStore.getState();
+    // Cut at 1.2 m above the floor (standard architectural practice) —
+    // storey elevation maps directly to renderer Y (see lib/level-offsets).
+    state.setUnderlayCut(storey.elevation + 1.2);
+    state.setUnderlayViewLocked(true);
+    const store =
+      storey.modelId === 'legacy'
+        ? ifcDataStore
+        : models.get(storey.modelId)?.ifcDataStore;
+    state.setUnderlayActiveStoreyGuid(store?.entities.getGlobalId(storey.expressId) || null);
+    setProjectionMode('orthographic');
+    cameraCallbacks.setPresetView?.('top');
+  }, [models, ifcDataStore, setProjectionMode, cameraCallbacks]);
+
+  /** Leave the drawing view: remove the cut, unlock the camera. */
+  const exitDrawingView = useCallback(() => {
+    const state = useViewerStore.getState();
+    state.setUnderlayCut(null);
+    state.setUnderlayViewLocked(false);
+    state.setUnderlayActiveStoreyGuid(null);
+    setProjectionMode('perspective');
+  }, [setProjectionMode]);
+
+  return { availableStoreys, activateFloorplan, enterDrawingView, exitDrawingView };
 }

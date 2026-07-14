@@ -49,6 +49,7 @@ import { useSpaceMouseControls } from './useSpaceMouseControls.js';
 import { useAnimationLoop } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
 import { usePointCloudSync } from './usePointCloudSync.js';
+import { useDrawingUnderlay } from '@/hooks/useDrawingUnderlay';
 import { usePointCloudLifecycle } from './usePointCloudLifecycle.js';
 import { useRenderUpdates } from './useRenderUpdates.js';
 import {
@@ -530,6 +531,9 @@ export function Viewport({
   const sectionPlaneRef = useLatestRef(sectionPlane);
   const sectionRangeRef = useLatestRef(sectionRange);
   const sectionPickModeRef = useLatestRef(sectionPickMode);
+  // Drawing-view storey cut (D-072) — applied while the Section tool is off.
+  const underlayCut = useViewerStore((s) => s.underlayCut);
+  const underlayCutRef = useLatestRef(underlayCut);
   const visualEnhancementRef = useLatestRef(visualEnhancement);
   // Renderer model bounds, kept fresh per-render. The face-pick handler
   // forwards these to the slice so the cardinal-fallback `position` % is
@@ -1310,6 +1314,7 @@ export function Viewport({
     clearColorRef,
     sectionPlaneRef,
     sectionRangeRef,
+    underlayCutRef,
     modelBoundsRef,
     visualEnhancementRef,
     environmentRef,
@@ -1357,6 +1362,10 @@ export function Viewport({
     pointClouds,
     hasMeshes: (geometry?.length ?? 0) > 0,
   });
+
+  // Georeferenced PDF drawing underlays (D-072) — syncs calibrated
+  // placements from the store into a PdfPlanePipeline external overlay.
+  useDrawingUnderlay({ rendererRef, isInitialized });
 
   usePointCloudLifecycle({
     rendererRef,

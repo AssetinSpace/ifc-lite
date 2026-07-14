@@ -31,6 +31,7 @@ import {
   ListTree,
   Users,
   Layers as LayersIcon,
+  Map as MapIcon,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -52,7 +53,8 @@ export type WorkspacePanelId =
   | 'gantt'
   | 'lists'
   | 'collab'
-  | 'layers';
+  | 'layers'
+  | 'drawing-underlay';
 
 /** Activity-bar clustering — a divider is drawn whenever the group changes. */
 export type PanelGroup = 'navigate' | 'inspect' | 'review' | 'author' | 'work';
@@ -102,6 +104,9 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Alt+1..0 mapping stays intact (no Alt shortcut). The activity bar only
   // surfaces it while a federated layer stack is loaded.
   { id: 'layers', title: 'Layer stack', short: 'Layers', Icon: LayersIcon, group: 'review', region: 'side' },
+  // Georeferenced PDF drawing underlays (D-072 in the AIM repo). APPENDED so
+  // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
+  { id: 'drawing-underlay', title: 'Drawing underlays', short: 'Drawings', Icon: MapIcon, group: 'author', region: 'side' },
 ];
 
 /** The bottom-strip panel ids, mapped to their store visibility flag + setter
