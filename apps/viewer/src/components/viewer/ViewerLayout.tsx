@@ -38,6 +38,7 @@ import { ListPanel } from './lists/ListPanel';
 import { ScriptPanel } from './ScriptPanel';
 import { GanttPanel } from './schedule/GanttPanel';
 import { ExtensionsPanel } from '@/components/extensions/ExtensionsPanel';
+import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
 import { TourHost } from '@/components/tours/TourHost';
@@ -210,6 +211,8 @@ export function ViewerLayout() {
   const setClashPanelVisible = useViewerStore((s) => s.setClashPanelVisible);
   const comparePanelVisible = useViewerStore((s) => s.comparePanelVisible);
   const setComparePanelVisible = useViewerStore((s) => s.setComparePanelVisible);
+  const underlayPanelVisible = useViewerStore((s) => s.underlayPanelVisible);
+  const setUnderlayPanelVisible = useViewerStore((s) => s.setUnderlayPanelVisible);
   const scriptPanelVisible = useViewerStore((s) => s.scriptPanelVisible);
   const setScriptPanelVisible = useViewerStore((s) => s.setScriptPanelVisible);
   const ganttPanelVisible = useViewerStore((s) => s.ganttPanelVisible);
@@ -489,7 +492,7 @@ export function ViewerLayout() {
             {/* Mobile Bottom Sheet - Properties, BCF, IDS, or Lists */}
             {!rightPanelCollapsed && (
               <MobileBottomSheet
-                title={activeAnalysisExtension ? activeAnalysisExtension.label : ganttPanelVisible ? 'Schedule' : scriptPanelVisible ? 'Script' : listPanelVisible ? 'Lists' : activeTool === 'addElement' ? 'Add element' : lensPanelVisible ? 'Lens' : idsPanelVisible ? 'IDS Validation' : bcfPanelVisible ? 'BCF Issues' : extensionsPanelVisible ? 'Extensions' : 'Properties'}
+                title={activeAnalysisExtension ? activeAnalysisExtension.label : ganttPanelVisible ? 'Schedule' : scriptPanelVisible ? 'Script' : listPanelVisible ? 'Lists' : activeTool === 'addElement' ? 'Add element' : lensPanelVisible ? 'Lens' : idsPanelVisible ? 'IDS Validation' : bcfPanelVisible ? 'BCF Issues' : extensionsPanelVisible ? 'Extensions' : underlayPanelVisible ? 'Drawing Underlays' : 'Properties'}
                 bottomInset={bottomViewportInset}
                 onClose={() => {
                   setRightPanelCollapsed(true);
@@ -500,6 +503,7 @@ export function ViewerLayout() {
                   if (lensPanelVisible) setLensPanelVisible(false);
                   if (idsPanelVisible) setIdsPanelVisible(false);
                   if (extensionsPanelVisible) setExtensionsPanelVisible(false);
+                  if (underlayPanelVisible) setUnderlayPanelVisible(false);
                   if (activeAnalysisExtension) closeActiveAnalysisExtension();
                   if (activeTool === 'addElement') setActiveTool('select');
                 }}
@@ -524,6 +528,8 @@ export function ViewerLayout() {
                   <BCFPanel onClose={() => setBcfPanelVisible(false)} />
                 ) : extensionsPanelVisible ? (
                   <ExtensionsPanel onClose={() => setExtensionsPanelVisible(false)} />
+                ) : underlayPanelVisible ? (
+                  <DrawingUnderlayPanel onClose={() => setUnderlayPanelVisible(false)} />
                 ) : (
                   <PropertiesPanel />
                 )}
