@@ -66,11 +66,19 @@ export interface DrawingUnderlaySlice {
    */
   underlayCut: number | null;
   /**
-   * Camera lock for the drawing view: orbit disabled (pan/zoom stay live) so
-   * the top-down orientation can't be lost by an errant drag.
+   * Camera lock for the calibration drawing view: orbit disabled (pan/zoom
+   * stay live) so the top-down orientation can't be lost while picking.
    */
   underlayViewLocked: boolean;
-  /** Storey GUID the drawing view is locked to (drives the 2D pane). */
+  /**
+   * Real 2D|3D split view (Dalux-style): the resizable 2D plan pane is shown
+   * beside a FREELY navigable 3D viewport. Distinct from `underlayViewLocked`
+   * (which is the top-down locked calibration view).
+   */
+  underlaySplitView: boolean;
+  /** Enlarge the calibration PDF surface into a viewport overlay for picking. */
+  underlayCalibrationExpanded: boolean;
+  /** Storey GUID the drawing/split view is bound to (drives the 2D pane). */
   underlayActiveStoreyGuid: string | null;
   /**
    * Host persistence hook (e.g. the AIM bridge). Called after a placement
@@ -102,6 +110,8 @@ export interface DrawingUnderlaySlice {
   /** Move the cut by a delta (no-op when no cut is active). */
   nudgeUnderlayCut: (deltaY: number) => void;
   setUnderlayViewLocked: (locked: boolean) => void;
+  setUnderlaySplitView: (on: boolean) => void;
+  setUnderlayCalibrationExpanded: (on: boolean) => void;
   setUnderlayActiveStoreyGuid: (guid: string | null) => void;
 
   startUnderlayCalibration: (
@@ -145,6 +155,8 @@ export const createDrawingUnderlaySlice: StateCreator<
   underlayCalibration: null,
   underlayCut: null,
   underlayViewLocked: false,
+  underlaySplitView: false,
+  underlayCalibrationExpanded: false,
   underlayActiveStoreyGuid: null,
   underlaySaveHandler: null,
 
@@ -232,6 +244,10 @@ export const createDrawingUnderlaySlice: StateCreator<
 
   setUnderlayViewLocked: (locked) => set({ underlayViewLocked: locked }),
 
+  setUnderlaySplitView: (on) => set({ underlaySplitView: on }),
+
+  setUnderlayCalibrationExpanded: (on) => set({ underlayCalibrationExpanded: on }),
+
   setUnderlayActiveStoreyGuid: (guid) => set({ underlayActiveStoreyGuid: guid }),
 
   startUnderlayCalibration: (drawingId, page, storey) =>
@@ -245,6 +261,8 @@ export const createDrawingUnderlaySlice: StateCreator<
         pagePoints: [],
         modelPoints: [],
       },
+      // Start inline; the user opts into the big overlay per calibration.
+      underlayCalibrationExpanded: false,
     }),
 
   setUnderlayCalibrationPageSize: (pageSize) =>
@@ -286,7 +304,8 @@ export const createDrawingUnderlaySlice: StateCreator<
       return state;
     }),
 
-  cancelUnderlayCalibration: () => set({ underlayCalibration: null }),
+  cancelUnderlayCalibration: () =>
+    set({ underlayCalibration: null, underlayCalibrationExpanded: false }),
 
   setUnderlaySaveHandler: (handler) => set({ underlaySaveHandler: handler }),
 });

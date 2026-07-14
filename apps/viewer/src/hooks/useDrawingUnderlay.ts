@@ -70,6 +70,7 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
   const drawings = useViewerStore((s) => s.underlayDrawings);
   const models = useViewerStore((s) => s.models);
   const calibration = useViewerStore((s) => s.underlayCalibration);
+  const underlayCut = useViewerStore((s) => s.underlayCut);
 
   const pipelineRef = useRef<PdfPlanePipeline | null>(null);
   /** drawingId → texture signature of the raster currently on the GPU. */
@@ -221,6 +222,15 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
       })();
     }
   }, [drawings, models, calibration, isInitialized, rendererRef]);
+
+  // Depth-always (no z-fight) while a storey cut is active — a top-down floor
+  // plan has nothing above the cut to occlude it; depth-tested + bigger lift
+  // when viewing the full model in free 3D. Separate effect so it reacts to
+  // cut toggles without re-running the (heavier) sync above.
+  useEffect(() => {
+    pipelineRef.current?.setOcclude(underlayCut === null);
+    rendererRef.current?.requestRender();
+  }, [underlayCut, rendererRef]);
 
   // Teardown on unmount / renderer swap.
   useEffect(() => {

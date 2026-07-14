@@ -19,8 +19,9 @@ import { ToolOverlays } from './ToolOverlays';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
 import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { Section2DPanel } from './Section2DPanel';
-import { DrawingViewPane } from './DrawingViewPane';
 import { CalibrationOverlay3D } from './CalibrationOverlay3D';
+import { DrawingLocationOverlay3D } from './DrawingLocationOverlay3D';
+import { CalibrationPdfOverlay } from './CalibrationPdfOverlay';
 import { BasketPresentationDock } from './BasketPresentationDock';
 import { BCFOverlay } from './bcf/BCFOverlay';
 import { CesiumOverlay } from './CesiumOverlay';
@@ -1379,11 +1380,12 @@ export function ViewportContainer() {
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}
       />
-      {/* Drawing-view 2D pane (D-072): split view with click-to-jump +
-          camera marker while the level-locked drawing view is active. */}
-      <DrawingViewPane />
       {/* Calibration A/B markers + line over the picked model points. */}
       <CalibrationOverlay3D />
+      {/* Split-view location marker mirroring the 2D plan pane's marker. */}
+      <DrawingLocationOverlay3D />
+      {/* Large calibration PDF surface (expand-to-big for precise picking). */}
+      <CalibrationPdfOverlay />
     </div>
   );
 }

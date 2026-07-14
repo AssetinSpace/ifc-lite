@@ -103,7 +103,12 @@ export class PdfPlanePipeline {
   private readonly depthConvention: 'reverse' | 'standard';
   private readonly extraColorTargets: GPUColorTargetState[];
 
+  /** Depth-tested variant — occludes behind model geometry (free 3D view). */
   private pipeline: GPURenderPipeline | null = null;
+  /** depthCompare 'always' variant — no z-fight; used while a storey cut is on. */
+  private pipelineNoDepth: GPURenderPipeline | null = null;
+  /** Whether planes should be occluded by geometry (default true). */
+  private occlude = true;
   private cameraBindGroupLayout: GPUBindGroupLayout | null = null;
   private planeBindGroupLayout: GPUBindGroupLayout | null = null;
   private cameraBuffer: GPUBuffer | null = null;
@@ -148,57 +153,66 @@ export class PdfPlanePipeline {
     });
 
     const reverseZ = this.depthConvention === 'reverse';
-    this.pipeline = this.device.createRenderPipeline({
-      label: 'pdf-plane-pipeline',
-      layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [this.cameraBindGroupLayout, this.planeBindGroupLayout],
-      }),
-      vertex: {
-        module,
-        entryPoint: 'vs_main',
-        buffers: [
-          {
-            arrayStride: QUAD_VERTEX_STRIDE_BYTES,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
-              { shaderLocation: 1, offset: 3 * 4, format: 'float32x2' }, // uv
-            ],
-          },
-        ],
-      },
-      fragment: {
-        module,
-        entryPoint: 'fs_main',
-        targets: [
-          {
-            format: this.format,
-            blend: {
-              // Premultiplied-alpha composite over the existing scene.
-              color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            },
-            writeMask: GPUColorWrite.ALL,
-          },
-          ...this.extraColorTargets,
-        ],
-      },
-      // No culling: the drawing must read from below the plane too (e.g. a
-      // camera under a lifted underlay in section views).
-      primitive: { topology: 'triangle-strip', cullMode: 'none' },
-      depthStencil: {
-        format: this.depthFormat,
-        // Underlay: tested against model geometry but never occluding it in
-        // the depth buffer, so picking and later overlay draws stay intact.
-        depthWriteEnabled: false,
-        depthCompare: reverseZ ? 'greater-equal' : 'less-equal',
-        // Decal bias toward the camera so a plane sitting on a slab face
-        // doesn't z-fight (sign flips with the depth convention).
-        depthBias: reverseZ ? -4 : 4,
-        depthBiasSlopeScale: reverseZ ? -0.5 : 0.5,
-        depthBiasClamp: 0,
-      },
-      multisample: { count: this.sampleCount },
+    const layout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.cameraBindGroupLayout, this.planeBindGroupLayout],
     });
+    const vertex: GPUVertexState = {
+      module,
+      entryPoint: 'vs_main',
+      buffers: [
+        {
+          arrayStride: QUAD_VERTEX_STRIDE_BYTES,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
+            { shaderLocation: 1, offset: 3 * 4, format: 'float32x2' }, // uv
+          ],
+        },
+      ],
+    };
+    const fragment: GPUFragmentState = {
+      module,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: this.format,
+          blend: {
+            // Premultiplied-alpha composite over the existing scene.
+            color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+          writeMask: GPUColorWrite.ALL,
+        },
+        ...this.extraColorTargets,
+      ],
+    };
+    // No culling: the drawing must read from below the plane too (e.g. a
+    // camera under a lifted underlay in section views).
+    const primitive: GPUPrimitiveState = { topology: 'triangle-strip', cullMode: 'none' };
+    const makePipeline = (depthCompare: GPUCompareFunction, biased: boolean) =>
+      this.device.createRenderPipeline({
+        label: `pdf-plane-pipeline-${depthCompare}`,
+        layout,
+        vertex,
+        fragment,
+        primitive,
+        depthStencil: {
+          format: this.depthFormat,
+          // Never writes depth, so picking + later overlays stay intact.
+          depthWriteEnabled: false,
+          depthCompare,
+          // Strong slope-scaled decal bias keeps a near-coplanar quad on the
+          // winning side at grazing angles (weak bias was the z-fight cause).
+          // Only meaningful for the depth-tested variant.
+          depthBias: biased ? (reverseZ ? -16 : 16) : 0,
+          depthBiasSlopeScale: biased ? (reverseZ ? -1.5 : 1.5) : 0,
+          depthBiasClamp: 0,
+        },
+        multisample: { count: this.sampleCount },
+      });
+
+    // Depth-tested (occludes behind geometry) + non-occluding ('always').
+    this.pipeline = makePipeline(reverseZ ? 'greater-equal' : 'less-equal', true);
+    this.pipelineNoDepth = makePipeline('always', false);
 
     this.cameraBuffer = this.device.createBuffer({
       label: 'pdf-plane-camera',
@@ -394,6 +408,16 @@ export class PdfPlanePipeline {
     entry.visible = visible;
   }
 
+  /**
+   * Whether planes are occluded by model geometry. Set `false` while a
+   * horizontal storey cut is active (a top-down floor plan has nothing above
+   * the cut to occlude it, and the depth-always pass eliminates z-fighting
+   * with the slab). Default `true` for free 3D viewing.
+   */
+  setOcclude(occlude: boolean): void {
+    this.occlude = occlude;
+  }
+
   removePlane(id: string): void {
     const entry = this.planes.get(id);
     if (!entry) return;
@@ -422,11 +446,12 @@ export class PdfPlanePipeline {
 
   /** Draw all visible planes. Call from inside the host's blended pass. */
   render(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
-    if (!this.pipeline || !this.cameraBuffer || !this.cameraBindGroup) return;
+    const pipeline = this.occlude ? this.pipeline : this.pipelineNoDepth;
+    if (!pipeline || !this.cameraBuffer || !this.cameraBindGroup) return;
     if (!this.hasGeometry()) return;
 
     this.device.queue.writeBuffer(this.cameraBuffer, 0, viewProj);
-    pass.setPipeline(this.pipeline);
+    pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.cameraBindGroup);
     for (const entry of this.planes.values()) {
       if (!entry.visible) continue;
@@ -443,6 +468,7 @@ export class PdfPlanePipeline {
     this.cameraBuffer = null;
     this.cameraBindGroup = null;
     this.pipeline = null;
+    this.pipelineNoDepth = null;
     this.mipPipeline = null;
     this.mipSampler = null;
     this.sampler = null;

@@ -39,6 +39,7 @@ import { ScriptPanel } from './ScriptPanel';
 import { GanttPanel } from './schedule/GanttPanel';
 import { ExtensionsPanel } from '@/components/extensions/ExtensionsPanel';
 import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
+import { DrawingPlanPane } from '@/components/viewer/DrawingPlanPane';
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
 import { TourHost } from '@/components/tours/TourHost';
@@ -256,6 +257,18 @@ export function ViewerLayout() {
     else if (!leftPanelCollapsed && panel.isCollapsed()) panel.expand();
   }, [leftPanelCollapsed]);
 
+  // D-072 split view: the 2D plan Panel is always mounted (so ViewportContainer
+  // never remounts / loses its WebGPU renderer) and collapses/expands with the
+  // `underlaySplitView` flag, like the left hierarchy panel above.
+  const underlaySplitView = useViewerStore((s) => s.underlaySplitView);
+  const planePanelRef = useRef<PanelImperativeHandle>(null);
+  useEffect(() => {
+    const panel = planePanelRef.current;
+    if (!panel) return;
+    if (underlaySplitView && panel.isCollapsed()) panel.expand();
+    else if (!underlaySplitView && !panel.isCollapsed()) panel.collapse();
+  }, [underlaySplitView]);
+
   // Bottom panel resize state (pixel height, persisted in ref to avoid re-renders during drag)
   const [bottomHeight, setBottomHeight] = useState(BOTTOM_PANEL_DEFAULT_HEIGHT);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -406,15 +419,31 @@ export function ViewerLayout() {
 
                   <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
 
-                  {/* Center - Viewport */}
+                  {/* Center - Viewport (nested split: 2D plan | 3D). The 2D
+                      Panel is collapsible so ViewportContainer stays mounted. */}
                   <Panel id="viewport-panel" defaultSize={78} minSize={30}>
-                    {/* data-floating-snap-bounds: edge-docked floating panels
-                        (#1201) snap to THIS region, not the whole window, so a
-                        dock never hides under the toolbar (its own close control
-                        with it) or over the hierarchy / sidebar (#1245). */}
-                    <div data-floating-snap-bounds className="h-full w-full overflow-hidden relative">
-                      <ViewportContainer />
-                    </div>
+                    <PanelGroup orientation="horizontal" className="h-full">
+                      <Panel
+                        id="drawing-plan-panel"
+                        defaultSize={0}
+                        minSize={20}
+                        collapsible
+                        collapsedSize={0}
+                        panelRef={planePanelRef}
+                      >
+                        <DrawingPlanPane />
+                      </Panel>
+                      <PanelResizeHandle
+                        className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${underlaySplitView ? '' : 'hidden'}`}
+                      />
+                      <Panel id="viewport-3d-panel" defaultSize={100} minSize={30}>
+                        {/* data-floating-snap-bounds: edge-docked floating panels
+                            (#1201) snap to THIS region, not the whole window. */}
+                        <div data-floating-snap-bounds className="h-full w-full overflow-hidden relative">
+                          <ViewportContainer />
+                        </div>
+                      </Panel>
+                    </PanelGroup>
                   </Panel>
                 </PanelGroup>
               </div>
@@ -466,6 +495,15 @@ export function ViewerLayout() {
             <div className="h-full w-full">
               <ViewportContainer />
             </div>
+
+            {/* D-072 split view on mobile: a phone can't fit a side-by-side
+                split, so the 2D plan takes over as a full-screen overlay
+                (tap the plan to jump the 3D camera, exit to return). */}
+            {underlaySplitView && (
+              <div className="absolute inset-0 z-40 bg-background">
+                <DrawingPlanPane />
+              </div>
+            )}
 
             {/* Backdrop overlay when sheet is open */}
             {(!leftPanelCollapsed || !rightPanelCollapsed) && (
