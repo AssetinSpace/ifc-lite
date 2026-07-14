@@ -19,6 +19,7 @@
  */
 
 import { useEffect, useRef } from 'react';
+import { parsePlacement, serializePlacement } from '@ifc-lite/drawing-underlay';
 import { useBim } from '../sdk/BimProvider.js';
 import { useViewerStore } from '../store/index.js';
 import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '../lib/autoload.js';
@@ -139,12 +140,40 @@ export function AimBridge() {
         case 'AIM_PANEL_EMPTY':
           useAimPanelStore.getState().resolve(e.data.guid, { reason: e.data.reason });
           break;
+        case 'UNDERLAYS_LOAD': {
+          // Georeferencované PDF podklady (D-072): host posiela zoznam
+          // dokumentov naviazaných na podlažia + perzistované _georef.
+          // Placement JSON je untrusted — validuje ho parsePlacement;
+          // nevalidný georef = výkres bez umiestnenia (kalibruje sa znova).
+          const drawings = e.data.drawings.map((d) => ({
+            id: d.documentId,
+            name: d.name,
+            pdfUrl: d.pdfUrl,
+            placement: d.georef !== undefined ? parsePlacement(d.georef) : null,
+          }));
+          useViewerStore.getState().setUnderlayDrawings(drawings);
+          break;
+        }
       }
     }
 
+    // Kalibrácia uložená vo viewri → host ju perzistuje do
+    // documents.properties._georef (D-072). Session-only bez hosta.
+    useViewerStore.getState().setUnderlaySaveHandler((documentId, placement) => {
+      post({
+        source: SOURCE,
+        type: 'UNDERLAY_SAVE',
+        documentId,
+        georef: serializePlacement(placement),
+      });
+    });
+
     window.addEventListener('message', onMessage);
     post({ source: SOURCE, type: 'READY' });
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      useViewerStore.getState().setUnderlaySaveHandler(null);
+    };
   }, [bim]);
 
   // Signal the host once models finish loading (the `?models=` autoload is

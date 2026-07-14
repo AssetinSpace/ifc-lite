@@ -9,7 +9,9 @@
  */
 
 import type { MouseHandlerContext } from './mouseHandlerTypes.js';
+import { worldToIfcMetres } from '@ifc-lite/drawing-underlay';
 import { useViewerStore } from '@/store';
+import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { fromGlobalIdFromModels, toGlobalIdFromModels } from '@/store/globalId';
 import { pointInPolygon } from '@/lib/polygon-clip';
 import { toast } from '@/components/ui/toast';
@@ -38,6 +40,40 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
   // Measure tool now uses drag interaction (see mousedown/mousemove/mouseup)
   if (tool === 'measure') {
     return; // Skip click handling for measure tool
+  }
+
+  // Drawing-underlay calibration (D-072): while a 2-point calibration is
+  // waiting for a model point (page point already picked in the panel), a
+  // click picks the matching model coordinate. Surface hit preferred;
+  // empty-space clicks fall back to the storey floor plane so the two
+  // points can straddle open areas. Intercepted BEFORE the generic select
+  // path so the pick doesn't also flip the selection.
+  {
+    const state = useViewerStore.getState();
+    const calibration = state.underlayCalibration;
+    if (
+      calibration &&
+      calibration.modelPoints.length < calibration.pagePoints.length &&
+      calibration.modelPoints.length < 2
+    ) {
+      const hit = renderer.raycastScene(x, y, {
+        hiddenIds: ctx.hiddenEntitiesRef.current,
+        isolatedIds: ctx.isolatedEntitiesRef.current,
+      });
+      const world = hit?.intersection?.point ?? raycastStoreyFloor(ctx, x, y);
+      if (!world) {
+        toast.error("Couldn't read a model point here — click on geometry or the floor");
+        return;
+      }
+      // Placements store IFC plan metres; invert the shared frame's
+      // recentering offset (see useDrawingUnderlay for the same convention).
+      const firstModel = [...state.models.values()].find(
+        (m) => m.geometryResult?.coordinateInfo,
+      );
+      const offset = totalYupOffset(firstModel?.geometryResult?.coordinateInfo);
+      state.addUnderlayCalibrationModelPoint(worldToIfcMetres(world, offset));
+      return;
+    }
   }
 
   // Section-tool face-pick (issue #243): clicking any visible face places

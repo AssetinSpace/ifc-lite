@@ -30,6 +30,11 @@ import { RoomPanel } from '@/components/viewer/RoomPanel';
 const LayersPanel = lazy(() =>
   import('@/components/viewer/layers/LayersPanel').then((m) => ({ default: m.LayersPanel })),
 );
+// Lazy: the Drawing-underlays panel pulls in pdf.js (~1 MB worker) via the
+// calibration preview; keep it out of the initial bundle until first opened.
+const DrawingUnderlayPanel = lazy(() =>
+  import('@/components/viewer/DrawingUnderlayPanel').then((m) => ({ default: m.DrawingUnderlayPanel })),
+);
 
 /**
  * Render the body for a workspace panel. `onClose` is the host's "close this
@@ -55,6 +60,11 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
     case 'layers': return (
       <Suspense fallback={null}>
         <LayersPanel onClose={onClose} />
+      </Suspense>
+    );
+    case 'drawing-underlay': return (
+      <Suspense fallback={null}>
+        <DrawingUnderlayPanel onClose={onClose} />
       </Suspense>
     );
   }

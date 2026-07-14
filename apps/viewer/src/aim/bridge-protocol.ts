@@ -58,6 +58,19 @@ export interface OpsSelector {
   model?: string;
 }
 
+/**
+ * One drawing pushed by the host (D-072): the document identity, a fetchable
+ * PDF URL, and optionally the persisted `_georef` placement JSON. The georef
+ * payload is treated as untrusted — the handler validates it with
+ * `parsePlacement` before it reaches the store.
+ */
+export interface UnderlayDrawingWire {
+  documentId: string;
+  name: string;
+  pdfUrl: string;
+  georef?: unknown;
+}
+
 export type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
@@ -73,7 +86,10 @@ export type InboundMessage =
   // AIM panel data for the selected element (host DB → AimCard in the
   // PropertiesPanel). Guid-stamped so stale answers are dropped store-side.
   | { source: typeof SOURCE; type: 'AIM_PANEL_DATA'; guid: string; data: AimPanelData }
-  | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string };
+  | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string }
+  // Georeferenced PDF underlays (D-072): the host pushes its drawing list
+  // (documents linked to storeys + persisted _georef) after MODELS_LOADED.
+  | { source: typeof SOURCE; type: 'UNDERLAYS_LOAD'; drawings: UnderlayDrawingWire[] };
 
 export type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
@@ -82,7 +98,10 @@ export type OutboundMessage =
   | { source: typeof SOURCE; type: 'ENTITY_DESELECTED' }
   // Click on a link inside the AimCard — the parent app performs the
   // navigation (href is a host-relative path, e.g. /node/{id}).
-  | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string };
+  | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string }
+  // A drawing was (re)calibrated in the viewer — the host persists the
+  // serialized _georef v1 JSON on the document (D-072).
+  | { source: typeof SOURCE; type: 'UNDERLAY_SAVE'; documentId: string; georef: unknown };
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.
@@ -114,6 +133,21 @@ function hasValidOpTarget(msg: { guids?: unknown; selector?: unknown }): boolean
   return true;
 }
 
+/**
+ * One wire drawing entry must carry a non-empty documentId/name/pdfUrl;
+ * `georef` stays `unknown` here — placement validation is the store
+ * handler's job (parsePlacement), not the envelope check's.
+ */
+function isUnderlayDrawingWire(v: unknown): v is UnderlayDrawingWire {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as { documentId?: unknown; name?: unknown; pdfUrl?: unknown };
+  return (
+    typeof d.documentId === 'string' && d.documentId.length > 0 &&
+    typeof d.name === 'string' &&
+    typeof d.pdfUrl === 'string' && d.pdfUrl.length > 0
+  );
+}
+
 export function isInboundMessage(data: unknown): data is InboundMessage {
   if (!data || typeof data !== 'object') return false;
   const msg = data as {
@@ -125,6 +159,7 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
     guid?: unknown;
     data?: unknown;
     reason?: unknown;
+    drawings?: unknown;
   };
   if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
   switch (msg.type) {
@@ -146,6 +181,8 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
       return typeof msg.guid === 'string' && !!msg.data && typeof msg.data === 'object';
     case 'AIM_PANEL_EMPTY':
       return typeof msg.guid === 'string' && typeof msg.reason === 'string';
+    case 'UNDERLAYS_LOAD':
+      return Array.isArray(msg.drawings) && msg.drawings.every(isUnderlayDrawingWire);
     default:
       // Unknown type — not a message this bridge version handles.
       return false;

@@ -573,6 +573,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       extensionsPanelVisible: panel === 'extensions',
       collabPanelVisible: panel === 'collab',
       layersPanelVisible: panel === 'layers',
+      underlayPanelVisible: panel === 'drawing-underlay',
       rightPanelCollapsed: false,
     });
     if (get().sidebarMode !== 'expanded') get().setSidebarMode('expanded');
@@ -608,6 +609,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         extensionsPanelVisible: false,
         collabPanelVisible: false,
         layersPanelVisible: false,
+        underlayPanelVisible: false,
         rightPanelCollapsed: false,
       });
       get().setSidebarActivePanel('properties');
@@ -687,6 +689,7 @@ const SIDEBAR_PANEL_FLAGS: ReadonlyArray<readonly [keyof ViewerState, WorkspaceP
   ['extensionsPanelVisible', 'extensions'],
   ['collabPanelVisible', 'collab'],
   ['layersPanelVisible', 'layers'],
+  ['underlayPanelVisible', 'drawing-underlay'],
 ];
 
 /**

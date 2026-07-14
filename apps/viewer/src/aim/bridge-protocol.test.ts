@@ -89,6 +89,29 @@ describe('isInboundMessage', () => {
     assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_DATA', guid: 'g' }), false); // no data
     assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_EMPTY', guid: 'g' }), false); // no reason
   });
+
+  it('accepts and validates UNDERLAYS_LOAD (D-072)', () => {
+    const drawing = { documentId: 'doc-1', name: 'Pudorys 1NP', pdfUrl: 'https://x/y.pdf' };
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD', drawings: [] }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD', drawings: [drawing] }));
+    // georef rides along unvalidated at the envelope level (parsePlacement
+    // handles it) — any value is fine as long as the identity fields hold.
+    assert.ok(isInboundMessage({
+      source: SOURCE,
+      type: 'UNDERLAYS_LOAD',
+      drawings: [{ ...drawing, georef: { version: 1 } }],
+    }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD' }), false); // no drawings
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD', drawings: 'x' }), false);
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD', drawings: [{ documentId: '', name: 'n', pdfUrl: 'u' }] }),
+      false, // empty documentId
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'UNDERLAYS_LOAD', drawings: [{ documentId: 'd', name: 'n' }] }),
+      false, // missing pdfUrl
+    );
+  });
 });
 
 describe('resolveGuids', () => {
