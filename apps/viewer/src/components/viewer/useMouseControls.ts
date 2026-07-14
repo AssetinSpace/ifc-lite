@@ -810,13 +810,29 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // Debounce: clear isInteracting 150ms after the last wheel event
     let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // Physical Ctrl-key state for the cut-move gesture (D-072). Browsers
+    // synthesize wheel events with ctrlKey=true for TRACKPAD PINCH, so
+    // gating on e.ctrlKey would hijack pinch-zoom into cut movement.
+    // Tracking real keydown/keyup distinguishes a held Ctrl from a pinch
+    // (Cmd/metaKey is never synthesized, so it can pass through directly).
+    let physicalCtrlHeld = false;
+    const handleModifierDown = (e: KeyboardEvent) => {
+      if (e.key === 'Control') physicalCtrlHeld = true;
+    };
+    const handleModifierUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control') physicalCtrlHeld = false;
+    };
+    const handleWindowBlur = () => {
+      physicalCtrlHeld = false;
+    };
+
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
 
       // Ctrl/Cmd+scroll moves the active horizontal cut up/down (D-072):
       // the drawing-view cut when set, else the Section tool's plane. The
       // binding was previously unused, so plain zoom is untouched.
-      if (e.ctrlKey || e.metaKey) {
+      if (physicalCtrlHeld || e.metaKey) {
         const state = useViewerStore.getState();
         // ~0.25 m per wheel notch (deltaY ≈ ±100); trackpads scale down.
         const step = -e.deltaY * 0.0025;
@@ -875,6 +891,9 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     canvas.addEventListener('contextmenu', handleContextMenu);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     canvas.addEventListener('click', handleClick);
+    window.addEventListener('keydown', handleModifierDown);
+    window.addEventListener('keyup', handleModifierUp);
+    window.addEventListener('blur', handleWindowBlur);
 
     return () => {
       canvas.removeEventListener('pointerdown', handleMouseDown);
@@ -884,6 +903,9 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       canvas.removeEventListener('contextmenu', handleContextMenu);
       canvas.removeEventListener('wheel', handleWheel);
       canvas.removeEventListener('click', handleClick);
+      window.removeEventListener('keydown', handleModifierDown);
+      window.removeEventListener('keyup', handleModifierUp);
+      window.removeEventListener('blur', handleWindowBlur);
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
 
       // Cancel pending raycast requests

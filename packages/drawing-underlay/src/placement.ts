@@ -79,7 +79,10 @@ export function createDrawingPlacement(input: CreateDrawingPlacementInput): Draw
     storeyZ: input.storeyZ,
     page: input.page,
     pageSize: [input.pageSize[0], input.pageSize[1]],
-    affine: [...input.affine] as unknown as Affine2x3,
+    affine: [
+      input.affine[0], input.affine[1], input.affine[2],
+      input.affine[3], input.affine[4], input.affine[5],
+    ],
     calibration: input.calibration.map((c) => ({
       pdfPt: [c.page.x, c.page.y],
       ifcM: [c.model.x, c.model.y],

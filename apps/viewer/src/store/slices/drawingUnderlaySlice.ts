@@ -77,7 +77,15 @@ export interface DrawingUnderlaySlice {
   removeUnderlayDrawing: (id: string) => void;
   /** Commit a placement (calibration save / host update) and notify the host. */
   setUnderlayPlacement: (id: string, placement: DrawingPlacement) => void;
+  /**
+   * Live opacity update — store + GPU only, NO host save. Continuous inputs
+   * (slider drag) call this per tick and persist once via
+   * `commitUnderlayPlacement` on release, so a drag can't flood the host's
+   * rate-limited write endpoint with one PATCH per change event.
+   */
   setUnderlayOpacity: (id: string, opacity: number) => void;
+  /** Persist the drawing's current placement via the host save handler. */
+  commitUnderlayPlacement: (id: string) => void;
   setUnderlayVisible: (id: string, visible: boolean) => void;
   setUnderlayPanelVisible: (visible: boolean) => void;
 
@@ -127,9 +135,21 @@ export const createDrawingUnderlaySlice: StateCreator<
   underlaySaveHandler: null,
 
   setUnderlayDrawings: (drawings) => {
-    const map = new Map<string, UnderlayDrawing>();
-    for (const d of drawings) map.set(d.id, d);
-    set({ underlayDrawings: map, underlayCalibration: null });
+    set((state) => {
+      const map = new Map<string, UnderlayDrawing>();
+      for (const d of drawings) map.set(d.id, d);
+      // A host re-send must not nuke session-local work: locally-added
+      // drawings (Add PDF, `local:` ids) survive, and an in-flight
+      // calibration is kept as long as its drawing still exists.
+      for (const [id, d] of state.underlayDrawings) {
+        if (id.startsWith('local:') && !map.has(id)) map.set(id, d);
+      }
+      const calibration =
+        state.underlayCalibration && map.has(state.underlayCalibration.drawingId)
+          ? state.underlayCalibration
+          : null;
+      return { underlayDrawings: map, underlayCalibration: calibration };
+    });
   },
 
   upsertUnderlayDrawing: (drawing) => {
@@ -163,15 +183,16 @@ export const createDrawingUnderlaySlice: StateCreator<
 
   setUnderlayOpacity: (id, opacity) => {
     const clamped = Math.min(1, Math.max(0, opacity));
-    let saved: DrawingPlacement | null = null;
     set((state) => ({
-      underlayDrawings: withDrawing(state.underlayDrawings, id, (d) => {
-        if (!d.placement) return d;
-        saved = { ...d.placement, opacity: clamped };
-        return { ...d, placement: saved };
-      }),
+      underlayDrawings: withDrawing(state.underlayDrawings, id, (d) =>
+        d.placement ? { ...d, placement: { ...d.placement, opacity: clamped } } : d,
+      ),
     }));
-    if (saved) get().underlaySaveHandler?.(id, saved);
+  },
+
+  commitUnderlayPlacement: (id) => {
+    const placement = get().underlayDrawings.get(id)?.placement;
+    if (placement) get().underlaySaveHandler?.(id, placement);
   },
 
   setUnderlayVisible: (id, visible) => {

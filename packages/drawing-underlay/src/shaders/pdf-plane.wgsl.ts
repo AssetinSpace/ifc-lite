@@ -69,7 +69,7 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
-  // Fullscreen triangle: (-1,-1) (3,-1) (-1,3).
+  // Fullscreen triangle: i=0 -> (-1,-1), i=1 -> (-1,3), i=2 -> (3,-1).
   var out: VsOut;
   let x = f32(i32(i) / 2) * 4.0 - 1.0;
   let y = f32(i32(i) % 2) * 4.0 - 1.0;

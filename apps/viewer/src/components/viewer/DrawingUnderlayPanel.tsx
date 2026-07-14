@@ -67,6 +67,7 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const addPagePoint = useViewerStore((s) => s.addUnderlayCalibrationPagePoint);
   const setPlacement = useViewerStore((s) => s.setUnderlayPlacement);
   const setOpacity = useViewerStore((s) => s.setUnderlayOpacity);
+  const commitPlacement = useViewerStore((s) => s.commitUnderlayPlacement);
   const setVisible = useViewerStore((s) => s.setUnderlayVisible);
   const upsertDrawing = useViewerStore((s) => s.upsertUnderlayDrawing);
   const removeDrawing = useViewerStore((s) => s.removeUnderlayDrawing);
@@ -387,8 +388,18 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
               key={d.id}
               drawing={d}
               calibrating={calibration?.drawingId === d.id}
-              onCalibrate={() => startCalibration(d.id, d.placement?.page ?? 1)}
+              onCalibrate={() => {
+                // Recalibration edits the drawing's OWN storey — preselect it
+                // so Save can't silently move the drawing to whatever level
+                // happened to be picked in the dropdown.
+                if (d.placement) {
+                  const own = storeyOptions.find((s) => s.guid === d.placement!.storeyGuid);
+                  if (own) setStoreyKey(own.key);
+                }
+                startCalibration(d.id, d.placement?.page ?? 1);
+              }}
               onOpacity={(v) => setOpacity(d.id, v)}
+              onOpacityCommit={() => commitPlacement(d.id)}
               onToggleVisible={() => setVisible(d.id, !(d.placement?.visible ?? true))}
               onRemove={() => removeDrawing(d.id)}
             />
@@ -404,13 +415,17 @@ function DrawingRow({
   calibrating,
   onCalibrate,
   onOpacity,
+  onOpacityCommit,
   onToggleVisible,
   onRemove,
 }: {
   drawing: UnderlayDrawing;
   calibrating: boolean;
   onCalibrate: () => void;
+  /** Live (per-tick) opacity update — store/GPU only, no persistence. */
   onOpacity: (value: number) => void;
+  /** Persist once, on gesture end (pointer/key release, blur). */
+  onOpacityCommit: () => void;
   onToggleVisible: () => void;
   onRemove: () => void;
 }) {
@@ -474,6 +489,9 @@ function DrawingRow({
               step={0.05}
               value={p.opacity}
               onChange={(e) => onOpacity(Number(e.target.value))}
+              onPointerUp={onOpacityCommit}
+              onKeyUp={onOpacityCommit}
+              onBlur={onOpacityCommit}
               className="h-1 min-w-0 flex-1"
               aria-label="Drawing opacity"
             />

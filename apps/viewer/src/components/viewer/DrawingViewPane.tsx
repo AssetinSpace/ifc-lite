@@ -61,6 +61,24 @@ export function DrawingViewPane() {
     return totalYupOffset(first?.geometryResult?.coordinateInfo);
   }, [models]);
 
+  // Fit the page box into the pane body explicitly (ResizeObserver), so the
+  // canvas, the click mapping, and the marker all share ONE pixel box.
+  // CSS aspect-ratio + max-constraints can silently break the ratio when
+  // both axes clamp, which would desync marker percentages from the canvas.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [bodySize, setBodySize] = useState<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r) setBodySize({ w: r.width, h: r.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+    // Re-attach when the pane materializes (it renders null until locked).
+  }, [locked, drawing, expanded]);
+
   // ── Page raster ──────────────────────────────────────────────────────────
   const hostRef = useRef<HTMLDivElement>(null);
   const [pageAspect, setPageAspect] = useState<number>(1.414);
@@ -113,10 +131,14 @@ export function DrawingViewPane() {
       if (!host) return;
       const rect = host.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
+      const nx = (e.clientX - rect.left) / rect.width;
+      const ny = (e.clientY - rect.top) / rect.height;
+      // Defensive: never jump the camera off-page from an edge/margin click.
+      if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
       const [w, h] = drawing.placement.pageSize;
       const pagePt: Point2 = {
-        x: ((e.clientX - rect.left) / rect.width) * w,
-        y: (1 - (e.clientY - rect.top) / rect.height) * h,
+        x: nx * w,
+        y: (1 - ny) * h,
       };
       const ifc = pageToIfcMetres(drawing.placement.affine, pagePt);
       const world = ifcToWorld(ifc, drawing.placement.storeyZ, offset);
@@ -161,10 +183,16 @@ export function DrawingViewPane() {
     const left = (page.x / w) * 100;
     const top = ((h - page.y) / h) * 100;
     if (left < -5 || left > 105 || top < -5 || top > 105) return null;
-    // Camera azimuth mapped into page space: subtract the drawing's world
-    // rotation so the wedge points where the camera looks on paper.
-    const angleRad = cameraRotation.azimuth - similarityRotation(drawing.placement.affine);
-    return { left, top, angleDeg: (angleRad * 180) / Math.PI };
+    // Camera azimuth mapped into page space. Units: `cameraRotation.azimuth`
+    // is DEGREES (camera-controls convention), `similarityRotation` is
+    // RADIANS — convert before combining. Sign: the drawing's world rotation
+    // (page CCW, y-up) subtracts from the camera azimuth, and CSS rotate()
+    // is clockwise in the y-down screen box, so the page-space CCW angle
+    // flips sign. Final orientation to be confirmed visually on a real
+    // calibrated drawing (ROADMAP F7 follow-up).
+    const drawingRotDeg = (similarityRotation(drawing.placement.affine) * 180) / Math.PI;
+    const angleDeg = -(cameraRotation.azimuth - drawingRotDeg);
+    return { left, top, angleDeg };
     // frameTick re-derives from the live camera each viewpoint change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawing, offset, cameraRotation.azimuth, frameTick]);
@@ -201,13 +229,19 @@ export function DrawingViewPane() {
           <X className="size-3" aria-hidden />
         </Button>
       </div>
-      <div className="relative min-h-0 flex-1 cursor-crosshair" onClick={onPaneClick}>
+      <div
+        ref={bodyRef}
+        className={`flex min-h-0 items-center justify-center overflow-hidden ${expanded ? 'flex-1' : 'h-56'}`}
+      >
+        {/* The page box: canvas fill, click mapping and marker percentages
+            all resolve against THIS element — one shared pixel box. */}
         <div
-          ref={hostRef}
-          className="mx-auto h-full"
-          style={expanded ? { aspectRatio: String(pageAspect), maxWidth: '100%' } : { aspectRatio: String(pageAspect) }}
-        />
-        {marker && (
+          className="relative cursor-crosshair"
+          style={fitBox(pageAspect, bodySize)}
+          onClick={onPaneClick}
+        >
+          <div ref={hostRef} className="h-full w-full" />
+          {marker && (
           <span
             className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-1/2"
             style={{ left: `${marker.left}%`, top: `${marker.top}%` }}
@@ -233,8 +267,25 @@ export function DrawingViewPane() {
             {/* Green location circle (Dalux-style). */}
             <span className="block size-3 rounded-full border-2 border-background bg-emerald-500 shadow" />
           </span>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
+}
+
+/**
+ * Largest width/height that fits `aspect` (w/h) into the measured body box.
+ * Explicit pixels — CSS aspect-ratio with double max-constraints can break
+ * the ratio and desync the marker from the canvas.
+ */
+function fitBox(
+  aspect: number,
+  body: { w: number; h: number } | null,
+): React.CSSProperties {
+  if (!body || body.w <= 0 || body.h <= 0 || !(aspect > 0)) {
+    return { width: '100%', aspectRatio: String(aspect) };
+  }
+  const width = Math.min(body.w, body.h * aspect);
+  return { width: `${width}px`, height: `${width / aspect}px` };
 }
