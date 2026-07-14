@@ -17,6 +17,9 @@ import { GeometryModeBanner } from './GeometryModeBanner';
 import { LevelDisplayIndicator } from './LevelDisplayIndicator';
 import { ToolOverlays } from './ToolOverlays';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
+// >>> AIM-FORK: Reality Capture pin billboard (D-073)
+import { CapturePinLayer } from '../../aim/CapturePinLayer';
+// <<< AIM-FORK
 import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { Section2DPanel } from './Section2DPanel';
 import { CalibrationOverlay3D } from './CalibrationOverlay3D';
@@ -1363,6 +1366,10 @@ export function ViewportContainer() {
         onGeometryReleased={releaseGeometryMemory}
       />
       <AnnotationLayer />
+      {/* >>> AIM-FORK: Reality Capture pin billboard (D-073) — AIM-owned layer,
+          same canvas container as AnnotationLayer so it re-projects over the scene. */}
+      <CapturePinLayer />
+      {/* <<< AIM-FORK */}
       <CollabPresenceLayer />
       {bcfOverlayVisible && <BCFOverlay />}
       <ViewportOverlays />

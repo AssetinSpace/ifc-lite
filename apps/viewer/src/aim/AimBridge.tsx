@@ -35,6 +35,7 @@ import {
   type OutboundMessage,
 } from './bridge-protocol.js';
 import { useAimPanelStore } from './aimPanelStore.js';
+import { useCapturePinsStore } from './capturePinsStore.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -154,6 +155,11 @@ export function AimBridge() {
           useViewerStore.getState().setUnderlayDrawings(drawings);
           break;
         }
+        case 'CAPTURES_LOAD':
+          // Reality Capture pins (D-073): host pushes capture points with world
+          // coords; the billboard layer (CapturePinLayer) renders them.
+          useCapturePinsStore.getState().setPins(e.data.captures);
+          break;
       }
     }
 
@@ -168,11 +174,18 @@ export function AimBridge() {
       });
     });
 
+    // 3D -> host: a capture pin click opens its gallery/panorama host-side (D-073).
+    useCapturePinsStore.getState().setEmitClick((captureId) => {
+      post({ source: SOURCE, type: 'CAPTURE_PIN_CLICK', captureId });
+    });
+
     window.addEventListener('message', onMessage);
     post({ source: SOURCE, type: 'READY' });
     return () => {
       window.removeEventListener('message', onMessage);
       useViewerStore.getState().setUnderlaySaveHandler(null);
+      useCapturePinsStore.getState().setEmitClick(null);
+      useCapturePinsStore.getState().setPins([]);
     };
   }, [bim]);
 
