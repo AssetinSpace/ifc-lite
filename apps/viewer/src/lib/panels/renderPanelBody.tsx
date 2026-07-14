@@ -30,11 +30,11 @@ import { RoomPanel } from '@/components/viewer/RoomPanel';
 const LayersPanel = lazy(() =>
   import('@/components/viewer/layers/LayersPanel').then((m) => ({ default: m.LayersPanel })),
 );
-// Lazy: the Drawing-underlays panel pulls in pdf.js (~1 MB worker) via the
-// calibration preview; keep it out of the initial bundle until first opened.
-const DrawingUnderlayPanel = lazy(() =>
-  import('@/components/viewer/DrawingUnderlayPanel').then((m) => ({ default: m.DrawingUnderlayPanel })),
-);
+// Eager on purpose: pdf.js stays out of the initial bundle regardless (the
+// rasterizer dynamic-imports pdfjs-dist on first use), and a lazy() chunk
+// here produced a rolldown chunk-order cycle that broke react-dom's CJS
+// interop at startup ("require_react_dom is not a function", blank app).
+import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
 
 /**
  * Render the body for a workspace panel. `onClose` is the host's "close this
@@ -62,10 +62,6 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
         <LayersPanel onClose={onClose} />
       </Suspense>
     );
-    case 'drawing-underlay': return (
-      <Suspense fallback={null}>
-        <DrawingUnderlayPanel onClose={onClose} />
-      </Suspense>
-    );
+    case 'drawing-underlay': return <DrawingUnderlayPanel onClose={onClose} />;
   }
 }
