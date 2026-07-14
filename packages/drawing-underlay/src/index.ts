@@ -5,8 +5,7 @@
 /**
  * @ifc-lite/drawing-underlay — georeferenced 2D drawing underlays (PDF floor
  * plans) for IFC models: placement schema, 2-point similarity calibration,
- * and drawing-to-world transforms. The WebGPU textured-plane pipeline lands
- * in pdf-plane-pipeline.ts (M2).
+ * drawing-to-world transforms, and a WebGPU textured-plane pipeline.
  */
 
 export {
@@ -42,3 +41,10 @@ export {
   ZERO_OFFSET,
 } from './world-transform.js';
 export type { PlacementCorners, Vec3 } from './world-transform.js';
+
+export { PdfPlanePipeline } from './pdf-plane-pipeline.js';
+export type {
+  PdfPlanePipelineOptions,
+  PlaneImageSource,
+  PlaneInput,
+} from './pdf-plane-pipeline.js';

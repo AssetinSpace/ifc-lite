@@ -109,6 +109,9 @@ import type {
     SeparationLinesQuality,
 } from './types.js';
 import { SectionPlaneRenderer } from './section-plane.js';
+// >>> AIM-FORK: PIPELINE_CONSTANTS for getOverlayPassDescriptor's depth format.
+import { PIPELINE_CONSTANTS } from './constants.js';
+// <<< AIM-FORK
 import { packClipBox } from './clip-box.js';
 import { Section2DOverlayRenderer, type CutPolygon2D, type DrawingLine2D } from './section-2d-overlay.js';
 import {
@@ -139,6 +142,19 @@ import { buildTriangleBVH } from './deviation/triangle-bvh.js';
 
 const MAX_ENCODED_ENTITY_ID = 0xFFFFFF;
 let warnedEntityIdRange = false;
+
+// >>> AIM-FORK: external-overlay hook contract (upstream-PR candidate).
+/**
+ * A self-contained overlay pipeline registered via
+ * `Renderer.registerExternalOverlay` — drawn inside the main blended pass,
+ * beneath the symbolic annotation layer. Implementations must be
+ * pass-compatible (build them from `Renderer.getOverlayPassDescriptor()`).
+ */
+export interface ExternalOverlay {
+    hasGeometry(): boolean;
+    render(pass: GPURenderPassEncoder, viewProj: Float32Array): void;
+}
+// <<< AIM-FORK
 
 type ResolvedVisualEnhancement = {
     enabled: boolean;
@@ -198,6 +214,12 @@ export class Renderer {
     // the device exists; nulled until then.
     private symbolicFillPipeline: SymbolicFillPipeline | null = null;
     private symbolicTextPipeline: SymbolicTextPipeline | null = null;
+    // >>> AIM-FORK: generic external-overlay hook (upstream-PR candidate) —
+    // lets app-level packages (e.g. @ifc-lite/drawing-underlay) composite
+    // self-contained pipelines into the main blended pass without forking
+    // renderer internals. Keyed registry; drawn beneath the symbolic layer.
+    private externalOverlays = new Map<string, ExternalOverlay>();
+    // <<< AIM-FORK
     private postProcessor: PostProcessor | null = null;
     private readonly interactionEffects = new InteractionEffectsGovernor();
     private edlPass: EdlPass | null = null;
@@ -2579,6 +2601,12 @@ export class Renderer {
             //
             // Order: fills (background) → lines (outlines on top) →
             // texts (labels above everything).
+            // >>> AIM-FORK: external overlays draw first — underlays (e.g.
+            // georeferenced PDF drawing planes) sit beneath every annotation.
+            for (const overlay of this.externalOverlays.values()) {
+                if (overlay.hasGeometry()) overlay.render(pass, viewProj);
+            }
+            // <<< AIM-FORK
             if (this.symbolicFillPipeline?.hasGeometry()) {
                 this.symbolicFillPipeline.render(pass, viewProj);
             }
@@ -2969,6 +2997,51 @@ export class Renderer {
         this.section2DOverlayRenderer?.setOverlayLineColor(color);
         this.requestRender();
     }
+
+    // >>> AIM-FORK: external-overlay registry (upstream-PR candidate).
+    /**
+     * Register a self-contained overlay pipeline drawn inside the main
+     * blended pass, beneath the symbolic annotation layer. The overlay must
+     * be pass-compatible — build it from `getOverlayPassDescriptor()`.
+     * Re-registering an id replaces the previous overlay (caller owns
+     * destruction of the old one).
+     */
+    registerExternalOverlay(id: string, overlay: ExternalOverlay): void {
+        this.externalOverlays.set(id, overlay);
+        this.requestRender();
+    }
+
+    /** Remove an external overlay. Caller destroys the pipeline's resources. */
+    unregisterExternalOverlay(id: string): void {
+        if (this.externalOverlays.delete(id)) this.requestRender();
+    }
+
+    /**
+     * The attachment shape of the main blended pass, for constructing
+     * pass-compatible external overlay pipelines: device, presentation
+     * format, MSAA sample count, depth format, and the extra (write-masked)
+     * picker color target every pipeline in the pass must declare.
+     * `null` until the renderer is initialised.
+     */
+    getOverlayPassDescriptor(): {
+        device: GPUDevice;
+        format: GPUTextureFormat;
+        sampleCount: number;
+        depthFormat: GPUTextureFormat;
+        extraColorTargets: GPUColorTargetState[];
+    } | null {
+        if (!this.pipeline) return null;
+        return {
+            device: this.device.getDevice(),
+            format: this.device.getFormat(),
+            sampleCount: this.pipeline.getSampleCount(),
+            depthFormat: PIPELINE_CONSTANTS.DEPTH_FORMAT,
+            // The objectId picker slot; write-masked off so overlay draws
+            // never clobber picking of the geometry underneath.
+            extraColorTargets: [{ format: 'rgba8unorm', writeMask: 0 }],
+        };
+    }
+    // <<< AIM-FORK
 
     /**
      * Upload pre-lifted 3D line-list vertices for the standalone annotation

@@ -26,6 +26,7 @@ import { createDataSlice, type DataSlice } from './slices/dataSlice.js';
 import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
 import { createMutationSlice, type MutationSlice } from './slices/mutationSlice.js';
 import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSlice.js';
+import { createDrawingUnderlaySlice, type DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
@@ -77,6 +78,7 @@ export type { ForwardModelMapLike } from './globalId.js';
 
 // Re-export Drawing2D types
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
+export type { UnderlayDrawing, UnderlayCalibrationDraft, DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 
 // Re-export Sheet types
 export type { SheetState } from './slices/sheetSlice.js';
@@ -141,6 +143,7 @@ export type ViewerState = LoadingSlice &
   ModelSlice &
   MutationSlice &
   Drawing2DSlice &
+  DrawingUnderlaySlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
@@ -228,6 +231,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createModelSlice(...args),
   ...createMutationSlice(...args),
   ...createDrawing2DSlice(...args),
+  ...createDrawingUnderlaySlice(...args),
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
@@ -388,6 +392,12 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       cesiumPlacementEditMode: false,
       cesiumPlacementDraftModelId: null,
       cesiumPlacementDraft: null,
+
+      // Drawing underlays (D-072) — the host re-sends its drawing list after
+      // the next MODELS_LOADED, so a model swap starts from a clean slate.
+      underlayDrawings: new Map(),
+      underlayCalibration: null,
+      underlayPanelVisible: false,
 
       // Drawing 2D
       drawing2D: null,

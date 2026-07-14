@@ -49,6 +49,7 @@ import { useSpaceMouseControls } from './useSpaceMouseControls.js';
 import { useAnimationLoop } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
 import { usePointCloudSync } from './usePointCloudSync.js';
+import { useDrawingUnderlay } from '@/hooks/useDrawingUnderlay';
 import { usePointCloudLifecycle } from './usePointCloudLifecycle.js';
 import { useRenderUpdates } from './useRenderUpdates.js';
 import {
@@ -1357,6 +1358,10 @@ export function Viewport({
     pointClouds,
     hasMeshes: (geometry?.length ?? 0) > 0,
   });
+
+  // Georeferenced PDF drawing underlays (D-072) — syncs calibrated
+  // placements from the store into a PdfPlanePipeline external overlay.
+  useDrawingUnderlay({ rendererRef, isInitialized });
 
   usePointCloudLifecycle({
     rendererRef,
