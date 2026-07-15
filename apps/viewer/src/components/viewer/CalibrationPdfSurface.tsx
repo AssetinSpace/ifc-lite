@@ -14,13 +14,16 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ZoomIn, ZoomOut } from 'lucide-react';
+import { Magnet, ZoomIn, ZoomOut } from 'lucide-react';
 import type { Point2 } from '@ifc-lite/drawing-underlay';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
+import { snapToDrawingFeature } from '@/lib/pdf/snap';
 
-const RASTER_PX = 2000;
+/** Base raster (zoom 1) and the ceiling for zoomed re-rasters. */
+const RASTER_PX = 2400;
+const RASTER_MAX_PX = 8192;
 
 interface PreviewState {
   canvas: HTMLCanvasElement;
@@ -50,6 +53,9 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [pdfZoom, setPdfZoom] = useState(1);
   const [pdfPan, setPdfPan] = useState({ x: 0, y: 0 });
+  const [magnetOn, setMagnetOn] = useState(true);
+  /** Longest raster edge currently on screen — re-rastered as zoom grows. */
+  const [rasterPx, setRasterPx] = useState(RASTER_PX);
 
   const clipRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -58,37 +64,86 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
   useEffect(() => {
     setPdfZoom(1);
     setPdfPan({ x: 0, y: 0 });
+    setRasterPx(RASTER_PX);
   }, [calibration?.drawingId, calibration?.page]);
 
-  const zoomTo = useCallback((next: number) => {
-    const clamped = Math.min(8, Math.max(1, next));
+  /** Zoom about a fixed point in clip-container coordinates. */
+  const zoomAt = useCallback((next: number, cx: number, cy: number) => {
+    const clamped = Math.min(12, Math.max(1, next));
     setPdfZoom((prev) => {
+      if (clamped === prev) return prev;
       if (clamped === 1) {
         setPdfPan({ x: 0, y: 0 });
         return 1;
       }
-      const clip = clipRef.current;
-      const cw = (clip?.clientWidth ?? 0) / 2;
-      const ch = (clip?.clientHeight ?? 0) / 2;
       setPdfPan((pan) => ({
-        x: cw - ((cw - pan.x) * clamped) / prev,
-        y: ch - ((ch - pan.y) * clamped) / prev,
+        x: cx - ((cx - pan.x) * clamped) / prev,
+        y: cy - ((cy - pan.y) * clamped) / prev,
       }));
       return clamped;
     });
   }, []);
 
-  // Rasterize the page (once per drawing/page).
+  const zoomTo = useCallback(
+    (next: number) => {
+      const clip = clipRef.current;
+      zoomAt(next, (clip?.clientWidth ?? 0) / 2, (clip?.clientHeight ?? 0) / 2);
+    },
+    [zoomAt],
+  );
+
+  // Wheel zoom-to-cursor. Native listener with passive: false — React's
+  // synthetic onWheel can't reliably preventDefault, and the page would
+  // scroll instead of zooming (live report).
   useEffect(() => {
-    setPreview(null);
+    const clip = clipRef.current;
+    if (!clip) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = clip.getBoundingClientRect();
+      setPdfZoom((prev) => {
+        const next = Math.min(12, Math.max(1, prev * Math.exp(-e.deltaY * 0.0018)));
+        if (next === prev) return prev;
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        if (next === 1) {
+          setPdfPan({ x: 0, y: 0 });
+          return 1;
+        }
+        setPdfPan((pan) => ({
+          x: cx - ((cx - pan.x) * next) / prev,
+          y: cy - ((cy - pan.y) * next) / prev,
+        }));
+        return next;
+      });
+    };
+    clip.addEventListener('wheel', onWheel, { passive: false });
+    return () => clip.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Sharp re-raster once a zoom gesture settles: the on-screen pixel density
+  // should track the zoom, else the page reads blurry (live report). CSS
+  // keeps scaling the old canvas meanwhile, so there is no flash.
+  useEffect(() => {
+    const target = Math.min(RASTER_MAX_PX, Math.ceil((RASTER_PX * pdfZoom) / 1024) * 1024);
+    if (target === rasterPx) return;
+    const timer = setTimeout(() => setRasterPx(target), 280);
+    return () => clearTimeout(timer);
+  }, [pdfZoom, rasterPx]);
+
+  // Rasterize the page (per drawing/page, and re-raster as zoom deepens).
+  useEffect(() => {
     setPreviewError(null);
-    if (!calibration || !drawing) return;
+    if (!calibration || !drawing) {
+      setPreview(null);
+      return;
+    }
     let stale = false;
     void (async () => {
       try {
         const doc = await openPdfDocument(drawing.pdfUrl);
         try {
-          const raster = await rasterizePdfPage(doc, calibration.page, RASTER_PX, RASTER_PX);
+          const raster = await rasterizePdfPage(doc, calibration.page, rasterPx, rasterPx);
           if (stale) {
             raster.image.close();
             return;
@@ -112,7 +167,7 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
       stale = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [calibration?.drawingId, calibration?.page, drawing?.pdfUrl]);
+  }, [calibration?.drawingId, calibration?.page, drawing?.pdfUrl, rasterPx]);
 
   // Mount the rasterized canvas into the host.
   useEffect(() => {
@@ -135,14 +190,24 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
       const nx = (clientX - rect.left) / rect.width;
       const ny = (clientY - rect.top) / rect.height;
       if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
-      const rasterX = nx * preview.canvas.width;
-      const rasterY = ny * preview.canvas.height;
+      let rasterX = nx * preview.canvas.width;
+      let rasterY = ny * preview.canvas.height;
+      if (magnetOn) {
+        // Magnet: snap onto nearby linework/intersections. The search radius
+        // shrinks with zoom in page terms (fixed in raster px), so a zoomed-in
+        // pick stays a precise pick.
+        const snapped = snapToDrawingFeature(preview.canvas, rasterX, rasterY, 18);
+        if (snapped) {
+          rasterX = snapped.x;
+          rasterY = snapped.y;
+        }
+      }
       addPagePoint({
         x: rasterX / preview.pixelsPerPoint,
         y: (preview.canvas.height - rasterY) / preview.pixelsPerPoint,
       });
     },
-    [calibration, preview, awaiting, addPagePoint],
+    [calibration, preview, awaiting, addPagePoint, magnetOn],
   );
 
   const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
@@ -216,10 +281,16 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
               return style ? (
                 <span
                   key={i}
-                  className="pointer-events-none absolute z-20 flex size-4 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-bold text-white ring-2 ring-background"
-                  style={{ ...style, transform: `translate(-50%, -50%) scale(${1 / pdfZoom})` }}
+                  className="pointer-events-none absolute z-20"
+                  style={{ ...style, transform: `scale(${1 / pdfZoom})` }}
                 >
-                  {i === 0 ? 'A' : 'B'}
+                  {/* Thin crosshair marks the EXACT picked point... */}
+                  <span className="absolute -left-px -top-3 block h-6 w-0.5 bg-emerald-600" />
+                  <span className="absolute -left-3 -top-px block h-0.5 w-6 bg-emerald-600" />
+                  {/* ...and the letter ball hangs below so it never covers it. */}
+                  <span className="absolute -left-2 top-2.5 flex size-4 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-bold text-white ring-2 ring-background">
+                    {i === 0 ? 'A' : 'B'}
+                  </span>
                 </span>
               ) : null;
             })}
@@ -234,9 +305,19 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
         </Button>
         {pdfZoom > 1 && (
           <button className="rounded px-1 text-[10px] text-muted-foreground hover:bg-muted" onClick={() => zoomTo(1)}>
-            {pdfZoom}× reset
+            {Math.round(pdfZoom * 10) / 10}× reset
           </button>
         )}
+        <Button
+          variant={magnetOn ? 'default' : 'ghost'}
+          size="icon"
+          className="size-6"
+          onClick={() => setMagnetOn((v) => !v)}
+          aria-label={magnetOn ? 'Magnet snapping on' : 'Magnet snapping off'}
+          title="Magnet: snap picks onto nearby lines and intersections"
+        >
+          <Magnet className="size-3.5" aria-hidden />
+        </Button>
         <span className="flex-1 text-right text-[10px] text-muted-foreground">
           PDF {calibration.pagePoints.length}/2 · model {calibration.modelPoints.length}/2
         </span>

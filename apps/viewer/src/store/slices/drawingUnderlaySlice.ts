@@ -94,6 +94,12 @@ export interface DrawingUnderlaySlice {
   /** Commit a placement (calibration save / host update) and notify the host. */
   setUnderlayPlacement: (id: string, placement: DrawingPlacement) => void;
   /**
+   * Live placement update — store + GPU only, NO host save. Fine-tune nudge
+   * controls call this per step and persist once via
+   * `commitUnderlayPlacement` when the adjustment session ends.
+   */
+  updateUnderlayPlacementLive: (id: string, placement: DrawingPlacement) => void;
+  /**
    * Live opacity update — store + GPU only, NO host save. Continuous inputs
    * (slider drag) call this per tick and persist once via
    * `commitUnderlayPlacement` on release, so a drag can't flood the host's
@@ -205,6 +211,12 @@ export const createDrawingUnderlaySlice: StateCreator<
         state.underlayCalibration?.drawingId === id ? null : state.underlayCalibration,
     }));
     get().underlaySaveHandler?.(id, placement);
+  },
+
+  updateUnderlayPlacementLive: (id, placement) => {
+    set((state) => ({
+      underlayDrawings: withDrawing(state.underlayDrawings, id, (d) => ({ ...d, placement })),
+    }));
   },
 
   setUnderlayOpacity: (id, opacity) => {

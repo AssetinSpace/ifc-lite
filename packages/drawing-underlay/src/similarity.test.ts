@@ -5,7 +5,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  adjustAffine,
   applyAffine,
+  composeAffine,
   invertAffine,
   similarityRotation,
   similarityScale,
@@ -119,6 +121,51 @@ describe('solveSimilarityFromCalibration', () => {
         pair({ x: 10, y: 0 }, { x: 4, y: 4 }),
       ]),
     ).toThrow(/model points/);
+  });
+});
+
+describe('composeAffine / adjustAffine', () => {
+  const base: Affine2x3 = [0.05, 0, 2, 0, 0.05, 3]; // 1:20-ish plan at (2,3)
+
+  it('composeAffine applies right-hand side first', () => {
+    const translate: Affine2x3 = [1, 0, 10, 0, 1, -5];
+    const composed = composeAffine(translate, base);
+    expectPointClose(applyAffine(composed, { x: 0, y: 0 }), { x: 12, y: -2 });
+    expectPointClose(
+      applyAffine(composed, { x: 100, y: 0 }),
+      { x: applyAffine(base, { x: 100, y: 0 }).x + 10, y: -2 },
+    );
+  });
+
+  it('adjustAffine translate shifts the placement in model metres', () => {
+    const moved = adjustAffine(base, { translate: { x: 0.5, y: -0.25 } });
+    expectPointClose(applyAffine(moved, { x: 40, y: 40 }), {
+      x: applyAffine(base, { x: 40, y: 40 }).x + 0.5,
+      y: applyAffine(base, { x: 40, y: 40 }).y - 0.25,
+    });
+  });
+
+  it('adjustAffine rotates about the given model-space centre (pivot fixed)', () => {
+    const c = applyAffine(base, { x: 50, y: 50 });
+    const rot = adjustAffine(base, { rotateRad: Math.PI / 2, center: c });
+    // The pivot's page preimage still maps to the pivot.
+    expectPointClose(applyAffine(rot, { x: 50, y: 50 }), c);
+    // A point 1 page-unit right of the pivot swings 90° CCW: offset (s,0)→(0,s).
+    const p = applyAffine(rot, { x: 51, y: 50 });
+    expect(p.x - c.x).toBeCloseTo(0, 9);
+    expect(p.y - c.y).toBeCloseTo(0.05, 9);
+    // Similarity properties preserved.
+    expect(similarityScale(rot)).toBeCloseTo(0.05, 9);
+    expect(similarityRotation(rot)).toBeCloseTo(Math.PI / 2, 9);
+  });
+
+  it('adjustAffine scales about the centre (pivot fixed, scale multiplied)', () => {
+    const c = applyAffine(base, { x: 50, y: 50 });
+    const scaled = adjustAffine(base, { scaleFactor: 2, center: c });
+    expectPointClose(applyAffine(scaled, { x: 50, y: 50 }), c);
+    expect(similarityScale(scaled)).toBeCloseTo(0.1, 9);
+    const p = applyAffine(scaled, { x: 51, y: 50 });
+    expect(p.x - c.x).toBeCloseTo(0.1, 9);
   });
 });
 
