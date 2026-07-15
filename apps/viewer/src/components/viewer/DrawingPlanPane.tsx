@@ -19,10 +19,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import {
+  applyAffine,
   ifcMetresToPage,
   ifcToWorld,
+  invertAffine,
   pageToIfcMetres,
-  similarityRotation,
   worldToIfcMetres,
   type Point2,
 } from '@ifc-lite/drawing-underlay';
@@ -154,8 +155,28 @@ export function DrawingPlanPane() {
     if (!vp) return null;
     const ifc = worldToIfcMetres(vp.target, offset);
     let page: Point2;
+    let angleDeg: number;
     try {
       page = ifcMetresToPage(drawing.placement.affine, ifc);
+      // View direction, derived from the actual camera vectors (no azimuth
+      // sign conventions): horizontal forward in world XZ; near-top-down
+      // views degenerate, so fall back to the camera's up vector (= screen
+      // up on the map).
+      let fx = vp.target.x - vp.position.x;
+      let fz = vp.target.z - vp.position.z;
+      if (Math.hypot(fx, fz) < 1e-3) {
+        fx = vp.up.x;
+        fz = vp.up.z;
+      }
+      // world → IFC plan direction (ifcY = -worldZ), then IFC → page through
+      // the inverse affine's linear part (translation cancelled out).
+      const inv = invertAffine(drawing.placement.affine);
+      const o = applyAffine(inv, { x: 0, y: 0 });
+      const q = applyAffine(inv, { x: fx, y: -fz });
+      const pdx = q.x - o.x;
+      const pdy = q.y - o.y;
+      // Page y-up → screen y-down; the cone points "up" at 0°, CSS rotates CW.
+      angleDeg = (Math.atan2(pdx, pdy) * 180) / Math.PI;
     } catch {
       return null;
     }
@@ -164,8 +185,6 @@ export function DrawingPlanPane() {
     const left = (page.x / w) * 100;
     const top = ((h - page.y) / h) * 100;
     if (left < -5 || left > 105 || top < -5 || top > 105) return null;
-    const drawingRotDeg = (similarityRotation(drawing.placement.affine) * 180) / Math.PI;
-    const angleDeg = -(cameraRotation.azimuth - drawingRotDeg);
     return { left, top, angleDeg };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawing, offset, cameraRotation.azimuth, frameTick]);
@@ -195,25 +214,30 @@ export function DrawingPlanPane() {
             <div ref={hostRef} className="h-full w-full" />
             {marker && (
               <span
-                className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-1/2"
+                className="pointer-events-none absolute z-10"
                 style={{ left: `${marker.left}%`, top: `${marker.top}%` }}
               >
-                <span
-                  className="absolute left-1/2 top-1/2 block h-0 w-0"
-                  style={{ transform: `translate(-50%, -50%) rotate(${marker.angleDeg}deg)` }}
+                {/* Dalux-style view cone: a translucent ~55° sector showing
+                    where the 3D camera looks, rotating with it. */}
+                <svg
+                  width="88"
+                  height="88"
+                  viewBox="-44 -44 88 88"
+                  className="absolute"
+                  style={{
+                    left: '-44px',
+                    top: '-44px',
+                    transform: `rotate(${marker.angleDeg}deg)`,
+                  }}
                 >
-                  <span
-                    className="absolute block"
-                    style={{
-                      left: '-7px',
-                      top: '-18px',
-                      borderLeft: '7px solid transparent',
-                      borderRight: '7px solid transparent',
-                      borderBottom: '11px solid rgb(16 185 129 / 0.55)',
-                    }}
+                  <path
+                    d="M 0 0 L -19 -38 A 42.5 42.5 0 0 1 19 -38 Z"
+                    fill="rgb(16 185 129 / 0.30)"
+                    stroke="rgb(16 185 129 / 0.55)"
+                    strokeWidth="1"
                   />
-                </span>
-                <span className="block size-3.5 rounded-full border-2 border-background bg-emerald-500 shadow" />
+                </svg>
+                <span className="absolute -left-[7px] -top-[7px] block size-3.5 rounded-full border-2 border-background bg-emerald-500 shadow" />
               </span>
             )}
           </div>
