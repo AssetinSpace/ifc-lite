@@ -71,6 +71,20 @@ export interface UnderlayDrawingWire {
   georef?: unknown;
 }
 
+/**
+ * One reality-capture pin pushed by the host (D-073): a capture point with its
+ * world-space position (viewer Y-up frame), kind (photo vs 360° panorama) and an
+ * optional thumbnail. Clicking it in 3D bounces `CAPTURE_PIN_CLICK` back so the
+ * host opens the gallery / panorama.
+ */
+export interface CapturePinWire {
+  id: string;
+  kind: 'photo' | 'pano360';
+  world: { x: number; y: number; z: number };
+  name?: string;
+  thumbUrl?: string;
+}
+
 export type InboundMessage =
   | { source: typeof SOURCE; type: 'FOCUS'; guids: string[] }
   | { source: typeof SOURCE; type: 'HIGHLIGHT_FILTER'; guids: string[] }
@@ -89,7 +103,10 @@ export type InboundMessage =
   | { source: typeof SOURCE; type: 'AIM_PANEL_EMPTY'; guid: string; reason: string }
   // Georeferenced PDF underlays (D-072): the host pushes its drawing list
   // (documents linked to storeys + persisted _georef) after MODELS_LOADED.
-  | { source: typeof SOURCE; type: 'UNDERLAYS_LOAD'; drawings: UnderlayDrawingWire[] };
+  | { source: typeof SOURCE; type: 'UNDERLAYS_LOAD'; drawings: UnderlayDrawingWire[] }
+  // Reality Capture pins (D-073): the host pushes capture points with world
+  // coords after MODELS_LOADED; the viewer billboards them over the canvas.
+  | { source: typeof SOURCE; type: 'CAPTURES_LOAD'; captures: CapturePinWire[] };
 
 export type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
@@ -101,7 +118,10 @@ export type OutboundMessage =
   | { source: typeof SOURCE; type: 'AIM_NAVIGATE'; href: string }
   // A drawing was (re)calibrated in the viewer — the host persists the
   // serialized _georef v1 JSON on the document (D-072).
-  | { source: typeof SOURCE; type: 'UNDERLAY_SAVE'; documentId: string; georef: unknown };
+  | { source: typeof SOURCE; type: 'UNDERLAY_SAVE'; documentId: string; georef: unknown }
+  // A reality-capture pin was clicked in 3D (D-073) — the host opens the
+  // capture's gallery / 360° panorama for the given capture point id.
+  | { source: typeof SOURCE; type: 'CAPTURE_PIN_CLICK'; captureId: string };
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.
@@ -148,6 +168,25 @@ function isUnderlayDrawingWire(v: unknown): v is UnderlayDrawingWire {
   );
 }
 
+/**
+ * One capture pin must carry a non-empty id, a known kind and finite world
+ * coordinates; name/thumbUrl are optional. Malformed entries are dropped so a
+ * bad host payload can't crash the billboard projection loop.
+ */
+function isCapturePinWire(v: unknown): v is CapturePinWire {
+  if (!v || typeof v !== 'object') return false;
+  const c = v as { id?: unknown; kind?: unknown; world?: unknown };
+  if (typeof c.id !== 'string' || c.id.length === 0) return false;
+  if (c.kind !== 'photo' && c.kind !== 'pano360') return false;
+  const w = c.world as { x?: unknown; y?: unknown; z?: unknown } | undefined;
+  if (!w || typeof w !== 'object') return false;
+  return (
+    Number.isFinite(w.x as number) &&
+    Number.isFinite(w.y as number) &&
+    Number.isFinite(w.z as number)
+  );
+}
+
 export function isInboundMessage(data: unknown): data is InboundMessage {
   if (!data || typeof data !== 'object') return false;
   const msg = data as {
@@ -160,6 +199,7 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
     data?: unknown;
     reason?: unknown;
     drawings?: unknown;
+    captures?: unknown;
   };
   if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
   switch (msg.type) {
@@ -183,6 +223,8 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
       return typeof msg.guid === 'string' && typeof msg.reason === 'string';
     case 'UNDERLAYS_LOAD':
       return Array.isArray(msg.drawings) && msg.drawings.every(isUnderlayDrawingWire);
+    case 'CAPTURES_LOAD':
+      return Array.isArray(msg.captures) && msg.captures.every(isCapturePinWire);
     default:
       // Unknown type — not a message this bridge version handles.
       return false;

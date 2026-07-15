@@ -112,6 +112,35 @@ describe('isInboundMessage', () => {
       false, // missing pdfUrl
     );
   });
+
+  it('accepts and validates CAPTURES_LOAD (D-073)', () => {
+    const pin = { id: 'c1', kind: 'photo', world: { x: 1, y: 2, z: 3 } };
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [] }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [pin] }));
+    assert.ok(isInboundMessage({
+      source: SOURCE,
+      type: 'CAPTURES_LOAD',
+      captures: [{ ...pin, kind: 'pano360', name: 'Vstup', thumbUrl: 'https://x/t.jpg' }],
+    }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD' }), false); // no captures
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: 'x' }), false);
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [{ kind: 'photo', world: { x: 0, y: 0, z: 0 } }] }),
+      false, // missing id
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [{ id: 'c', kind: 'video', world: { x: 0, y: 0, z: 0 } }] }),
+      false, // bad kind
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [{ id: 'c', kind: 'photo', world: { x: 0, y: 0 } }] }),
+      false, // incomplete world
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [{ id: 'c', kind: 'photo', world: { x: Infinity, y: 0, z: 0 } }] }),
+      false, // non-finite world
+    );
+  });
 });
 
 describe('resolveGuids', () => {
