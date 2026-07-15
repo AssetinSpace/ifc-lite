@@ -16,6 +16,10 @@
  *
  * Same rAF + procedural-SVG, `pointer-events: none` pattern as
  * CalibrationOverlay3D / BasepointOverlay.
+ *
+ * Hidden in walk mode: there the user IS the marker (street-view semantics),
+ * so a ball floating at their own position would only block the view — the
+ * 2D pane still shows position + look direction.
  */
 
 import { useEffect, useRef } from 'react';
@@ -27,7 +31,9 @@ import { totalYupOffset } from '@/lib/geo/ifc-origin';
 const MARKER_COLOR = '#10b981'; // emerald-500, matches the 2D pane marker
 
 export function DrawingLocationOverlay3D() {
-  const active = useViewerStore((s) => s.underlaySplitView);
+  const splitView = useViewerStore((s) => s.underlaySplitView);
+  const walkMode = useViewerStore((s) => s.activeTool === 'walk');
+  const active = splitView && !walkMode;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);

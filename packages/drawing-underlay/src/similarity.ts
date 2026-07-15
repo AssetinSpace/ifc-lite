@@ -82,6 +82,56 @@ export function similarityRotation(m: Affine2x3): number {
   return Math.atan2(m[3], m[0]);
 }
 
+/** Compose two affines: result applies `a` first, then `b` (b ∘ a). */
+export function composeAffine(b: Affine2x3, a: Affine2x3): Affine2x3 {
+  return [
+    b[0] * a[0] + b[1] * a[3],
+    b[0] * a[1] + b[1] * a[4],
+    b[0] * a[2] + b[1] * a[5] + b[2],
+    b[3] * a[0] + b[4] * a[3],
+    b[3] * a[1] + b[4] * a[4],
+    b[3] * a[2] + b[4] * a[5] + b[5],
+  ];
+}
+
+/**
+ * Fine-tune a placement affine (page → IFC metres) in MODEL space:
+ * translate by metres, rotate by radians and/or scale by a factor about a
+ * model-space centre point. Used by numeric nudge controls, so a placed
+ * drawing can be adjusted without re-picking calibration points.
+ */
+export function adjustAffine(
+  affine: Affine2x3,
+  adjust: {
+    /** Translation in IFC metres. */
+    translate?: Point2;
+    /** CCW rotation in radians about `center`. */
+    rotateRad?: number;
+    /** Uniform scale factor about `center`. */
+    scaleFactor?: number;
+    /** Model-space pivot for rotate/scale (default: affine's image of (0,0)). */
+    center?: Point2;
+  },
+): Affine2x3 {
+  const c = adjust.center ?? applyAffine(affine, { x: 0, y: 0 });
+  let out = affine;
+  if (adjust.rotateRad || (adjust.scaleFactor !== undefined && adjust.scaleFactor !== 1)) {
+    const s = adjust.scaleFactor ?? 1;
+    const cos = Math.cos(adjust.rotateRad ?? 0) * s;
+    const sin = Math.sin(adjust.rotateRad ?? 0) * s;
+    // T(c) · R·S · T(-c), post-applied in model space.
+    const m: Affine2x3 = [
+      cos, -sin, c.x - cos * c.x + sin * c.y,
+      sin, cos, c.y - sin * c.x - cos * c.y,
+    ];
+    out = composeAffine(m, out);
+  }
+  if (adjust.translate) {
+    out = [out[0], out[1], out[2] + adjust.translate.x, out[3], out[4], out[5] + adjust.translate.y];
+  }
+  return out;
+}
+
 /**
  * Solve the proper similarity (uniform scale + rotation + translation) that
  * maps the two `page` points onto the two `model` points exactly.

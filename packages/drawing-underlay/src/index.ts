@@ -9,7 +9,9 @@
  */
 
 export {
+  adjustAffine,
   applyAffine,
+  composeAffine,
   invertAffine,
   similarityRotation,
   similarityScale,

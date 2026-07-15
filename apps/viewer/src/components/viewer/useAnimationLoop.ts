@@ -34,13 +34,16 @@ function underlayCutPlane(
   cutY: number | null,
   bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null,
 ):
-  | { axis: 'down'; position: number; enabled: true; flipped: false; showCap: true; showOutlines: true }
+  | { axis: 'down'; position: number; enabled: true; flipped: false; showCap: false; showOutlines: true }
   | undefined {
   if (cutY === null || !bounds) return undefined;
   const range = bounds.max.y - bounds.min.y;
   if (!(range > 0)) return undefined;
   const position = Math.max(0, Math.min(100, ((cutY - bounds.min.y) / range) * 100));
-  return { axis: 'down', position, enabled: true, flipped: false, showCap: true, showOutlines: true };
+  // No cap fills: the PDF underlay draws depth-always + translucent, so the
+  // grey hatched cap surfaces would shine through it as blotches (live
+  // report). Outlines stay — the cut still reads clearly, plan-style.
+  return { axis: 'down', position, enabled: true, flipped: false, showCap: false, showOutlines: true };
 }
 
 export interface UseAnimationLoopParams {

@@ -19,23 +19,34 @@
  * interception in selectionHandlers.ts as IFC plan metres.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Crosshair,
   Eye,
   EyeOff,
   FilePlus2,
   Map as MapIcon,
   Maximize2,
+  Move,
+  RotateCcw,
+  RotateCw,
   Trash2,
   Undo2,
   X,
 } from 'lucide-react';
 import {
+  adjustAffine,
+  applyAffine,
   createDrawingPlacement,
   similarityRotation,
+  similarityScale,
   solveSimilarityFromCalibration,
   type CalibrationPair,
+  type DrawingPlacement,
 } from '@ifc-lite/drawing-underlay';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -393,6 +404,7 @@ function DrawingRow({
   onRemove: () => void;
 }) {
   const p = drawing.placement;
+  const [fineTune, setFineTune] = useState(false);
   return (
     <div className={`rounded border p-2 ${calibrating ? 'ring-1 ring-primary/50' : ''}`}>
       <div className="flex items-center gap-1.5">
@@ -443,6 +455,17 @@ function DrawingRow({
           {p ? 'Recalibrate' : 'Calibrate'}
         </Button>
         {p && (
+          <Button
+            variant={fineTune ? 'default' : 'ghost'}
+            size="sm"
+            className="h-6 px-2 text-[11px]"
+            onClick={() => setFineTune((v) => !v)}
+            title="Nudge the placed drawing numerically (move / rotate / scale)"
+          >
+            <Move className="mr-1 size-3" aria-hidden /> Fine-tune
+          </Button>
+        )}
+        {p && (
           <>
             <span className="text-[10px] text-muted-foreground">Opacity</span>
             <input
@@ -460,6 +483,144 @@ function DrawingRow({
             />
           </>
         )}
+      </div>
+      {p && fineTune && <FineTuneControls drawingId={drawing.id} placement={p} />}
+    </div>
+  );
+}
+
+/**
+ * Numeric fine-tuning of a placed drawing (D-072 live feedback): nudge the
+ * placement without re-picking calibration points — move by a chosen step in
+ * plan metres, rotate in degrees about the page centre, or type an exact
+ * drawing scale (1:N). Updates are live (store + GPU only); the placement is
+ * persisted once, debounced, after the last nudge.
+ */
+function FineTuneControls({
+  drawingId,
+  placement,
+}: {
+  drawingId: string;
+  placement: DrawingPlacement;
+}) {
+  const updateLive = useViewerStore((s) => s.updateUnderlayPlacementLive);
+  const commitPlacement = useViewerStore((s) => s.commitUnderlayPlacement);
+
+  const [moveStep, setMoveStep] = useState(0.05);
+  const [rotStep, setRotStep] = useState(0.1);
+  // Derived drawing scale: model mm per paper mm (1 pt = 25.4/72 mm).
+  const currentDen = (similarityScale(placement.affine) * 1000 * 72) / 25.4;
+  const [scaleInput, setScaleInput] = useState(String(Math.round(currentDen * 10) / 10));
+
+  const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleCommit = useCallback(() => {
+    if (commitTimer.current) clearTimeout(commitTimer.current);
+    commitTimer.current = setTimeout(() => commitPlacement(drawingId), 1000);
+  }, [commitPlacement, drawingId]);
+  useEffect(() => () => {
+    // Unmount mid-session: persist immediately rather than dropping the edit.
+    if (commitTimer.current) {
+      clearTimeout(commitTimer.current);
+      commitPlacement(drawingId);
+    }
+  }, [commitPlacement, drawingId]);
+
+  const apply = useCallback(
+    (adjust: Parameters<typeof adjustAffine>[1]) => {
+      const [w, h] = placement.pageSize;
+      const center = applyAffine(placement.affine, { x: w / 2, y: h / 2 });
+      const affine = adjustAffine(placement.affine, { ...adjust, center: adjust.center ?? center });
+      updateLive(drawingId, { ...placement, affine });
+      scheduleCommit();
+    },
+    [drawingId, placement, updateLive, scheduleCommit],
+  );
+
+  return (
+    <div className="mt-1.5 flex flex-col gap-1.5 rounded border bg-muted/30 p-1.5">
+      <div className="flex items-center gap-1">
+        <span className="w-10 text-[10px] text-muted-foreground">Move</span>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Move left"
+          onClick={() => apply({ translate: { x: -moveStep, y: 0 } })}>
+          <ChevronLeft className="size-3.5" aria-hidden />
+        </Button>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Move right"
+          onClick={() => apply({ translate: { x: moveStep, y: 0 } })}>
+          <ChevronRight className="size-3.5" aria-hidden />
+        </Button>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Move up (plan north)"
+          onClick={() => apply({ translate: { x: 0, y: moveStep } })}>
+          <ChevronUp className="size-3.5" aria-hidden />
+        </Button>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Move down (plan south)"
+          onClick={() => apply({ translate: { x: 0, y: -moveStep } })}>
+          <ChevronDown className="size-3.5" aria-hidden />
+        </Button>
+        <select
+          className="h-5 rounded border bg-background px-0.5 text-[10px]"
+          value={moveStep}
+          onChange={(e) => setMoveStep(Number(e.target.value))}
+          aria-label="Move step"
+        >
+          <option value={0.01}>1 cm</option>
+          <option value={0.05}>5 cm</option>
+          <option value={0.25}>25 cm</option>
+          <option value={1}>1 m</option>
+        </select>
+      </div>
+      <div className="flex items-center gap-1">
+        <span className="w-10 text-[10px] text-muted-foreground">Rotate</span>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Rotate counter-clockwise"
+          onClick={() => apply({ rotateRad: (rotStep * Math.PI) / 180 })}>
+          <RotateCcw className="size-3.5" aria-hidden />
+        </Button>
+        <Button variant="ghost" size="icon" className="size-6" aria-label="Rotate clockwise"
+          onClick={() => apply({ rotateRad: (-rotStep * Math.PI) / 180 })}>
+          <RotateCw className="size-3.5" aria-hidden />
+        </Button>
+        <select
+          className="h-5 rounded border bg-background px-0.5 text-[10px]"
+          value={rotStep}
+          onChange={(e) => setRotStep(Number(e.target.value))}
+          aria-label="Rotate step"
+        >
+          <option value={0.05}>0.05°</option>
+          <option value={0.1}>0.1°</option>
+          <option value={0.5}>0.5°</option>
+          <option value={5}>5°</option>
+          <option value={90}>90°</option>
+        </select>
+        <span className="flex-1 text-right text-[10px] text-muted-foreground">
+          now {(similarityRotation(placement.affine) * 180 / Math.PI).toFixed(2)}°
+        </span>
+      </div>
+      <div className="flex items-center gap-1">
+        <span className="w-10 text-[10px] text-muted-foreground">Scale</span>
+        <span className="text-[10px] text-muted-foreground">1:</span>
+        <input
+          type="number"
+          min={1}
+          step={1}
+          value={scaleInput}
+          onChange={(e) => setScaleInput(e.target.value)}
+          className="h-5 w-16 rounded border bg-background px-1 text-[10px]"
+          aria-label="Drawing scale denominator"
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-5 px-1.5 text-[10px]"
+          onClick={() => {
+            const target = Number(scaleInput);
+            if (!Number.isFinite(target) || target <= 0) return;
+            apply({ scaleFactor: target / currentDen });
+          }}
+        >
+          Set
+        </Button>
+        <span className="flex-1 text-right text-[10px] text-muted-foreground">
+          now ≈ 1:{Math.round(currentDen * 10) / 10}
+        </span>
       </div>
     </div>
   );

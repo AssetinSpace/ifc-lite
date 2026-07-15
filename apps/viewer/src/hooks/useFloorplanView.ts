@@ -136,12 +136,20 @@ export function useFloorplanView() {
 
   const enterDrawingView = useCallback((storey: StoreyInfo) => {
     const state = useViewerStore.getState();
+    const guid = storeyGuidFor(storey);
+    // Idempotent: re-entering the view already active (e.g. Recalibrate on
+    // the same storey) must not re-apply the projection/preset — repeated
+    // top presets visibly spin the view (live report).
+    const alreadyThere =
+      state.underlayViewLocked && state.underlayActiveStoreyGuid === guid;
     state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayViewLocked(true);
     state.setUnderlaySplitView(false);
-    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
-    setProjectionMode('orthographic');
-    cameraCallbacks.setPresetView?.('top');
+    state.setUnderlayActiveStoreyGuid(guid);
+    if (!alreadyThere) {
+      setProjectionMode('orthographic');
+      cameraCallbacks.setPresetView?.('top');
+    }
   }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
 
   /** Leave the drawing view: remove the cut, unlock the camera. */
