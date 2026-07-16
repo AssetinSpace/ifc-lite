@@ -133,6 +133,36 @@ export function adjustAffine(
 }
 
 /**
+ * Build the proper similarity from ONE anchor correspondence plus an explicit
+ * scale and rotation — the "1 point + scale + angle" calibration. The anchor
+ * page point maps exactly onto the anchor model point; `scale` is model
+ * metres per PDF page point; `rotationRad` is CCW.
+ *
+ * Unlike the 2-point solve, nothing is measured: scale typically comes from
+ * the drawing's title block (1:N) and rotation is usually 0° (plan drawn
+ * parallel to the model axes), so a single unambiguous pivot point fully
+ * determines the placement — no angular error amplified by a short pick span.
+ */
+export function similarityFromAnchor(
+  anchor: CalibrationPair,
+  scale: number,
+  rotationRad: number,
+): Affine2x3 {
+  if (!Number.isFinite(scale) || scale <= 0) {
+    throw new Error(`similarityFromAnchor: scale must be a positive number (got ${scale})`);
+  }
+  if (!Number.isFinite(rotationRad)) {
+    throw new Error(`similarityFromAnchor: rotation must be finite (got ${rotationRad})`);
+  }
+  const qRe = Math.cos(rotationRad) * scale;
+  const qIm = Math.sin(rotationRad) * scale;
+  // t = model − q · page (complex multiply), so the anchor maps exactly.
+  const tx = anchor.model.x - (qRe * anchor.page.x - qIm * anchor.page.y);
+  const ty = anchor.model.y - (qIm * anchor.page.x + qRe * anchor.page.y);
+  return [qRe, -qIm, tx, qIm, qRe, ty];
+}
+
+/**
  * Solve the proper similarity (uniform scale + rotation + translation) that
  * maps the two `page` points onto the two `model` points exactly.
  *

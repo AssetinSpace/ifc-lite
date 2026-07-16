@@ -160,6 +160,7 @@ export function useFloorplanView() {
     if (!state.underlayViewLocked && !state.underlaySplitView) return;
     state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+    state.setUnderlayPlanPin(null); // pin belongs to the previous storey's plan
   }, [worldCutY, storeyGuidFor]);
 
   /** Leave the drawing view: remove the cut, unlock the camera. */
@@ -183,6 +184,7 @@ export function useFloorplanView() {
     state.setUnderlayViewLocked(false);
     state.setUnderlaySplitView(true);
     state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+    state.setUnderlayPlanPin(null);
     setProjectionMode('perspective');
     cameraCallbacks.home?.();
   }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
@@ -193,6 +195,7 @@ export function useFloorplanView() {
     state.setUnderlaySplitView(false);
     state.setUnderlayCut(null);
     state.setUnderlayActiveStoreyGuid(null);
+    state.setUnderlayPlanPin(null);
   }, []);
 
   return {

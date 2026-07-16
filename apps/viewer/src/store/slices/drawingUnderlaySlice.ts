@@ -38,6 +38,17 @@ export interface UnderlayCalibrationDraft {
   /** 1-based page being calibrated. */
   page: number;
   /**
+   * Calibration mode. `two-point`: solve scale+rotation+translation from two
+   * correspondences. `one-point`: one anchor correspondence, scale and
+   * rotation entered explicitly (title-block 1:N, usually 0°) — immune to the
+   * angular error a short 2-point span amplifies.
+   */
+  mode: 'two-point' | 'one-point';
+  /** One-point mode: drawing scale denominator N as in 1:N. */
+  oneScaleDen: number;
+  /** One-point mode: CCW rotation of the drawing in degrees. */
+  oneRotationDeg: number;
+  /**
    * Target storey — carried in the draft so the live ghost preview and Save
    * use the storey the flow is bound to. Set at start; an explicit dropdown
    * change mid-flow rebinds it via `retargetUnderlayCalibrationStorey`.
@@ -81,6 +92,13 @@ export interface DrawingUnderlaySlice {
   /** Storey GUID the drawing/split view is bound to (drives the 2D pane). */
   underlayActiveStoreyGuid: string | null;
   /**
+   * Split-view location pin, PDF page points of the active drawing. Set by
+   * clicking the 2D plan (outside walk mode); marks the exact clicked spot in
+   * BOTH panes and stays put while the 3D camera moves — camera-independent
+   * by design (the camera-coupled marker is walk-mode-only).
+   */
+  underlayPlanPin: Point2 | null;
+  /**
    * Host persistence hook (e.g. the AIM bridge). Called after a placement
    * is created or its presentation fields change. Null = session-only.
    */
@@ -119,6 +137,7 @@ export interface DrawingUnderlaySlice {
   setUnderlaySplitView: (on: boolean) => void;
   setUnderlayCalibrationExpanded: (on: boolean) => void;
   setUnderlayActiveStoreyGuid: (guid: string | null) => void;
+  setUnderlayPlanPin: (p: Point2 | null) => void;
 
   startUnderlayCalibration: (
     drawingId: string,
@@ -131,6 +150,16 @@ export interface DrawingUnderlaySlice {
    * storey's floor; page points survive (same PDF page).
    */
   retargetUnderlayCalibrationStorey: (storey: { guid: string; z: number }) => void;
+  /**
+   * Switch calibration mode mid-flow. Going to `one-point` trims picks to
+   * the first pair (the anchor); going back keeps whatever is picked.
+   */
+  setUnderlayCalibrationMode: (mode: 'two-point' | 'one-point') => void;
+  /** Update the one-point mode's explicit scale (1:N) / rotation (degrees). */
+  setUnderlayCalibrationOneParams: (params: {
+    scaleDen?: number;
+    rotationDeg?: number;
+  }) => void;
   setUnderlayCalibrationPageSize: (pageSize: [number, number]) => void;
   addUnderlayCalibrationPagePoint: (p: Point2) => void;
   addUnderlayCalibrationModelPoint: (p: Point2) => void;
@@ -170,6 +199,7 @@ export const createDrawingUnderlaySlice: StateCreator<
   underlaySplitView: false,
   underlayCalibrationExpanded: false,
   underlayActiveStoreyGuid: null,
+  underlayPlanPin: null,
   underlaySaveHandler: null,
 
   setUnderlayDrawings: (drawings) => {
@@ -268,11 +298,16 @@ export const createDrawingUnderlaySlice: StateCreator<
 
   setUnderlayActiveStoreyGuid: (guid) => set({ underlayActiveStoreyGuid: guid }),
 
+  setUnderlayPlanPin: (p) => set({ underlayPlanPin: p }),
+
   startUnderlayCalibration: (drawingId, page, storey) =>
     set({
       underlayCalibration: {
         drawingId,
         page,
+        mode: 'two-point',
+        oneScaleDen: 50,
+        oneRotationDeg: 0,
         storeyGuid: storey.guid,
         storeyZ: storey.z,
         pageSize: null,
@@ -281,6 +316,33 @@ export const createDrawingUnderlaySlice: StateCreator<
       },
       // Start inline; the user opts into the big overlay per calibration.
       underlayCalibrationExpanded: false,
+    }),
+
+  setUnderlayCalibrationMode: (mode) =>
+    set((state) => {
+      const c = state.underlayCalibration;
+      if (!c || c.mode === mode) return state;
+      return {
+        underlayCalibration: {
+          ...c,
+          mode,
+          pagePoints: mode === 'one-point' ? c.pagePoints.slice(0, 1) : c.pagePoints,
+          modelPoints: mode === 'one-point' ? c.modelPoints.slice(0, 1) : c.modelPoints,
+        },
+      };
+    }),
+
+  setUnderlayCalibrationOneParams: (params) =>
+    set((state) => {
+      const c = state.underlayCalibration;
+      if (!c) return state;
+      return {
+        underlayCalibration: {
+          ...c,
+          oneScaleDen: params.scaleDen ?? c.oneScaleDen,
+          oneRotationDeg: params.rotationDeg ?? c.oneRotationDeg,
+        },
+      };
     }),
 
   retargetUnderlayCalibrationStorey: (storey) =>
@@ -307,7 +369,8 @@ export const createDrawingUnderlaySlice: StateCreator<
   addUnderlayCalibrationPagePoint: (p) =>
     set((state) => {
       const c = state.underlayCalibration;
-      if (!c || c.pagePoints.length >= 2) return state;
+      const cap = c?.mode === 'one-point' ? 1 : 2;
+      if (!c || c.pagePoints.length >= cap) return state;
       return { underlayCalibration: { ...c, pagePoints: [...c.pagePoints, p] } };
     }),
 

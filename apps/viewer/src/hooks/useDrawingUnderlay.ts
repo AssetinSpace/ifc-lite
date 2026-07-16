@@ -25,6 +25,7 @@ import {
   createDrawingPlacement,
   PdfPlanePipeline,
   placementWorldCorners,
+  similarityFromAnchor,
   solveSimilarityFromCalibration,
   type DrawingPlacement,
 } from '@ifc-lite/drawing-underlay';
@@ -91,23 +92,34 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
       .filter((d) => d.placement !== null)
       .map((d) => ({ id: d.id, pdfUrl: d.pdfUrl, name: d.name, placement: d.placement! }));
 
-    // Live ghost preview (Dalux-style "combined view"): once both point
-    // pairs are picked, the drawing shows up immediately as a translucent
-    // plane so the fit can be judged BEFORE saving. Degenerate picks
-    // (coincident points) simply produce no ghost.
+    // Live ghost preview (Dalux-style "combined view"): once the mode's
+    // point pairs are picked, the drawing shows up immediately as a
+    // translucent plane so the fit can be judged BEFORE saving — in
+    // one-point mode it also re-fits live as scale/rotation are typed.
+    // Degenerate picks (coincident points) simply produce no ghost.
+    const needPairs = calibration?.mode === 'one-point' ? 1 : 2;
     if (
       calibration &&
       calibration.pageSize &&
-      calibration.pagePoints.length === 2 &&
-      calibration.modelPoints.length === 2
+      calibration.pagePoints.length === needPairs &&
+      calibration.modelPoints.length === needPairs
     ) {
       const drawing = drawings.get(calibration.drawingId);
       if (drawing) {
         try {
-          const affine = solveSimilarityFromCalibration([
-            { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
-            { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
-          ]);
+          const anchor = { page: calibration.pagePoints[0], model: calibration.modelPoints[0] };
+          const affine =
+            calibration.mode === 'one-point'
+              ? // 1:N paper→model with 1 pt = 25.4/72 mm ⇒ metres per page pt.
+                similarityFromAnchor(
+                  anchor,
+                  (calibration.oneScaleDen * 25.4) / 72000,
+                  (calibration.oneRotationDeg * Math.PI) / 180,
+                )
+              : solveSimilarityFromCalibration([
+                  anchor,
+                  { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
+                ]);
           entries.push({
             id: `preview:${drawing.id}`,
             pdfUrl: drawing.pdfUrl,

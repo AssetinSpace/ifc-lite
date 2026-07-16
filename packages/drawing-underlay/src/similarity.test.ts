@@ -9,6 +9,7 @@ import {
   applyAffine,
   composeAffine,
   invertAffine,
+  similarityFromAnchor,
   similarityRotation,
   similarityScale,
   solveSimilarityFromCalibration,
@@ -166,6 +167,48 @@ describe('composeAffine / adjustAffine', () => {
     expect(similarityScale(scaled)).toBeCloseTo(0.1, 9);
     const p = applyAffine(scaled, { x: 51, y: 50 });
     expect(p.x - c.x).toBeCloseTo(0.1, 9);
+  });
+});
+
+describe('similarityFromAnchor', () => {
+  it('maps the anchor exactly and carries the given scale and rotation', () => {
+    const anchor = pair({ x: 120, y: 340 }, { x: 8.5, y: -3.25 });
+    const m = similarityFromAnchor(anchor, 0.02, Math.PI / 6);
+    expectPointClose(applyAffine(m, anchor.page), anchor.model);
+    expect(similarityScale(m)).toBeCloseTo(0.02, 12);
+    expect(similarityRotation(m)).toBeCloseTo(Math.PI / 6, 12);
+  });
+
+  it('with zero rotation is a pure scale+translate about the anchor', () => {
+    const anchor = pair({ x: 100, y: 50 }, { x: 2, y: 3 });
+    const m = similarityFromAnchor(anchor, 0.05, 0);
+    // 10 page units right of the anchor → 0.5 m right of its model point.
+    expectPointClose(applyAffine(m, { x: 110, y: 50 }), { x: 2.5, y: 3 });
+    expectPointClose(applyAffine(m, { x: 100, y: 60 }), { x: 2, y: 3.5 });
+  });
+
+  it('agrees with the 2-point solve when fed the solve’s own scale/rotation', () => {
+    const pairs: readonly [CalibrationPair, CalibrationPair] = [
+      pair({ x: 10, y: 10 }, { x: 1, y: 2 }),
+      pair({ x: 210, y: 130 }, { x: 9.4, y: 6.1 }),
+    ];
+    const solved = solveSimilarityFromCalibration(pairs);
+    const rebuilt = similarityFromAnchor(
+      pairs[0],
+      similarityScale(solved),
+      similarityRotation(solved),
+    );
+    for (const p of [pairs[0].page, pairs[1].page, { x: 0, y: 0 }, { x: 300, y: -40 }]) {
+      expectPointClose(applyAffine(rebuilt, p), applyAffine(solved, p));
+    }
+  });
+
+  it('rejects non-positive or non-finite scale and non-finite rotation', () => {
+    const anchor = pair({ x: 0, y: 0 }, { x: 0, y: 0 });
+    expect(() => similarityFromAnchor(anchor, 0, 0)).toThrow(/scale/);
+    expect(() => similarityFromAnchor(anchor, -0.05, 0)).toThrow(/scale/);
+    expect(() => similarityFromAnchor(anchor, Number.NaN, 0)).toThrow(/scale/);
+    expect(() => similarityFromAnchor(anchor, 0.05, Number.POSITIVE_INFINITY)).toThrow(/rotation/);
   });
 });
 

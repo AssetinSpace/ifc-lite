@@ -42,9 +42,11 @@ import {
   adjustAffine,
   applyAffine,
   createDrawingPlacement,
+  similarityFromAnchor,
   similarityRotation,
   similarityScale,
   solveSimilarityFromCalibration,
+  type Affine2x3,
   type CalibrationPair,
   type DrawingPlacement,
 } from '@ifc-lite/drawing-underlay';
@@ -72,6 +74,8 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const drawings = useViewerStore((s) => s.underlayDrawings);
   const calibration = useViewerStore((s) => s.underlayCalibration);
   const startCalibration = useViewerStore((s) => s.startUnderlayCalibration);
+  const setCalibrationMode = useViewerStore((s) => s.setUnderlayCalibrationMode);
+  const setOneParams = useViewerStore((s) => s.setUnderlayCalibrationOneParams);
   const cancelCalibration = useViewerStore((s) => s.cancelUnderlayCalibration);
   const undoCalibrationPoint = useViewerStore((s) => s.undoUnderlayCalibrationPoint);
   const setCalibrationExpanded = useViewerStore((s) => s.setUnderlayCalibrationExpanded);
@@ -131,20 +135,37 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
     [upsertDrawing],
   );
 
-  /** Whose turn is it? Alternation: page → model → page → model. */
+  /** Pairs the active mode needs: 1 anchor, or 2 for the full solve. */
+  const needPairs = calibration?.mode === 'one-point' ? 1 : 2;
+
+  /** Whose turn is it? Alternation: page → model (→ page → model). */
   const awaiting: 'page' | 'model' | 'done' = !calibration
     ? 'done'
     : calibration.pagePoints.length > calibration.modelPoints.length
       ? 'model'
-      : calibration.pagePoints.length < 2
+      : calibration.pagePoints.length < needPairs
         ? 'page'
         : 'done';
 
   const canSave =
     !!calibration &&
-    calibration.pagePoints.length === 2 &&
-    calibration.modelPoints.length === 2 &&
-    !!calibration.pageSize;
+    calibration.pagePoints.length === needPairs &&
+    calibration.modelPoints.length === needPairs &&
+    !!calibration.pageSize &&
+    (calibration.mode === 'two-point' || calibration.oneScaleDen > 0);
+
+  // One-point mode inputs (local strings; valid parses stream to the draft so
+  // the ghost preview re-fits live). Re-seeded when a calibration starts.
+  const [oneScaleInput, setOneScaleInput] = useState('50');
+  const [oneAngleInput, setOneAngleInput] = useState('0');
+  const calibrationDrawingId = calibration?.drawingId ?? null;
+  useEffect(() => {
+    if (!calibrationDrawingId) return;
+    const c = useViewerStore.getState().underlayCalibration;
+    if (!c) return;
+    setOneScaleInput(String(c.oneScaleDen));
+    setOneAngleInput(String(c.oneRotationDeg));
+  }, [calibrationDrawingId]);
 
   /**
    * Dalux-style precision feedback for the picked A–B span: model distance,
@@ -152,7 +173,9 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
    * both pairs are picked (or when the picks are degenerate).
    */
   const metrics = useMemo(() => {
-    if (!canSave || !calibration) return null;
+    // Only the 2-point solve MEASURES scale/rotation; in one-point mode both
+    // are user inputs, so there is nothing derived to report.
+    if (!canSave || !calibration || calibration.mode !== 'two-point') return null;
     const pairs: [CalibrationPair, CalibrationPair] = [
       { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
       { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
@@ -179,14 +202,31 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
 
   const onSave = useCallback(() => {
     if (!calibration || !calibration.pageSize || !calibratingDrawing) return;
-    const pairs: [CalibrationPair, CalibrationPair] = [
-      { page: calibration.pagePoints[0], model: calibration.modelPoints[0] },
-      { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
-    ];
     try {
-      const affine = solveSimilarityFromCalibration(pairs);
-      // Storey comes from the draft — fixed when the calibration started,
-      // immune to later dropdown changes.
+      const anchor: CalibrationPair = {
+        page: calibration.pagePoints[0],
+        model: calibration.modelPoints[0],
+      };
+      let affine: Affine2x3;
+      let pairs: CalibrationPair[];
+      if (calibration.mode === 'one-point') {
+        // 1:N paper→model with 1 pt = 25.4/72 mm ⇒ metres per page point.
+        affine = similarityFromAnchor(
+          anchor,
+          (calibration.oneScaleDen * 25.4) / 72000,
+          (calibration.oneRotationDeg * Math.PI) / 180,
+        );
+        pairs = [anchor];
+      } else {
+        const two: [CalibrationPair, CalibrationPair] = [
+          anchor,
+          { page: calibration.pagePoints[1], model: calibration.modelPoints[1] },
+        ];
+        affine = solveSimilarityFromCalibration(two);
+        pairs = two;
+      }
+      // Storey comes from the draft — bound at start, follows explicit
+      // dropdown retargets.
       const placement = createDrawingPlacement({
         storeyGuid: calibration.storeyGuid,
         storeyZ: calibration.storeyZ,
@@ -298,12 +338,78 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
                 Calibrating: {calibratingDrawing.name}
               </span>
             </div>
+            {/* Mode: measure everything from 2 points, or trust the drawing
+                (1 anchor + title-block scale + angle — no angular error from
+                a short pick span). */}
+            <div className="mb-2 flex gap-1" role="group" aria-label="Calibration mode">
+              <Button
+                variant={calibration.mode === 'two-point' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-6 flex-1 px-2 text-[11px]"
+                onClick={() => setCalibrationMode('two-point')}
+                title="Pick two point pairs — scale and rotation are measured from them"
+              >
+                2 points
+              </Button>
+              <Button
+                variant={calibration.mode === 'one-point' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-6 flex-1 px-2 text-[11px]"
+                onClick={() => setCalibrationMode('one-point')}
+                title="Pick one anchor point and type the drawing scale (1:N) and rotation — exact when the title block is trusted"
+              >
+                1 point + scale
+              </Button>
+            </div>
+            {calibration.mode === 'one-point' && (
+              <div className="mb-2 flex items-center gap-1.5">
+                <label className="text-[10px] text-muted-foreground" htmlFor="one-point-scale">
+                  Scale 1:
+                </label>
+                <input
+                  id="one-point-scale"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={oneScaleInput}
+                  onChange={(e) => {
+                    setOneScaleInput(e.target.value);
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v > 0) setOneParams({ scaleDen: v });
+                  }}
+                  className="h-5 w-16 rounded border bg-background px-1 text-[10px]"
+                />
+                <label className="text-[10px] text-muted-foreground" htmlFor="one-point-angle">
+                  Angle
+                </label>
+                <input
+                  id="one-point-angle"
+                  type="number"
+                  step={0.01}
+                  value={oneAngleInput}
+                  onChange={(e) => {
+                    setOneAngleInput(e.target.value);
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) setOneParams({ rotationDeg: v });
+                  }}
+                  className="h-5 w-14 rounded border bg-background px-1 text-[10px]"
+                />
+                <span className="text-[10px] text-muted-foreground">°</span>
+              </div>
+            )}
             <p className="mb-2 text-[11px] text-muted-foreground">
               {awaiting === 'page' &&
-                `Click point ${calibration.pagePoints.length + 1} of 2 on the drawing below.`}
+                (calibration.mode === 'one-point'
+                  ? 'Click the reference point on the drawing below.'
+                  : `Click point ${calibration.pagePoints.length + 1} of 2 on the drawing below.`)}
               {awaiting === 'model' &&
-                `Now click the matching point ${calibration.modelPoints.length + 1} in the 3D model.`}
-              {awaiting === 'done' && 'Both point pairs picked — save to place the drawing.'}
+                (calibration.mode === 'one-point'
+                  ? 'Now click the matching point in the 3D model.'
+                  : `Now click the matching point ${calibration.modelPoints.length + 1} in the 3D model.`)}
+              {awaiting === 'done' &&
+                (calibration.mode === 'one-point'
+                  ? 'Anchor placed — adjust scale/angle (live preview) and save.'
+                  : 'Both point pairs picked — save to place the drawing.')}
             </p>
             <div className="mb-1.5 flex justify-end">
               <Button
@@ -391,6 +497,16 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
                   guid: target.guid,
                   z: target.elevation,
                 });
+                // Recalibrate seeds one-point mode with the CURRENT placement's
+                // scale/rotation, so switching modes starts from reality.
+                if (d.placement) {
+                  const den = (similarityScale(d.placement.affine) * 1000 * 72) / 25.4;
+                  const deg = (similarityRotation(d.placement.affine) * 180) / Math.PI;
+                  setOneParams({
+                    scaleDen: Math.round(den * 10) / 10,
+                    rotationDeg: Math.round(deg * 100) / 100,
+                  });
+                }
               }}
               onOpacity={(v) => setOpacity(d.id, v)}
               onOpacityCommit={() => commitPlacement(d.id)}

@@ -23,10 +23,11 @@ export function CalibrationPdfOverlay() {
 
   if (!calibration || !expanded) return null;
   const drawing = drawings.get(calibration.drawingId);
+  const needPairs = calibration.mode === 'one-point' ? 1 : 2;
   const awaiting =
     calibration.pagePoints.length > calibration.modelPoints.length
       ? 'model'
-      : calibration.pagePoints.length < 2
+      : calibration.pagePoints.length < needPairs
         ? 'page'
         : 'done';
 
@@ -36,7 +37,9 @@ export function CalibrationPdfOverlay() {
       <div className="pointer-events-none absolute inset-x-0 top-3 z-40 flex justify-center">
         <div className="pointer-events-auto flex items-center gap-2 rounded-full border bg-background/95 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur">
           <span className="font-medium">
-            Click matching point {calibration.modelPoints.length + 1} in the 3D model
+            {needPairs === 1
+              ? 'Click the matching point in the 3D model'
+              : `Click matching point ${calibration.modelPoints.length + 1} in the 3D model`}
           </span>
         </div>
       </div>
@@ -50,7 +53,9 @@ export function CalibrationPdfOverlay() {
           Calibrate: {drawing?.name ?? ''}
         </span>
         <span className="text-[11px] text-muted-foreground">
-          Click point {calibration.pagePoints.length + 1} of 2 on the drawing
+          {needPairs === 1
+            ? 'Click the reference point on the drawing'
+            : `Click point ${calibration.pagePoints.length + 1} of 2 on the drawing`}
         </span>
         <Button
           variant="ghost"
