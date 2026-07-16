@@ -83,7 +83,9 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const removeDrawing = useViewerStore((s) => s.removeUnderlayDrawing);
 
   const { models, ifcDataStore } = useIfc();
-  const { availableStoreys, enterDrawingView, enterSplitView, exitSplitView } = useFloorplanView();
+  const { availableStoreys, enterDrawingView, enterSplitView, exitSplitView, retargetView } =
+    useFloorplanView();
+  const retargetCalibrationStorey = useViewerStore((s) => s.retargetUnderlayCalibrationStorey);
   const splitView = useViewerStore((s) => s.underlaySplitView);
 
   // Storeys with resolved GlobalIds — placements are keyed to the storey GUID
@@ -238,7 +240,25 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
           id="underlay-storey"
           className="h-6 min-w-0 flex-1 rounded border bg-background px-1 text-[11px]"
           value={selectedStorey?.key ?? ''}
-          onChange={(e) => setStoreyKey(e.target.value)}
+          onChange={(e) => {
+            setStoreyKey(e.target.value);
+            // A live drawing/split view follows the dropdown: re-cut the 3D
+            // at the new level; mid-calibration also rebind the draft (its
+            // model points are cleared — they sat on the old floor).
+            const option = storeyOptions.find((s) => s.key === e.target.value);
+            const storey = availableStoreys.find(
+              (s) => `${s.modelId}:${s.expressId}` === e.target.value,
+            );
+            if (!option || !storey) return;
+            retargetView(storey);
+            if (calibration) {
+              const hadModelPoints = calibration.modelPoints.length > 0;
+              retargetCalibrationStorey({ guid: option.guid, z: option.elevation });
+              if (hadModelPoints) {
+                toast.info('Storey changed — pick the model points again on the new level');
+              }
+            }
+          }}
         >
           {storeyOptions.length === 0 && <option value="">No storeys loaded</option>}
           {storeyOptions.map((s) => (
@@ -508,6 +528,8 @@ function FineTuneControls({
 
   const [moveStep, setMoveStep] = useState(0.05);
   const [rotStep, setRotStep] = useState(0.1);
+  const currentRotDeg = (similarityRotation(placement.affine) * 180) / Math.PI;
+  const [rotInput, setRotInput] = useState(currentRotDeg.toFixed(2));
   // Derived drawing scale: model mm per paper mm (1 pt = 25.4/72 mm).
   const currentDen = (similarityScale(placement.affine) * 1000 * 72) / 25.4;
   const [scaleInput, setScaleInput] = useState(String(Math.round(currentDen * 10) / 10));
@@ -534,6 +556,26 @@ function FineTuneControls({
       scheduleCommit();
     },
     [drawingId, placement, updateLive, scheduleCommit],
+  );
+
+  /** Absolute rotation: type the degrees, rotate by the delta to reach them. */
+  const setRotationTo = useCallback(
+    (raw: string) => {
+      const target = Number(raw);
+      if (!Number.isFinite(target)) return;
+      apply({ rotateRad: ((target - currentRotDeg) * Math.PI) / 180 });
+    },
+    [apply, currentRotDeg],
+  );
+
+  /** Absolute drawing scale: type the 1:N denominator. */
+  const setScaleTo = useCallback(
+    (raw: string) => {
+      const target = Number(raw);
+      if (!Number.isFinite(target) || target <= 0) return;
+      apply({ scaleFactor: target / currentDen });
+    },
+    [apply, currentDen],
   );
 
   return (
@@ -590,8 +632,25 @@ function FineTuneControls({
           <option value={5}>5°</option>
           <option value={90}>90°</option>
         </select>
+        <input
+          type="number"
+          step={0.01}
+          value={rotInput}
+          onChange={(e) => setRotInput(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && setRotationTo(rotInput)}
+          className="h-5 w-14 rounded border bg-background px-1 text-[10px]"
+          aria-label="Rotation in degrees (absolute)"
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-5 px-1.5 text-[10px]"
+          onClick={() => setRotationTo(rotInput)}
+        >
+          Set
+        </Button>
         <span className="flex-1 text-right text-[10px] text-muted-foreground">
-          now {(similarityRotation(placement.affine) * 180 / Math.PI).toFixed(2)}°
+          now {currentRotDeg.toFixed(2)}°
         </span>
       </div>
       <div className="flex items-center gap-1">
@@ -603,6 +662,7 @@ function FineTuneControls({
           step={1}
           value={scaleInput}
           onChange={(e) => setScaleInput(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && setScaleTo(scaleInput)}
           className="h-5 w-16 rounded border bg-background px-1 text-[10px]"
           aria-label="Drawing scale denominator"
         />
@@ -610,11 +670,7 @@ function FineTuneControls({
           variant="outline"
           size="sm"
           className="h-5 px-1.5 text-[10px]"
-          onClick={() => {
-            const target = Number(scaleInput);
-            if (!Number.isFinite(target) || target <= 0) return;
-            apply({ scaleFactor: target / currentDen });
-          }}
+          onClick={() => setScaleTo(scaleInput)}
         >
           Set
         </Button>
