@@ -32,6 +32,7 @@ import {
   Users,
   Layers as LayersIcon,
   Map as MapIcon,
+  Files,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -54,7 +55,8 @@ export type WorkspacePanelId =
   | 'lists'
   | 'collab'
   | 'layers'
-  | 'drawing-underlay';
+  | 'drawing-underlay'
+  | 'documents';
 
 /** Activity-bar clustering — a divider is drawn whenever the group changes. */
 export type PanelGroup = 'navigate' | 'inspect' | 'review' | 'author' | 'work';
@@ -107,6 +109,9 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Georeferenced PDF drawing underlays (D-072 in the AIM repo). APPENDED so
   // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
   { id: 'drawing-underlay', title: 'Drawing underlays', short: 'Drawings', Icon: MapIcon, group: 'author', region: 'side' },
+  // Project documents library (D-075 in the AIM repo): PDFs & images open as
+  // tabs in the center document pane. APPENDED — frozen Alt mapping untouched.
+  { id: 'documents', title: 'Documents', short: 'Docs', Icon: Files, group: 'navigate', region: 'side' },
 ];
 
 /** The bottom-strip panel ids, mapped to their store visibility flag + setter

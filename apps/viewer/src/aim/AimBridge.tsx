@@ -155,6 +155,30 @@ export function AimBridge() {
           useViewerStore.getState().setUnderlayDrawings(drawings);
           break;
         }
+        case 'DOCUMENTS_LOAD': {
+          // Projektové dokumenty (D-075): host posiela knižnicu dokumentov
+          // (výkresy/dokumenty/obrázky) pre in-viewer Documents panel.
+          // Súrodenec UNDERLAYS_LOAD — kalibrované výkresy chodia v oboch.
+          const docs = e.data.documents.map((d) => ({
+            id: d.documentId,
+            name: d.name,
+            kind: d.kind,
+            url: d.url,
+            mime: d.mime,
+            storeyGuid: d.storeyGuid ?? null,
+            folder: d.folder,
+            meta: d.meta,
+          }));
+          useViewerStore.getState().setViewerDocuments(docs);
+          break;
+        }
+        case 'DOCUMENT_OPEN':
+          // Deep link (D-075): otvor dokument ako kartu. Neznáme id je no-op
+          // (openDocument si to ustráži) — host mohol poslať staršiu linku.
+          useViewerStore
+            .getState()
+            .openDocument(e.data.documentId, e.data.page !== undefined ? { page: e.data.page } : undefined);
+          break;
         case 'CAPTURES_LOAD':
           // Reality Capture pins (D-073): host pushes capture points with world
           // coords; the billboard layer (CapturePinLayer) renders them.
@@ -179,11 +203,20 @@ export function AimBridge() {
       post({ source: SOURCE, type: 'CAPTURE_PIN_CLICK', captureId });
     });
 
+    // Tab dokumentu otvorený/zavretý vo viewri → host recents/analytics (D-075).
+    useViewerStore.getState().setDocumentEventHandler(({ docId, event, page }) => {
+      // Session-local files never leave the viewer — the host has no use for
+      // (and no way to resolve) `local:` ids.
+      if (docId.startsWith('local:')) return;
+      post({ source: SOURCE, type: 'DOCUMENT_EVENT', documentId: docId, event, page });
+    });
+
     window.addEventListener('message', onMessage);
     post({ source: SOURCE, type: 'READY' });
     return () => {
       window.removeEventListener('message', onMessage);
       useViewerStore.getState().setUnderlaySaveHandler(null);
+      useViewerStore.getState().setDocumentEventHandler(null);
       useCapturePinsStore.getState().setEmitClick(null);
       useCapturePinsStore.getState().setPins([]);
     };

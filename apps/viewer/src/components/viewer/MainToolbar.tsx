@@ -93,6 +93,7 @@ import { ExportChangesButton } from './ExportChangesButton';
 import { ShareDialog } from './ShareDialog';
 import { isCollabEnabled } from '@/lib/collab/config';
 import { SearchInline } from './SearchInline';
+import { ViewModeSwitcher } from './ViewModeSwitcher';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import {
   supportsFileSystemAccess,
@@ -1824,6 +1825,9 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         </TooltipTrigger>
         <TooltipContent>SpaceMouse</TooltipContent>
       </Tooltip>
+
+      {/* D-075 workspace view mode: 3D | 2D | Split + storey picker. */}
+      <ViewModeSwitcher />
 
       {/*
         Consolidated View dropdown — holds projection toggle, preset

@@ -72,6 +72,27 @@ export interface UnderlayDrawingWire {
 }
 
 /**
+ * One project document pushed by the host (D-075): identity, a fetchable URL
+ * and library metadata for the in-viewer Documents panel. A sibling of
+ * `UnderlayDrawingWire`, NOT a replacement — calibrated drawings arrive in
+ * both messages (same documentId) and cross-link via `storeyGuid`.
+ */
+export interface DocumentDescriptorWire {
+  documentId: string;
+  name: string;
+  /** 'drawing' = calibratable plan; 'document' = paged PDF; 'image' = bitmap. */
+  kind: 'drawing' | 'document' | 'image';
+  url: string;
+  mime?: string;
+  /** Storey GlobalId a `drawing` belongs to (D-072 binding), if known. */
+  storeyGuid?: string;
+  /** Host-defined tree path for the panel's grouping, e.g. ['Building A', '2.NP']. */
+  folder?: string[];
+  /** Free-form metadata shown in the list (revision, status, discipline…). */
+  meta?: Record<string, string>;
+}
+
+/**
  * One reality-capture pin pushed by the host (D-073): a capture point with its
  * world-space position (viewer Y-up frame), kind (photo vs 360° panorama) and an
  * optional thumbnail. Clicking it in 3D bounces `CAPTURE_PIN_CLICK` back so the
@@ -104,6 +125,12 @@ export type InboundMessage =
   // Georeferenced PDF underlays (D-072): the host pushes its drawing list
   // (documents linked to storeys + persisted _georef) after MODELS_LOADED.
   | { source: typeof SOURCE; type: 'UNDERLAYS_LOAD'; drawings: UnderlayDrawingWire[] }
+  // Project documents (D-075): the host pushes the document library after
+  // MODELS_LOADED (same timing slot as UNDERLAYS_LOAD).
+  | { source: typeof SOURCE; type: 'DOCUMENTS_LOAD'; documents: DocumentDescriptorWire[] }
+  // Deep link (D-075): open one document as a tab (postMessage-only — the
+  // host owns the iframe src, and changing it reloads the whole viewer).
+  | { source: typeof SOURCE; type: 'DOCUMENT_OPEN'; documentId: string; page?: number }
   // Reality Capture pins (D-073): the host pushes capture points with world
   // coords after MODELS_LOADED; the viewer billboards them over the canvas.
   | { source: typeof SOURCE; type: 'CAPTURES_LOAD'; captures: CapturePinWire[] };
@@ -121,7 +148,10 @@ export type OutboundMessage =
   | { source: typeof SOURCE; type: 'UNDERLAY_SAVE'; documentId: string; georef: unknown }
   // A reality-capture pin was clicked in 3D (D-073) — the host opens the
   // capture's gallery / 360° panorama for the given capture point id.
-  | { source: typeof SOURCE; type: 'CAPTURE_PIN_CLICK'; captureId: string };
+  | { source: typeof SOURCE; type: 'CAPTURE_PIN_CLICK'; captureId: string }
+  // A document tab was opened/closed in the viewer (D-075) — host-side
+  // recents / analytics; the viewer expects no reply.
+  | { source: typeof SOURCE; type: 'DOCUMENT_EVENT'; documentId: string; event: 'opened' | 'closed'; page?: number };
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.
@@ -169,6 +199,37 @@ function isUnderlayDrawingWire(v: unknown): v is UnderlayDrawingWire {
 }
 
 /**
+ * One wire document must carry a non-empty documentId/name/url and a known
+ * kind; the optional fields are shape-checked so a malformed host payload
+ * can't leak junk into the documents store.
+ */
+function isDocumentDescriptorWire(v: unknown): v is DocumentDescriptorWire {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as {
+    documentId?: unknown;
+    name?: unknown;
+    kind?: unknown;
+    url?: unknown;
+    mime?: unknown;
+    storeyGuid?: unknown;
+    folder?: unknown;
+    meta?: unknown;
+  };
+  if (typeof d.documentId !== 'string' || d.documentId.length === 0) return false;
+  if (typeof d.name !== 'string') return false;
+  if (d.kind !== 'drawing' && d.kind !== 'document' && d.kind !== 'image') return false;
+  if (typeof d.url !== 'string' || d.url.length === 0) return false;
+  if (d.mime !== undefined && typeof d.mime !== 'string') return false;
+  if (d.storeyGuid !== undefined && typeof d.storeyGuid !== 'string') return false;
+  if (d.folder !== undefined && !isStringArray(d.folder)) return false;
+  if (d.meta !== undefined) {
+    if (!d.meta || typeof d.meta !== 'object') return false;
+    if (!Object.values(d.meta).every((s) => typeof s === 'string')) return false;
+  }
+  return true;
+}
+
+/**
  * One capture pin must carry a non-empty id, a known kind and finite world
  * coordinates; name/thumbUrl are optional. Malformed entries are dropped so a
  * bad host payload can't crash the billboard projection loop.
@@ -199,6 +260,9 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
     data?: unknown;
     reason?: unknown;
     drawings?: unknown;
+    documents?: unknown;
+    documentId?: unknown;
+    page?: unknown;
     captures?: unknown;
   };
   if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
@@ -223,6 +287,14 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
       return typeof msg.guid === 'string' && typeof msg.reason === 'string';
     case 'UNDERLAYS_LOAD':
       return Array.isArray(msg.drawings) && msg.drawings.every(isUnderlayDrawingWire);
+    case 'DOCUMENTS_LOAD':
+      return Array.isArray(msg.documents) && msg.documents.every(isDocumentDescriptorWire);
+    case 'DOCUMENT_OPEN':
+      return (
+        typeof msg.documentId === 'string' &&
+        msg.documentId.length > 0 &&
+        (msg.page === undefined || (typeof msg.page === 'number' && Number.isFinite(msg.page)))
+      );
     case 'CAPTURES_LOAD':
       return Array.isArray(msg.captures) && msg.captures.every(isCapturePinWire);
     default:

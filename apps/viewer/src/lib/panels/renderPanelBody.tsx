@@ -35,6 +35,7 @@ const LayersPanel = lazy(() =>
 // here produced a rolldown chunk-order cycle that broke react-dom's CJS
 // interop at startup ("require_react_dom is not a function", blank app).
 import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
+import { DocumentsPanel } from '@/components/documents/DocumentsPanel';
 
 /**
  * Render the body for a workspace panel. `onClose` is the host's "close this
@@ -63,5 +64,6 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
       </Suspense>
     );
     case 'drawing-underlay': return <DrawingUnderlayPanel onClose={onClose} />;
+    case 'documents': return <DocumentsPanel onClose={onClose} />;
   }
 }

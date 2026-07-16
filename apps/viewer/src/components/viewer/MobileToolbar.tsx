@@ -48,6 +48,7 @@ import { exportGlbFromGeometry } from '@/lib/export/glb';
 import { downloadBlob } from '@/lib/export/download';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import { toast } from '@/components/ui/toast';
+import { ViewModeSwitcher } from './ViewModeSwitcher';
 
 type Tool = 'select' | 'walk' | 'measure' | 'section';
 
@@ -235,6 +236,13 @@ export function MobileToolbar() {
       <Button variant="ghost" size="icon-sm" className="h-9 w-9 flex-shrink-0" onClick={handleShowAll} aria-label="Show All">
         <Eye className="h-4 w-4" />
       </Button>
+
+      {/* D-075 view mode (3D / 2D / Split — 2D and Split open the plan overlay) */}
+      {hasModelsLoaded && (
+        <div className="flex-shrink-0 ml-0.5">
+          <ViewModeSwitcher />
+        </div>
+      )}
 
       {/* Spacer */}
       <div className="flex-1 min-w-2" />
