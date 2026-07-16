@@ -31,10 +31,10 @@ interface PreviewState {
   pageSizePts: [number, number];
 }
 
-/** page → model → page → model. */
-function pickTurn(pageCount: number, modelCount: number): 'page' | 'model' | 'done' {
+/** page → model (→ page → model); `need` = pairs the mode requires (1 | 2). */
+function pickTurn(pageCount: number, modelCount: number, need: number): 'page' | 'model' | 'done' {
   if (pageCount > modelCount) return 'model';
-  if (pageCount < 2) return 'page';
+  if (pageCount < need) return 'page';
   return 'done';
 }
 
@@ -45,8 +45,9 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
   const addPagePoint = useViewerStore((s) => s.addUnderlayCalibrationPagePoint);
 
   const drawing = calibration ? drawings.get(calibration.drawingId) : undefined;
+  const needPairs = calibration?.mode === 'one-point' ? 1 : 2;
   const awaiting = calibration
-    ? pickTurn(calibration.pagePoints.length, calibration.modelPoints.length)
+    ? pickTurn(calibration.pagePoints.length, calibration.modelPoints.length, needPairs)
     : 'done';
 
   const [preview, setPreview] = useState<PreviewState | null>(null);
@@ -319,7 +320,8 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
           <Magnet className="size-3.5" aria-hidden />
         </Button>
         <span className="flex-1 text-right text-[10px] text-muted-foreground">
-          PDF {calibration.pagePoints.length}/2 · model {calibration.modelPoints.length}/2
+          PDF {calibration.pagePoints.length}/{needPairs} · model{' '}
+          {calibration.modelPoints.length}/{needPairs}
         </span>
       </div>
     </div>

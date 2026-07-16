@@ -9,12 +9,13 @@
  *
  *  - click on the plan → the 3D camera moves there (orbit: pan the target;
  *    walk: teleport, keeping eye height and heading);
- *  - drag ON the marker/cone → rotates the camera look direction, so the
- *    view can be steered from the map;
  *  - drag elsewhere pans the (zoomable) plan; wheel zooms to the cursor,
  *    with a sharp re-raster once the gesture settles;
- *  - the green marker + view cone tracks the camera: its ORBIT TARGET in
- *    orbit mode, or the CAMERA POSITION in walk mode (you are the marker).
+ *  - OUTSIDE walk mode the green ball is a click-anchored PIN: it marks the
+ *    exact clicked plan spot (in both panes) and does NOT follow the camera,
+ *    so orbiting the model never moves it;
+ *  - IN walk mode you are the marker: ball = camera position, plus a view
+ *    cone for the look direction — dragging the cone turns the camera.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -183,7 +184,9 @@ export function DrawingPlanPane() {
         cameraCallbacks.applyViewpoint({ ...vp, position, target }, true);
         return;
       }
-      // Orbit: keep the camera's offset from its target, move the target.
+      // Orbit: drop the pin at the click (both panes mark this exact spot,
+      // camera-independent), then pan the camera target over it.
+      useViewerStore.getState().setUnderlayPlanPin(pagePt);
       const dx = vp.position.x - vp.target.x;
       const dy = vp.position.y - vp.target.y;
       const dz = vp.position.z - vp.target.z;
@@ -196,17 +199,20 @@ export function DrawingPlanPane() {
     [drawing, offset],
   );
 
-  /** Rotate the camera so it looks along marker→cursor (page space). */
+  /**
+   * Walk mode only: turn in place to look along marker→cursor (page space).
+   * Outside walk mode the marker is a static pin, so there is no cone to drag.
+   */
   const rotateToward = useCallback(
     (pagePt: Point2) => {
       if (!drawing?.placement) return;
       const { cameraCallbacks, activeTool: tool } = useViewerStore.getState();
+      if (tool !== 'walk') return;
       const vp = cameraCallbacks.getViewpoint?.();
       if (!vp || !cameraCallbacks.applyViewpoint) return;
-      const anchorWorld = tool === 'walk' ? vp.position : vp.target;
       const anchorPage = (() => {
         try {
-          return ifcMetresToPage(drawing.placement!.affine, worldToIfcMetres(anchorWorld, offset));
+          return ifcMetresToPage(drawing.placement!.affine, worldToIfcMetres(vp.position, offset));
         } catch {
           return null;
         }
@@ -224,25 +230,14 @@ export function DrawingPlanPane() {
       const len = Math.hypot(wx, wz) || 1;
       wx /= len;
       wz /= len;
-      if (tool === 'walk') {
-        // Turn in place: swing the target around the camera position.
-        const horiz = Math.hypot(vp.target.x - vp.position.x, vp.target.z - vp.position.z) || 5;
-        const target = {
-          x: vp.position.x + wx * horiz,
-          y: vp.target.y,
-          z: vp.position.z + wz * horiz,
-        };
-        cameraCallbacks.applyViewpoint({ ...vp, target }, false);
-        return;
-      }
-      // Orbit: swing the camera around its target to face the new direction.
-      const horiz = Math.hypot(vp.position.x - vp.target.x, vp.position.z - vp.target.z) || 5;
-      const position = {
-        x: vp.target.x - wx * horiz,
-        y: vp.position.y,
-        z: vp.target.z - wz * horiz,
+      // Turn in place: swing the target around the camera position.
+      const horiz = Math.hypot(vp.target.x - vp.position.x, vp.target.z - vp.position.z) || 5;
+      const target = {
+        x: vp.position.x + wx * horiz,
+        y: vp.target.y,
+        z: vp.position.z + wz * horiz,
       };
-      cameraCallbacks.applyViewpoint({ ...vp, position }, false);
+      cameraCallbacks.applyViewpoint({ ...vp, target }, false);
     },
     [drawing, offset],
   );
@@ -275,9 +270,9 @@ export function DrawingPlanPane() {
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       let mode: 'maybe-click' | 'rotate' = 'maybe-click';
-      // Grab the marker/cone → rotate instead of pan/click.
+      // Walk mode: grab the marker/cone → rotate instead of pan/click.
       const host = hostRef.current;
-      if (host && markerRef.current && drawing?.placement) {
+      if (walkMode && host && markerRef.current && drawing?.placement) {
         const rect = host.getBoundingClientRect();
         const mx = rect.left + (markerRef.current.left / 100) * rect.width;
         const my = rect.top + (markerRef.current.top / 100) * rect.height;
@@ -293,7 +288,7 @@ export function DrawingPlanPane() {
       };
       e.currentTarget.setPointerCapture(e.pointerId);
     },
-    [drawing, pan],
+    [drawing, pan, walkMode],
   );
 
   const onPointerMove = useCallback(
@@ -327,18 +322,26 @@ export function DrawingPlanPane() {
     [clientToPage, jumpTo],
   );
 
-  // ── 3D → 2D: marker follows the camera (target; position in walk mode) ──
+  // ── Marker. Walk mode: follows the camera (you are the ball, cone = look
+  // direction). Otherwise: the click-anchored pin — camera moves never touch
+  // it, so it stays glued to the same drawing spot while orbiting.
+  const planPin = useViewerStore((s) => s.underlayPlanPin);
   const getViewpoint = useViewerStore((s) => s.cameraCallbacks.getViewpoint);
-  const frameTick = useCameraTickSubscription(getViewpoint, !!(active && drawing));
-  const marker = useMemo(() => {
+  const frameTick = useCameraTickSubscription(getViewpoint, !!(active && drawing && walkMode));
+  const marker = useMemo((): { left: number; top: number; angleDeg: number | null } | null => {
     if (!drawing?.placement) return null;
+    const [w, h] = drawing.placement.pageSize;
+    if (w <= 0 || h <= 0) return null;
+    if (!walkMode) {
+      if (!planPin) return null;
+      return { left: (planPin.x / w) * 100, top: ((h - planPin.y) / h) * 100, angleDeg: null };
+    }
     const vp = useViewerStore.getState().cameraCallbacks.getViewpoint?.();
     if (!vp) return null;
-    const anchor = walkMode ? vp.position : vp.target;
     let page: Point2;
     let angleDeg: number;
     try {
-      page = ifcMetresToPage(drawing.placement.affine, worldToIfcMetres(anchor, offset));
+      page = ifcMetresToPage(drawing.placement.affine, worldToIfcMetres(vp.position, offset));
       let fx = vp.target.x - vp.position.x;
       let fz = vp.target.z - vp.position.z;
       if (Math.hypot(fx, fz) < 1e-3) {
@@ -354,14 +357,12 @@ export function DrawingPlanPane() {
     } catch {
       return null;
     }
-    const [w, h] = drawing.placement.pageSize;
-    if (w <= 0 || h <= 0) return null;
     const left = (page.x / w) * 100;
     const top = ((h - page.y) / h) * 100;
     if (left < -5 || left > 105 || top < -5 || top > 105) return null;
     return { left, top, angleDeg };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawing, offset, walkMode, frameTick]);
+  }, [drawing, offset, walkMode, planPin, frameTick]);
   const markerRef = useRef(marker);
   markerRef.current = marker;
 
@@ -416,21 +417,23 @@ export function DrawingPlanPane() {
                       transform: `scale(${1 / zoom})`,
                     }}
                   >
-                    {/* View cone (drag it to rotate the camera). */}
-                    <svg
-                      width="88"
-                      height="88"
-                      viewBox="-44 -44 88 88"
-                      className="absolute"
-                      style={{ left: '-44px', top: '-44px', transform: `rotate(${marker.angleDeg}deg)` }}
-                    >
-                      <path
-                        d="M 0 0 L -19 -38 A 42.5 42.5 0 0 1 19 -38 Z"
-                        fill="rgb(16 185 129 / 0.30)"
-                        stroke="rgb(16 185 129 / 0.55)"
-                        strokeWidth="1"
-                      />
-                    </svg>
+                    {/* View cone — walk mode only (drag it to turn). */}
+                    {marker.angleDeg !== null && (
+                      <svg
+                        width="88"
+                        height="88"
+                        viewBox="-44 -44 88 88"
+                        className="absolute"
+                        style={{ left: '-44px', top: '-44px', transform: `rotate(${marker.angleDeg}deg)` }}
+                      >
+                        <path
+                          d="M 0 0 L -19 -38 A 42.5 42.5 0 0 1 19 -38 Z"
+                          fill="rgb(16 185 129 / 0.30)"
+                          stroke="rgb(16 185 129 / 0.55)"
+                          strokeWidth="1"
+                        />
+                      </svg>
+                    )}
                     <span className="absolute -left-[7px] -top-[7px] block size-3.5 rounded-full border-2 border-background bg-emerald-500 shadow" />
                   </span>
                 )}

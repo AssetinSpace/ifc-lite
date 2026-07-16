@@ -13,6 +13,7 @@ export {
   applyAffine,
   composeAffine,
   invertAffine,
+  similarityFromAnchor,
   similarityRotation,
   similarityScale,
   solveSimilarityFromCalibration,

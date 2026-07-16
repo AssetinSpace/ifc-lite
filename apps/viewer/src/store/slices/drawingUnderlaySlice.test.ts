@@ -57,6 +57,31 @@ describe('DrawingUnderlaySlice — calibration storey retarget', () => {
     assert.strictEqual(state.underlayCalibration, before);
   });
 
+  it('one-point mode trims picks to the anchor pair and caps page points at 1', () => {
+    state.startUnderlayCalibration('d1', 1, { guid: 'G1', z: 2 });
+    state.addUnderlayCalibrationPagePoint({ x: 1, y: 1 });
+    state.addUnderlayCalibrationModelPoint({ x: 2, y: 2 });
+    state.addUnderlayCalibrationPagePoint({ x: 3, y: 3 });
+
+    state.setUnderlayCalibrationMode('one-point');
+    let c = state.underlayCalibration;
+    assert.ok(c);
+    assert.strictEqual(c.mode, 'one-point');
+    assert.deepStrictEqual(c.pagePoints, [{ x: 1, y: 1 }]);
+    assert.deepStrictEqual(c.modelPoints, [{ x: 2, y: 2 }]);
+
+    state.addUnderlayCalibrationPagePoint({ x: 9, y: 9 }); // over the 1-pair cap
+    c = state.underlayCalibration;
+    assert.ok(c);
+    assert.strictEqual(c.pagePoints.length, 1);
+
+    state.setUnderlayCalibrationOneParams({ scaleDen: 75, rotationDeg: -1.5 });
+    c = state.underlayCalibration;
+    assert.ok(c);
+    assert.strictEqual(c.oneScaleDen, 75);
+    assert.strictEqual(c.oneRotationDeg, -1.5);
+  });
+
   it('allows re-picking model points after a retarget (alternation intact)', () => {
     state.startUnderlayCalibration('d1', 1, { guid: 'G1', z: 2 });
     state.addUnderlayCalibrationPagePoint({ x: 10, y: 20 });
