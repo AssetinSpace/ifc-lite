@@ -136,21 +136,31 @@ export function useFloorplanView() {
 
   const enterDrawingView = useCallback((storey: StoreyInfo) => {
     const state = useViewerStore.getState();
-    const guid = storeyGuidFor(storey);
-    // Idempotent: re-entering the view already active (e.g. Recalibrate on
-    // the same storey) must not re-apply the projection/preset — repeated
-    // top presets visibly spin the view (live report).
-    const alreadyThere =
-      state.underlayViewLocked && state.underlayActiveStoreyGuid === guid;
+    // Idempotent camera: when the locked top-down view is already active
+    // (Recalibrate, or switching storeys mid-calibration) only the cut moves —
+    // re-applying the top preset visibly spins the view (live report).
+    const alreadyTopDown = state.underlayViewLocked;
     state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayViewLocked(true);
     state.setUnderlaySplitView(false);
-    state.setUnderlayActiveStoreyGuid(guid);
-    if (!alreadyThere) {
+    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+    if (!alreadyTopDown) {
       setProjectionMode('orthographic');
       cameraCallbacks.setPresetView?.('top');
     }
   }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
+
+  /**
+   * Move an ACTIVE drawing/split view to another storey: update the cut and
+   * the bound storey GUID, leaving camera and projection untouched. No-op
+   * when neither view is active (a dropdown change alone shouldn't cut).
+   */
+  const retargetView = useCallback((storey: StoreyInfo) => {
+    const state = useViewerStore.getState();
+    if (!state.underlayViewLocked && !state.underlaySplitView) return;
+    state.setUnderlayCut(worldCutY(storey));
+    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+  }, [worldCutY, storeyGuidFor]);
 
   /** Leave the drawing view: remove the cut, unlock the camera. */
   const exitDrawingView = useCallback(() => {
@@ -192,5 +202,6 @@ export function useFloorplanView() {
     exitDrawingView,
     enterSplitView,
     exitSplitView,
+    retargetView,
   };
 }

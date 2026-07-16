@@ -38,9 +38,9 @@ export interface UnderlayCalibrationDraft {
   /** 1-based page being calibrated. */
   page: number;
   /**
-   * Target storey, fixed at calibration start — carried in the draft so the
-   * live ghost preview and Save use the storey the flow was started for
-   * (not whatever the dropdown shows later).
+   * Target storey — carried in the draft so the live ghost preview and Save
+   * use the storey the flow is bound to. Set at start; an explicit dropdown
+   * change mid-flow rebinds it via `retargetUnderlayCalibrationStorey`.
    */
   storeyGuid: string;
   /** Target storey elevation in metres (IFC Z). */
@@ -125,6 +125,12 @@ export interface DrawingUnderlaySlice {
     page: number,
     storey: { guid: string; z: number },
   ) => void;
+  /**
+   * Rebind an in-flight calibration to a different storey (dropdown change
+   * mid-flow). Model points are cleared — they were raycast on the old
+   * storey's floor; page points survive (same PDF page).
+   */
+  retargetUnderlayCalibrationStorey: (storey: { guid: string; z: number }) => void;
   setUnderlayCalibrationPageSize: (pageSize: [number, number]) => void;
   addUnderlayCalibrationPagePoint: (p: Point2) => void;
   addUnderlayCalibrationModelPoint: (p: Point2) => void;
@@ -275,6 +281,20 @@ export const createDrawingUnderlaySlice: StateCreator<
       },
       // Start inline; the user opts into the big overlay per calibration.
       underlayCalibrationExpanded: false,
+    }),
+
+  retargetUnderlayCalibrationStorey: (storey) =>
+    set((state) => {
+      const c = state.underlayCalibration;
+      if (!c || (c.storeyGuid === storey.guid && c.storeyZ === storey.z)) return state;
+      return {
+        underlayCalibration: {
+          ...c,
+          storeyGuid: storey.guid,
+          storeyZ: storey.z,
+          modelPoints: [],
+        },
+      };
     }),
 
   setUnderlayCalibrationPageSize: (pageSize) =>
