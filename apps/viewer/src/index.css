@@ -1107,3 +1107,50 @@ body {
   border-radius: 0.25rem;
   animation: skeleton-pulse 2s ease-in-out infinite;
 }
+
+/* PDF document reader text layer (D-075) — scoped copy of pdf.js's textLayer
+   contract: spans are positioned in page-relative % and sized via
+   --total-scale-factor, so zoom only updates the variable (no re-render).
+   Text is transparent; only the selection highlight is visible. */
+.pdf-doc-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  text-align: initial;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 2;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor, 1) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.pdf-doc-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+.pdf-doc-text-layer > :not(.markedContent),
+.pdf-doc-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.pdf-doc-text-layer .markedContent {
+  display: contents;
+}
+.pdf-doc-text-layer span[role='img'] {
+  user-select: none;
+  cursor: default;
+}
+.pdf-doc-text-layer ::selection {
+  background: rgb(59 130 246 / 0.35);
+}
