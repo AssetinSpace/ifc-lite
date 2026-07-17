@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '@/lib/autoload';
+import { AUTOLOAD_COMPLETE_EVENT, AUTOLOAD_MAX_MODEL_BYTES, parseAutoloadUrls, readBodyWithCap } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
 import { MobileToolbar } from './MobileToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
@@ -107,14 +107,16 @@ export function ViewerLayout() {
     const urls = parseAutoloadUrls(window.location.search, window.location.href);
     if (urls.length === 0) return;
     autoloadDoneRef.current = true;
+    const ac = new AbortController();
     (async () => {
       // Sequential: the WASM parser isn't re-entrant, and federated adds must
       // observe the earlier model's RTC/anchor before they finalize.
       for (const modelUrl of urls) {
+        if (ac.signal.aborted) return;
         try {
-          const res = await fetch(modelUrl);
+          const res = await fetch(modelUrl, { signal: ac.signal });
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-          const blob = await res.blob();
+          const blob = await readBodyWithCap(res, AUTOLOAD_MAX_MODEL_BYTES);
           const filename = (() => {
             try { return new URL(modelUrl, window.location.href).pathname.split('/').pop() || 'model.ifc'; }
             catch { return 'model.ifc'; }
@@ -122,13 +124,20 @@ export function ViewerLayout() {
           const file = new File([blob], filename, { type: blob.type || 'application/x-step' });
           await autoloadAddModel(file);
         } catch (err) {
+          if (ac.signal.aborted) return;
           console.error('[viewer] autoload failed for', modelUrl, err);
         }
       }
       // Always fires — even if some (or all) URLs failed — so listeners
       // (AimBridge MODELS_LOADED) can't wait forever on a broken model URL.
-      window.dispatchEvent(new Event(AUTOLOAD_COMPLETE_EVENT));
+      if (!ac.signal.aborted) window.dispatchEvent(new Event(AUTOLOAD_COMPLETE_EVENT));
     })();
+    return () => {
+      // Unmount (aj StrictMode dev double-invoke) — zruš rozbehnutý fetch a
+      // odlatchni, nech prípadný re-mount autoload zopakuje od začiatku.
+      ac.abort();
+      autoloadDoneRef.current = false;
+    };
   }, [autoloadAddModel]);
   // <<< AIM-FORK
 

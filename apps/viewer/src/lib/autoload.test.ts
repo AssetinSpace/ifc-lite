@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
-import { AUTOLOAD_MAX_MODELS, parseAutoloadUrls } from './autoload.js';
+import { AUTOLOAD_MAX_MODELS, parseAutoloadUrls, readBodyWithCap } from './autoload.js';
 
 const BASE = 'https://viewer.example/';
 
@@ -52,5 +52,37 @@ describe('parseAutoloadUrls', () => {
     const out = parseAutoloadUrls(`?models=${urls.join(',')}`, BASE);
     assert.equal(out.length, AUTOLOAD_MAX_MODELS);
     assert.equal(out[0], 'https://x/0.ifc');
+  });
+});
+
+describe('readBodyWithCap', () => {
+  const body = (chunks: Uint8Array[], headers: Record<string, string> = {}) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const c of chunks) controller.enqueue(c);
+          controller.close();
+        },
+      }),
+      { headers },
+    );
+
+  it('returns the full body when under the cap', async () => {
+    const blob = await readBodyWithCap(body([new Uint8Array(10), new Uint8Array(5)]), 100);
+    assert.equal(blob.size, 15);
+  });
+
+  it('rejects early on a Content-Length above the cap', async () => {
+    await assert.rejects(
+      readBodyWithCap(body([], { 'content-length': '101' }), 100),
+      /autoload cap/,
+    );
+  });
+
+  it('rejects mid-stream when the body exceeds the cap (absent/lying Content-Length)', async () => {
+    await assert.rejects(
+      readBodyWithCap(body([new Uint8Array(60), new Uint8Array(60)]), 100),
+      /autoload cap/,
+    );
   });
 });
