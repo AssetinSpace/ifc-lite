@@ -17,12 +17,12 @@
  * lightweight view state (page / zoom) survives in the store.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { Minus, Plus } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
-import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
+import { openPdfDocument, rasterizePdfPage, rasterizePdfRegion } from '@/lib/pdf/rasterize';
 
 /**
  * Raster ceiling (longest edge, device px). Deep zoom into drawings needs
@@ -38,9 +38,19 @@ const CANVAS_LRU_BUDGET_PX = 32_000_000;
 const CANVAS_LRU_MAX_COUNT = 12;
 const PAGE_GAP_PX = 12;
 const ZOOM_MIN = 0.5;
-const ZOOM_MAX = 10;
+const ZOOM_MAX = 16;
 /** Trailing debounce before committing a new raster width (CSS scales until). */
 const RASTER_SETTLE_MS = 200;
+/**
+ * Sharp-crop overlay ("vector zoom"): once the zoom outgrows the base
+ * raster's ceiling, the VISIBLE crop of the page is re-rendered from the PDF
+ * vectors at the exact device scale and layered over the base canvas — so
+ * any zoom level reads crisp, like a native PDF viewer. The crop extends one
+ * margin beyond the viewport to tolerate small pans; each edge is capped so
+ * a single overlay can never exceed one safe canvas.
+ */
+const SHARP_CROP_MARGIN = 0.5;
+const SHARP_CROP_MAX_PX = 4096;
 
 interface PdfDocumentViewProps {
   docId: string;
@@ -216,6 +226,24 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
     };
   }, [numPages]);
 
+  // Scroll-settle tick for the sharp-crop overlays: pages re-render their
+  // visible crop only once panning pauses, not per scroll frame.
+  const [viewportTick, setViewportTick] = useState(0);
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onScroll = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => setViewportTick((t) => t + 1), RASTER_SETTLE_MS);
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      clearTimeout(timer);
+    };
+  }, []);
+
   // Persist view state, debounced — every ctrl+wheel tick would otherwise
   // rebuild docTabs (and re-render the whole pane tree) per event.
   useEffect(() => {
@@ -310,6 +338,8 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
                   rasterWidth={rasterWidth || pageWidth}
                   aspect={aspects.get(page) ?? defaultAspect}
                   render={visible.has(page)}
+                  viewportTick={viewportTick}
+                  scrollRootRef={scrollRef}
                   onAspect={onPageAspect}
                   registerEl={registerPageEl}
                 />
@@ -389,12 +419,36 @@ interface PdfPageProps {
   rasterWidth: number;
   aspect: number;
   render: boolean;
+  /** Bumps once panning settles — schedules a sharp-crop re-render. */
+  viewportTick: number;
+  scrollRootRef: RefObject<HTMLDivElement | null>;
   onAspect: (page: number, aspect: number) => void;
   registerEl: (page: number, el: HTMLDivElement | null) => void;
 }
 
-function PdfPage({ pdf, page, width, rasterWidth, aspect, render, onAspect, registerEl }: PdfPageProps) {
+function PdfPage({
+  pdf,
+  page,
+  width,
+  rasterWidth,
+  aspect,
+  render,
+  viewportTick,
+  scrollRootRef,
+  onAspect,
+  registerEl,
+}: PdfPageProps) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const outerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const removeOverlay = useCallback(() => {
+    const overlay = overlayRef.current;
+    overlayRef.current = null;
+    if (!overlay) return;
+    overlay.remove();
+    overlay.width = 0;
+    overlay.height = 0;
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -448,13 +502,108 @@ function PdfPage({ pdf, page, width, rasterWidth, aspect, render, onAspect, regi
     // those need the corrected raster anyway.
   }, [pdf, page, rasterWidth, aspect, render, onAspect]);
 
+  // ── Sharp-crop overlay: true "vector zoom". When the layout outgrows the
+  // base raster (density < 1), re-render the visible crop from the PDF
+  // vectors at the exact device scale and pin it over the base canvas.
+  useEffect(() => {
+    const outer = outerRef.current;
+    const root = scrollRootRef.current;
+    if (!outer || !root || !render || rasterWidth <= 0) {
+      removeOverlay();
+      return;
+    }
+    let stale = false;
+    void (async () => {
+      const dpr = window.devicePixelRatio;
+      const pageRect = outer.getBoundingClientRect();
+      const rootRect = root.getBoundingClientRect();
+      if (pageRect.width <= 0) return;
+      // Base sharp enough? (base canvas device width vs needed device width)
+      const baseCanvas = hostRef.current?.querySelector('canvas');
+      const neededDeviceW = pageRect.width * dpr;
+      if (baseCanvas && baseCanvas.width >= neededDeviceW * 0.98) {
+        removeOverlay();
+        return;
+      }
+      // Visible intersection in page-local CSS coords, padded by the margin.
+      const marginX = rootRect.width * SHARP_CROP_MARGIN;
+      const marginY = rootRect.height * SHARP_CROP_MARGIN;
+      let x0 = Math.max(0, rootRect.left - marginX - pageRect.left);
+      let y0 = Math.max(0, rootRect.top - marginY - pageRect.top);
+      let x1 = Math.min(pageRect.width, rootRect.right + marginX - pageRect.left);
+      let y1 = Math.min(pageRect.height, rootRect.bottom + marginY - pageRect.top);
+      if (x1 <= x0 || y1 <= y0) {
+        removeOverlay();
+        return;
+      }
+      // Per-edge canvas cap — shrink the margin, keeping the visible center.
+      const capCss = SHARP_CROP_MAX_PX / dpr;
+      if (x1 - x0 > capCss) {
+        const cx = (Math.max(x0, rootRect.left - pageRect.left) + Math.min(x1, rootRect.right - pageRect.left)) / 2;
+        x0 = Math.max(0, cx - capCss / 2);
+        x1 = Math.min(pageRect.width, x0 + capCss);
+      }
+      if (y1 - y0 > capCss) {
+        const cy = (Math.max(y0, rootRect.top - pageRect.top) + Math.min(y1, rootRect.bottom - pageRect.top)) / 2;
+        y0 = Math.max(0, cy - capCss / 2);
+        y1 = Math.min(pageRect.height, y0 + capCss);
+      }
+      try {
+        const pdfPage = await pdf.getPage(page);
+        if (stale) return;
+        const basePts = pdfPage.getViewport({ scale: 1 });
+        const pixelsPerPoint = neededDeviceW / basePts.width;
+        const region = await rasterizePdfRegion(pdf, page, pixelsPerPoint, {
+          x: x0 * dpr,
+          y: y0 * dpr,
+          width: (x1 - x0) * dpr,
+          height: (y1 - y0) * dpr,
+        });
+        if (stale) {
+          region.image.close();
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = region.width;
+        canvas.height = region.height;
+        canvas.getContext('2d')?.drawImage(region.image, 0, 0);
+        region.image.close();
+        canvas.style.position = 'absolute';
+        canvas.style.left = `${(x0 / pageRect.width) * 100}%`;
+        canvas.style.top = `${(y0 / pageRect.height) * 100}%`;
+        canvas.style.width = `${((x1 - x0) / pageRect.width) * 100}%`;
+        canvas.style.height = `${((y1 - y0) / pageRect.height) * 100}%`;
+        canvas.style.pointerEvents = 'none';
+        if (!stale && outerRef.current) {
+          removeOverlay();
+          overlayRef.current = canvas;
+          outerRef.current.appendChild(canvas);
+        }
+      } catch (err) {
+        console.error(`pdf document view: sharp crop for page ${page} failed`, err);
+      }
+    })();
+    return () => {
+      stale = true;
+    };
+    // width is intentionally read fresh from the DOM (pageRect) — the effect
+    // fires on settled signals only: raster commit, pan settle, page window.
+  }, [pdf, page, rasterWidth, aspect, render, viewportTick, scrollRootRef, removeOverlay]);
+
+  // Leaving the render window drops the overlay's memory immediately.
+  useEffect(() => {
+    if (!render) removeOverlay();
+  }, [render, removeOverlay]);
+  useEffect(() => () => removeOverlay(), [removeOverlay]);
+
   return (
     <div
       ref={(el) => {
+        outerRef.current = el;
         registerEl(page, el);
       }}
       data-page={page}
-      className="bg-white shadow-sm"
+      className="relative overflow-hidden bg-white shadow-sm"
       style={{
         width: `${width}px`,
         height: `${width / aspect}px`,
