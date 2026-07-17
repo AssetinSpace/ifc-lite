@@ -65,6 +65,7 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
         console.error(`identifier links: page ${page} text scan failed`, err);
         useViewerStore.getState().setIdentifierScanStats({
           source: 'document', page, status: 'error', textItems: 0, codes: 0, matched: 0,
+          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
         });
       }
     })();

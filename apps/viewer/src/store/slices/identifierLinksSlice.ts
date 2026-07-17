@@ -34,6 +34,8 @@ export interface IdentifierScanStats {
   codes: number;
   /** Codes that resolved to at least one model element. */
   matched: number;
+  /** Error message when status === 'error' (surfaced in the UI, no console). */
+  error?: string;
 }
 
 export interface IdentifierLinksSlice {

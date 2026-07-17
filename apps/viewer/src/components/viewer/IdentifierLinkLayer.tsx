@@ -71,6 +71,7 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
         console.error('identifier links: page text scan failed', err);
         useViewerStore.getState().setIdentifierScanStats({
           source: drawing.name, page, status: 'error', textItems: 0, codes: 0, matched: 0,
+          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
         });
       }
     })();
