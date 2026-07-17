@@ -10,8 +10,9 @@
  * WebGPU scene + underlay textures), so this is a virtualized page list, not
  * a render-everything view: pages mount as aspect-ratio placeholders and only
  * the ones near the viewport are rasterized (IntersectionObserver), with a
- * small LRU of live canvases. Rasters target reading resolution (≤2400 px),
- * far below the plan pane's texture ceiling. ImageBitmaps are closed right
+ * pixel-budgeted LRU of live canvases. Rasters follow the zoom up to
+ * READ_RASTER_MAX_PX so drawings stay sharp when zoomed in, still below the
+ * plan pane's texture ceiling. ImageBitmaps are closed right
  * after drawImage, and unmounting (tab switch) drops every canvas — only the
  * lightweight view state (page / zoom) survives in the store.
  */
@@ -23,12 +24,21 @@ import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 
-/** Reading raster ceiling (longest edge, device px) and live-canvas budget. */
-const READ_RASTER_MAX_PX = 2400;
-const CANVAS_LRU_MAX = 4;
+/**
+ * Raster ceiling (longest edge, device px). Deep zoom into drawings needs
+ * real resolution — beyond this the canvas is CSS-upscaled (soft). 4096 is
+ * safe on every GPU/canvas backend; memory is held in check by the visible
+ * ±1 window plus the pixel-budget LRU below, so the worst case is a couple
+ * of ~12 MP canvases, not one per page.
+ */
+const READ_RASTER_MAX_PX = 4096;
+/** Live-canvas budget: total detached pixels the LRU may retain (~128 MB
+ *  RGBA), plus a count cap so hundreds of tiny thumbnails can't pile up. */
+const CANVAS_LRU_BUDGET_PX = 32_000_000;
+const CANVAS_LRU_MAX_COUNT = 12;
 const PAGE_GAP_PX = 12;
 const ZOOM_MIN = 0.5;
-const ZOOM_MAX = 4;
+const ZOOM_MAX = 10;
 /** Trailing debounce before committing a new raster width (CSS scales until). */
 const RASTER_SETTLE_MS = 200;
 
@@ -313,7 +323,8 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
 
 /**
  * Shared LRU of live page canvases. The pane shows ONE document at a time,
- * so a module-level LRU capped at {@link CANVAS_LRU_MAX} detached entries is
+ * so a module-level LRU capped at {@link CANVAS_LRU_BUDGET_PX} detached
+ * pixels (and {@link CANVAS_LRU_MAX_COUNT} entries) is
  * the memory budget; canvases still mounted in the DOM are never evicted
  * (blanking a visible page), and the document-lifecycle cleanup releases all
  * detached entries when a tab unmounts.
@@ -337,13 +348,28 @@ function lruRelease(key: string, canvas: HTMLCanvasElement): void {
   canvas.height = 0;
 }
 
+function lruDetachedPixels(): number {
+  let total = 0;
+  for (const c of canvasLru.values()) {
+    if (!c.isConnected) total += c.width * c.height;
+  }
+  return total;
+}
+
 function lruPut(key: string, canvas: HTMLCanvasElement): void {
   canvasLru.set(key, canvas);
-  if (canvasLru.size <= CANVAS_LRU_MAX) return;
+  // Pixel budget instead of a fixed count: one deep-zoom canvas weighs as
+  // much as dozens of fit-width pages, so the budget adapts — a couple of
+  // ~12 MP rasters at high zoom, many small ones while skimming.
+  let overBudget = lruDetachedPixels() > CANVAS_LRU_BUDGET_PX;
+  let overCount = canvasLru.size > CANVAS_LRU_MAX_COUNT;
+  if (!overBudget && !overCount) return;
   for (const [k, c] of canvasLru) {
-    if (canvasLru.size <= CANVAS_LRU_MAX) break;
+    if (!overBudget && !overCount) break;
     if (k === key || c.isConnected) continue; // never blank a mounted page
     lruRelease(k, c);
+    overBudget = lruDetachedPixels() > CANVAS_LRU_BUDGET_PX;
+    overCount = canvasLru.size > CANVAS_LRU_MAX_COUNT;
   }
 }
 
@@ -374,13 +400,17 @@ function PdfPage({ pdf, page, width, rasterWidth, aspect, render, onAspect, regi
     const host = hostRef.current;
     if (!host || !render || rasterWidth <= 0) return;
     let stale = false;
-    // Raster key: page identity + resolution bucket (512 px steps so small
-    // zoom nudges reuse the cached canvas instead of re-rendering). Width
-    // alone drives the bucket — folding the (lazily refined) aspect in would
-    // re-render every page once its true aspect arrives.
+    // The reader is width-fit, but rasterizePdfPage bounds the LONGEST edge —
+    // for a portrait page that edge is the height, so a width-derived target
+    // must be scaled up by h/w or the raster comes out narrower than the
+    // layout box and CSS-upscales into blur. The aspect refines lazily; the
+    // effect deps include it, so the raster follows the correction.
+    const wantedWidthPx = rasterWidth * window.devicePixelRatio;
+    const wantedLongestPx = aspect < 1 ? wantedWidthPx / aspect : wantedWidthPx;
+    // Bucketed to 512 px steps so small zoom nudges reuse the cached canvas.
     const targetPx = Math.min(
       READ_RASTER_MAX_PX,
-      Math.ceil((rasterWidth * window.devicePixelRatio) / 512) * 512,
+      Math.ceil(wantedLongestPx / 512) * 512,
     );
     const key = `${pdf.fingerprints[0] ?? 'doc'}:${page}:${targetPx}`;
     const cached = lruGet(key);
@@ -413,7 +443,10 @@ function PdfPage({ pdf, page, width, rasterWidth, aspect, render, onAspect, regi
       stale = true;
       host.replaceChildren();
     };
-  }, [pdf, page, rasterWidth, render, onAspect]);
+    // `aspect` is a real input (portrait scaling above): a lazily refined
+    // aspect re-rasters only pages whose orientation differs from page 1 —
+    // those need the corrected raster anyway.
+  }, [pdf, page, rasterWidth, aspect, render, onAspect]);
 
   return (
     <div
