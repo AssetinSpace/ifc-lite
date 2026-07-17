@@ -60,6 +60,51 @@ export async function openPdfDocument(url: string): Promise<PDFDocumentProxy> {
 }
 
 /**
+ * Rasterize a REGION of one page at an exact scale — the "vector zoom" path
+ * (D-075): when the whole-page raster's ceiling is passed, the visible crop
+ * is re-rendered from the PDF vectors at the current device scale, so text
+ * and linework stay sharp at any zoom. The crop is expressed in device
+ * pixels of the scaled page (viewport offsets shift the page so the crop
+ * lands on the canvas; pdf.js clips to the canvas bounds).
+ */
+export interface RasterizedRegion {
+  image: ImageBitmap;
+  /** Region size in device pixels (canvas size). */
+  width: number;
+  height: number;
+}
+
+export async function rasterizePdfRegion(
+  doc: PDFDocumentProxy,
+  pageNumber: number,
+  /** Raster scale: device pixels per PDF point. */
+  pixelsPerPoint: number,
+  /** Crop origin/size in device pixels of the scaled page (top-left frame). */
+  crop: { x: number; y: number; width: number; height: number },
+): Promise<RasterizedRegion> {
+  const page = await doc.getPage(pageNumber);
+  const viewport = page.getViewport({
+    scale: pixelsPerPoint,
+    offsetX: -crop.x,
+    offsetY: -crop.y,
+  });
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.ceil(crop.width));
+  canvas.height = Math.max(1, Math.ceil(crop.height));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('rasterizePdfRegion: 2D canvas context unavailable');
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+
+  const image = await createImageBitmap(canvas);
+  return { image, width: canvas.width, height: canvas.height };
+}
+
+/**
  * Rasterize one page to an ImageBitmap for texture upload.
  *
  * `targetPx` bounds the raster's longest edge; the effective size is further
