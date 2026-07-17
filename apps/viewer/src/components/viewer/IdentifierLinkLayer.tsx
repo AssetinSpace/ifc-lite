@@ -51,6 +51,9 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
   useEffect(() => {
     if (!config.enabled || page === undefined) return;
     let stale = false;
+    useViewerStore.getState().setIdentifierScanStats({
+      source: drawing.name, page, status: 'scanning', textItems: 0, codes: 0, matched: 0,
+    });
     void (async () => {
       try {
         const doc = await openPdfDocument(drawing.pdfUrl);
@@ -64,14 +67,18 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
           void doc.destroy();
         }
       } catch (err) {
+        if (stale) return;
         console.error('identifier links: page text scan failed', err);
+        useViewerStore.getState().setIdentifierScanStats({
+          source: drawing.name, page, status: 'error', textItems: 0, codes: 0, matched: 0,
+        });
       }
     })();
     return () => {
       stale = true;
       setBoxes(null);
     };
-  }, [config.enabled, config.pattern, drawing.pdfUrl, page]);
+  }, [config.enabled, config.pattern, drawing.pdfUrl, page, drawing.name]);
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !boxes) return [];
@@ -84,6 +91,7 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
     useViewerStore.getState().setIdentifierScanStats({
       source: drawing.name,
       page,
+      status: 'done',
       textItems,
       codes: boxes.length,
       matched: links.filter((l) => l.targets.length > 0).length,

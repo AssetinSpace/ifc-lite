@@ -95,7 +95,10 @@ export function IdentifierLinkBoxes({
             className={
               matched
                 ? 'pointer-events-auto absolute cursor-pointer rounded-[2px] bg-emerald-300/20 shadow-[inset_0_-2px_0_0_rgb(16_185_129/0.55)] hover:bg-emerald-300/40'
-                : 'absolute rounded-[1px] border border-dashed border-amber-500/70'
+                : // Debug: recognized-but-unmatched. A visible amber fill +
+                  // outline (not a thin dashed line lost over dense linework
+                  // at high zoom), so "found but not in the model" is obvious.
+                  'absolute rounded-[1px] bg-amber-400/25 outline outline-1 outline-amber-500/80'
             }
             style={toCss(link)}
             onPointerDown={matched ? (e) => e.stopPropagation() : undefined}

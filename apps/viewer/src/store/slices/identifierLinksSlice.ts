@@ -26,6 +26,8 @@ export interface IdentifierScanStats {
   /** Where the scan ran (drawing/document name or id). */
   source: string;
   page: number;
+  /** Lifecycle of the scan — 'scanning' before results, 'error' on failure. */
+  status: 'scanning' | 'done' | 'error';
   /** pdf.js text items on the page (0 = the PDF has no text layer). */
   textItems: number;
   /** Identifier-shaped codes recognized on the page. */
