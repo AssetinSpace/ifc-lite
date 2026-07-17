@@ -64,10 +64,11 @@ export function useIdentifierLinks(): UseIdentifierLinksResult {
     return parts.join('|');
   }, [models]);
 
-  // 2) Build the index when enabled and out of date.
+  // 2) Build the index when enabled and out of date. An empty model set
+  // still "builds" (an empty index) so the page scan + debug outlines work
+  // before a model finishes loading.
   useEffect(() => {
     if (!config.enabled) return;
-    if (modelsSignature === '' || !modelsSignature.includes(':1')) return;
     const signature = `${modelsSignature}::${JSON.stringify({
       sources: config.sources,
       pattern: config.pattern,
