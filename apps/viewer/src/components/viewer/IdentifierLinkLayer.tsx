@@ -19,6 +19,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { UnderlayDrawing } from '@/store';
+import { useViewerStore } from '@/store';
 import { useIdentifierLinks } from '@/hooks/useIdentifierLinks';
 import { compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
@@ -41,6 +42,7 @@ interface IdentifierLinkLayerProps {
 export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps) {
   const { config, index } = useIdentifierLinks();
   const [boxes, setBoxes] = useState<PageLinkBox[] | null>(null);
+  const [textItems, setTextItems] = useState(0);
 
   const placement = drawing.placement;
   const page = placement?.page;
@@ -56,6 +58,7 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
           const { items } = await getPdfPageTextItems(doc, page);
           if (stale) return;
           const re = compileIdentifierPattern(config.pattern);
+          setTextItems(items.length);
           setBoxes(re ? findIdentifierBoxes(items, re) : []);
         } finally {
           void doc.destroy();
@@ -74,6 +77,18 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
     if (!config.enabled || !index || !boxes) return [];
     return resolvePageLinks(boxes, index, { preferStoreyGuid: placement?.storeyGuid });
   }, [config.enabled, index, boxes, placement?.storeyGuid]);
+
+  // Publish scan diagnostics for the settings panel ("why don't I see links?").
+  useEffect(() => {
+    if (!config.enabled || boxes === null || page === undefined) return;
+    useViewerStore.getState().setIdentifierScanStats({
+      source: drawing.name,
+      page,
+      textItems,
+      codes: boxes.length,
+      matched: links.filter((l) => l.targets.length > 0).length,
+    });
+  }, [config.enabled, boxes, links, textItems, drawing.name, page]);
 
   if (!config.enabled || !placement) return null;
 

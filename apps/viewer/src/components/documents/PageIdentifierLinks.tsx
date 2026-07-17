@@ -18,6 +18,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
+import { useViewerStore } from '@/store';
 import { useIdentifierLinks } from '@/hooks/useIdentifierLinks';
 import { compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
@@ -38,9 +39,11 @@ interface PageIdentifierLinksProps {
 
 export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksProps) {
   const { config, index } = useIdentifierLinks();
-  const [scan, setScan] = useState<{ boxes: PageLinkBox[]; pageSize: [number, number] } | null>(
-    null,
-  );
+  const [scan, setScan] = useState<{
+    boxes: PageLinkBox[];
+    pageSize: [number, number];
+    textItems: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!config.enabled || !render) return;
@@ -50,7 +53,11 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
         const { items, pageSizePts } = await getPdfPageTextItems(pdf, page);
         if (stale) return;
         const re = compileIdentifierPattern(config.pattern);
-        setScan({ boxes: re ? findIdentifierBoxes(items, re) : [], pageSize: pageSizePts });
+        setScan({
+          boxes: re ? findIdentifierBoxes(items, re) : [],
+          pageSize: pageSizePts,
+          textItems: items.length,
+        });
       } catch (err) {
         console.error(`identifier links: page ${page} text scan failed`, err);
       }
@@ -65,6 +72,18 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
     if (!config.enabled || !index || !scan) return [];
     return resolvePageLinks(scan.boxes, index);
   }, [config.enabled, index, scan]);
+
+  // Publish scan diagnostics for the settings panel ("why don't I see links?").
+  useEffect(() => {
+    if (!config.enabled || !scan) return;
+    useViewerStore.getState().setIdentifierScanStats({
+      source: 'document',
+      page,
+      textItems: scan.textItems,
+      codes: scan.boxes.length,
+      matched: links.filter((l) => l.targets.length > 0).length,
+    });
+  }, [config.enabled, scan, links, page]);
 
   if (!config.enabled || !scan) return null;
 
