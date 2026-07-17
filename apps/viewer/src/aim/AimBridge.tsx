@@ -56,11 +56,15 @@ export function AimBridge() {
 
     // This app is only ever embedded by the AIM host, so the referrer at
     // mount time IS the trusted origin — no build-time config needed.
+    // Without a referrer (host with Referrer-Policy: no-referrer) the bridge
+    // stays mute instead of degrading to postMessage '*' / accept-any-origin:
+    // GUIDs of the selection would otherwise leak to whatever window embeds us.
     parentOriginRef.current = document.referrer ? new URL(document.referrer).origin : null;
     useAimPanelStore.getState().setEmbedded(true, parentOriginRef.current);
 
     function post(msg: OutboundMessage) {
-      window.parent.postMessage(msg, parentOriginRef.current ?? '*');
+      if (!parentOriginRef.current) return;
+      window.parent.postMessage(msg, parentOriginRef.current);
     }
 
     // Ops berú buď explicitné GUIDy, alebo množinový selektor (typy/model)
@@ -76,7 +80,9 @@ export function AimBridge() {
       // Len priamy rodič — iné okná (popupy, vnorené iframy) nemajú čo
       // posielať bridge príkazy, ani keby trafili origin.
       if (e.source !== window.parent) return;
-      if (parentOriginRef.current && e.origin !== parentOriginRef.current) return;
+      // Fail-closed: bez známeho parent originu (prázdny referrer) sa príkazy
+      // neprijímajú — inak by ich mohol posielať ľubovoľný embedder.
+      if (!parentOriginRef.current || e.origin !== parentOriginRef.current) return;
       if (!isInboundMessage(e.data)) return;
 
       switch (e.data.type) {
@@ -204,11 +210,11 @@ export function AimBridge() {
   const modelsAnnouncedRef = useRef(false);
   const announceModels = () => {
     const count = useViewerStore.getState().models.size;
-    if (count === 0 || modelsAnnouncedRef.current) return;
+    if (count === 0 || modelsAnnouncedRef.current || !parentOriginRef.current) return;
     modelsAnnouncedRef.current = true;
     window.parent.postMessage(
       { source: SOURCE, type: 'MODELS_LOADED', count } satisfies OutboundMessage,
-      parentOriginRef.current ?? '*',
+      parentOriginRef.current,
     );
   };
   const autoloadingRef = useRef(false);
@@ -247,7 +253,10 @@ export function AimBridge() {
   const hadSelectionRef = useRef(false);
   useEffect(() => {
     if (!embeddedRef.current) return;
-    const targetOrigin = parentOriginRef.current ?? '*';
+    // Bez trusted parent originu (prázdny referrer) selekcie von neposielame —
+    // broadcast GUIDov na '*' by čítal ľubovoľný embedder.
+    const targetOrigin = parentOriginRef.current;
+    if (!targetOrigin) return;
     if (!selectedEntity) {
       // Úvodný render má selectedEntity === null — DESELECTED posielaj až
       // po skutočnej selekcii, inak host dostane šum hneď po READY.

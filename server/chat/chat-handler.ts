@@ -271,6 +271,14 @@ function getHeader(headers: HeaderBag, name: string): string | null {
 }
 
 function getRequestUrl(req: HandlerRequest, config: ChatConfig): URL {
+  // Trust model: deriving our own origin from Host/X-Forwarded-Host is safe
+  // against browser CSRF because browsers cannot set either header (forbidden
+  // request headers), so a page on evil.example can never make its Origin
+  // match the host it sends here. Non-browser clients can spoof both — but
+  // they can spoof Origin itself too, so origin checks were never a defense
+  // there; the per-IP quota is. Deriving from the request host (not
+  // config.appUrl) is what lets same-origin preview deployments work while
+  // APP_URL points at production.
   const host = getHeader(req.headers, 'x-forwarded-host') ?? getHeader(req.headers, 'host');
   const proto = getHeader(req.headers, 'x-forwarded-proto') ?? 'https';
   const fallbackBase = host ? `${proto}://${host}` : config.appUrl;
