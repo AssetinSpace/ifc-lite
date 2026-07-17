@@ -1,0 +1,97 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   AIM-FORK: assetin brand theme (design kit D-070)
+
+   Loads AFTER index.css (see main.tsx import order) and re-points the
+   upstream Tokyo Night theme at the assetin design-kit tokens
+   (`@assetinspace/design-kit/css/tokens.css`, imported in main.tsx before
+   this file). Strategy: the upstream dark-mode rules all read from the
+   `--tokyo-*` palette, so we remap that palette to semantic `--ds-*`
+   aliases — the aliases flip automatically between light and dark, so a
+   single :root block covers most of the theme and the ~1000 lines of
+   upstream override rules keep working untouched.
+
+   The `.colorful` mode ("Brutalist Aurora", shift-click the theme toggle)
+   defines its own `--cf-*` palette and stays deliberately unbranded.
+
+   Never hardcode brand colours here — use `--ds-*` tokens (design-kit
+   rule 1); brand changes happen in the kit, then bump the dependency.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Tokyo Night palette → assetin tokens ─────────────────────────────────
+     Semantic --ds-* aliases resolve at the use site, so these pick up the
+     dark values automatically under `.dark`. */
+  --tokyo-storm: var(--ds-surface-muted);        /* page background */
+  --tokyo-night: var(--ds-surface);              /* panels, cards */
+  --tokyo-bg-dark: var(--ds-surface-muted);
+  --tokyo-bg-highlight: var(--ds-surface-hover); /* hover / raised rows */
+  --tokyo-terminal-black: var(--ds-border-strong);
+  --tokyo-comment: var(--ds-text-faint);
+  --tokyo-dark3: var(--ds-border);
+  --tokyo-fg: var(--ds-text);
+  --tokyo-fg-dark: var(--ds-text-muted);
+  --tokyo-fg-gutter: var(--ds-surface-raised);
+
+  /* Accents: primary blue → brand green; the rest map to semantic states. */
+  --tokyo-blue: var(--ds-primary);
+  --tokyo-cyan: var(--ds-info);
+  --tokyo-teal: var(--ds-success);
+  --tokyo-green: var(--ds-success);
+  --tokyo-yellow: var(--ds-warning);
+  --tokyo-red: var(--ds-danger);
+
+  /* ── shadcn-style semantic tokens (light; dark rides the --tokyo-* remap
+     via index.css's own `.dark` block) ──────────────────────────────────── */
+  --color-primary: var(--ds-primary);
+  --color-primary-foreground: var(--ds-text-on-brand);
+  --color-ring: var(--ds-primary);
+  --color-destructive: var(--ds-danger);
+  --color-foreground: var(--ds-text);
+  --color-card-foreground: var(--ds-text);
+  --color-popover-foreground: var(--ds-text);
+  --color-secondary: var(--ds-gray-100);
+  --color-secondary-foreground: var(--ds-text-strong);
+  --color-muted: var(--ds-gray-100);
+  --color-muted-foreground: var(--ds-text-muted);
+  --color-accent: var(--ds-brand-green-soft);
+  --color-accent-foreground: var(--ds-primary-hover);
+  --color-border: var(--ds-border);
+  --color-input: var(--ds-border);
+
+  /* Hierarchy panel + tabs (light) — upstream zinc literals → gray tokens. */
+  --hierarchy-selected-bg: var(--ds-gray-200);
+  --hierarchy-selected-text: var(--ds-text-strong);
+  --hierarchy-text: var(--ds-gray-600);
+  --hierarchy-hover-bg: var(--ds-gray-100);
+  --tabs-bg: var(--ds-gray-100);
+  --tabs-border: var(--ds-gray-200);
+  --tab-text: var(--ds-text-muted);
+  --tab-active-bg: var(--ds-white);
+  --tab-active-text: var(--ds-text-strong);
+
+  /* Brand font (Inter, loaded in index.html). */
+  --font-sans: var(--ds-font-sans);
+}
+
+/* Upstream sets these per-mode with literals at :root.dark specificity, so
+   the :root block above can't reach them — re-state for dark explicitly. */
+:root.dark,
+.dark {
+  --hierarchy-selected-bg: var(--ds-surface-hover);
+  --hierarchy-selected-text: var(--ds-text);
+  --hierarchy-text: var(--ds-text-muted);
+  --hierarchy-hover-bg: color-mix(in srgb, var(--ds-surface-hover) 50%, transparent);
+  --tabs-bg: var(--ds-surface-hover);
+  --tabs-border: var(--ds-border-strong);
+  --tab-text: var(--ds-text-muted);            /* ≥4.5:1 on --tabs-bg (AA) */
+  --tab-active-bg: var(--ds-surface);
+  --tab-active-text: var(--ds-text);
+  --tab-inactive-bg: var(--tabs-bg);
+  /* upstream pins #828bb8 (Tokyo hue) here; brand equivalent: */
+  --color-muted-foreground: var(--ds-text-muted);
+}
+
+html,
+body {
+  font-family: var(--ds-font-sans);
+}
