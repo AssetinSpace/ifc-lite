@@ -74,7 +74,9 @@ export function IdentifierLinkBoxes({
   };
 
   return (
-    <div className="pointer-events-none absolute inset-0" data-testid="identifier-link-layer">
+    // z-10: must stack above the PDF reader's sharp-crop overlay canvas
+    // (appended later in DOM order), or deep zoom paints the links over.
+    <div className="pointer-events-none absolute inset-0 z-10" data-testid="identifier-link-layer">
       {links.map((link, i) => {
         const matched = link.targets.length > 0;
         if (!matched && !debug) return null;
