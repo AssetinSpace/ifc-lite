@@ -48,18 +48,24 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
   useEffect(() => {
     if (!config.enabled || !render) return;
     let stale = false;
+    // Publish a "scanning" marker up front, so the settings readout reflects
+    // this page even if the scan then errors or the PDF has no text layer.
+    useViewerStore.getState().setIdentifierScanStats({
+      source: 'document', page, status: 'scanning', textItems: 0, codes: 0, matched: 0,
+    });
     void (async () => {
       try {
         const { items, pageSizePts } = await getPdfPageTextItems(pdf, page);
         if (stale) return;
         const re = compileIdentifierPattern(config.pattern);
-        setScan({
-          boxes: re ? findIdentifierBoxes(items, re) : [],
-          pageSize: pageSizePts,
-          textItems: items.length,
-        });
+        const boxes = re ? findIdentifierBoxes(items, re) : [];
+        setScan({ boxes, pageSize: pageSizePts, textItems: items.length });
       } catch (err) {
+        if (stale) return;
         console.error(`identifier links: page ${page} text scan failed`, err);
+        useViewerStore.getState().setIdentifierScanStats({
+          source: 'document', page, status: 'error', textItems: 0, codes: 0, matched: 0,
+        });
       }
     })();
     return () => {
@@ -79,6 +85,7 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
     useViewerStore.getState().setIdentifierScanStats({
       source: 'document',
       page,
+      status: 'done',
       textItems: scan.textItems,
       codes: scan.boxes.length,
       matched: links.filter((l) => l.targets.length > 0).length,

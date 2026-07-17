@@ -89,6 +89,53 @@ export function IdentifierLinkSettings() {
               element — configure where the code is stored in this model.
             </p>
 
+            {/* Prominent scan diagnostic — the first thing to check when links
+                don't appear. Always shown while enabled so it can't be missed. */}
+            {config.enabled && (
+              <div className="rounded border border-amber-500/40 bg-amber-500/5 p-1.5 text-[11px] leading-snug">
+                <div className="font-medium">Drawing scan</div>
+                {!scanStats && (
+                  <div className="text-muted-foreground">
+                    Open a PDF drawing/document to scan its text for codes.
+                  </div>
+                )}
+                {scanStats?.status === 'scanning' && (
+                  <div className="text-muted-foreground">Scanning {scanStats.source}…</div>
+                )}
+                {scanStats?.status === 'error' && (
+                  <div className="text-destructive">
+                    Scan of {scanStats.source} failed — see the browser console.
+                  </div>
+                )}
+                {scanStats?.status === 'done' && (
+                  <>
+                    <div className="text-muted-foreground">
+                      {scanStats.source}, page {scanStats.page}: {scanStats.textItems} text items,{' '}
+                      {scanStats.codes} codes, {scanStats.matched} linked.
+                    </div>
+                    {scanStats.textItems === 0 && (
+                      <div className="mt-0.5 text-amber-700 dark:text-amber-400">
+                        This PDF has no selectable text layer (outlined text / scan). Links can't be
+                        detected — the drawing would need OCR.
+                      </div>
+                    )}
+                    {scanStats.textItems > 0 && scanStats.codes === 0 && (
+                      <div className="mt-0.5 text-amber-700 dark:text-amber-400">
+                        Text found, but no token matched the pattern. Copy a printed code into the
+                        test field below and adjust the regex until it matches.
+                      </div>
+                    )}
+                    {scanStats.codes > 0 && scanStats.matched === 0 && (
+                      <div className="mt-0.5 text-amber-700 dark:text-amber-400">
+                        Codes found on the page but none exist in the model — switch the identifier
+                        source (the code is stored in a different attribute/property).
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             {/* Identifier sources, fallback order */}
             <div className="flex flex-col gap-1" role="group" aria-label="Identifier sources">
               {config.sources.map((source, i) => (
@@ -232,21 +279,6 @@ export function IdentifierLinkSettings() {
             <p className="text-[10px] text-muted-foreground/70">
               build {__BUILD_SHA__}
             </p>
-
-            {config.enabled && scanStats && (
-              <p className="text-[11px] text-muted-foreground">
-                Last scan — {scanStats.source}, page {scanStats.page}: {scanStats.textItems} text
-                items, {scanStats.codes} codes, {scanStats.matched} linked.
-                {scanStats.textItems === 0 &&
-                  ' This PDF has no text layer (outlines/scan) — links cannot work on it.'}
-                {scanStats.textItems > 0 &&
-                  scanStats.codes === 0 &&
-                  ' No code matched the pattern — check the regex against a printed code.'}
-                {scanStats.codes > 0 &&
-                  scanStats.matched === 0 &&
-                  ' Codes found on the page but none exist in the model — check the identifier source.'}
-              </p>
-            )}
       </div>
     </div>
   );
