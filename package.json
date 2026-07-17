@@ -39,7 +39,7 @@
     "collab:demo": "pnpm turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo.mjs",
     "collab:demo:3d": "pnpm turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo-3d.mjs",
     "typecheck": "turbo typecheck",
-    "lint": "pnpm -r lint",
+    "lint": "node scripts/check-house-rules.mjs && pnpm -r lint",
     "knip": "knip",
     "docs:serve": "python3 -m mkdocs serve",
     "docs:build": "python3 -m mkdocs build",
