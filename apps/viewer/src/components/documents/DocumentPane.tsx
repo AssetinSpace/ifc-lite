@@ -20,12 +20,6 @@ import { cn } from '@/lib/utils';
 import { PdfDocumentView } from './PdfDocumentView';
 import { ImageDocumentView } from './ImageDocumentView';
 
-/** Extension fallback when the host didn't provide a mime type. */
-function isImageDoc(name: string, mime?: string): boolean {
-  if (mime) return mime.startsWith('image/');
-  return /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(name);
-}
-
 export function DocumentPane() {
   const docs = useViewerStore((s) => s.viewerDocuments);
   const tabs = useViewerStore((s) => s.docTabs);
@@ -83,8 +77,11 @@ export function DocumentPane() {
         })}
       </div>
       <div className="min-h-0 flex-1">
+        {/* Route on `kind` alone — both ingestion points (the host adapter
+            and the local file picker) already classify; a second extension
+            sniff here would just be a divergent copy of that rule. */}
         {activeDoc &&
-          (isImageDoc(activeDoc.name, activeDoc.mime) || activeDoc.kind === 'image' ? (
+          (activeDoc.kind === 'image' ? (
             <ImageDocumentView key={activeDoc.id} url={activeDoc.url} name={activeDoc.name} />
           ) : (
             <PdfDocumentView key={activeDoc.id} docId={activeDoc.id} url={activeDoc.url} />

@@ -19,6 +19,20 @@ export interface StoreyInfo {
   elevation: number;
 }
 
+/**
+ * A storey option with its resolved GlobalId — the single source for every
+ * storey picker (DrawingUnderlayPanel, ViewModeSwitcher). Placements and the
+ * 2D/Split view bind to storey GUIDs (stable across loads), never the
+ * session-scoped expressId; storeys without a GUID are unusable and filtered.
+ */
+export interface StoreyOption {
+  key: string;
+  name: string;
+  elevation: number;
+  guid: string;
+  info: StoreyInfo;
+}
+
 export function useFloorplanView() {
   const { models, ifcDataStore } = useIfc();
   const setSectionPlaneAxis = useViewerStore((s) => s.setSectionPlaneAxis);
@@ -217,8 +231,25 @@ export function useFloorplanView() {
     state.setUnderlayPlanPin(null);
   }, []);
 
+  const storeyOptions = useMemo((): StoreyOption[] => {
+    const options: StoreyOption[] = [];
+    for (const s of availableStoreys) {
+      const guid = storeyGuidFor(s);
+      if (!guid) continue;
+      options.push({
+        key: `${s.modelId}:${s.expressId}`,
+        name: s.name,
+        elevation: s.elevation,
+        guid,
+        info: s,
+      });
+    }
+    return options;
+  }, [availableStoreys, storeyGuidFor]);
+
   return {
     availableStoreys,
+    storeyOptions,
     activateFloorplan,
     enterDrawingView,
     exitDrawingView,

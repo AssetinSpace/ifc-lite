@@ -30,7 +30,10 @@ function groupLabel(doc: ViewerDocument): string {
 }
 
 function kindOfFile(file: File): ViewerDocument['kind'] {
-  return file.type.startsWith('image/') ? 'image' : 'document';
+  // Extension fallback: some platforms hand over files with an empty type.
+  if (file.type.startsWith('image/')) return 'image';
+  if (!file.type && /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(file.name)) return 'image';
+  return 'document';
 }
 
 export function DocumentsPanel({ onClose }: DocumentsPanelProps) {

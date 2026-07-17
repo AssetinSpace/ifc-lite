@@ -21,6 +21,7 @@ import {
   Crosshair,
   Loader2,
   Map as MapIcon,
+  Files,
   MoreHorizontal,
   Plus,
   Download,
@@ -81,6 +82,9 @@ export function MobileToolbar() {
   // in the mobile bottom sheet (see ViewerLayout's right-sheet branches).
   const underlayPanelVisible = useViewerStore((state) => state.underlayPanelVisible);
   const setUnderlayPanelVisible = useViewerStore((state) => state.setUnderlayPanelVisible);
+  // Documents (D-075) — same mobile bottom-sheet entry pattern as underlays.
+  const documentsPanelVisible = useViewerStore((state) => state.documentsPanelVisible);
+  const setDocumentsPanelVisible = useViewerStore((state) => state.setDocumentsPanelVisible);
   const setRightPanelCollapsed = useViewerStore((state) => state.setRightPanelCollapsed);
   const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
   const theme = useViewerStore((state) => state.theme);
@@ -309,6 +313,18 @@ export function MobileToolbar() {
           >
             <MapIcon className="h-4 w-4 mr-2" />
             Drawing Underlays
+          </DropdownMenuCheckboxItem>
+
+          {/* Documents (D-075): opens as a mobile bottom sheet. */}
+          <DropdownMenuCheckboxItem
+            checked={documentsPanelVisible}
+            onCheckedChange={(checked) => {
+              setDocumentsPanelVisible(checked === true);
+              setRightPanelCollapsed(checked !== true);
+            }}
+          >
+            <Files className="h-4 w-4 mr-2" />
+            Documents
           </DropdownMenuCheckboxItem>
 
           <DropdownMenuSeparator />

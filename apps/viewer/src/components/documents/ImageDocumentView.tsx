@@ -19,14 +19,19 @@ interface ImageDocumentViewProps {
   name: string;
 }
 
+interface Transform {
+  zoom: number;
+  pan: { x: number; y: number };
+}
+
+const IDENTITY: Transform = { zoom: 1, pan: { x: 0, y: 0 } };
+
 export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
   const clipRef = useRef<HTMLDivElement>(null);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  useEffect(() => {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-  }, [url]);
+  // One atomic transform: the pan is a projection of the zoom anchor, so a
+  // wheel tick must update both in a single (pure) state transition.
+  const [{ zoom, pan }, setTransform] = useState<Transform>(IDENTITY);
+  useEffect(() => setTransform(IDENTITY), [url]);
 
   useEffect(() => {
     const clip = clipRef.current;
@@ -34,20 +39,22 @@ export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const rect = clip.getBoundingClientRect();
-      setZoom((prev) => {
-        const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, prev * Math.exp(-e.deltaY * 0.0018)));
-        if (next === prev) return prev;
+      setTransform((prev) => {
+        const next = Math.min(
+          ZOOM_MAX,
+          Math.max(ZOOM_MIN, prev.zoom * Math.exp(-e.deltaY * 0.0018)),
+        );
+        if (next === prev.zoom) return prev;
+        if (next === 1) return IDENTITY;
         const cx = e.clientX - rect.left;
         const cy = e.clientY - rect.top;
-        if (next === 1) {
-          setPan({ x: 0, y: 0 });
-          return 1;
-        }
-        setPan((p) => ({
-          x: cx - ((cx - p.x) * next) / prev,
-          y: cy - ((cy - p.y) * next) / prev,
-        }));
-        return next;
+        return {
+          zoom: next,
+          pan: {
+            x: cx - ((cx - prev.pan.x) * next) / prev.zoom,
+            y: cy - ((cy - prev.pan.y) * next) / prev.zoom,
+          },
+        };
       });
     };
     clip.addEventListener('wheel', onWheel, { passive: false });
@@ -71,7 +78,10 @@ export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
-    setPan({ x: drag.panX + (e.clientX - drag.startX), y: drag.panY + (e.clientY - drag.startY) });
+    setTransform((prev) => ({
+      zoom: prev.zoom,
+      pan: { x: drag.panX + (e.clientX - drag.startX), y: drag.panY + (e.clientY - drag.startY) },
+    }));
   }, []);
   const onPointerUp = useCallback(() => (dragRef.current = null), []);
 

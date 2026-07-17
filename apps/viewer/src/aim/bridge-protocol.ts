@@ -151,7 +151,7 @@ export type OutboundMessage =
   | { source: typeof SOURCE; type: 'CAPTURE_PIN_CLICK'; captureId: string }
   // A document tab was opened/closed in the viewer (D-075) — host-side
   // recents / analytics; the viewer expects no reply.
-  | { source: typeof SOURCE; type: 'DOCUMENT_EVENT'; documentId: string; event: 'opened' | 'closed'; page?: number };
+  | { source: typeof SOURCE; type: 'DOCUMENT_EVENT'; documentId: string; event: 'opened' | 'closed' };
 
 /**
  * Narrow untrusted `MessageEvent.data` to a bridge message we handle.

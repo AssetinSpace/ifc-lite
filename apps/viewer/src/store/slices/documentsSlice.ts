@@ -45,7 +45,6 @@ export interface DocTabView {
   /** 1-based page the viewport is on (PDFs; images are always 1). */
   page: number;
   zoom: number;
-  scrollY?: number;
 }
 
 /** One open tab. Tabs are keyed by document id — a document opens once. */
@@ -57,7 +56,18 @@ export interface DocTab {
 export interface DocumentEvent {
   docId: string;
   event: 'opened' | 'closed';
-  page?: number;
+}
+
+/**
+ * One-shot page-jump request for an ALREADY-open tab (deep link while the
+ * document is active — a mounted viewer treats the stored view as an initial
+ * snapshot, so it needs an explicit signal). Consumed by the viewer.
+ */
+export interface DocJumpRequest {
+  docId: string;
+  page: number;
+  /** Monotonic marker so repeated jumps to the same page still fire. */
+  nonce: number;
 }
 
 export interface DocumentsSlice {
@@ -68,6 +78,8 @@ export interface DocumentsSlice {
   docTabs: DocTab[];
   /** Active tab's document id, or null when the pane is closed. */
   activeDocTabId: string | null;
+  /** Pending page jump for an already-open tab, or null. */
+  docJump: DocJumpRequest | null;
   /**
    * Host analytics/recents hook (e.g. the AIM bridge). Called on tab
    * open/close. Null = standalone session.
@@ -86,8 +98,22 @@ export interface DocumentsSlice {
   closeDocTab: (docId: string) => void;
   setActiveDocTab: (docId: string) => void;
   setDocTabView: (docId: string, view: Partial<DocTabView>) => void;
+  /** Clear a consumed page-jump request (viewer-side ack). */
+  clearDocJump: () => void;
 
   setDocumentEventHandler: (handler: ((e: DocumentEvent) => void) | null) => void;
+}
+
+/**
+ * Release a session-local document's object URL. Local files enter the store
+ * via `URL.createObjectURL`; without a matching revoke the underlying File
+ * blob stays pinned for the whole session (memory is D-075's #1 constraint).
+ * Guarded — node test runs have no createObjectURL/revokeObjectURL.
+ */
+function revokeLocalUrl(doc: ViewerDocument | undefined): void {
+  if (doc?.url.startsWith('blob:') && typeof URL.revokeObjectURL === 'function') {
+    URL.revokeObjectURL(doc.url);
+  }
 }
 
 export const createDocumentsSlice: StateCreator<
@@ -100,9 +126,11 @@ export const createDocumentsSlice: StateCreator<
   documentsPanelVisible: false,
   docTabs: [],
   activeDocTabId: null,
+  docJump: null,
   documentEventHandler: null,
 
   setViewerDocuments: (docs) => {
+    const closed: string[] = [];
     set((state) => {
       const map = new Map<string, ViewerDocument>();
       for (const d of docs) map.set(d.id, d);
@@ -112,17 +140,27 @@ export const createDocumentsSlice: StateCreator<
       for (const [id, d] of state.viewerDocuments) {
         if (id.startsWith('local:') && !map.has(id)) map.set(id, d);
       }
-      const docTabs = state.docTabs.filter((t) => map.has(t.docId));
+      const docTabs = state.docTabs.filter((t) => {
+        if (map.has(t.docId)) return true;
+        closed.push(t.docId);
+        return false;
+      });
       const activeDocTabId =
         state.activeDocTabId && docTabs.some((t) => t.docId === state.activeDocTabId)
           ? state.activeDocTabId
           : (docTabs[docTabs.length - 1]?.docId ?? null);
       return { viewerDocuments: map, docTabs, activeDocTabId };
     });
+    // Keep the opened/closed pairing intact for the host even when a tab is
+    // closed by a library re-send rather than by the user.
+    const handler = get().documentEventHandler;
+    if (handler) for (const docId of closed) handler({ docId, event: 'closed' });
   },
 
   upsertViewerDocument: (doc) => {
     set((state) => {
+      const previous = state.viewerDocuments.get(doc.id);
+      if (previous && previous.url !== doc.url) revokeLocalUrl(previous);
       const next = new Map(state.viewerDocuments);
       next.set(doc.id, doc);
       return { viewerDocuments: next };
@@ -134,6 +172,7 @@ export const createDocumentsSlice: StateCreator<
     if (!state.viewerDocuments.has(id)) return;
     if (state.docTabs.some((t) => t.docId === id)) state.closeDocTab(id);
     set((s) => {
+      revokeLocalUrl(s.viewerDocuments.get(id));
       const next = new Map(s.viewerDocuments);
       next.delete(id);
       return { viewerDocuments: next };
@@ -155,12 +194,18 @@ export const createDocumentsSlice: StateCreator<
                 t.docId === docId ? { ...t, view: { ...t.view, page: opts.page! } } : t,
               )
             : state.docTabs,
+        // A mounted viewer reads the stored view only at mount — an explicit
+        // deep-link page for an open tab needs a one-shot jump signal.
+        docJump:
+          opts?.page !== undefined
+            ? { docId, page: opts.page, nonce: (state.docJump?.nonce ?? 0) + 1 }
+            : state.docJump,
       });
       return;
     }
     const tab: DocTab = { docId, view: { page: opts?.page ?? 1, zoom: 1 } };
     set({ docTabs: [...state.docTabs, tab], activeDocTabId: docId });
-    state.documentEventHandler?.({ docId, event: 'opened', page: tab.view.page });
+    state.documentEventHandler?.({ docId, event: 'opened' });
   },
 
   closeDocTab: (docId) => {
@@ -187,6 +232,8 @@ export const createDocumentsSlice: StateCreator<
       ),
     }));
   },
+
+  clearDocJump: () => set({ docJump: null }),
 
   setDocumentEventHandler: (handler) => set({ documentEventHandler: handler }),
 });

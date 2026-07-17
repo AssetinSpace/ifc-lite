@@ -204,11 +204,11 @@ export function AimBridge() {
     });
 
     // Tab dokumentu otvorený/zavretý vo viewri → host recents/analytics (D-075).
-    useViewerStore.getState().setDocumentEventHandler(({ docId, event, page }) => {
+    useViewerStore.getState().setDocumentEventHandler(({ docId, event }) => {
       // Session-local files never leave the viewer — the host has no use for
       // (and no way to resolve) `local:` ids.
       if (docId.startsWith('local:')) return;
-      post({ source: SOURCE, type: 'DOCUMENT_EVENT', documentId: docId, event, page });
+      post({ source: SOURCE, type: 'DOCUMENT_EVENT', documentId: docId, event });
     });
 
     window.addEventListener('message', onMessage);

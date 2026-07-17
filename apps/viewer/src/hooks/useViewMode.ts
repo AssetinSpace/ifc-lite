@@ -20,19 +20,11 @@
 
 import { useCallback, useMemo } from 'react';
 import { useViewerStore } from '@/store';
-import { useIfc } from './useIfc';
-import { useFloorplanView, type StoreyInfo } from './useFloorplanView';
+import { useFloorplanView, type StoreyOption } from './useFloorplanView';
+import { deriveViewMode, type ViewMode } from './viewModeCore';
 
-export type ViewMode = '3d' | '2d' | 'split';
-
-/** A storey option with its resolved GlobalId (view state binds to GUIDs). */
-export interface ViewModeStorey {
-  key: string;
-  name: string;
-  elevation: number;
-  guid: string;
-  info: StoreyInfo;
-}
+export type { ViewMode } from './viewModeCore';
+export type { StoreyOption } from './useFloorplanView';
 
 export function useViewMode() {
   const splitView = useViewerStore((s) => s.underlaySplitView);
@@ -41,9 +33,8 @@ export function useViewMode() {
   const activeStoreyGuid = useViewerStore((s) => s.underlayActiveStoreyGuid);
   const lastStoreyGuid = useViewerStore((s) => s.underlayLastStoreyGuid);
   const drawings = useViewerStore((s) => s.underlayDrawings);
-  const { models, ifcDataStore } = useIfc();
   const {
-    availableStoreys,
+    storeyOptions: storeys,
     enterDrawingView,
     exitDrawingView,
     enterSplitView,
@@ -52,32 +43,10 @@ export function useViewMode() {
     retargetView,
   } = useFloorplanView();
 
-  const mode: ViewMode = useMemo(() => {
-    if (splitView && planFull) return '2d';
-    if (splitView) return 'split';
-    if (viewLocked) return '2d';
-    return '3d';
-  }, [splitView, planFull, viewLocked]);
-
-  // Storeys with resolved GlobalIds (same resolution as DrawingUnderlayPanel;
-  // storeys without a GUID are unusable — placements couldn't bind to them).
-  const storeys = useMemo((): ViewModeStorey[] => {
-    const options: ViewModeStorey[] = [];
-    for (const s of availableStoreys) {
-      const store =
-        s.modelId === 'legacy' ? ifcDataStore : models.get(s.modelId)?.ifcDataStore;
-      const guid = store?.entities.getGlobalId(s.expressId) ?? '';
-      if (!guid) continue;
-      options.push({
-        key: `${s.modelId}:${s.expressId}`,
-        name: s.name,
-        elevation: s.elevation,
-        guid,
-        info: s,
-      });
-    }
-    return options;
-  }, [availableStoreys, models, ifcDataStore]);
+  const mode: ViewMode = useMemo(
+    () => deriveViewMode({ splitView, planFull, viewLocked }),
+    [splitView, planFull, viewLocked],
+  );
 
   /** Does the storey have a calibrated, visible drawing (plan pane content)? */
   const storeyHasDrawing = useCallback(
@@ -92,7 +61,7 @@ export function useViewMode() {
 
   /** Target storey: explicit pick → active → last used → first available. */
   const resolveStorey = useCallback(
-    (explicit?: ViewModeStorey): ViewModeStorey | null => {
+    (explicit?: StoreyOption): StoreyOption | null => {
       if (explicit) return explicit;
       const byGuid = (guid: string | null) =>
         guid ? (storeys.find((s) => s.guid === guid) ?? null) : null;
@@ -102,7 +71,7 @@ export function useViewMode() {
   );
 
   const setMode = useCallback(
-    (next: ViewMode, storey?: ViewModeStorey) => {
+    (next: ViewMode, storey?: StoreyOption) => {
       const state = useViewerStore.getState();
       if (next === '3d') {
         if (state.underlaySplitView) exitSplitView();
@@ -145,7 +114,7 @@ export function useViewMode() {
 
   /** Move an active 2D/Split view to another storey (mode is kept). */
   const setStorey = useCallback(
-    (storey: ViewModeStorey) => {
+    (storey: StoreyOption) => {
       if (mode === '3d') return;
       // 2D with a drawing ↔ 2D without one differ in surface (plan pane vs
       // locked model view), so a storey change re-evaluates the mode.

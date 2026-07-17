@@ -415,6 +415,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       documentsPanelVisible: false,
       docTabs: [],
       activeDocTabId: null,
+      docJump: null,
 
       // Drawing 2D
       drawing2D: null,
