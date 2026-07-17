@@ -192,19 +192,71 @@ export async function getPdfPageTextItems(
 ): Promise<{ items: PdfPageTextItem[]; pageSizePts: [number, number] }> {
   const page = await doc.getPage(pageNumber);
   const viewport = page.getViewport({ scale: 1 });
-  const content = await page.getTextContent();
+  // Read text through the SAME streaming API the (working) selectable text
+  // layer uses (`streamTextContent`), not `getTextContent`: some documents
+  // throw in the collected getTextContent path while the stream renders fine.
+  const rawItems = await collectStreamTextItems(page);
+  // Guard the rotation remap: if pdf.js ever hands back a malformed viewport
+  // transform, fall back to the raw item transform rather than throwing and
+  // killing the whole scan (a bad item must not black out every link).
+  const vt = Array.isArray(viewport.transform) && viewport.transform.length >= 6
+    ? viewport.transform
+    : null;
   const items: PdfPageTextItem[] = [];
-  for (const item of content.items) {
+  for (const item of rawItems) {
     // Skip TextMarkedContent entries — only real text runs carry `str`.
     if (!('str' in item) || typeof item.str !== 'string' || item.str.length === 0) continue;
+    const rawTransform = Array.isArray(item.transform) && item.transform.length >= 6
+      ? item.transform
+      : null;
+    if (!rawTransform) continue;
     items.push({
       str: item.str,
-      transform: mapTextTransformToViewport(item.transform, viewport.transform, viewport.height),
-      width: item.width,
-      height: item.height,
+      transform: vt ? mapTextTransformToViewport(rawTransform, vt, viewport.height) : rawTransform,
+      width: typeof item.width === 'number' ? item.width : 0,
+      height: typeof item.height === 'number' ? item.height : 0,
     });
   }
   return { items, pageSizePts: [viewport.width, viewport.height] };
+}
+
+/** Text run shape from pdf.js `streamTextContent` chunks. */
+interface StreamTextItem {
+  str?: unknown;
+  transform?: unknown;
+  width?: unknown;
+  height?: unknown;
+}
+
+/**
+ * Drain `page.streamTextContent()` into a flat item array. Mirrors what
+ * pdf.js `getTextContent` does internally but is resilient: a chunk that
+ * throws stops the drain with whatever was collected so far, rather than
+ * rejecting the whole scan.
+ */
+async function collectStreamTextItems(
+  page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>,
+): Promise<StreamTextItem[]> {
+  const stream = page.streamTextContent({ includeMarkedContent: false, disableNormalization: false });
+  const reader = stream.getReader();
+  const items: StreamTextItem[] = [];
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = value as { items?: StreamTextItem[] } | undefined;
+      if (chunk?.items) items.push(...chunk.items);
+    }
+  } catch (err) {
+    console.warn('identifier links: text stream ended early', err);
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
+    }
+  }
+  return items;
 }
 
 /**

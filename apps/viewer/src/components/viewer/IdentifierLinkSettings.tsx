@@ -104,7 +104,8 @@ export function IdentifierLinkSettings() {
                 )}
                 {scanStats?.status === 'error' && (
                   <div className="text-destructive">
-                    Scan of {scanStats.source} failed — see the browser console.
+                    Scan of {scanStats.source} failed:{' '}
+                    <span className="break-words font-mono">{scanStats.error ?? 'unknown error'}</span>
                   </div>
                 )}
                 {scanStats?.status === 'done' && (
