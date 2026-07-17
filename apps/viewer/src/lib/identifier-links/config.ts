@@ -96,6 +96,25 @@ export function matchesIdentifierPattern(re: RegExp, value: string): boolean {
 }
 
 /**
+ * Compile the configured pattern UNANCHORED, for extracting a code that is
+ * EMBEDDED in a longer attribute value — model authors often keep the code
+ * plus a human description in one field ("Dvere DD02.05.04"), mirroring how
+ * the AIM ETL regex-extracts `object_ref` from the IFC Name. Page-side token
+ * matching stays anchored (a full token must be a code); this search form is
+ * for the model-value side of the index only.
+ */
+export function compileIdentifierSearchPattern(pattern: string): RegExp | null {
+  const trimmed = pattern.trim();
+  if (!trimmed) return null;
+  const body = trimmed.replace(/^\^/, '').replace(/\$$/, '');
+  try {
+    return new RegExp(body);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Sources exempt from normalization: IFC GlobalIds are case-sensitive base64
  * (`_` and `$` are payload, upper/lower case are DIFFERENT guids), so
  * uppercasing or separator-collapsing them would corrupt the key. Exempt

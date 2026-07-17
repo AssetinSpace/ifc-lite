@@ -46,6 +46,18 @@ describe('buildIdentifierIndex', () => {
     assert.ok(index.byCode.get('SN.11'));
   });
 
+  it('extracts a code embedded in a longer value (code + description)', async () => {
+    const model = makeModel('m1', [
+      { expressId: 1, type: 'IfcDoor', globalId: 'A', name: 'Dvere vnútorné DD.01.02 pravé' },
+      { expressId: 2, type: 'IfcWall', globalId: 'B', name: 'Stena bez kódu' },
+    ]);
+    const index = await buildIdentifierIndex([model], CONFIG);
+    assert.equal(index.byCode.size, 1);
+    const hit = index.byCode.get('DD.01.02');
+    assert.equal(hit?.length, 1);
+    assert.equal(hit?.[0].rawValue, 'Dvere vnútorné DD.01.02 pravé');
+  });
+
   it('keeps every duplicate carrier of the same code', async () => {
     const model = makeModel('m1', [
       { expressId: 1, type: 'IfcWall', globalId: 'A', name: 'DD.01.02' },

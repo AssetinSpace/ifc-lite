@@ -21,8 +21,8 @@ import {
   type IfcDataStore,
 } from '@ifc-lite/parser';
 import {
-  compileIdentifierPattern,
-  identifierKeyForSource,
+  compileIdentifierSearchPattern,
+  isCaseSensitiveSource,
   normalizeIdentifier,
   type IdentifierLinkConfig,
   type IdentifierSource,
@@ -156,7 +156,8 @@ export async function buildIdentifierIndex(
   const start = performance.now();
   const chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
   const signal = options.signal;
-  const re = compileIdentifierPattern(config.pattern);
+  // Unanchored: the code may be embedded in a longer value ("Dvere DD02.05.04").
+  const re = compileIdentifierSearchPattern(config.pattern);
   const byCode = new Map<string, IdentifierTarget[]>();
   let scannedEntities = 0;
 
@@ -229,10 +230,16 @@ export async function buildIdentifierIndex(
         for (const source of config.sources) {
           const rawValue = readSource(source, row, expressId);
           if (!rawValue) continue;
-          // Case-sensitive sources (GlobalId) key on the trimmed raw value;
-          // everything else on the normalized code.
-          const code = identifierKeyForSource(source.kind, rawValue);
-          if (!code || !re.test(code)) continue;
+          // Case-sensitive sources (GlobalId) search the trimmed raw value;
+          // everything else the normalized form. The FIRST pattern match
+          // inside the value becomes the code — so a Name that carries the
+          // code plus a description still indexes.
+          const haystack = isCaseSensitiveSource(source.kind)
+            ? rawValue.trim()
+            : normalizeIdentifier(rawValue);
+          const match = haystack ? re.exec(haystack) : null;
+          const code = match?.[0] ?? '';
+          if (!code) continue;
 
           const storeyId = hierarchy?.elementToStorey.get(expressId);
           const target: IdentifierTarget = {
