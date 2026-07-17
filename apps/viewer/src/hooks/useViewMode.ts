@@ -132,5 +132,5 @@ export function useViewMode() {
     [storeys, activeStoreyGuid],
   );
 
-  return { mode, setMode, setStorey, storeys, activeStorey };
+  return { mode, setMode, setStorey, storeys, activeStorey, storeyHasDrawing };
 }

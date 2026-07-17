@@ -15,6 +15,7 @@
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { FilePlus2, FileText, Image as ImageIcon, Map as MapIcon, X } from 'lucide-react';
+import type { StoreyOption } from '@/hooks/useViewMode';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useViewerStore, type ViewerDocument } from '@/store';
@@ -41,7 +42,7 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
   const openDocument = useViewerStore((s) => s.openDocument);
   const upsertDocument = useViewerStore((s) => s.upsertViewerDocument);
   const removeDocument = useViewerStore((s) => s.removeViewerDocument);
-  const { setMode, storeys } = useViewMode();
+  const { setMode, storeys, storeyHasDrawing } = useViewMode();
 
   const [filter, setFilter] = useState('');
   const [dragOver, setDragOver] = useState(false);
@@ -81,12 +82,37 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
     [upsertDocument],
   );
 
+  const storeyOf = useCallback(
+    (doc: ViewerDocument): StoreyOption | undefined =>
+      doc.storeyGuid ? storeys.find((s) => s.guid === doc.storeyGuid) : undefined,
+    [storeys],
+  );
+
   const openInPlan = useCallback(
     (doc: ViewerDocument) => {
-      const storey = storeys.find((s) => s.guid === doc.storeyGuid);
+      const storey = storeyOf(doc);
       if (storey) setMode('split', storey);
     },
-    [storeys, setMode],
+    [storeyOf, setMode],
+  );
+
+  /**
+   * Primary click, Dalux-style: a CALIBRATED drawing jumps straight to the
+   * Split view of its storey (plan synced with the model); everything else —
+   * text PDFs, images, drawings not calibrated yet — opens as a document tab.
+   */
+  const openPrimary = useCallback(
+    (doc: ViewerDocument) => {
+      if (doc.kind === 'drawing') {
+        const storey = storeyOf(doc);
+        if (storey && storeyHasDrawing(storey.guid)) {
+          setMode('split', storey);
+          return;
+        }
+      }
+      openDocument(doc.id);
+    },
+    [storeyOf, storeyHasDrawing, setMode, openDocument],
   );
 
   return (
@@ -162,16 +188,23 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
                     {label}
                   </div>
                 )}
-                {list.map((doc) => (
-                  <DocumentRow
-                    key={doc.id}
-                    doc={doc}
-                    canPlan={!!doc.storeyGuid && storeys.some((s) => s.guid === doc.storeyGuid)}
-                    onOpen={() => openDocument(doc.id)}
-                    onPlan={() => openInPlan(doc)}
-                    onRemove={doc.id.startsWith('local:') ? () => removeDocument(doc.id) : undefined}
-                  />
-                ))}
+                {list.map((doc) => {
+                  const storey = storeyOf(doc);
+                  const planPrimary =
+                    doc.kind === 'drawing' && !!storey && storeyHasDrawing(storey.guid);
+                  return (
+                    <DocumentRow
+                      key={doc.id}
+                      doc={doc}
+                      planPrimary={planPrimary}
+                      canPlan={!!storey}
+                      onOpen={() => openPrimary(doc)}
+                      onOpenTab={() => openDocument(doc.id)}
+                      onPlan={() => openInPlan(doc)}
+                      onRemove={doc.id.startsWith('local:') ? () => removeDocument(doc.id) : undefined}
+                    />
+                  );
+                })}
               </div>
             ))}
           </div>
@@ -188,13 +221,17 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
 
 interface DocumentRowProps {
   doc: ViewerDocument;
+  /** Calibrated drawing: the row's primary click opens the Split plan view. */
+  planPrimary: boolean;
   canPlan: boolean;
   onOpen: () => void;
+  /** Open as a plain document tab (secondary action for planPrimary rows). */
+  onOpenTab: () => void;
   onPlan: () => void;
   onRemove?: () => void;
 }
 
-function DocumentRow({ doc, canPlan, onOpen, onPlan, onRemove }: DocumentRowProps) {
+function DocumentRow({ doc, planPrimary, canPlan, onOpen, onOpenTab, onPlan, onRemove }: DocumentRowProps) {
   const Icon = doc.kind === 'image' ? ImageIcon : doc.kind === 'drawing' ? MapIcon : FileText;
   const revision = doc.meta?.revision;
   return (
@@ -203,13 +240,24 @@ function DocumentRow({ doc, canPlan, onOpen, onPlan, onRemove }: DocumentRowProp
       <button
         type="button"
         onClick={onOpen}
-        title={doc.name}
+        title={planPrimary ? `${doc.name} — opens the 2D/Split plan of its storey` : doc.name}
         className="min-w-0 flex-1 truncate text-left text-[11px]"
       >
         {doc.name}
         {revision && <span className="ml-1.5 text-[10px] text-muted-foreground">rev {revision}</span>}
       </button>
-      {canPlan && (
+      {planPrimary ? (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-5 opacity-0 transition-opacity group-hover:opacity-100"
+          onClick={onOpenTab}
+          aria-label="Open as a document tab"
+          title="Open as a document tab (plain PDF)"
+        >
+          <FileText className="size-3" aria-hidden />
+        </Button>
+      ) : canPlan ? (
         <Button
           variant="ghost"
           size="icon"
@@ -220,7 +268,7 @@ function DocumentRow({ doc, canPlan, onOpen, onPlan, onRemove }: DocumentRowProp
         >
           <MapIcon className="size-3" aria-hidden />
         </Button>
-      )}
+      ) : null}
       {onRemove && (
         <Button
           variant="ghost"
