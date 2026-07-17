@@ -17,7 +17,7 @@
  * lightweight view state (page / zoom) survives in the store.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { Minus, Plus } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { Button } from '@/components/ui/button';
@@ -275,21 +275,144 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
     clearDocJump();
   }, [docJump, docId, pdf, clearDocJump]);
 
-  // ── Zoom (buttons + ctrl/cmd-wheel) ──────────────────────────────────────
-  const applyZoom = useCallback((factor: number) => {
-    setZoom((z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z * factor)));
+  // ── Zoom (buttons, ctrl/cmd-wheel, touch pinch, double-tap) ─────────────
+  // Every path funnels through zoomTo, which records an anchor (the point
+  // that must stay put: cursor, pinch midpoint, or viewport center); the
+  // layout effect below re-projects the scroll offsets right after the new
+  // page width commits, so zooming never "runs away" from the target.
+  const zoomRef = useRef(zoom);
+  const pendingAnchorRef = useRef<{
+    clientX: number;
+    clientY: number;
+    contentX: number;
+    contentY: number;
+    prevZoom: number;
+    nextZoom: number;
+  } | null>(null);
+
+  const zoomTo = useCallback((target: number, clientX?: number, clientY?: number) => {
+    const prev = zoomRef.current;
+    const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, target));
+    if (next === prev) return;
+    const root = scrollRef.current;
+    if (root) {
+      const rect = root.getBoundingClientRect();
+      const cx = clientX ?? rect.left + rect.width / 2;
+      const cy = clientY ?? rect.top + rect.height / 2;
+      pendingAnchorRef.current = {
+        clientX: cx,
+        clientY: cy,
+        contentX: root.scrollLeft + (cx - rect.left),
+        contentY: root.scrollTop + (cy - rect.top),
+        prevZoom: prev,
+        nextZoom: next,
+      };
+    }
+    // Eager ref update keeps rapid wheel/pinch events compounding correctly
+    // even before React commits the state.
+    zoomRef.current = next;
+    setZoom(next);
   }, []);
+
+  const applyZoom = useCallback(
+    (factor: number, clientX?: number, clientY?: number) =>
+      zoomTo(zoomRef.current * factor, clientX, clientY),
+    [zoomTo],
+  );
+
+  useLayoutEffect(() => {
+    const a = pendingAnchorRef.current;
+    const root = scrollRef.current;
+    if (!a || !root || a.nextZoom !== zoom) return;
+    pendingAnchorRef.current = null;
+    // Content scales ~linearly with zoom (constant padding is negligible).
+    const rect = root.getBoundingClientRect();
+    const r = a.nextZoom / a.prevZoom;
+    root.scrollLeft = a.contentX * r - (a.clientX - rect.left);
+    root.scrollTop = a.contentY * r - (a.clientY - rect.top);
+  }, [zoom]);
+
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey && !e.metaKey) return; // plain wheel scrolls the list
       e.preventDefault();
-      applyZoom(Math.exp(-e.deltaY * 0.0018));
+      applyZoom(Math.exp(-e.deltaY * 0.0018), e.clientX, e.clientY);
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
   }, [applyZoom]);
+
+  // Touch: two-finger pinch drives OUR zoom (sharp re-raster + crop overlay)
+  // instead of the browser's page zoom, which can only blur the bitmap —
+  // `touch-action: pan-x pan-y` on the scroller keeps one-finger scrolling
+  // native but hands the pinch to these handlers; the webkit gesture events
+  // are cancelled so iOS Safari can't hijack it either. A quick double-tap
+  // toggles fit-width ↔ 3× at the tapped spot (manual detection: dblclick
+  // would also fire for desktop double-clicks that should select text).
+  const touchesRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{ dist: number; zoom: number } | null>(null);
+  const lastTapRef = useRef<{ t: number; x: number; y: number } | null>(null);
+
+  const onTouchPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType !== 'touch') return;
+    touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touchesRef.current.size === 2) {
+      const [a, b] = [...touchesRef.current.values()];
+      pinchRef.current = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: zoomRef.current };
+      lastTapRef.current = null; // a pinch is not a tap
+    }
+  }, []);
+
+  const onTouchPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.pointerType !== 'touch' || !touchesRef.current.has(e.pointerId)) return;
+      touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const pinch = pinchRef.current;
+      if (!pinch || touchesRef.current.size < 2) return;
+      const [a, b] = [...touchesRef.current.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (dist <= 0 || pinch.dist <= 0) return;
+      zoomTo(pinch.zoom * (dist / pinch.dist), (a.x + b.x) / 2, (a.y + b.y) / 2);
+    },
+    [zoomTo],
+  );
+
+  const onTouchPointerEnd = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.pointerType !== 'touch') return;
+      const wasPinch = pinchRef.current !== null;
+      touchesRef.current.delete(e.pointerId);
+      if (touchesRef.current.size < 2) pinchRef.current = null;
+      // Double-tap detection (single-finger taps only).
+      if (wasPinch || e.type !== 'pointerup') return;
+      const now = performance.now();
+      const last = lastTapRef.current;
+      if (last && now - last.t < 350 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 30) {
+        lastTapRef.current = null;
+        if (zoomRef.current < 1.5) zoomTo(3, e.clientX, e.clientY);
+        else zoomTo(1);
+      } else {
+        lastTapRef.current = { t: now, x: e.clientX, y: e.clientY };
+      }
+    },
+    [zoomTo],
+  );
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // iOS Safari's proprietary pinch pipeline — cancel it inside the reader
+    // so the pinch always reaches the pointer handlers above.
+    const cancel = (e: Event) => e.preventDefault();
+    el.addEventListener('gesturestart', cancel);
+    el.addEventListener('gesturechange', cancel);
+    return () => {
+      el.removeEventListener('gesturestart', cancel);
+      el.removeEventListener('gesturechange', cancel);
+    };
+  }, []);
 
   const pages = useMemo(
     () => Array.from({ length: numPages }, (_, i) => i + 1),
@@ -325,7 +448,15 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
           <Plus className="size-3" aria-hidden />
         </Button>
       </div>
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto bg-muted/30">
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-auto bg-muted/30"
+        style={{ touchAction: 'pan-x pan-y' }}
+        onPointerDown={onTouchPointerDown}
+        onPointerMove={onTouchPointerMove}
+        onPointerUp={onTouchPointerEnd}
+        onPointerCancel={onTouchPointerEnd}
+      >
         {error ? (
           <div className="flex h-full items-center justify-center p-6 text-center text-[11px] text-muted-foreground">
             {error}

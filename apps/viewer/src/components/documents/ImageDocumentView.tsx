@@ -62,20 +62,66 @@ export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
   }, []);
 
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; panX: number; panY: number } | null>(null);
+  // Touch pinch: two fingers scale the transform around their midpoint —
+  // without this, a mobile pinch falls through to the browser's page zoom.
+  const touchesRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{ dist: number; start: Transform; mid: { x: number; y: number } } | null>(null);
+
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      dragRef.current = {
-        pointerId: e.pointerId,
-        startX: e.clientX,
-        startY: e.clientY,
-        panX: pan.x,
-        panY: pan.y,
-      };
+      if (e.pointerType === 'touch') {
+        touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touchesRef.current.size === 2) {
+          const [a, b] = [...touchesRef.current.values()];
+          const rect = e.currentTarget.getBoundingClientRect();
+          pinchRef.current = {
+            dist: Math.hypot(a.x - b.x, a.y - b.y),
+            start: { zoom, pan },
+            mid: { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top },
+          };
+          dragRef.current = null; // a pinch is not a pan
+        }
+      }
+      if (!pinchRef.current) {
+        dragRef.current = {
+          pointerId: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          panX: pan.x,
+          panY: pan.y,
+        };
+      }
       e.currentTarget.setPointerCapture(e.pointerId);
     },
-    [pan],
+    [zoom, pan],
   );
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'touch' && touchesRef.current.has(e.pointerId)) {
+      touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const pinch = pinchRef.current;
+      if (pinch && touchesRef.current.size >= 2) {
+        const [a, b] = [...touchesRef.current.values()];
+        const rect = e.currentTarget.getBoundingClientRect();
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        if (dist <= 0 || pinch.dist <= 0) return;
+        const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, pinch.start.zoom * (dist / pinch.dist)));
+        if (next === 1) {
+          setTransform(IDENTITY);
+          return;
+        }
+        // Keep the content point under the (moving) midpoint anchored.
+        const mid = { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top };
+        const r = next / pinch.start.zoom;
+        setTransform({
+          zoom: next,
+          pan: {
+            x: mid.x - (pinch.mid.x - pinch.start.pan.x) * r,
+            y: mid.y - (pinch.mid.y - pinch.start.pan.y) * r,
+          },
+        });
+        return;
+      }
+    }
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
     setTransform((prev) => ({
@@ -83,7 +129,13 @@ export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
       pan: { x: drag.panX + (e.clientX - drag.startX), y: drag.panY + (e.clientY - drag.startY) },
     }));
   }, []);
-  const onPointerUp = useCallback(() => (dragRef.current = null), []);
+  const onPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'touch') {
+      touchesRef.current.delete(e.pointerId);
+      if (touchesRef.current.size < 2) pinchRef.current = null;
+    }
+    dragRef.current = null;
+  }, []);
 
   return (
     <div
