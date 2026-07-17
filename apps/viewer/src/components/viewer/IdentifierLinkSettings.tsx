@@ -7,8 +7,8 @@
  * element identifier lives in this project's IFC model (Name / Description /
  * ObjectType / Tag / custom Pset property, with fallback order), the code
  * regex (with a live test field), and the per-project enable/debug switches.
- * Rendered as a section of the drawing-underlays panel; the config persists
- * per project via localStorage keyed by the primary model's file name.
+ * Rendered as a section of the Documents panel; the config persists per
+ * project via localStorage keyed by the primary model's file name.
  */
 
 import { useMemo, useState } from 'react';
