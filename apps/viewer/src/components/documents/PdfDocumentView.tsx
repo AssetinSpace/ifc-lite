@@ -22,7 +22,12 @@ import { Minus, Plus } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
-import { openPdfDocument, rasterizePdfPage, rasterizePdfRegion } from '@/lib/pdf/rasterize';
+import {
+  openPdfDocument,
+  rasterizePdfPage,
+  rasterizePdfRegion,
+  renderPdfTextLayer,
+} from '@/lib/pdf/rasterize';
 
 /**
  * Raster ceiling (longest edge, device px). Deep zoom into drawings needs
@@ -596,6 +601,46 @@ function PdfPage({
   }, [render, removeOverlay]);
   useEffect(() => () => removeOverlay(), [removeOverlay]);
 
+  // ── Selectable text layer. pdf.js lays spans out in page-relative % and
+  // sizes fonts via --total-scale-factor, so it renders ONCE per page visit;
+  // zooming only updates the CSS variable (effect below).
+  const textHostRef = useRef<HTMLDivElement>(null);
+  const ptsWidthRef = useRef<number | null>(null);
+  useEffect(() => {
+    const host = textHostRef.current;
+    if (!host || !render) return;
+    let cancelled = false;
+    let cancelLayer: (() => void) | null = null;
+    void (async () => {
+      try {
+        const layer = await renderPdfTextLayer(pdf, page, host);
+        if (cancelled) {
+          layer.cancel();
+          host.replaceChildren();
+          return;
+        }
+        cancelLayer = layer.cancel;
+        ptsWidthRef.current = layer.pageWidthPts;
+        const w = outerRef.current?.getBoundingClientRect().width ?? 0;
+        if (w > 0) host.style.setProperty('--total-scale-factor', String(w / layer.pageWidthPts));
+      } catch (err) {
+        console.error(`pdf document view: text layer for page ${page} failed`, err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      cancelLayer?.();
+      host.replaceChildren();
+    };
+  }, [pdf, page, render]);
+  useEffect(() => {
+    const host = textHostRef.current;
+    const pts = ptsWidthRef.current;
+    if (host && pts && width > 0) {
+      host.style.setProperty('--total-scale-factor', String(width / pts));
+    }
+  }, [width]);
+
   return (
     <div
       ref={(el) => {
@@ -611,6 +656,7 @@ function PdfPage({
       }}
     >
       <div ref={hostRef} className="h-full w-full" />
+      <div ref={textHostRef} className="pdf-doc-text-layer" />
     </div>
   );
 }

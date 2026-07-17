@@ -104,6 +104,42 @@ export async function rasterizePdfRegion(
   return { image, width: canvas.width, height: canvas.height };
 }
 
+/** Handle for a rendered text layer — cancel stops streaming/layout. */
+export interface PdfTextLayerHandle {
+  cancel: () => void;
+  /** Page width in PDF points — the caller derives `--total-scale-factor`
+   *  (CSS px per point) from its layout width to keep spans aligned. */
+  pageWidthPts: number;
+}
+
+/**
+ * Render the selectable text layer for one page into `container` (D-075).
+ * pdf.js positions spans in page-relative percentages and scales fonts via
+ * the `--total-scale-factor` CSS variable, so zooming needs NO re-render —
+ * the caller just updates the variable. Styling contract: the container
+ * carries the `.pdf-doc-text-layer` class (see index.css).
+ */
+export async function renderPdfTextLayer(
+  doc: PDFDocumentProxy,
+  pageNumber: number,
+  container: HTMLElement,
+): Promise<PdfTextLayerHandle> {
+  const pdfjs = await loadPdfjs();
+  const page = await doc.getPage(pageNumber);
+  const viewport = page.getViewport({ scale: 1 });
+  const layer = new pdfjs.TextLayer({
+    textContentSource: page.streamTextContent(),
+    container,
+    viewport,
+  });
+  await layer.render();
+  const raw = viewport.rawDims as { pageWidth?: number };
+  return {
+    cancel: () => layer.cancel(),
+    pageWidthPts: raw.pageWidth ?? viewport.width,
+  };
+}
+
 /**
  * Rasterize one page to an ImageBitmap for texture upload.
  *
