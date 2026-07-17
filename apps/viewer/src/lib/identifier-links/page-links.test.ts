@@ -63,7 +63,7 @@ describe('findIdentifierBoxes', () => {
 
   it('ignores plain text, dimensions and scales', () => {
     const boxes = findIdentifierBoxes(
-      [item('Pôdorys 1.NP'), item('1:50'), item('2400'), item('A1')],
+      [item('Pôdorys 1.NP', 0, 300), item('1:50', 0, 260), item('2400', 0, 220), item('A1', 0, 180)],
       PATTERN,
     );
     assert.equal(boxes.length, 0);
@@ -92,6 +92,44 @@ describe('findIdentifierBoxes', () => {
       boxes.map((b) => b.code),
       ['DD.01.02', 'SN.11.01'],
     );
+  });
+});
+
+describe('findIdentifierBoxes — per-glyph CAD output (mergeTextItems)', () => {
+  it('reassembles a code emitted one glyph at a time', () => {
+    // AutoCAD/Revit print drivers emit each character as its own text item.
+    const glyphs = ['Z', 'V', '0', '1', '.', '0', '2'].map((ch, i) =>
+      item(ch, 100 + i * 5, 200, 5, 10),
+    );
+    const boxes = findIdentifierBoxes(glyphs, PATTERN);
+    assert.equal(boxes.length, 1);
+    assert.equal(boxes[0].code, 'ZV01.02');
+    assert.equal(boxes[0].x, 100);
+    assert.equal(boxes[0].w, 35);
+  });
+
+  it('keeps word gaps as token boundaries when merging a line', () => {
+    // "DVERE" and the code on one line, separated by a word-sized gap.
+    const glyphs = [
+      ...['D', 'V', 'E', 'R', 'E'].map((ch, i) => item(ch, 100 + i * 5, 200, 5, 10)),
+      ...['D', 'D', '0', '1', '.', '0', '2'].map((ch, i) => item(ch, 132 + i * 5, 200, 5, 10)),
+    ];
+    const boxes = findIdentifierBoxes(glyphs, PATTERN);
+    assert.equal(boxes.length, 1);
+    assert.equal(boxes[0].code, 'DD01.02');
+  });
+
+  it('does not merge glyphs across different lines', () => {
+    // Same x-range, stacked lines — the bubble case: ZV01 over 02 must stay
+    // two runs and join via the proximity layer, not string concatenation.
+    const glyphs = [
+      ...['Z', 'V', '0', '1'].map((ch, i) => item(ch, 100 + i * 5, 210, 5, 10)),
+      ...['0', '2'].map((ch, i) => item(ch, 105 + i * 5, 195, 5, 10)),
+    ];
+    const boxes = findIdentifierBoxes(glyphs, PATTERN);
+    assert.equal(boxes.length, 1);
+    assert.equal(boxes[0].code, 'ZV01.02');
+    assert.equal(boxes[0].layer, 'proximity');
   });
 });
 
@@ -192,29 +230,37 @@ describe('resolvePageLinks', () => {
     scannedEntities: 3,
     buildTimeMs: 0,
   };
+  // Distinct lines — co-located items would (correctly) merge into one run.
   const boxes = findIdentifierBoxes(
-    [item('DD.01.02.003'), item('SN.11.01'), item('ZZ.99.99')],
+    [item('DD.01.02.003', 100, 240), item('SN.11.01', 100, 200), item('ZZ.99.99', 100, 160)],
     PATTERN,
   );
+
+  const byCode = (links: ReturnType<typeof resolvePageLinks>, code: string) => {
+    const hit = links.find((l) => l.code === code);
+    assert.ok(hit, `link ${code} present`);
+    return hit;
+  };
 
   it('resolves matched codes and leaves unknown codes targetless', () => {
     const links = resolvePageLinks(boxes, index);
     assert.equal(links.length, 3);
-    assert.equal(links[0].targets.length, 2);
-    assert.equal(links[1].targets.length, 1);
-    assert.equal(links[2].targets.length, 0, 'recognized but not in the model');
+    assert.equal(byCode(links, 'DD.01.02.003').targets.length, 2);
+    assert.equal(byCode(links, 'SN.11.01').targets.length, 1);
+    assert.equal(byCode(links, 'ZZ.99.99').targets.length, 0, 'recognized but not in the model');
   });
 
   it('prefers same-storey candidates for duplicated codes', () => {
     const links = resolvePageLinks(boxes, index, { preferStoreyGuid: 'S2' });
-    assert.equal(links[0].targets.length, 1);
-    assert.equal(links[0].targets[0].expressId, 2);
+    const dd = byCode(links, 'DD.01.02.003');
+    assert.equal(dd.targets.length, 1);
+    assert.equal(dd.targets[0].expressId, 2);
     // Single candidates stay untouched even off-storey.
-    assert.equal(links[1].targets.length, 1);
+    assert.equal(byCode(links, 'SN.11.01').targets.length, 1);
   });
 
   it('keeps all candidates when none is on the preferred storey', () => {
     const links = resolvePageLinks(boxes, index, { preferStoreyGuid: 'S9' });
-    assert.equal(links[0].targets.length, 2);
+    assert.equal(byCode(links, 'DD.01.02.003').targets.length, 2);
   });
 });
