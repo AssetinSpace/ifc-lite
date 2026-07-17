@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * AIM tree decorations state (D-076) — per-GUID badge counts pushed by the AIM
+ * AIM tree decorations state (D-077) — per-GUID badge counts pushed by the AIM
  * host over the aim-bridge (AIM_TREE_DECORATIONS) and rendered as pills on
  * HierarchyPanel rows. A standalone zustand store (like capturePinsStore):
  * everything AIM lives under src/aim so upstream rebases touch zero shared

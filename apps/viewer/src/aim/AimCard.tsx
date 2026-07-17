@@ -105,7 +105,7 @@ function AimCardBody({ data }: { data: AimPanelData }) {
         </div>
       )}
 
-      {/* Responsibilities (v2, D-076) — who is responsible for the element */}
+      {/* Responsibilities (v2, D-077) — who is responsible for the element */}
       {data.responsibilities && data.responsibilities.length > 0 && (
         <div>
           <div className="px-3 pt-1.5 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -136,7 +136,7 @@ function AimCardBody({ data }: { data: AimPanelData }) {
         </div>
       )}
 
-      {/* Reality Capture summary (v2, D-076) */}
+      {/* Reality Capture summary (v2, D-077) */}
       {data.captures && data.captures.count > 0 && (
         <AimLink
           href={data.captures.href}
@@ -148,7 +148,7 @@ function AimCardBody({ data }: { data: AimPanelData }) {
         </AimLink>
       )}
 
-      {/* GUID history (v2, D-076) — bitemporal validity, read-only */}
+      {/* GUID history (v2, D-077) — bitemporal validity, read-only */}
       {data.history && data.history.length > 0 && (
         <div>
           <div className="flex items-center gap-1.5 px-3 pt-1.5 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">

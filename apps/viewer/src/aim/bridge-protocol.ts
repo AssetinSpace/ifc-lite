@@ -28,7 +28,7 @@ export const FOCUS_COLOR = '#f97316';
  * (e.g. /node/{id}) bounced back via AIM_NAVIGATE — never navigated here.
  */
 export interface AimPanelData {
-  /** v2 (D-076) is additive — every v2 field is optional, v1 payloads render unchanged. */
+  /** v2 (D-077) is additive — every v2 field is optional, v1 payloads render unchanged. */
   version: 1 | 2;
   /** Echo of the requested element's GlobalId — used to drop stale responses. */
   guid: string;
@@ -41,7 +41,7 @@ export interface AimPanelData {
   }[];
   documents?: { name: string; href: string; badge?: string }[];
   actions?: { label: string; href: string; primary?: boolean }[];
-  // --- v2 typed sections (D-076: AIM inspector) ---
+  // --- v2 typed sections (D-077: AIM inspector) ---
   /** Responsible persons/organizations for the element (host DB roles). */
   responsibilities?: { name: string; role: string; org?: string; href?: string }[];
   /** Reality-capture summary — count + host link opening the gallery. */
@@ -51,7 +51,7 @@ export interface AimPanelData {
 }
 
 /**
- * Per-element AIM badge counts for the hierarchy tree (D-076), keyed by IFC
+ * Per-element AIM badge counts for the hierarchy tree (D-077), keyed by IFC
  * GlobalId. Compact single-letter fields keep the payload small across the
  * whole model: d = linked documents, r = responsibilities, c = captures.
  * A missing field means zero.
@@ -154,7 +154,7 @@ export type InboundMessage =
   // Reality Capture pins (D-073): the host pushes capture points with world
   // coords after MODELS_LOADED; the viewer billboards them over the canvas.
   | { source: typeof SOURCE; type: 'CAPTURES_LOAD'; captures: CapturePinWire[] }
-  // AIM tree decorations (D-076): per-GUID badge counts for HierarchyPanel,
+  // AIM tree decorations (D-077): per-GUID badge counts for HierarchyPanel,
   // pushed by the host after MODELS_LOADED (same timing slot as the loads above).
   | { source: typeof SOURCE; type: 'AIM_TREE_DECORATIONS'; decorations: Record<string, AimTreeDecoration> };
 

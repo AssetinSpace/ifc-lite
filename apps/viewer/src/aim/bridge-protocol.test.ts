@@ -193,7 +193,7 @@ describe('isInboundMessage', () => {
     );
   });
 
-  it('accepts and validates AIM_TREE_DECORATIONS (D-076)', () => {
+  it('accepts and validates AIM_TREE_DECORATIONS (D-077)', () => {
     assert.ok(isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: {} }));
     assert.ok(isInboundMessage({
       source: SOURCE,

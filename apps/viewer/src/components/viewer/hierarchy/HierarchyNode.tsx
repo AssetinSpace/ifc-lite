@@ -9,7 +9,7 @@ import {
   EyeOff,
   FileBox,
   X,
-  // >>> AIM-FORK: ikonky AIM badge (D-076)
+  // >>> AIM-FORK: ikonky AIM badge (D-077)
   FileText,
   Users,
   Camera,
@@ -53,7 +53,7 @@ export interface HierarchyNodeProps {
   onModelVisibilityToggle: (modelId: string, e: React.MouseEvent) => void;
   onRemoveModel: (modelId: string, e: React.MouseEvent) => void;
   onModelHeaderClick: (modelId: string, nodeId: string, hasChildren: boolean) => void;
-  // >>> AIM-FORK: per-GUID badge counts z AIM hosta (D-076); undefined = bez badge
+  // >>> AIM-FORK: per-GUID badge counts z AIM hosta (D-077); undefined = bez badge
   aimDecoration?: AimTreeDecoration;
   // <<< AIM-FORK
 }
@@ -346,7 +346,7 @@ export function HierarchyNode({
           </Tooltip>
         )}
 
-        {/* >>> AIM-FORK: AIM badge — počty naviazaných záznamov z platformy (D-076) */}
+        {/* >>> AIM-FORK: AIM badge — počty naviazaných záznamov z platformy (D-077) */}
         {aimDecoration && ((aimDecoration.d ?? 0) + (aimDecoration.r ?? 0) + (aimDecoration.c ?? 0) > 0) && (
           <Tooltip>
             <TooltipTrigger asChild>

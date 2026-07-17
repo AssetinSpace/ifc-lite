@@ -224,7 +224,7 @@ export function PropertiesPanel() {
   // tools — behind a single switch.
   const editMode = useViewerStore((s) => s.editEnabled);
   const propertiesActiveTab = useViewerStore((s) => s.propertiesActiveTab);
-  // >>> AIM-FORK: AIM | IFC inspector (D-076) — skrytie natívneho obsahu pod AIM tabom
+  // >>> AIM-FORK: AIM | IFC inspector (D-077) — skrytie natívneho obsahu pod AIM tabom
   const aimNativeHidden = useAimNativeHidden();
   // <<< AIM-FORK
   const setPropertiesActiveTab = useViewerStore((s) => s.setPropertiesActiveTab);
@@ -1440,7 +1440,7 @@ export function PropertiesPanel() {
         )}
       </div>
 
-      {/* >>> AIM-FORK: AIM | IFC inspector (D-076) — tab lišta + AIM karta;
+      {/* >>> AIM-FORK: AIM | IFC inspector (D-077) — tab lišta + AIM karta;
           natívny obsah nižšie je pod AIM tabom skrytý (display:contents wrapper,
           layout pri IFC tabe ostáva upstream-identický) */}
       <AimInspectorTabs />
@@ -1783,7 +1783,7 @@ export function PropertiesPanel() {
           </TabsContent>
         </ScrollArea>
       </Tabs>
-      {/* >>> AIM-FORK: koniec wrappera natívneho obsahu (D-076) */}
+      {/* >>> AIM-FORK: koniec wrappera natívneho obsahu (D-077) */}
       </div>
       {/* <<< AIM-FORK */}
     </div>

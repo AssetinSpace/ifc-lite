@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useViewerStore, resolveEntityRef } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
-// >>> AIM-FORK: AIM dekorácie stromu (D-076)
+// >>> AIM-FORK: AIM dekorácie stromu (D-077)
 import { useAimDecorationsStore } from '@/aim/aimDecorationsStore';
 import { guidForEntity, type AimTreeDecoration } from '@/aim/bridge-protocol';
 // <<< AIM-FORK
@@ -740,7 +740,7 @@ export function HierarchyPanel() {
     return { isSelected, nodeHidden, modelVisible };
   }, [selectedStoreys, selectedEntityId, selectedEntityIds, hiddenEntities, getNodeElements, models, toGlobalId]);
 
-  // >>> AIM-FORK: AIM dekorácie stromu (D-076) — riadok → IFC GlobalId → badge counts.
+  // >>> AIM-FORK: AIM dekorácie stromu (D-077) — riadok → IFC GlobalId → badge counts.
   // Lookup beží len keď host poslal dekorácie (hasDecorations), inak nula réžie;
   // guidForEntity je O(1) nad GlobalId indexom modelu.
   const aimDecorations = useAimDecorationsStore((s) => s.decorations);

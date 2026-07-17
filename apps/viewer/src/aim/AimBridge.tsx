@@ -186,7 +186,7 @@ export function AimBridge() {
           useCapturePinsStore.getState().setPins(e.data.captures);
           break;
         case 'AIM_TREE_DECORATIONS':
-          // Per-GUID badge counts (D-076) — HierarchyPanel rows render pills.
+          // Per-GUID badge counts (D-077) — HierarchyPanel rows render pills.
           useAimDecorationsStore.getState().setDecorations(e.data.decorations);
           break;
       }

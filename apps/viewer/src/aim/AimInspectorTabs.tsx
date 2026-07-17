@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * AIM | IFC inspector switch (D-076) — the tab bar shown at the top of the
+ * AIM | IFC inspector switch (D-077) — the tab bar shown at the top of the
  * PropertiesPanel when the viewer is embedded in the AIM host and an element
  * is selected. "AIM" shows the host-fed AimCard (platform data), "IFC" shows
  * the panel's native file-derived content; PropertiesPanel hides its native
