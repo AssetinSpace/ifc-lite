@@ -20,6 +20,10 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useViewerStore, resolveEntityRef } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
+// >>> AIM-FORK: AIM dekorácie stromu (D-076)
+import { useAimDecorationsStore } from '@/aim/aimDecorationsStore';
+import { guidForEntity, type AimTreeDecoration } from '@/aim/bridge-protocol';
+// <<< AIM-FORK
 import { useIfc } from '@/hooks/useIfc';
 import { useEntityListMultiSelect, type MultiSelectItem } from '@/hooks/useEntityListMultiSelect';
 import { Rule, type FilterRule } from '@/lib/search/filter-rules';
@@ -736,6 +740,22 @@ export function HierarchyPanel() {
     return { isSelected, nodeHidden, modelVisible };
   }, [selectedStoreys, selectedEntityId, selectedEntityIds, hiddenEntities, getNodeElements, models, toGlobalId]);
 
+  // >>> AIM-FORK: AIM dekorácie stromu (D-076) — riadok → IFC GlobalId → badge counts.
+  // Lookup beží len keď host poslal dekorácie (hasDecorations), inak nula réžie;
+  // guidForEntity je O(1) nad GlobalId indexom modelu.
+  const aimDecorations = useAimDecorationsStore((s) => s.decorations);
+  const aimHasDecorations = useAimDecorationsStore((s) => s.hasDecorations);
+  const aimDecorationFor = useCallback((node: TreeNode): AimTreeDecoration | undefined => {
+    if (!aimHasDecorations) return undefined;
+    if (node.type !== 'element' && node.type !== 'IfcSpace' && node.type !== 'group-member') return undefined;
+    const modelId = node.modelIds[0];
+    const expressId = node.expressIds[0];
+    if (!modelId || modelId === 'legacy' || expressId === undefined) return undefined;
+    const guid = guidForEntity(models, { modelId, expressId });
+    return guid ? aimDecorations[guid] : undefined;
+  }, [aimHasDecorations, aimDecorations, models]);
+  // <<< AIM-FORK
+
   if (!ifcDataStore && models.size === 0) {
     return (
       <div className="h-full flex flex-col border-r-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
@@ -797,6 +817,7 @@ export function HierarchyPanel() {
         onModelVisibilityToggle={handleModelVisibilityToggle}
         onRemoveModel={handleRemoveModel}
         onModelHeaderClick={handleModelHeaderClick}
+        aimDecoration={aimDecorationFor(node)}
       />
     );
   };
