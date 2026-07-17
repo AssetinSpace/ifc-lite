@@ -56,6 +56,7 @@ import { toast } from '@/components/ui/toast';
 import { useViewerStore, type UnderlayDrawing } from '@/store';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { CalibrationPdfSurface } from './CalibrationPdfSurface';
+import { IdentifierLinkSettings } from './IdentifierLinkSettings';
 
 interface DrawingUnderlayPanelProps {
   onClose: () => void;
@@ -479,6 +480,9 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
             />
           ))}
         </div>
+
+        {/* Identifier hyperlinks (D-076): code source + pattern per project. */}
+        <IdentifierLinkSettings />
       </ScrollArea>
     </div>
   );

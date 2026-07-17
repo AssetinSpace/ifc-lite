@@ -28,6 +28,7 @@ import { createMutationSlice, type MutationSlice } from './slices/mutationSlice.
 import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSlice.js';
 import { createDrawingUnderlaySlice, type DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 import { createDocumentsSlice, type DocumentsSlice } from './slices/documentsSlice.js';
+import { createIdentifierLinksSlice, type IdentifierLinksSlice } from './slices/identifierLinksSlice.js';
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
@@ -81,6 +82,7 @@ export type { ForwardModelMapLike } from './globalId.js';
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
 export type { UnderlayDrawing, UnderlayCalibrationDraft, DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 export type { ViewerDocument, ViewerDocumentKind, DocTab, DocTabView, DocumentEvent, DocumentsSlice } from './slices/documentsSlice.js';
+export type { IdentifierLinksSlice, IdentifierIndexStatus } from './slices/identifierLinksSlice.js';
 
 // Re-export Sheet types
 export type { SheetState } from './slices/sheetSlice.js';
@@ -147,6 +149,7 @@ export type ViewerState = LoadingSlice &
   Drawing2DSlice &
   DrawingUnderlaySlice &
   DocumentsSlice &
+  IdentifierLinksSlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
@@ -236,6 +239,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createDrawing2DSlice(...args),
   ...createDrawingUnderlaySlice(...args),
   ...createDocumentsSlice(...args),
+  ...createIdentifierLinksSlice(...args),
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
@@ -276,6 +280,12 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       selectedEntityId: null,
       selectedEntityIds: new Set(),
       selectedStoreys: new Set(),
+      // Identifier links — the index references the outgoing model's stores;
+      // the per-project config reloads via useIdentifierLinks on next model.
+      identifierIndex: null,
+      identifierIndexStatus: 'idle',
+      identifierIndexSignature: null,
+      identifierConfigModelKey: null,
       // Drop the shared active storey — it references the outgoing model, so a
       // new file must not inherit a stale storey for Solo / Space Sketch.
       activeStorey: null,

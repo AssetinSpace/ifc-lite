@@ -35,6 +35,7 @@ import { useCameraTickSubscription } from '@/hooks/useCameraTickSubscription';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
+import { IdentifierLinkLayer } from './IdentifierLinkLayer';
 
 /** Base raster (zoom 1) and the ceiling for zoomed re-rasters. */
 const PANE_RASTER_PX = 2000;
@@ -433,6 +434,8 @@ export function DrawingPlanPane() {
             <div className="flex h-full w-full items-center justify-center p-2">
               <div className="relative cursor-crosshair" style={fitBox(pageAspect, bodySize)}>
                 <div ref={hostRef} className="h-full w-full" />
+                {/* Identifier hyperlinks (D-076): clickable element codes over the plan. */}
+                <IdentifierLinkLayer drawing={drawing} zoom={zoom} />
                 {marker && (
                   <span
                     className="pointer-events-none absolute z-10"

@@ -140,6 +140,41 @@ export async function renderPdfTextLayer(
   };
 }
 
+/** One positioned text run of a page (scale-1 viewport, page points, y-up). */
+export interface PdfPageTextItem {
+  str: string;
+  /** pdf.js text transform [a, b, c, d, e, f]; e/f = baseline origin. */
+  transform: number[];
+  width: number;
+  height: number;
+}
+
+/**
+ * Extract the positioned text items of one page (identifier-link scanning,
+ * D-076 in the AIM repo). Returns page-point geometry at scale 1 so boxes can
+ * be mapped into the same frame the calibration affine is defined on.
+ */
+export async function getPdfPageTextItems(
+  doc: PDFDocumentProxy,
+  pageNumber: number,
+): Promise<{ items: PdfPageTextItem[]; pageSizePts: [number, number] }> {
+  const page = await doc.getPage(pageNumber);
+  const viewport = page.getViewport({ scale: 1 });
+  const content = await page.getTextContent();
+  const items: PdfPageTextItem[] = [];
+  for (const item of content.items) {
+    // Skip TextMarkedContent entries — only real text runs carry `str`.
+    if (!('str' in item) || typeof item.str !== 'string' || item.str.length === 0) continue;
+    items.push({
+      str: item.str,
+      transform: item.transform,
+      width: item.width,
+      height: item.height,
+    });
+  }
+  return { items, pageSizePts: [viewport.width, viewport.height] };
+}
+
 /**
  * Rasterize one page to an ImageBitmap for texture upload.
  *
