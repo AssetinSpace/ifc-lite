@@ -21,6 +21,7 @@ import { usePrivacyDisclosure } from '@/hooks/usePrivacyDisclosure';
 import { isSafeMode } from '@/lib/safe-mode';
 import { ShieldAlert, Grip } from 'lucide-react';
 import { usePanelDetachDrag } from '@/hooks/usePanelDetachDrag';
+import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { ExtensionDockHost } from '@/components/extensions/ExtensionDockHost';
 import { useIfc } from '@/hooks/useIfc';
 import { useViewerStore } from '@/store';
@@ -333,6 +334,23 @@ export function ViewerLayout() {
       if (panel.getSize().asPercentage < 20) resizePanelPct(panel, DOC_PANE_OPEN_PCT);
     }
   }, []);
+
+  // D-075: opening/focusing a document tab must never happen invisibly. The
+  // 2D full-plan mode hides the doc pane by design — drop it to Split so the
+  // tab shows beside the plan; on mobile the split plan overlay covers the
+  // doc overlay, so opening a document exits the split (reading the document
+  // is the more recent intent there — one surface at a time on a phone).
+  const { exitSplitView } = useFloorplanView();
+  const activeDocTabId = useViewerStore((s) => s.activeDocTabId);
+  const prevActiveDocRef = useRef(activeDocTabId);
+  useEffect(() => {
+    const prev = prevActiveDocRef.current;
+    prevActiveDocRef.current = activeDocTabId;
+    if (!activeDocTabId || activeDocTabId === prev) return;
+    const s = useViewerStore.getState();
+    if (s.underlayPlanFull) s.setUnderlayPlanFull(false);
+    if (isMobile && s.underlaySplitView) exitSplitView();
+  }, [activeDocTabId, isMobile, exitSplitView]);
 
   // Bottom panel resize state (pixel height, persisted in ref to avoid re-renders during drag)
   const [bottomHeight, setBottomHeight] = useState(BOTTOM_PANEL_DEFAULT_HEIGHT);
