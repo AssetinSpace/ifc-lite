@@ -192,6 +192,54 @@ describe('isInboundMessage', () => {
       false, // non-finite world
     );
   });
+
+  it('accepts and validates AIM_TREE_DECORATIONS (D-076)', () => {
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: {} }));
+    assert.ok(isInboundMessage({
+      source: SOURCE,
+      type: 'AIM_TREE_DECORATIONS',
+      decorations: { G1: { d: 2 }, G2: { d: 1, r: 3, c: 0 }, G3: {} },
+    }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS' }), false); // no decorations
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: 'x' }), false);
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: [] }),
+      false, // array is not a record
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: { G1: null } }),
+      false, // null value
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: { G1: { d: 'x' } } }),
+      false, // non-numeric count
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: { G1: { d: -1 } } }),
+      false, // negative count
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'AIM_TREE_DECORATIONS', decorations: { G1: { d: Infinity } } }),
+      false, // non-finite count
+    );
+  });
+
+  it('accepts v1 and v2 AIM_PANEL_DATA payloads', () => {
+    const base = { version: 1, guid: 'G1', title: 'Prvok' };
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'AIM_PANEL_DATA', guid: 'G1', data: base }));
+    assert.ok(isInboundMessage({
+      source: SOURCE,
+      type: 'AIM_PANEL_DATA',
+      guid: 'G1',
+      data: {
+        ...base,
+        version: 2,
+        responsibilities: [{ name: 'Ján Kováč', role: 'správca' }],
+        captures: { count: 3, href: '/ifc?captures=s1' },
+        history: [{ guid: 'G1', validFrom: '2026-01-01', active: true }],
+      },
+    }));
+  });
 });
 
 describe('resolveGuids', () => {
