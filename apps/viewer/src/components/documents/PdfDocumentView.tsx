@@ -28,6 +28,7 @@ import {
   rasterizePdfRegion,
   renderPdfTextLayer,
 } from '@/lib/pdf/rasterize';
+import { PageIdentifierLinks } from './PageIdentifierLinks';
 
 /**
  * Raster ceiling (longest edge, device px). Deep zoom into drawings needs
@@ -788,6 +789,8 @@ function PdfPage({
     >
       <div ref={hostRef} className="h-full w-full" />
       <div ref={textHostRef} className="pdf-doc-text-layer" />
+      {/* Identifier hyperlinks (D-076): clickable element codes on the page. */}
+      <PageIdentifierLinks pdf={pdf} page={page} render={render} />
     </div>
   );
 }

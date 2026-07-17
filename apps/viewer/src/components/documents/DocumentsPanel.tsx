@@ -14,10 +14,11 @@
  */
 
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { FilePlus2, FileText, Image as ImageIcon, Map as MapIcon, X } from 'lucide-react';
+import { FilePlus2, FileText, Image as ImageIcon, Map as MapIcon, Settings2, X } from 'lucide-react';
 import type { StoreyOption } from '@/hooks/useViewMode';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { IdentifierLinkSettings } from '@/components/viewer/IdentifierLinkSettings';
 import { useViewerStore, type ViewerDocument } from '@/store';
 import { useViewMode } from '@/hooks/useViewMode';
 
@@ -46,6 +47,7 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
 
   const [filter, setFilter] = useState('');
   const [dragOver, setDragOver] = useState(false);
+  const [showLinkSettings, setShowLinkSettings] = useState(false);
 
   const groups = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -153,6 +155,16 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
           <FilePlus2 className="size-3.5" aria-hidden />
         </Button>
         <Button
+          variant={showLinkSettings ? 'secondary' : 'ghost'}
+          size="icon"
+          className="size-6"
+          onClick={() => setShowLinkSettings((v) => !v)}
+          aria-label="Identifier links settings"
+          title="Identifier links: map element codes in drawings to model elements"
+        >
+          <Settings2 className="size-3.5" aria-hidden />
+        </Button>
+        <Button
           variant="ghost"
           size="icon"
           className="size-6"
@@ -162,6 +174,8 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
           <X className="size-3.5" aria-hidden />
         </Button>
       </div>
+      {/* Identifier hyperlinks (D-076): code source + pattern per project. */}
+      {showLinkSettings && <IdentifierLinkSettings />}
       <div className="border-b px-3 py-1.5">
         <input
           type="search"
