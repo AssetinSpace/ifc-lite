@@ -22,6 +22,15 @@
  */
 
 import { matchesIdentifierPattern, normalizeIdentifier } from './config.js';
+
+/**
+ * A candidate string matches when either its NORMALIZED form (regular code
+ * sources) or its EXACT form (case-sensitive sources like GlobalId, where
+ * normalization would corrupt the key) passes the pattern.
+ */
+function matchesEitherForm(pattern: RegExp, value: string): boolean {
+  return matchesIdentifierPattern(pattern, value) || pattern.test(value);
+}
 import type { IdentifierIndex, IdentifierTarget } from './identifier-index.js';
 
 /** Minimal shape of a pdf.js `TextItem` (scale-1 viewport). */
@@ -37,8 +46,10 @@ export interface PdfTextItemLike {
 
 /** One identifier occurrence on the page, box in PDF points (bottom-left origin). */
 export interface PageLinkBox {
-  /** Normalized code (index lookup key). */
+  /** Normalized code (index lookup key for normalized sources). */
   code: string;
+  /** Exact trimmed text — lookup key for case-sensitive sources (GlobalId). */
+  exactKey: string;
   /** Raw matched text as printed (joined fragments separated by a space). */
   raw: string;
   x: number;
@@ -151,10 +162,11 @@ export function findIdentifierBoxes(
 
   // Layer 1 — full single-token matches.
   for (const token of tokens) {
-    if (!matchesIdentifierPattern(pattern, token.raw)) continue;
+    if (!matchesEitherForm(pattern, token.raw)) continue;
     token.matched = true;
     boxes.push({
       code: normalizeIdentifier(token.raw),
+      exactKey: token.raw,
       raw: token.raw,
       x: token.x,
       y: token.y,
@@ -186,7 +198,7 @@ export function findIdentifierBoxes(
       const dy = Math.abs(a.cy - b.cy);
       const aFirst = dy > dx ? a.cy > b.cy : a.cx < b.cx;
       if (!aFirst) continue;
-      if (!matchesIdentifierPattern(pattern, `${a.raw}.${b.raw}`)) continue;
+      if (!matchesEitherForm(pattern, `${a.raw}.${b.raw}`)) continue;
       if (!best || dist < best.dist) best = { token: b, dist };
     }
     if (!best) continue;
@@ -197,6 +209,7 @@ export function findIdentifierBoxes(
     const minY = Math.min(a.y, b.y);
     boxes.push({
       code: normalizeIdentifier(`${a.raw}.${b.raw}`),
+      exactKey: `${a.raw}.${b.raw}`,
       raw: `${a.raw} ${b.raw}`,
       x: minX,
       y: minY,
@@ -223,7 +236,16 @@ export function resolvePageLinks(
 ): ResolvedPageLink[] {
   const prefer = options.preferStoreyGuid;
   return boxes.map((box) => {
-    let targets = index.byCode.get(box.code) ?? [];
+    // Union of the normalized-key and exact-key (GlobalId) target lists.
+    const fromCode = index.byCode.get(box.code) ?? [];
+    let targets = fromCode;
+    if (box.exactKey !== box.code) {
+      const fromExact = index.byCode.get(box.exactKey) ?? [];
+      if (fromExact.length > 0) {
+        const seen = new Set(fromCode.map((t) => `${t.modelId}:${t.expressId}`));
+        targets = [...fromCode, ...fromExact.filter((t) => !seen.has(`${t.modelId}:${t.expressId}`))];
+      }
+    }
     if (prefer && targets.length > 1) {
       const sameStorey = targets.filter((t) => t.storeyGuid === prefer);
       if (sameStorey.length > 0) targets = sameStorey;

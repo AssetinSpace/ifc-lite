@@ -163,6 +163,26 @@ describe('findIdentifierBoxes — proximity join (split label bubbles)', () => {
   });
 });
 
+describe('findIdentifierBoxes + resolvePageLinks — case-sensitive GlobalId keys', () => {
+  const GUID_PATTERN = compileIdentifierPattern('^[0-9A-Za-z_$]{22}$')!;
+  const guid = '2O2Fr$t4X7Zf8NOew3FLKI';
+
+  it('matches a printed GUID via its exact form and resolves by exact key', () => {
+    const boxes = findIdentifierBoxes([item(guid, 0, 0, 110, 10)], GUID_PATTERN);
+    assert.equal(boxes.length, 1);
+    assert.equal(boxes[0].exactKey, guid);
+
+    const index: IdentifierIndex = {
+      byCode: new Map([[guid, [target({ expressId: 9, rawValue: guid })]]]),
+      scannedEntities: 1,
+      buildTimeMs: 0,
+    };
+    const links = resolvePageLinks(boxes, index);
+    assert.equal(links[0].targets.length, 1);
+    assert.equal(links[0].targets[0].expressId, 9);
+  });
+});
+
 describe('resolvePageLinks', () => {
   const index: IdentifierIndex = {
     byCode: new Map([

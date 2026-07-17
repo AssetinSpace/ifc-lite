@@ -95,6 +95,21 @@ export function matchesIdentifierPattern(re: RegExp, value: string): boolean {
   return normalized.length > 0 && re.test(normalized);
 }
 
+/**
+ * Sources exempt from normalization: IFC GlobalIds are case-sensitive base64
+ * (`_` and `$` are payload, upper/lower case are DIFFERENT guids), so
+ * uppercasing or separator-collapsing them would corrupt the key. Exempt
+ * sources are keyed and matched on the trimmed raw value instead.
+ */
+export function isCaseSensitiveSource(kind: IdentifierSourceKind): boolean {
+  return kind === 'globalId';
+}
+
+/** Index/lookup key for a value produced by the given source kind. */
+export function identifierKeyForSource(kind: IdentifierSourceKind, raw: string): string {
+  return isCaseSensitiveSource(kind) ? raw.trim() : normalizeIdentifier(raw);
+}
+
 // ── Per-project persistence (localStorage; host-agnostic) ───────────────────
 
 const STORAGE_PREFIX = 'ifc-lite:identifier-links:';

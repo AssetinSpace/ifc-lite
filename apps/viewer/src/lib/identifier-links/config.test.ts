@@ -7,6 +7,7 @@ import assert from 'node:assert';
 import {
   compileIdentifierPattern,
   DEFAULT_IDENTIFIER_PATTERN,
+  identifierKeyForSource,
   matchesIdentifierPattern,
   normalizeIdentifier,
   sanitizeIdentifierLinkConfig,
@@ -30,6 +31,17 @@ describe('normalizeIdentifier', () => {
 
   it('returns empty for whitespace-only input', () => {
     assert.equal(normalizeIdentifier('   '), '');
+  });
+});
+
+describe('identifierKeyForSource', () => {
+  it('keeps GlobalId keys exact — case, underscores and $ survive', () => {
+    assert.equal(identifierKeyForSource('globalId', ' 2O2Fr$t4X7Zf8NOew3FLKI '), '2O2Fr$t4X7Zf8NOew3FLKI');
+  });
+
+  it('normalizes every other source kind', () => {
+    assert.equal(identifierKeyForSource('name', 'dd-01-02'), 'DD.01.02');
+    assert.equal(identifierKeyForSource('tag', ' sn 11 '), 'SN.11');
   });
 });
 

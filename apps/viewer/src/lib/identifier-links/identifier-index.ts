@@ -22,6 +22,7 @@ import {
 } from '@ifc-lite/parser';
 import {
   compileIdentifierPattern,
+  identifierKeyForSource,
   normalizeIdentifier,
   type IdentifierLinkConfig,
   type IdentifierSource,
@@ -228,7 +229,9 @@ export async function buildIdentifierIndex(
         for (const source of config.sources) {
           const rawValue = readSource(source, row, expressId);
           if (!rawValue) continue;
-          const code = normalizeIdentifier(rawValue);
+          // Case-sensitive sources (GlobalId) key on the trimmed raw value;
+          // everything else on the normalized code.
+          const code = identifierKeyForSource(source.kind, rawValue);
           if (!code || !re.test(code)) continue;
 
           const storeyId = hierarchy?.elementToStorey.get(expressId);
@@ -255,12 +258,22 @@ export async function buildIdentifierIndex(
   return { byCode, scannedEntities, buildTimeMs: performance.now() - start };
 }
 
-/** Look up one normalized code (settings live-test + link resolution). */
+/**
+ * Look up a printed value (settings live-test + link resolution). Tries the
+ * normalized key first, then the exact trimmed value — so codes from
+ * normalized sources AND case-sensitive GlobalId keys both resolve. Targets
+ * from both key spaces are merged (deduped per element).
+ */
 export function lookupIdentifier(
   index: IdentifierIndex,
   value: string,
 ): IdentifierTarget[] {
-  const code = normalizeIdentifier(value);
-  if (!code) return [];
-  return index.byCode.get(code) ?? [];
+  const normalized = normalizeIdentifier(value);
+  const exact = value.trim();
+  const fromNormalized = normalized ? (index.byCode.get(normalized) ?? []) : [];
+  if (!exact || exact === normalized) return fromNormalized;
+  const fromExact = index.byCode.get(exact) ?? [];
+  if (fromExact.length === 0) return fromNormalized;
+  const seen = new Set(fromNormalized.map((t) => `${t.modelId}:${t.expressId}`));
+  return [...fromNormalized, ...fromExact.filter((t) => !seen.has(`${t.modelId}:${t.expressId}`))];
 }

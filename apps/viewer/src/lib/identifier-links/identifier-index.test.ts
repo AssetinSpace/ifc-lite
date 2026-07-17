@@ -98,6 +98,37 @@ describe('buildIdentifierIndex', () => {
   });
 });
 
+describe('buildIdentifierIndex — case-sensitive GlobalId source', () => {
+  const GUID_CONFIG: IdentifierLinkConfig = {
+    ...CONFIG,
+    sources: [{ kind: 'globalId' }],
+    pattern: '^[0-9A-Za-z_$]{22}$',
+  };
+
+  it('keys GlobalId values exactly, without normalization', async () => {
+    const guid = '2O2Fr$t4X7Zf8NOew3FLKI';
+    const model = makeModel('m1', [
+      { expressId: 1, type: 'IfcWall', globalId: guid, name: 'Wall' },
+    ]);
+    const index = await buildIdentifierIndex([model], GUID_CONFIG);
+    assert.ok(index.byCode.get(guid), 'exact key present');
+    assert.equal(index.byCode.get(guid.toUpperCase()), undefined, 'no case-folded key');
+    assert.equal(lookupIdentifier(index, ` ${guid} `).length, 1, 'exact lookup, trimmed');
+    assert.equal(lookupIdentifier(index, guid.toLowerCase()).length, 0, 'case matters');
+  });
+
+  it('distinguishes guids differing only in case', async () => {
+    const model = makeModel('m1', [
+      { expressId: 1, type: 'IfcWall', globalId: 'aaaaaaaaaaaaaaaaaaaaaA', name: 'A' },
+      { expressId: 2, type: 'IfcWall', globalId: 'aaaaaaaaaaaaaaaaaaaaaB', name: 'B' },
+    ]);
+    const index = await buildIdentifierIndex([model], GUID_CONFIG);
+    assert.equal(index.byCode.size, 2);
+    assert.equal(lookupIdentifier(index, 'aaaaaaaaaaaaaaaaaaaaaA')[0]?.expressId, 1);
+    assert.equal(lookupIdentifier(index, 'aaaaaaaaaaaaaaaaaaaaaB')[0]?.expressId, 2);
+  });
+});
+
 describe('lookupIdentifier', () => {
   it('normalizes the query before the lookup', async () => {
     const model = makeModel('m1', [
