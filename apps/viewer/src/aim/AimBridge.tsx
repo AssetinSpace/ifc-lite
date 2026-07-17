@@ -303,6 +303,15 @@ export function AimBridge() {
       return;
     }
     programmaticSelectionRef.current = null;
+    // Mobil v embede (D-077 dodatok): tap síce prvok vyberie, ale Properties
+    // bottom sheet sa sám neotvorí a plávajúce tlačidlo je ľahké prehliadnuť —
+    // po používateľskej selekcii (nie FOCUS z hosta, guard vyššie) sheet
+    // otvoríme; default tab je AIM inspector. Standalone sa nemení (guard
+    // embeddedRef na začiatku effectu).
+    {
+      const store = useViewerStore.getState();
+      if (store.isMobile && store.rightPanelCollapsed) store.setRightPanelCollapsed(false);
+    }
     const guid = guidForEntity(useViewerStore.getState().models, selectedEntity);
     if (guid) {
       // AimCard shows its skeleton immediately; the host answers with
