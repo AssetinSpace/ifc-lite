@@ -32,6 +32,7 @@ const KIND_LABELS: Record<IdentifierSourceKind, string> = {
   description: 'Description',
   objectType: 'ObjectType',
   tag: 'Tag',
+  globalId: 'GlobalId (GUID)',
   pset: 'Property set…',
 };
 

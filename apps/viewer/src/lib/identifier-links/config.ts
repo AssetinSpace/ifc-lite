@@ -14,7 +14,13 @@
  * text (dimensions, axis numbers) can't produce accidental links.
  */
 
-export type IdentifierSourceKind = 'name' | 'description' | 'objectType' | 'tag' | 'pset';
+export type IdentifierSourceKind =
+  | 'name'
+  | 'description'
+  | 'objectType'
+  | 'tag'
+  | 'globalId'
+  | 'pset';
 
 export interface IdentifierSource {
   kind: IdentifierSourceKind;
@@ -107,6 +113,7 @@ function sanitizeSource(value: unknown): IdentifierSource | null {
     kind !== 'description' &&
     kind !== 'objectType' &&
     kind !== 'tag' &&
+    kind !== 'globalId' &&
     kind !== 'pset'
   ) {
     return null;

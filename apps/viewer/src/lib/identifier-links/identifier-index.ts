@@ -202,6 +202,10 @@ export async function buildIdentifierIndex(
           const idx = objectTypeCol[row];
           return idx !== 0 ? strings.get(idx) : '';
         }
+        case 'globalId': {
+          const idx = globalIdCol[row];
+          return idx !== 0 ? strings.get(idx) : '';
+        }
         case 'tag':
           return tagReader.read(expressId);
         case 'pset':
