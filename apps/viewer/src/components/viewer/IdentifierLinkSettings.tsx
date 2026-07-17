@@ -227,6 +227,12 @@ export function IdentifierLinkSettings() {
               {status === 'idle' && !config.enabled && 'Enable to build the identifier index.'}
             </p>
 
+            {/* Deployed-build stamp — lets users confirm which version a
+                browser is actually running (stale-cache triage). */}
+            <p className="text-[10px] text-muted-foreground/70">
+              build {__BUILD_SHA__}
+            </p>
+
             {config.enabled && scanStats && (
               <p className="text-[11px] text-muted-foreground">
                 Last scan — {scanStats.source}, page {scanStats.page}: {scanStats.textItems} text
