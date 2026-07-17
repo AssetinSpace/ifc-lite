@@ -28,7 +28,8 @@ export const FOCUS_COLOR = '#f97316';
  * (e.g. /node/{id}) bounced back via AIM_NAVIGATE — never navigated here.
  */
 export interface AimPanelData {
-  version: 1;
+  /** v2 (D-077) is additive — every v2 field is optional, v1 payloads render unchanged. */
+  version: 1 | 2;
   /** Echo of the requested element's GlobalId — used to drop stale responses. */
   guid: string;
   title: string;
@@ -40,6 +41,25 @@ export interface AimPanelData {
   }[];
   documents?: { name: string; href: string; badge?: string }[];
   actions?: { label: string; href: string; primary?: boolean }[];
+  // --- v2 typed sections (D-077: AIM inspector) ---
+  /** Responsible persons/organizations for the element (host DB roles). */
+  responsibilities?: { name: string; role: string; org?: string; href?: string }[];
+  /** Reality-capture summary — count + host link opening the gallery. */
+  captures?: { count: number; href: string };
+  /** GUID history entries (bitemporal validity; `active` = current GUID). */
+  history?: { guid: string; validFrom: string; validUntil?: string; active: boolean }[];
+}
+
+/**
+ * Per-element AIM badge counts for the hierarchy tree (D-077), keyed by IFC
+ * GlobalId. Compact single-letter fields keep the payload small across the
+ * whole model: d = linked documents, r = responsibilities, c = captures.
+ * A missing field means zero.
+ */
+export interface AimTreeDecoration {
+  d?: number;
+  r?: number;
+  c?: number;
 }
 
 /**
@@ -133,7 +153,10 @@ export type InboundMessage =
   | { source: typeof SOURCE; type: 'DOCUMENT_OPEN'; documentId: string; page?: number }
   // Reality Capture pins (D-073): the host pushes capture points with world
   // coords after MODELS_LOADED; the viewer billboards them over the canvas.
-  | { source: typeof SOURCE; type: 'CAPTURES_LOAD'; captures: CapturePinWire[] };
+  | { source: typeof SOURCE; type: 'CAPTURES_LOAD'; captures: CapturePinWire[] }
+  // AIM tree decorations (D-077): per-GUID badge counts for HierarchyPanel,
+  // pushed by the host after MODELS_LOADED (same timing slot as the loads above).
+  | { source: typeof SOURCE; type: 'AIM_TREE_DECORATIONS'; decorations: Record<string, AimTreeDecoration> };
 
 export type OutboundMessage =
   | { source: typeof SOURCE; type: 'READY' }
@@ -234,6 +257,20 @@ function isDocumentDescriptorWire(v: unknown): v is DocumentDescriptorWire {
  * coordinates; name/thumbUrl are optional. Malformed entries are dropped so a
  * bad host payload can't crash the billboard projection loop.
  */
+/**
+ * One decoration value must be an object whose present count fields are
+ * finite non-negative numbers. Malformed entries reject the whole message —
+ * decorations are an all-or-nothing host push, partial junk helps nobody.
+ */
+function isAimTreeDecoration(v: unknown): v is AimTreeDecoration {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as { d?: unknown; r?: unknown; c?: unknown };
+  for (const n of [d.d, d.r, d.c]) {
+    if (n !== undefined && (typeof n !== 'number' || !Number.isFinite(n) || n < 0)) return false;
+  }
+  return true;
+}
+
 function isCapturePinWire(v: unknown): v is CapturePinWire {
   if (!v || typeof v !== 'object') return false;
   const c = v as { id?: unknown; kind?: unknown; world?: unknown };
@@ -264,6 +301,7 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
     documentId?: unknown;
     page?: unknown;
     captures?: unknown;
+    decorations?: unknown;
   };
   if (msg.source !== SOURCE || typeof msg.type !== 'string') return false;
   switch (msg.type) {
@@ -297,6 +335,13 @@ export function isInboundMessage(data: unknown): data is InboundMessage {
       );
     case 'CAPTURES_LOAD':
       return Array.isArray(msg.captures) && msg.captures.every(isCapturePinWire);
+    case 'AIM_TREE_DECORATIONS':
+      return (
+        !!msg.decorations &&
+        typeof msg.decorations === 'object' &&
+        !Array.isArray(msg.decorations) &&
+        Object.values(msg.decorations).every(isAimTreeDecoration)
+      );
     default:
       // Unknown type — not a message this bridge version handles.
       return false;

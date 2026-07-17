@@ -36,6 +36,7 @@ import {
 } from './bridge-protocol.js';
 import { useAimPanelStore } from './aimPanelStore.js';
 import { useCapturePinsStore } from './capturePinsStore.js';
+import { useAimDecorationsStore } from './aimDecorationsStore.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -184,6 +185,10 @@ export function AimBridge() {
           // coords; the billboard layer (CapturePinLayer) renders them.
           useCapturePinsStore.getState().setPins(e.data.captures);
           break;
+        case 'AIM_TREE_DECORATIONS':
+          // Per-GUID badge counts (D-077) — HierarchyPanel rows render pills.
+          useAimDecorationsStore.getState().setDecorations(e.data.decorations);
+          break;
       }
     }
 
@@ -219,6 +224,7 @@ export function AimBridge() {
       useViewerStore.getState().setDocumentEventHandler(null);
       useCapturePinsStore.getState().setEmitClick(null);
       useCapturePinsStore.getState().setPins([]);
+      useAimDecorationsStore.getState().clear();
     };
   }, [bim]);
 

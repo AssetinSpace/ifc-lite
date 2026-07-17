@@ -9,7 +9,15 @@ import {
   EyeOff,
   FileBox,
   X,
+  // >>> AIM-FORK: ikonky AIM badge (D-077)
+  FileText,
+  Users,
+  Camera,
+  // <<< AIM-FORK
 } from 'lucide-react';
+// >>> AIM-FORK
+import type { AimTreeDecoration } from '@/aim/bridge-protocol';
+// <<< AIM-FORK
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import type { TreeNode } from './types';
@@ -45,6 +53,9 @@ export interface HierarchyNodeProps {
   onModelVisibilityToggle: (modelId: string, e: React.MouseEvent) => void;
   onRemoveModel: (modelId: string, e: React.MouseEvent) => void;
   onModelHeaderClick: (modelId: string, nodeId: string, hasChildren: boolean) => void;
+  // >>> AIM-FORK: per-GUID badge counts z AIM hosta (D-077); undefined = bez badge
+  aimDecoration?: AimTreeDecoration;
+  // <<< AIM-FORK
 }
 
 export function HierarchyNode({
@@ -61,6 +72,9 @@ export function HierarchyNode({
   onModelVisibilityToggle,
   onRemoveModel,
   onModelHeaderClick,
+  // >>> AIM-FORK
+  aimDecoration,
+  // <<< AIM-FORK
 }: HierarchyNodeProps) {
   const resolvedType = node.ifcType || node.type;
   // Use Lucide icon for non-IFC structural nodes, Material Symbols for IFC classes
@@ -331,6 +345,31 @@ export function HierarchyNode({
             </TooltipContent>
           </Tooltip>
         )}
+
+        {/* >>> AIM-FORK: AIM badge — počty naviazaných záznamov z platformy (D-077) */}
+        {aimDecoration && ((aimDecoration.d ?? 0) + (aimDecoration.r ?? 0) + (aimDecoration.c ?? 0) > 0) && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="flex items-center gap-1 text-[10px] font-mono bg-amber-50 dark:bg-amber-950 px-1.5 py-0.5 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 rounded-none shrink-0">
+                {(aimDecoration.d ?? 0) > 0 && (
+                  <span className="flex items-center gap-0.5"><FileText className="h-2.5 w-2.5" />{aimDecoration.d}</span>
+                )}
+                {(aimDecoration.r ?? 0) > 0 && (
+                  <span className="flex items-center gap-0.5"><Users className="h-2.5 w-2.5" />{aimDecoration.r}</span>
+                )}
+                {(aimDecoration.c ?? 0) > 0 && (
+                  <span className="flex items-center gap-0.5"><Camera className="h-2.5 w-2.5" />{aimDecoration.c}</span>
+                )}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              <p className="text-xs">
+                AIM: {aimDecoration.d ?? 0} dokumentov · {aimDecoration.r ?? 0} zodpovedností · {aimDecoration.c ?? 0} snímok
+              </p>
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {/* <<< AIM-FORK */}
 
         {/* Element Count */}
         {node.elementCount !== undefined && (

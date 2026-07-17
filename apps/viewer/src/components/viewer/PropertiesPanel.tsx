@@ -58,7 +58,7 @@ import { RawStepCard } from './properties/RawStepCard';
 import { UnitDisplayControl } from './properties/UnitDisplayControl';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
 // >>> AIM-FORK: AIM asset card, rendered only inside the AIM host (see docs/FORK_MAINTENANCE.md)
-import { AimCard } from '@/aim/AimCard';
+import { AimInspectorTabs, useAimNativeHidden } from '@/aim/AimInspectorTabs';
 // <<< AIM-FORK
 
 /** IFC material *definition* classes selectable from the Materials tab. */
@@ -224,6 +224,9 @@ export function PropertiesPanel() {
   // tools — behind a single switch.
   const editMode = useViewerStore((s) => s.editEnabled);
   const propertiesActiveTab = useViewerStore((s) => s.propertiesActiveTab);
+  // >>> AIM-FORK: AIM | IFC inspector (D-077) — skrytie natívneho obsahu pod AIM tabom
+  const aimNativeHidden = useAimNativeHidden();
+  // <<< AIM-FORK
   const setPropertiesActiveTab = useViewerStore((s) => s.setPropertiesActiveTab);
   const setEditEnabled = useViewerStore((s) => s.setEditEnabled);
   const pendingPropertyFocus = useViewerStore((s) => s.pendingPropertyFocus);
@@ -1437,8 +1440,11 @@ export function PropertiesPanel() {
         )}
       </div>
 
-      {/* >>> AIM-FORK: AIM platform data (embedded in the AIM host only) */}
-      <AimCard />
+      {/* >>> AIM-FORK: AIM | IFC inspector (D-077) — tab lišta + AIM karta;
+          natívny obsah nižšie je pod AIM tabom skrytý (display:contents wrapper,
+          layout pri IFC tabe ostáva upstream-identický) */}
+      <AimInspectorTabs />
+      <div className={aimNativeHidden ? 'hidden' : 'contents'}>
       {/* <<< AIM-FORK */}
 
       {/* IFC Attributes */}
@@ -1777,6 +1783,9 @@ export function PropertiesPanel() {
           </TabsContent>
         </ScrollArea>
       </Tabs>
+      {/* >>> AIM-FORK: koniec wrappera natívneho obsahu (D-077) */}
+      </div>
+      {/* <<< AIM-FORK */}
     </div>
   );
 }

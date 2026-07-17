@@ -11,7 +11,7 @@
  * Renders nothing when standalone (not embedded) — zero upstream impact.
  */
 
-import { Database, FileText, ExternalLink } from 'lucide-react';
+import { Database, FileText, ExternalLink, Users, Camera, History } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -100,6 +100,75 @@ function AimCardBody({ data }: { data: AimPanelData }) {
                   <Badge variant="outline" className="text-[10px] px-1.5 py-0 shrink-0">{doc.badge}</Badge>
                 )}
               </AimLink>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Responsibilities (v2, D-077) — who is responsible for the element */}
+      {data.responsibilities && data.responsibilities.length > 0 && (
+        <div>
+          <div className="px-3 pt-1.5 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            Zodpovednosti ({data.responsibilities.length})
+          </div>
+          <div className="divide-y border-t">
+            {data.responsibilities.map((resp, i) => {
+              const body = (
+                <>
+                  <Users className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span className="truncate" title={resp.name}>{resp.name}</span>
+                  <span className="text-xs text-muted-foreground truncate shrink-0" title={resp.role}>
+                    {resp.role}
+                    {resp.org ? ` · ${resp.org}` : ''}
+                  </span>
+                </>
+              );
+              const cls = 'flex items-center gap-2 px-3 py-1.5 text-sm min-w-0';
+              return resp.href ? (
+                <AimLink key={`${resp.name}-${i}`} href={resp.href} className={`${cls} hover:bg-muted/50`}>
+                  {body}
+                </AimLink>
+              ) : (
+                <div key={`${resp.name}-${i}`} className={cls}>{body}</div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Reality Capture summary (v2, D-077) */}
+      {data.captures && data.captures.count > 0 && (
+        <AimLink
+          href={data.captures.href}
+          className="flex items-center gap-2 px-3 py-1.5 text-sm border-t hover:bg-muted/50 min-w-0"
+        >
+          <Camera className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <span className="truncate flex-1">Reality Capture ({data.captures.count})</span>
+          <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+        </AimLink>
+      )}
+
+      {/* GUID history (v2, D-077) — bitemporal validity, read-only */}
+      {data.history && data.history.length > 0 && (
+        <div>
+          <div className="flex items-center gap-1.5 px-3 pt-1.5 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            <History className="h-3 w-3" />
+            História GUID ({data.history.length})
+          </div>
+          <div className="divide-y border-t">
+            {data.history.map((h, i) => (
+              <div key={`${h.guid}-${i}`} className="flex items-center gap-2 px-3 py-1 text-xs min-w-0">
+                <span
+                  className={`font-mono truncate ${h.active ? 'font-semibold' : 'text-muted-foreground'}`}
+                  title={h.guid}
+                >
+                  {h.guid}
+                </span>
+                <span className="text-muted-foreground shrink-0 ml-auto">
+                  {h.validFrom}
+                  {h.validUntil ? ` – ${h.validUntil}` : h.active ? ' – teraz' : ''}
+                </span>
+              </div>
             ))}
           </div>
         </div>
