@@ -86,6 +86,12 @@ interface PageToken {
   h: number;
   cx: number;
   cy: number;
+  /** Unit baseline direction of the source run (viewed frame). */
+  ux: number;
+  uy: number;
+  /** Center in the TEXT's own frame: along the baseline / along "up". */
+  alongC: number;
+  upC: number;
   matched: boolean;
 }
 
@@ -231,6 +237,11 @@ function collectTokens(items: readonly PdfTextItemLike[]): PageToken[] {
     const { str, width } = item;
     if (!str || str.length === 0 || !(width > 0)) continue;
 
+    const [a, b] = item.transform;
+    const len = Math.hypot(a, b);
+    const ux = len > 1e-9 ? a / len : 1;
+    const uy = len > 1e-9 ? b / len : 0;
+
     const tokenRe = /\S+/g;
     let m: RegExpExecArray | null;
     while ((m = tokenRe.exec(str)) !== null) {
@@ -240,11 +251,19 @@ function collectTokens(items: readonly PdfTextItemLike[]): PageToken[] {
       const leading = rawToken.indexOf(trimmed);
       const startChar = m.index + (leading >= 0 ? leading : 0);
       const bounds = tokenBounds(item, startChar, trimmed.length);
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
       tokens.push({
         raw: trimmed,
         ...bounds,
-        cx: bounds.x + bounds.w / 2,
-        cy: bounds.y + bounds.h / 2,
+        cx,
+        cy,
+        ux,
+        uy,
+        // Text-frame center: reading order must be judged in the TEXT's own
+        // frame (rotated labels stack along a viewed-frame axis that isn't y).
+        alongC: cx * ux + cy * uy,
+        upC: -cx * uy + cy * ux,
         matched: false,
       });
     }
@@ -298,12 +317,16 @@ export function findIdentifierBoxes(
       if (used.has(b)) continue;
       const dist = Math.hypot(a.cx - b.cx, a.cy - b.cy);
       if (dist > PROXIMITY_PT) continue;
-      // Reading order: vertical stacks join top→bottom, rows join left→right.
+      // Fragments of one label share a text direction (rotated labels too).
+      if (a.ux * b.ux + a.uy * b.uy < 0.9) continue;
+      // Reading order IN THE TEXT'S OWN FRAME: stacks join top→bottom, rows
+      // join left→right — judged along the baseline/up axes, so rotated
+      // labels (whose stack axis is not the viewed y) order correctly.
       // Only the pair's FIRST fragment initiates the join, so each pair is
       // considered exactly once with a deterministic order.
-      const dx = Math.abs(a.cx - b.cx);
-      const dy = Math.abs(a.cy - b.cy);
-      const aFirst = dy > dx ? a.cy > b.cy : a.cx < b.cx;
+      const dAlong = Math.abs(a.alongC - b.alongC);
+      const dUp = Math.abs(a.upC - b.upC);
+      const aFirst = dUp > dAlong ? a.upC > b.upC : a.alongC < b.alongC;
       if (!aFirst) continue;
       if (!matchesEitherForm(pattern, `${a.raw}.${b.raw}`)) continue;
       if (!best || dist < best.dist) best = { token: b, dist };

@@ -38,6 +38,7 @@ const KIND_LABELS: Record<IdentifierSourceKind, string> = {
 export function IdentifierLinkSettings() {
   const { config, index, status, modelKey } = useIdentifierLinks();
   const setConfig = useViewerStore((s) => s.setIdentifierLinkConfig);
+  const scanStats = useViewerStore((s) => s.identifierScanStats);
   const [testValue, setTestValue] = useState('');
 
   const apply = (next: IdentifierLinkConfig) => {
@@ -225,6 +226,21 @@ export function IdentifierLinkSettings() {
               {status === 'idle' && config.enabled && 'Index will build once a model is loaded.'}
               {status === 'idle' && !config.enabled && 'Enable to build the identifier index.'}
             </p>
+
+            {config.enabled && scanStats && (
+              <p className="text-[11px] text-muted-foreground">
+                Last scan — {scanStats.source}, page {scanStats.page}: {scanStats.textItems} text
+                items, {scanStats.codes} codes, {scanStats.matched} linked.
+                {scanStats.textItems === 0 &&
+                  ' This PDF has no text layer (outlines/scan) — links cannot work on it.'}
+                {scanStats.textItems > 0 &&
+                  scanStats.codes === 0 &&
+                  ' No code matched the pattern — check the regex against a printed code.'}
+                {scanStats.codes > 0 &&
+                  scanStats.matched === 0 &&
+                  ' Codes found on the page but none exist in the model — check the identifier source.'}
+              </p>
+            )}
       </div>
     </div>
   );

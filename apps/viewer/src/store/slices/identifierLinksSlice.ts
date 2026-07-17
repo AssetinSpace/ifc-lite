@@ -21,6 +21,19 @@ import type { IdentifierIndex } from '@/lib/identifier-links/identifier-index';
 
 export type IdentifierIndexStatus = 'idle' | 'building' | 'ready' | 'error';
 
+/** Result of the most recent page-text scan — settings diagnostics. */
+export interface IdentifierScanStats {
+  /** Where the scan ran (drawing/document name or id). */
+  source: string;
+  page: number;
+  /** pdf.js text items on the page (0 = the PDF has no text layer). */
+  textItems: number;
+  /** Identifier-shaped codes recognized on the page. */
+  codes: number;
+  /** Codes that resolved to at least one model element. */
+  matched: number;
+}
+
 export interface IdentifierLinksSlice {
   identifierLinkConfig: IdentifierLinkConfig;
   /**
@@ -32,8 +45,11 @@ export interface IdentifierLinksSlice {
   identifierIndexStatus: IdentifierIndexStatus;
   /** Build signature (models + config) of the cached index. */
   identifierIndexSignature: string | null;
+  /** Most recent page-scan diagnostics (null until a page is scanned). */
+  identifierScanStats: IdentifierScanStats | null;
 
   setIdentifierLinkConfig: (config: IdentifierLinkConfig) => void;
+  setIdentifierScanStats: (stats: IdentifierScanStats | null) => void;
   setIdentifierConfigModelKey: (key: string | null) => void;
   setIdentifierIndexBuilding: (signature: string) => void;
   setIdentifierIndexReady: (index: IdentifierIndex, signature: string) => void;
@@ -52,6 +68,9 @@ export const createIdentifierLinksSlice: StateCreator<
   identifierIndex: null,
   identifierIndexStatus: 'idle',
   identifierIndexSignature: null,
+  identifierScanStats: null,
+
+  setIdentifierScanStats: (stats) => set({ identifierScanStats: stats }),
 
   setIdentifierLinkConfig: (config) =>
     set({

@@ -186,6 +186,22 @@ describe('findIdentifierBoxes — proximity join (split label bubbles)', () => {
     assert.equal(boxes[0].code, 'DD01.02');
   });
 
+  it('joins a stacked pair on a rotated (/Rotate 90) page in reading order', () => {
+    // Frame produced by mapTextTransformToViewport for a Rotate-90 page:
+    // baseline points down the viewed page (u = (0,-1)), "up" is viewed +x.
+    const W = 595;
+    const rot = (x: number, y: number, str: string, width: number): PdfTextItemLike => ({
+      str,
+      transform: [0, -1, 1, 0, y, W - x],
+      width,
+      height: 10,
+    });
+    const boxes = findIdentifierBoxes([rot(100, 210, 'DD01', 20), rot(100, 195, '02.03', 25)], PATTERN);
+    assert.equal(boxes.length, 1);
+    assert.equal(boxes[0].code, 'DD01.02.03', 'reading order judged in the text frame');
+    assert.equal(boxes[0].layer, 'proximity');
+  });
+
   it('picks the nearest candidate when several fragments qualify', () => {
     const boxes = findIdentifierBoxes(
       [

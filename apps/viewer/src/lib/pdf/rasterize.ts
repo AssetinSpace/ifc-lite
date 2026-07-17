@@ -150,9 +150,41 @@ export interface PdfPageTextItem {
 }
 
 /**
+ * Map a text-space transform into the VIEWED page frame (scale-1 viewport,
+ * bottom-left origin, y-up) — the same frame the rasterized page and the
+ * calibration affine live in. pdf.js text transforms are in raw PDF user
+ * space, which ignores the page's `/Rotate`; drawings are routinely stored
+ * rotated (landscape sheet + Rotate 90), so without this remap every link
+ * box lands off-page. For an unrotated page this composition is exactly the
+ * identity (flip ∘ viewportTransform = I).
+ *
+ * Exported for tests.
+ */
+export function mapTextTransformToViewport(
+  itemTransform: number[],
+  viewportTransform: number[],
+  viewportHeight: number,
+): number[] {
+  // compose(M2, M1): apply M1 first, then M2 — [a,b,c,d,e,f] row form.
+  const compose = (m2: number[], m1: number[]): number[] => [
+    m2[0] * m1[0] + m2[2] * m1[1],
+    m2[1] * m1[0] + m2[3] * m1[1],
+    m2[0] * m1[2] + m2[2] * m1[3],
+    m2[1] * m1[2] + m2[3] * m1[3],
+    m2[0] * m1[4] + m2[2] * m1[5] + m2[4],
+    m2[1] * m1[4] + m2[3] * m1[5] + m2[5],
+  ];
+  // viewportTransform maps user space → device space (top-left, y-down);
+  // the trailing flip converts device space to the y-up frame we use.
+  const flip = [1, 0, 0, -1, 0, viewportHeight];
+  return compose(compose(flip, viewportTransform), itemTransform);
+}
+
+/**
  * Extract the positioned text items of one page (identifier-link scanning,
- * D-076 in the AIM repo). Returns page-point geometry at scale 1 so boxes can
- * be mapped into the same frame the calibration affine is defined on.
+ * D-076 in the AIM repo). Returns geometry in the scale-1 VIEWPORT frame
+ * (page rotation applied, y-up) so boxes can be mapped onto the rendered
+ * raster and the calibration affine.
  */
 export async function getPdfPageTextItems(
   doc: PDFDocumentProxy,
@@ -167,7 +199,7 @@ export async function getPdfPageTextItems(
     if (!('str' in item) || typeof item.str !== 'string' || item.str.length === 0) continue;
     items.push({
       str: item.str,
-      transform: item.transform,
+      transform: mapTextTransformToViewport(item.transform, viewport.transform, viewport.height),
       width: item.width,
       height: item.height,
     });
