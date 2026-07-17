@@ -18,6 +18,7 @@ import { FilePlus2, FileText, Image as ImageIcon, Map as MapIcon, X } from 'luci
 import type { StoreyOption } from '@/hooks/useViewMode';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { IdentifierLinkSettings } from '@/components/viewer/IdentifierLinkSettings';
 import { useViewerStore, type ViewerDocument } from '@/store';
 import { useViewMode } from '@/hooks/useViewMode';
 
@@ -209,6 +210,9 @@ export function DocumentsPanel({ onClose }: DocumentsPanelProps) {
             ))}
           </div>
         )}
+
+        {/* Identifier hyperlinks (D-076): code source + pattern per project. */}
+        <IdentifierLinkSettings />
       </ScrollArea>
       {dragOver && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center border-2 border-dashed border-primary/60 bg-primary/5 text-xs font-medium text-primary">
