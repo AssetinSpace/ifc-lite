@@ -21,6 +21,7 @@ import {
   Crosshair,
   Loader2,
   Map as MapIcon,
+  Files,
   MoreHorizontal,
   Plus,
   Download,
@@ -48,6 +49,7 @@ import { exportGlbFromGeometry } from '@/lib/export/glb';
 import { downloadBlob } from '@/lib/export/download';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import { toast } from '@/components/ui/toast';
+import { ViewModeSwitcher } from './ViewModeSwitcher';
 
 type Tool = 'select' | 'walk' | 'measure' | 'section';
 
@@ -80,6 +82,9 @@ export function MobileToolbar() {
   // in the mobile bottom sheet (see ViewerLayout's right-sheet branches).
   const underlayPanelVisible = useViewerStore((state) => state.underlayPanelVisible);
   const setUnderlayPanelVisible = useViewerStore((state) => state.setUnderlayPanelVisible);
+  // Documents (D-075) — same mobile bottom-sheet entry pattern as underlays.
+  const documentsPanelVisible = useViewerStore((state) => state.documentsPanelVisible);
+  const setDocumentsPanelVisible = useViewerStore((state) => state.setDocumentsPanelVisible);
   const setRightPanelCollapsed = useViewerStore((state) => state.setRightPanelCollapsed);
   const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
   const theme = useViewerStore((state) => state.theme);
@@ -236,6 +241,13 @@ export function MobileToolbar() {
         <Eye className="h-4 w-4" />
       </Button>
 
+      {/* D-075 view mode (3D / 2D / Split — 2D and Split open the plan overlay) */}
+      {hasModelsLoaded && (
+        <div className="flex-shrink-0 ml-0.5">
+          <ViewModeSwitcher />
+        </div>
+      )}
+
       {/* Spacer */}
       <div className="flex-1 min-w-2" />
 
@@ -301,6 +313,18 @@ export function MobileToolbar() {
           >
             <MapIcon className="h-4 w-4 mr-2" />
             Drawing Underlays
+          </DropdownMenuCheckboxItem>
+
+          {/* Documents (D-075): opens as a mobile bottom sheet. */}
+          <DropdownMenuCheckboxItem
+            checked={documentsPanelVisible}
+            onCheckedChange={(checked) => {
+              setDocumentsPanelVisible(checked === true);
+              setRightPanelCollapsed(checked !== true);
+            }}
+          >
+            <Files className="h-4 w-4 mr-2" />
+            Documents
           </DropdownMenuCheckboxItem>
 
           <DropdownMenuSeparator />

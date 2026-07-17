@@ -12,11 +12,25 @@ import { useViewerStore } from '@/store';
 import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { useIfc } from './useIfc';
 
-interface StoreyInfo {
+export interface StoreyInfo {
   expressId: number;
   modelId: string;
   name: string;
   elevation: number;
+}
+
+/**
+ * A storey option with its resolved GlobalId — the single source for every
+ * storey picker (DrawingUnderlayPanel, ViewModeSwitcher). Placements and the
+ * 2D/Split view bind to storey GUIDs (stable across loads), never the
+ * session-scoped expressId; storeys without a GUID are unusable and filtered.
+ */
+export interface StoreyOption {
+  key: string;
+  name: string;
+  elevation: number;
+  guid: string;
+  info: StoreyInfo;
 }
 
 export function useFloorplanView() {
@@ -143,6 +157,7 @@ export function useFloorplanView() {
     state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayViewLocked(true);
     state.setUnderlaySplitView(false);
+    state.setUnderlayPlanFull(false);
     state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
     if (!alreadyTopDown) {
       setProjectionMode('orthographic');
@@ -183,27 +198,63 @@ export function useFloorplanView() {
     state.setUnderlayCut(worldCutY(storey));
     state.setUnderlayViewLocked(false);
     state.setUnderlaySplitView(true);
+    state.setUnderlayPlanFull(false);
     state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
     state.setUnderlayPlanPin(null);
     setProjectionMode('perspective');
     cameraCallbacks.home?.();
   }, [worldCutY, storeyGuidFor, setProjectionMode, cameraCallbacks]);
 
+  /**
+   * 2D plan view (D-075): the calibrated drawing takes the whole center pane
+   * and the 3D panel collapses (it stays mounted). Implemented as split view
+   * + `underlayPlanFull` so the plan pane, cut and storey binding are shared;
+   * the camera is left alone — the 3D pane is not visible in this mode.
+   */
+  const enterPlanView = useCallback((storey: StoreyInfo) => {
+    const state = useViewerStore.getState();
+    state.setUnderlayCut(worldCutY(storey));
+    state.setUnderlayViewLocked(false);
+    state.setUnderlaySplitView(true);
+    state.setUnderlayPlanFull(true);
+    state.setUnderlayActiveStoreyGuid(storeyGuidFor(storey));
+    state.setUnderlayPlanPin(null);
+  }, [worldCutY, storeyGuidFor]);
+
   /** Leave split view: close the 2D pane, remove the cut. */
   const exitSplitView = useCallback(() => {
     const state = useViewerStore.getState();
     state.setUnderlaySplitView(false);
+    state.setUnderlayPlanFull(false);
     state.setUnderlayCut(null);
     state.setUnderlayActiveStoreyGuid(null);
     state.setUnderlayPlanPin(null);
   }, []);
 
+  const storeyOptions = useMemo((): StoreyOption[] => {
+    const options: StoreyOption[] = [];
+    for (const s of availableStoreys) {
+      const guid = storeyGuidFor(s);
+      if (!guid) continue;
+      options.push({
+        key: `${s.modelId}:${s.expressId}`,
+        name: s.name,
+        elevation: s.elevation,
+        guid,
+        info: s,
+      });
+    }
+    return options;
+  }, [availableStoreys, storeyGuidFor]);
+
   return {
     availableStoreys,
+    storeyOptions,
     activateFloorplan,
     enterDrawingView,
     exitDrawingView,
     enterSplitView,
+    enterPlanView,
     exitSplitView,
     retargetView,
   };

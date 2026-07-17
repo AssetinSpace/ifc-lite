@@ -113,6 +113,57 @@ describe('isInboundMessage', () => {
     );
   });
 
+  it('accepts and validates DOCUMENTS_LOAD (D-075)', () => {
+    const doc = { documentId: 'doc-1', name: 'TS sprava.pdf', kind: 'document', url: 'https://x/y.pdf' };
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [] }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [doc] }));
+    assert.ok(isInboundMessage({
+      source: SOURCE,
+      type: 'DOCUMENTS_LOAD',
+      documents: [{
+        ...doc,
+        kind: 'drawing',
+        storeyGuid: 'G1',
+        folder: ['Budova A', '2.NP'],
+        meta: { revision: 'B', status: 'issued' },
+        mime: 'application/pdf',
+      }],
+    }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD' }), false); // no documents
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: 'x' }), false);
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [{ ...doc, documentId: '' }] }),
+      false, // empty documentId
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [{ ...doc, kind: 'video' }] }),
+      false, // unknown kind
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [{ ...doc, url: undefined }] }),
+      false, // missing url
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [{ ...doc, folder: [1] }] }),
+      false, // malformed folder
+    );
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENTS_LOAD', documents: [{ ...doc, meta: { a: 1 } }] }),
+      false, // non-string meta value
+    );
+  });
+
+  it('accepts and validates DOCUMENT_OPEN (D-075)', () => {
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'DOCUMENT_OPEN', documentId: 'doc-1' }));
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'DOCUMENT_OPEN', documentId: 'doc-1', page: 3 }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'DOCUMENT_OPEN' }), false); // no id
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'DOCUMENT_OPEN', documentId: '' }), false);
+    assert.equal(
+      isInboundMessage({ source: SOURCE, type: 'DOCUMENT_OPEN', documentId: 'doc-1', page: 'x' }),
+      false, // non-numeric page
+    );
+  });
+
   it('accepts and validates CAPTURES_LOAD (D-073)', () => {
     const pin = { id: 'c1', kind: 'photo', world: { x: 1, y: 2, z: 3 } };
     assert.ok(isInboundMessage({ source: SOURCE, type: 'CAPTURES_LOAD', captures: [] }));

@@ -55,19 +55,10 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/components/ui/toast';
 import { useViewerStore, type UnderlayDrawing } from '@/store';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
-import { useIfc } from '@/hooks/useIfc';
 import { CalibrationPdfSurface } from './CalibrationPdfSurface';
 
 interface DrawingUnderlayPanelProps {
   onClose: () => void;
-}
-
-/** A storey option with its resolved GlobalId (placements bind to GUIDs). */
-interface StoreyOption {
-  key: string;
-  name: string;
-  elevation: number;
-  guid: string;
 }
 
 export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
@@ -86,30 +77,12 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
   const upsertDrawing = useViewerStore((s) => s.upsertUnderlayDrawing);
   const removeDrawing = useViewerStore((s) => s.removeUnderlayDrawing);
 
-  const { models, ifcDataStore } = useIfc();
-  const { availableStoreys, enterDrawingView, enterSplitView, exitSplitView, retargetView } =
+  // storeyOptions: shared resolution (useFloorplanView) — placements are
+  // keyed to the storey GUID (stable across loads), never the expressId.
+  const { storeyOptions, enterDrawingView, enterSplitView, exitSplitView, retargetView } =
     useFloorplanView();
   const retargetCalibrationStorey = useViewerStore((s) => s.retargetUnderlayCalibrationStorey);
   const splitView = useViewerStore((s) => s.underlaySplitView);
-
-  // Storeys with resolved GlobalIds — placements are keyed to the storey GUID
-  // (stable across loads), never the session-scoped expressId.
-  const storeyOptions = useMemo((): StoreyOption[] => {
-    const options: StoreyOption[] = [];
-    for (const s of availableStoreys) {
-      const store =
-        s.modelId === 'legacy' ? ifcDataStore : models.get(s.modelId)?.ifcDataStore;
-      const guid = store?.entities.getGlobalId(s.expressId) ?? '';
-      if (!guid) continue; // no GUID → placement couldn't be re-resolved later
-      options.push({
-        key: `${s.modelId}:${s.expressId}`,
-        name: s.name,
-        elevation: s.elevation,
-        guid,
-      });
-    }
-    return options;
-  }, [availableStoreys, models, ifcDataStore]);
 
   const [storeyKey, setStoreyKey] = useState<string>('');
   const selectedStorey =
@@ -286,11 +259,8 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
             // at the new level; mid-calibration also rebind the draft (its
             // model points are cleared — they sat on the old floor).
             const option = storeyOptions.find((s) => s.key === e.target.value);
-            const storey = availableStoreys.find(
-              (s) => `${s.modelId}:${s.expressId}` === e.target.value,
-            );
-            if (!option || !storey) return;
-            retargetView(storey);
+            if (!option) return;
+            retargetView(option.info);
             if (calibration) {
               const hadModelPoints = calibration.modelPoints.length > 0;
               retargetCalibrationStorey({ guid: option.guid, z: option.elevation });
@@ -317,10 +287,7 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
               exitSplitView();
               return;
             }
-            const storey = availableStoreys.find(
-              (s) => `${s.modelId}:${s.expressId}` === selectedStorey?.key,
-            );
-            if (storey) enterSplitView(storey);
+            if (selectedStorey) enterSplitView(selectedStorey.info);
           }}
           title="Split view: 2D plan beside a navigable 3D, camera synced (Ctrl+scroll moves the storey cut)"
         >
@@ -489,10 +456,7 @@ export function DrawingUnderlayPanel({ onClose }: DrawingUnderlayPanelProps) {
                   toast.error('Load a model first — calibration needs a storey to bind to');
                   return;
                 }
-                const storey = availableStoreys.find(
-                  (s) => `${s.modelId}:${s.expressId}` === target.key,
-                );
-                if (storey) enterDrawingView(storey);
+                enterDrawingView(target.info);
                 startCalibration(d.id, d.placement?.page ?? 1, {
                   guid: target.guid,
                   z: target.elevation,

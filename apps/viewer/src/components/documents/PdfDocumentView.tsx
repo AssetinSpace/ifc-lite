@@ -1,0 +1,440 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * Paged PDF reader (D-075) — the document-tab body for `kind: 'document'`
+ * (and uncalibrated drawings opened as plain files).
+ *
+ * Memory is the design constraint (the viewer shares one process with the
+ * WebGPU scene + underlay textures), so this is a virtualized page list, not
+ * a render-everything view: pages mount as aspect-ratio placeholders and only
+ * the ones near the viewport are rasterized (IntersectionObserver), with a
+ * small LRU of live canvases. Rasters target reading resolution (≤2400 px),
+ * far below the plan pane's texture ceiling. ImageBitmaps are closed right
+ * after drawImage, and unmounting (tab switch) drops every canvas — only the
+ * lightweight view state (page / zoom) survives in the store.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Minus, Plus } from 'lucide-react';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
+import { Button } from '@/components/ui/button';
+import { useViewerStore } from '@/store';
+import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
+
+/** Reading raster ceiling (longest edge, device px) and live-canvas budget. */
+const READ_RASTER_MAX_PX = 2400;
+const CANVAS_LRU_MAX = 4;
+const PAGE_GAP_PX = 12;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 4;
+/** Trailing debounce before committing a new raster width (CSS scales until). */
+const RASTER_SETTLE_MS = 200;
+
+interface PdfDocumentViewProps {
+  docId: string;
+  url: string;
+}
+
+export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
+  const setDocTabView = useViewerStore((s) => s.setDocTabView);
+  // Initial view snapshot only — live view writes must not re-render/loop us.
+  const initialViewRef = useRef(
+    useViewerStore.getState().docTabs.find((t) => t.docId === docId)?.view,
+  );
+
+  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [numPages, setNumPages] = useState(0);
+  /** Page aspect (w/h): index 0 = document default, refined per page. */
+  const [aspects, setAspects] = useState<ReadonlyMap<number, number>>(new Map());
+  const defaultAspect = aspects.get(0) ?? 1 / 1.414;
+
+  const [zoom, setZoom] = useState(initialViewRef.current?.zoom ?? 1);
+  const [currentPage, setCurrentPage] = useState(initialViewRef.current?.page ?? 1);
+
+  // ── Document lifecycle ────────────────────────────────────────────────────
+  useEffect(() => {
+    let stale = false;
+    let doc: PDFDocumentProxy | null = null;
+    void (async () => {
+      try {
+        const opened = await openPdfDocument(url);
+        if (stale) {
+          // Unmounted while downloading — the cleanup below saw doc === null,
+          // so this instance must release the proxy itself.
+          void opened.destroy();
+          return;
+        }
+        doc = opened;
+        const first = await doc.getPage(1);
+        const vp = first.getViewport({ scale: 1 });
+        if (stale) return; // cleanup owns doc now — it will destroy it
+        setAspects(new Map([[0, vp.width / vp.height]]));
+        setNumPages(doc.numPages);
+        setPdf(doc);
+      } catch (err) {
+        console.error('pdf document view: open failed', err);
+        if (!stale) setError('Could not open this PDF.');
+      }
+    })();
+    return () => {
+      stale = true;
+      void doc?.destroy();
+      setPdf(null);
+      // This document's rasters are useless without its proxy; children have
+      // already detached their canvases (child cleanups run first), so every
+      // disconnected LRU entry is safe to release.
+      lruClearDisconnected();
+    };
+  }, [url]);
+
+  // ── Layout: fit-width base, explicit page heights for virtualization ─────
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [bodyWidth, setBodyWidth] = useState(0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r) setBodyWidth(r.width);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  /** Layout width (immediate — placeholders and CSS scale follow this). */
+  const pageWidth = Math.max(0, (bodyWidth - 24) * zoom);
+  /** Raster width (debounced — pdf.js renders only once a gesture settles). */
+  const [rasterWidth, setRasterWidth] = useState(0);
+  useEffect(() => {
+    if (pageWidth <= 0) return;
+    if (rasterWidth === 0) {
+      setRasterWidth(pageWidth); // first layout: no gesture to wait out
+      return;
+    }
+    const timer = setTimeout(() => setRasterWidth(pageWidth), RASTER_SETTLE_MS);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageWidth]);
+
+  // ── Visibility tracking (virtualization) ─────────────────────────────────
+  const [visible, setVisible] = useState<ReadonlySet<number>>(new Set());
+  const pageElsRef = useRef(new Map<number, HTMLDivElement>());
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root || numPages === 0) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisible((prev) => {
+          const next = new Set(prev);
+          for (const e of entries) {
+            const page = Number((e.target as HTMLElement).dataset.page);
+            if (!page) continue;
+            if (e.isIntersecting) next.add(page);
+            else next.delete(page);
+          }
+          return next;
+        });
+      },
+      // One viewport of lookahead in both directions — the "±1 page" window
+      // expressed in scroll space, so tall zoom levels don't over-rasterize.
+      { root, rootMargin: '100% 0%' },
+    );
+    observerRef.current = observer;
+    for (const el of pageElsRef.current.values()) observer.observe(el);
+    return () => {
+      observer.disconnect();
+      observerRef.current = null;
+    };
+  }, [numPages]);
+
+  const registerPageEl = useCallback((page: number, el: HTMLDivElement | null) => {
+    const prev = pageElsRef.current.get(page);
+    if (prev && observerRef.current) observerRef.current.unobserve(prev);
+    if (el) {
+      pageElsRef.current.set(page, el);
+      observerRef.current?.observe(el);
+    } else {
+      pageElsRef.current.delete(page);
+    }
+  }, []);
+
+  const onPageAspect = useCallback((page: number, aspect: number) => {
+    setAspects((prev) => {
+      if (prev.get(page) === aspect) return prev;
+      const next = new Map(prev);
+      next.set(page, aspect);
+      return next;
+    });
+  }, []);
+
+  // ── Current page = topmost page at the viewport top (scroll-derived; the
+  // IntersectionObserver set is inflated by its lookahead margin and would
+  // report a page up to one viewport above the one actually being read).
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root || numPages === 0) return;
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      // "The" page is the one under the reading line (top third of the
+      // viewport); when the line falls into a gap, the next page below it.
+      const line = root.getBoundingClientRect().top + root.clientHeight / 3;
+      let atLine: number | null = null;
+      let firstBelow: number | null = null;
+      for (const [page, el] of pageElsRef.current) {
+        const r = el.getBoundingClientRect();
+        if (r.top <= line && r.bottom > line) {
+          atLine = page;
+          break;
+        }
+        if (r.bottom > line && (firstBelow === null || page < firstBelow)) firstBelow = page;
+      }
+      const next = atLine ?? firstBelow ?? 1;
+      setCurrentPage((prev) => (prev === next ? prev : next));
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(measure);
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    measure();
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [numPages]);
+
+  // Persist view state, debounced — every ctrl+wheel tick would otherwise
+  // rebuild docTabs (and re-render the whole pane tree) per event.
+  useEffect(() => {
+    const timer = setTimeout(() => setDocTabView(docId, { page: currentPage, zoom }), 300);
+    return () => clearTimeout(timer);
+  }, [docId, currentPage, zoom, setDocTabView]);
+
+  // Restore: jump to the remembered page once sizes are known.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || !pdf || pageWidth <= 0) return;
+    restoredRef.current = true;
+    const page = initialViewRef.current?.page ?? 1;
+    if (page > 1) pageElsRef.current.get(page)?.scrollIntoView({ block: 'start' });
+  }, [pdf, pageWidth]);
+
+  // Deep-link jump for an ALREADY-open tab (DOCUMENT_OPEN with a page): the
+  // store view is only read at mount, so jumps arrive as one-shot requests.
+  const docJump = useViewerStore((s) => s.docJump);
+  const clearDocJump = useViewerStore((s) => s.clearDocJump);
+  useEffect(() => {
+    if (!docJump || docJump.docId !== docId || !pdf) return;
+    pageElsRef.current.get(docJump.page)?.scrollIntoView({ block: 'start' });
+    clearDocJump();
+  }, [docJump, docId, pdf, clearDocJump]);
+
+  // ── Zoom (buttons + ctrl/cmd-wheel) ──────────────────────────────────────
+  const applyZoom = useCallback((factor: number) => {
+    setZoom((z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z * factor)));
+  }, []);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return; // plain wheel scrolls the list
+      e.preventDefault();
+      applyZoom(Math.exp(-e.deltaY * 0.0018));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [applyZoom]);
+
+  const pages = useMemo(
+    () => Array.from({ length: numPages }, (_, i) => i + 1),
+    [numPages],
+  );
+
+  return (
+    <div className="flex h-full w-full flex-col overflow-hidden">
+      <div className="flex items-center gap-1.5 border-b px-2 py-1">
+        <span className="text-[11px] tabular-nums text-muted-foreground">
+          {numPages > 0 ? `${currentPage} / ${numPages}` : '…'}
+        </span>
+        <div className="flex-1" />
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-5"
+          onClick={() => applyZoom(1 / 1.25)}
+          aria-label="Zoom out"
+        >
+          <Minus className="size-3" aria-hidden />
+        </Button>
+        <span className="w-9 text-center text-[11px] tabular-nums text-muted-foreground">
+          {Math.round(zoom * 100)}%
+        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-5"
+          onClick={() => applyZoom(1.25)}
+          aria-label="Zoom in"
+        >
+          <Plus className="size-3" aria-hidden />
+        </Button>
+      </div>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto bg-muted/30">
+        {error ? (
+          <div className="flex h-full items-center justify-center p-6 text-center text-[11px] text-muted-foreground">
+            {error}
+          </div>
+        ) : (
+          <div className="mx-auto flex w-fit flex-col items-center px-3 py-3">
+            {pdf &&
+              pageWidth > 0 &&
+              pages.map((page) => (
+                <PdfPage
+                  key={page}
+                  pdf={pdf}
+                  page={page}
+                  width={pageWidth}
+                  rasterWidth={rasterWidth || pageWidth}
+                  aspect={aspects.get(page) ?? defaultAspect}
+                  render={visible.has(page)}
+                  onAspect={onPageAspect}
+                  registerEl={registerPageEl}
+                />
+              ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Shared LRU of live page canvases. The pane shows ONE document at a time,
+ * so a module-level LRU capped at {@link CANVAS_LRU_MAX} detached entries is
+ * the memory budget; canvases still mounted in the DOM are never evicted
+ * (blanking a visible page), and the document-lifecycle cleanup releases all
+ * detached entries when a tab unmounts.
+ */
+const canvasLru = new Map<string, HTMLCanvasElement>();
+
+function lruGet(key: string): HTMLCanvasElement | undefined {
+  const hit = canvasLru.get(key);
+  if (hit) {
+    canvasLru.delete(key);
+    canvasLru.set(key, hit); // refresh recency
+  }
+  return hit;
+}
+
+function lruRelease(key: string, canvas: HTMLCanvasElement): void {
+  canvasLru.delete(key);
+  // Release the backing store eagerly — GC alone is too lazy for ~20 MB
+  // canvases while the WebGPU scene is competing for the same memory.
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+function lruPut(key: string, canvas: HTMLCanvasElement): void {
+  canvasLru.set(key, canvas);
+  if (canvasLru.size <= CANVAS_LRU_MAX) return;
+  for (const [k, c] of canvasLru) {
+    if (canvasLru.size <= CANVAS_LRU_MAX) break;
+    if (k === key || c.isConnected) continue; // never blank a mounted page
+    lruRelease(k, c);
+  }
+}
+
+/** Drop every detached entry — called when a PDF tab unmounts. */
+function lruClearDisconnected(): void {
+  for (const [k, c] of canvasLru) {
+    if (!c.isConnected) lruRelease(k, c);
+  }
+}
+
+interface PdfPageProps {
+  pdf: PDFDocumentProxy;
+  page: number;
+  /** Layout width (immediate; CSS scales a stale raster until it settles). */
+  width: number;
+  /** Debounced width the raster is computed from. */
+  rasterWidth: number;
+  aspect: number;
+  render: boolean;
+  onAspect: (page: number, aspect: number) => void;
+  registerEl: (page: number, el: HTMLDivElement | null) => void;
+}
+
+function PdfPage({ pdf, page, width, rasterWidth, aspect, render, onAspect, registerEl }: PdfPageProps) {
+  const hostRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !render || rasterWidth <= 0) return;
+    let stale = false;
+    // Raster key: page identity + resolution bucket (512 px steps so small
+    // zoom nudges reuse the cached canvas instead of re-rendering). Width
+    // alone drives the bucket — folding the (lazily refined) aspect in would
+    // re-render every page once its true aspect arrives.
+    const targetPx = Math.min(
+      READ_RASTER_MAX_PX,
+      Math.ceil((rasterWidth * window.devicePixelRatio) / 512) * 512,
+    );
+    const key = `${pdf.fingerprints[0] ?? 'doc'}:${page}:${targetPx}`;
+    const cached = lruGet(key);
+    if (cached) {
+      styleCanvas(cached);
+      host.replaceChildren(cached);
+      return () => host.replaceChildren();
+    }
+    void (async () => {
+      try {
+        const raster = await rasterizePdfPage(pdf, page, targetPx, READ_RASTER_MAX_PX);
+        if (stale) {
+          raster.image.close();
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = raster.width;
+        canvas.height = raster.height;
+        canvas.getContext('2d')?.drawImage(raster.image, 0, 0);
+        raster.image.close();
+        onAspect(page, raster.width / raster.height);
+        styleCanvas(canvas);
+        lruPut(key, canvas);
+        if (!stale && hostRef.current) hostRef.current.replaceChildren(canvas);
+      } catch (err) {
+        console.error(`pdf document view: page ${page} raster failed`, err);
+      }
+    })();
+    return () => {
+      stale = true;
+      host.replaceChildren();
+    };
+  }, [pdf, page, rasterWidth, render, onAspect]);
+
+  return (
+    <div
+      ref={(el) => {
+        registerEl(page, el);
+      }}
+      data-page={page}
+      className="bg-white shadow-sm"
+      style={{
+        width: `${width}px`,
+        height: `${width / aspect}px`,
+        marginBottom: `${PAGE_GAP_PX}px`,
+      }}
+    >
+      <div ref={hostRef} className="h-full w-full" />
+    </div>
+  );
+}
+
+function styleCanvas(canvas: HTMLCanvasElement): void {
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  canvas.style.display = 'block';
+}

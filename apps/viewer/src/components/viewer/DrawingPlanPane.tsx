@@ -51,14 +51,24 @@ export function DrawingPlanPane() {
   const walkMode = activeTool === 'walk';
   const { exitSplitView } = useFloorplanView();
 
-  // The storey's calibrated, visible drawing (first match wins in MVP).
-  const drawing = useMemo(() => {
-    if (!storeyGuid) return null;
+  // All calibrated, visible drawings on the storey. Multiple disciplines can
+  // share a level (D-075); a header select picks one, first match by default.
+  const candidates = useMemo(() => {
+    if (!storeyGuid) return [];
+    const list = [];
     for (const d of drawings.values()) {
-      if (d.placement && d.placement.visible && d.placement.storeyGuid === storeyGuid) return d;
+      if (d.placement && d.placement.visible && d.placement.storeyGuid === storeyGuid) {
+        list.push(d);
+      }
     }
-    return null;
+    return list;
   }, [drawings, storeyGuid]);
+  const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
+  useEffect(() => setSelectedDrawingId(null), [storeyGuid]);
+  const drawing = useMemo(
+    () => candidates.find((d) => d.id === selectedDrawingId) ?? candidates[0] ?? null,
+    [candidates, selectedDrawingId],
+  );
 
   const offset = useMemo(() => {
     const first = [...models.values()].find((m) => m.geometryResult?.coordinateInfo);
@@ -371,10 +381,25 @@ export function DrawingPlanPane() {
   return (
     <div className="flex h-full w-full flex-col overflow-hidden border-r bg-background">
       <div className="flex items-center gap-1.5 border-b px-2 py-1">
-        <span className="min-w-0 flex-1 truncate text-[11px] font-medium" title={drawing?.name}>
-          {drawing ? drawing.name : 'Split view'}
-          {walkMode && <span className="ml-1 text-muted-foreground">· walk</span>}
-        </span>
+        {candidates.length > 1 ? (
+          <select
+            aria-label="Drawing"
+            className="h-5 min-w-0 flex-1 truncate rounded border bg-background px-1 text-[11px]"
+            value={drawing?.id ?? ''}
+            onChange={(e) => setSelectedDrawingId(e.target.value)}
+          >
+            {candidates.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[11px] font-medium" title={drawing?.name}>
+            {drawing ? drawing.name : 'Split view'}
+          </span>
+        )}
+        {walkMode && <span className="shrink-0 text-[11px] text-muted-foreground">walk</span>}
         <Button
           variant="ghost"
           size="icon"

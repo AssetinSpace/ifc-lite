@@ -87,6 +87,19 @@ export interface DrawingUnderlaySlice {
    * (which is the top-down locked calibration view).
    */
   underlaySplitView: boolean;
+  /**
+   * 2D mode (D-075): the plan pane takes the whole center and the 3D panel
+   * collapses to zero (it stays mounted — the WebGPU canvas must not
+   * remount). Only meaningful while `underlaySplitView` is true; the view
+   * mode reads '2d' when both are set, 'split' when only the split flag is.
+   */
+  underlayPlanFull: boolean;
+  /**
+   * Last storey the drawing/split view was bound to. Unlike
+   * `underlayActiveStoreyGuid` this survives exiting the view, so re-entering
+   * 2D/Split lands on the storey the user last worked with.
+   */
+  underlayLastStoreyGuid: string | null;
   /** Enlarge the calibration PDF surface into a viewport overlay for picking. */
   underlayCalibrationExpanded: boolean;
   /** Storey GUID the drawing/split view is bound to (drives the 2D pane). */
@@ -135,6 +148,7 @@ export interface DrawingUnderlaySlice {
   nudgeUnderlayCut: (deltaY: number) => void;
   setUnderlayViewLocked: (locked: boolean) => void;
   setUnderlaySplitView: (on: boolean) => void;
+  setUnderlayPlanFull: (on: boolean) => void;
   setUnderlayCalibrationExpanded: (on: boolean) => void;
   setUnderlayActiveStoreyGuid: (guid: string | null) => void;
   setUnderlayPlanPin: (p: Point2 | null) => void;
@@ -197,6 +211,8 @@ export const createDrawingUnderlaySlice: StateCreator<
   underlayCut: null,
   underlayViewLocked: false,
   underlaySplitView: false,
+  underlayPlanFull: false,
+  underlayLastStoreyGuid: null,
   underlayCalibrationExpanded: false,
   underlayActiveStoreyGuid: null,
   underlayPlanPin: null,
@@ -294,9 +310,16 @@ export const createDrawingUnderlaySlice: StateCreator<
 
   setUnderlaySplitView: (on) => set({ underlaySplitView: on }),
 
+  setUnderlayPlanFull: (on) => set({ underlayPlanFull: on }),
+
   setUnderlayCalibrationExpanded: (on) => set({ underlayCalibrationExpanded: on }),
 
-  setUnderlayActiveStoreyGuid: (guid) => set({ underlayActiveStoreyGuid: guid }),
+  setUnderlayActiveStoreyGuid: (guid) =>
+    set((state) => ({
+      underlayActiveStoreyGuid: guid,
+      // Remember the binding across view exits (which null the active guid).
+      underlayLastStoreyGuid: guid ?? state.underlayLastStoreyGuid,
+    })),
 
   setUnderlayPlanPin: (p) => set({ underlayPlanPin: p }),
 

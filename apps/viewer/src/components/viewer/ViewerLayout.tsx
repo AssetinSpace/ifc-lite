@@ -40,6 +40,8 @@ import { GanttPanel } from './schedule/GanttPanel';
 import { ExtensionsPanel } from '@/components/extensions/ExtensionsPanel';
 import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
 import { DrawingPlanPane } from '@/components/viewer/DrawingPlanPane';
+import { DocumentsPanel } from '@/components/documents/DocumentsPanel';
+import { DocumentPane } from '@/components/documents/DocumentPane';
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
 import { TourHost } from '@/components/tours/TourHost';
@@ -56,6 +58,16 @@ import {
 const BOTTOM_PANEL_MIN_HEIGHT = 120;
 const BOTTOM_PANEL_DEFAULT_HEIGHT = 300;
 const BOTTOM_PANEL_MAX_RATIO = 0.7; // max 70% of container
+
+/** First-open width of the document pane, as a % of the center group. */
+const DOC_PANE_OPEN_PCT = '42%';
+
+/** react-resizable-panels v4 parses CSS-like strings ('42%', '300px') at
+ *  runtime, but the shipped `resize` type only admits `number` — and a bare
+ *  number means PIXELS there, so percentages MUST go through as strings. */
+function resizePanelPct(panel: PanelImperativeHandle, size: string): void {
+  (panel.resize as unknown as (size: string) => void)(size);
+}
 
 /** Slim grip atop a bottom-strip panel — drag to lift it into a floating window,
  *  or drag onto another screen to pop it out (#1208). */
@@ -214,6 +226,7 @@ export function ViewerLayout() {
   const setComparePanelVisible = useViewerStore((s) => s.setComparePanelVisible);
   const underlayPanelVisible = useViewerStore((s) => s.underlayPanelVisible);
   const setUnderlayPanelVisible = useViewerStore((s) => s.setUnderlayPanelVisible);
+  const setDocumentsPanelVisible = useViewerStore((s) => s.setDocumentsPanelVisible);
   const scriptPanelVisible = useViewerStore((s) => s.scriptPanelVisible);
   const setScriptPanelVisible = useViewerStore((s) => s.setScriptPanelVisible);
   const ganttPanelVisible = useViewerStore((s) => s.ganttPanelVisible);
@@ -268,6 +281,58 @@ export function ViewerLayout() {
     if (underlaySplitView && panel.isCollapsed()) panel.expand();
     else if (!underlaySplitView && !panel.isCollapsed()) panel.collapse();
   }, [underlaySplitView]);
+
+  // D-075 2D mode: the mirror move — the 3D panel collapses to zero while the
+  // plan pane fills the center. Same always-mounted guarantee, in reverse.
+  const underlayPlanFull = useViewerStore((s) => s.underlayPlanFull);
+  const viewport3dPanelRef = useRef<PanelImperativeHandle>(null);
+  useEffect(() => {
+    const panel = viewport3dPanelRef.current;
+    if (!panel) return;
+    if (underlayPlanFull && !panel.isCollapsed()) panel.collapse();
+    else if (!underlayPlanFull && panel.isCollapsed()) panel.expand();
+  }, [underlayPlanFull]);
+  // `collapsible` also lets a resize-handle DRAG snap the panel to zero — a
+  // state no view-mode flag describes (blank center, every handle hidden).
+  // Only the 2D mode may collapse the 3D viewport; undo drag-collapses.
+  const onViewport3dResize = useCallback(() => {
+    const panel = viewport3dPanelRef.current;
+    if (!panel) return;
+    if (panel.isCollapsed() && !useViewerStore.getState().underlayPlanFull) panel.expand();
+  }, []);
+
+  // D-075 document pane: expands while document tabs are open OUTSIDE the 2D
+  // full-plan mode (2D promises the plan the whole center), collapses when
+  // the last tab closes. Same always-mounted pattern as the 2D pane.
+  const docPaneOpen = useViewerStore((s) => s.docTabs.length > 0);
+  const documentsPanelVisible = useViewerStore((s) => s.documentsPanelVisible);
+  const docPaneVisible = docPaneOpen && !underlayPlanFull;
+  const docPanelRef = useRef<PanelImperativeHandle>(null);
+  useEffect(() => {
+    const panel = docPanelRef.current;
+    if (!panel) return;
+    if (docPaneVisible && panel.isCollapsed()) {
+      panel.expand();
+      // expand() restores the last size, but this panel STARTS at 0 and is
+      // the group's last child — the first open can come up as a sliver.
+      // Enforce a readable width; later drags persist via expand() as usual.
+      if (panel.getSize().asPercentage < 20) resizePanelPct(panel, DOC_PANE_OPEN_PCT);
+    } else if (!docPaneVisible && !panel.isCollapsed()) {
+      panel.collapse();
+    }
+  }, [docPaneVisible]);
+  // Mirror guard: a drag must not collapse the pane while tabs are open —
+  // openDocument on an existing tab is a no-op, so nothing would re-expand it
+  // and host-pushed tabs would be stuck invisible.
+  const onDocPaneResize = useCallback(() => {
+    const panel = docPanelRef.current;
+    if (!panel) return;
+    const s = useViewerStore.getState();
+    if (panel.isCollapsed() && s.docTabs.length > 0 && !s.underlayPlanFull) {
+      panel.expand();
+      if (panel.getSize().asPercentage < 20) resizePanelPct(panel, DOC_PANE_OPEN_PCT);
+    }
+  }, []);
 
   // Bottom panel resize state (pixel height, persisted in ref to avoid re-renders during drag)
   const [bottomHeight, setBottomHeight] = useState(BOTTOM_PANEL_DEFAULT_HEIGHT);
@@ -434,14 +499,38 @@ export function ViewerLayout() {
                         <DrawingPlanPane />
                       </Panel>
                       <PanelResizeHandle
-                        className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${underlaySplitView ? '' : 'hidden'}`}
+                        className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${underlaySplitView && !underlayPlanFull ? '' : 'hidden'}`}
                       />
-                      <Panel id="viewport-3d-panel" defaultSize={100} minSize={30}>
+                      <Panel
+                        id="viewport-3d-panel"
+                        defaultSize={100}
+                        minSize={30}
+                        collapsible
+                        collapsedSize={0}
+                        panelRef={viewport3dPanelRef}
+                        onResize={onViewport3dResize}
+                      >
                         {/* data-floating-snap-bounds: edge-docked floating panels
                             (#1201) snap to THIS region, not the whole window. */}
                         <div data-floating-snap-bounds className="h-full w-full overflow-hidden relative">
                           <ViewportContainer />
                         </div>
+                      </Panel>
+                      <PanelResizeHandle
+                        className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${docPaneVisible ? '' : 'hidden'}`}
+                      />
+                      {/* D-075 document tabs pane — right of the 3D viewport,
+                          expanded only while tabs are open. */}
+                      <Panel
+                        id="document-pane-panel"
+                        defaultSize={0}
+                        minSize={20}
+                        collapsible
+                        collapsedSize={0}
+                        panelRef={docPanelRef}
+                        onResize={onDocPaneResize}
+                      >
+                        <DocumentPane />
                       </Panel>
                     </PanelGroup>
                   </Panel>
@@ -505,6 +594,17 @@ export function ViewerLayout() {
               </div>
             )}
 
+            {/* D-075 document tabs on mobile: same trick — the document pane
+                takes over full-screen while tabs are open (closing the last
+                tab returns to the 3D view). The 2D/Split plan overlay wins
+                when both are active — entering it is the more recent intent
+                and this pane has no own exit besides closing all tabs. */}
+            {docPaneOpen && !underlaySplitView && (
+              <div className="absolute inset-0 z-40 bg-background">
+                <DocumentPane />
+              </div>
+            )}
+
             {/* Backdrop overlay when sheet is open */}
             {(!leftPanelCollapsed || !rightPanelCollapsed) && (
               <div
@@ -530,7 +630,7 @@ export function ViewerLayout() {
             {/* Mobile Bottom Sheet - Properties, BCF, IDS, or Lists */}
             {!rightPanelCollapsed && (
               <MobileBottomSheet
-                title={activeAnalysisExtension ? activeAnalysisExtension.label : ganttPanelVisible ? 'Schedule' : scriptPanelVisible ? 'Script' : listPanelVisible ? 'Lists' : activeTool === 'addElement' ? 'Add element' : lensPanelVisible ? 'Lens' : idsPanelVisible ? 'IDS Validation' : bcfPanelVisible ? 'BCF Issues' : extensionsPanelVisible ? 'Extensions' : underlayPanelVisible ? 'Drawing Underlays' : 'Properties'}
+                title={activeAnalysisExtension ? activeAnalysisExtension.label : ganttPanelVisible ? 'Schedule' : scriptPanelVisible ? 'Script' : listPanelVisible ? 'Lists' : activeTool === 'addElement' ? 'Add element' : lensPanelVisible ? 'Lens' : idsPanelVisible ? 'IDS Validation' : bcfPanelVisible ? 'BCF Issues' : extensionsPanelVisible ? 'Extensions' : underlayPanelVisible ? 'Drawing Underlays' : documentsPanelVisible ? 'Documents' : 'Properties'}
                 bottomInset={bottomViewportInset}
                 onClose={() => {
                   setRightPanelCollapsed(true);
@@ -542,6 +642,7 @@ export function ViewerLayout() {
                   if (idsPanelVisible) setIdsPanelVisible(false);
                   if (extensionsPanelVisible) setExtensionsPanelVisible(false);
                   if (underlayPanelVisible) setUnderlayPanelVisible(false);
+                  if (documentsPanelVisible) setDocumentsPanelVisible(false);
                   if (activeAnalysisExtension) closeActiveAnalysisExtension();
                   if (activeTool === 'addElement') setActiveTool('select');
                 }}
@@ -568,6 +669,8 @@ export function ViewerLayout() {
                   <ExtensionsPanel onClose={() => setExtensionsPanelVisible(false)} />
                 ) : underlayPanelVisible ? (
                   <DrawingUnderlayPanel onClose={() => setUnderlayPanelVisible(false)} />
+                ) : documentsPanelVisible ? (
+                  <DocumentsPanel onClose={() => setDocumentsPanelVisible(false)} />
                 ) : (
                   <PropertiesPanel />
                 )}

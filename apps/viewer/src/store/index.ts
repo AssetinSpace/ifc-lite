@@ -27,6 +27,7 @@ import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
 import { createMutationSlice, type MutationSlice } from './slices/mutationSlice.js';
 import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSlice.js';
 import { createDrawingUnderlaySlice, type DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
+import { createDocumentsSlice, type DocumentsSlice } from './slices/documentsSlice.js';
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
@@ -79,6 +80,7 @@ export type { ForwardModelMapLike } from './globalId.js';
 // Re-export Drawing2D types
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
 export type { UnderlayDrawing, UnderlayCalibrationDraft, DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
+export type { ViewerDocument, ViewerDocumentKind, DocTab, DocTabView, DocumentEvent, DocumentsSlice } from './slices/documentsSlice.js';
 
 // Re-export Sheet types
 export type { SheetState } from './slices/sheetSlice.js';
@@ -144,6 +146,7 @@ export type ViewerState = LoadingSlice &
   MutationSlice &
   Drawing2DSlice &
   DrawingUnderlaySlice &
+  DocumentsSlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
@@ -232,6 +235,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createMutationSlice(...args),
   ...createDrawing2DSlice(...args),
   ...createDrawingUnderlaySlice(...args),
+  ...createDocumentsSlice(...args),
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
@@ -401,8 +405,17 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       underlayCut: null,
       underlayViewLocked: false,
       underlaySplitView: false,
+      underlayPlanFull: false,
+      underlayLastStoreyGuid: null,
       underlayCalibrationExpanded: false,
       underlayActiveStoreyGuid: null,
+
+      // Project documents (D-075) — same host re-send contract as underlays.
+      viewerDocuments: new Map(),
+      documentsPanelVisible: false,
+      docTabs: [],
+      activeDocTabId: null,
+      docJump: null,
 
       // Drawing 2D
       drawing2D: null,
@@ -579,6 +592,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       collabPanelVisible: panel === 'collab',
       layersPanelVisible: panel === 'layers',
       underlayPanelVisible: panel === 'drawing-underlay',
+      documentsPanelVisible: panel === 'documents',
       rightPanelCollapsed: false,
     });
     if (get().sidebarMode !== 'expanded') get().setSidebarMode('expanded');
@@ -615,6 +629,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         collabPanelVisible: false,
         layersPanelVisible: false,
         underlayPanelVisible: false,
+        documentsPanelVisible: false,
         rightPanelCollapsed: false,
       });
       get().setSidebarActivePanel('properties');
@@ -695,6 +710,7 @@ const SIDEBAR_PANEL_FLAGS: ReadonlyArray<readonly [keyof ViewerState, WorkspaceP
   ['collabPanelVisible', 'collab'],
   ['layersPanelVisible', 'layers'],
   ['underlayPanelVisible', 'drawing-underlay'],
+  ['documentsPanelVisible', 'documents'],
 ];
 
 /**
