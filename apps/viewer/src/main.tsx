@@ -26,6 +26,11 @@ import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import './lib/analytics';
 import './index.css';
+// >>> AIM-FORK: assetin design-kit branding (D-070) — tokens first, then the
+// theme remap; both must load AFTER index.css so they win the cascade.
+import '@assetinspace/design-kit/css/tokens.css';
+import './aim/assetin-theme.css';
+// <<< AIM-FORK
 import 'maplibre-gl/dist/maplibre-gl.css';
 // Wire the placement-edit helpers' parser-backed source reader. Pure
 // side-effect import; keeps `@ifc-lite/parser` out of placement-edit

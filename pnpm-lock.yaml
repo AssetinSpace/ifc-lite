@@ -66,6 +66,9 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.110.0
         version: 0.110.0(zod@4.4.3)
+      '@assetinspace/design-kit':
+        specifier: github:AssetinSpace/design-kit#main
+        version: https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b
       '@codemirror/autocomplete':
         specifier: ^6.20.3
         version: 6.20.3
@@ -1353,6 +1356,10 @@ packages:
     peerDependenciesMeta:
       zod:
         optional: true
+
+  '@assetinspace/design-kit@https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b':
+    resolution: {tarball: https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b}
+    version: 0.1.0
 
   '@automerge/automerge@3.2.6':
     resolution: {integrity: sha512-9/GXXfYYWNVGpnbRrGQzTNU4fWZ3XaEMeEg0OrpK4pvlQSpkmUBoirEb/4TMK6BwMysZGV5Yeneq3wwc7RNGfg==}
@@ -5116,6 +5123,8 @@ snapshots:
       standardwebhooks: 1.0.0
     optionalDependencies:
       zod: 4.4.3
+
+  '@assetinspace/design-kit@https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b': {}
 
   '@automerge/automerge@3.2.6': {}
 
