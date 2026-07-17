@@ -14,7 +14,6 @@
 import { useMemo, useState } from 'react';
 import { ArrowDown, ArrowUp, Link2, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useViewerStore } from '@/store';
 import { useIdentifierLinks } from '@/hooks/useIdentifierLinks';
 import {
@@ -68,32 +67,22 @@ export function IdentifierLinkSettings() {
   const codeCount = index?.byCode.size ?? 0;
 
   return (
-    <Collapsible defaultOpen={config.enabled}>
-      <div className="border-t p-2">
-        <div className="flex items-center gap-2 px-1">
-          <CollapsibleTrigger asChild>
-            <button
-              type="button"
-              className="flex min-w-0 flex-1 items-center gap-2 text-left"
-              aria-label="Identifier links settings"
-            >
-              <Link2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-              <span className="min-w-0 flex-1 truncate text-xs font-medium">Identifier links</span>
-            </button>
-          </CollapsibleTrigger>
-          <label className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={config.enabled}
-              onChange={(e) => apply({ ...config, enabled: e.target.checked })}
-              aria-label="Enable identifier links"
-            />
-            Enabled
-          </label>
-        </div>
+    <div className="border-b p-2" aria-label="Identifier links settings">
+      <div className="flex items-center gap-2 px-1">
+        <Link2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">Identifier links</span>
+        <label className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={config.enabled}
+            onChange={(e) => apply({ ...config, enabled: e.target.checked })}
+            aria-label="Enable identifier links"
+          />
+          Enabled
+        </label>
+      </div>
 
-        <CollapsibleContent>
-          <div className="mt-2 flex flex-col gap-2 px-1">
+      <div className="mt-2 flex flex-col gap-2 px-1">
             <p className="text-[11px] leading-snug text-muted-foreground">
               Element codes found in the 2D plan text become clickable links that select the
               element — configure where the code is stored in this model.
@@ -236,9 +225,7 @@ export function IdentifierLinkSettings() {
               {status === 'idle' && config.enabled && 'Index will build once a model is loaded.'}
               {status === 'idle' && !config.enabled && 'Enable to build the identifier index.'}
             </p>
-          </div>
-        </CollapsibleContent>
       </div>
-    </Collapsible>
+    </div>
   );
 }
