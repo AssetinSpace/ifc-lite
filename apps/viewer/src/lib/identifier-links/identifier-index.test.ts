@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { createSyntheticDataStore } from '@ifc-lite/parser';
+import { createSyntheticDataStore, IfcParser } from '@ifc-lite/parser';
 import { DEFAULT_IDENTIFIER_LINK_CONFIG, type IdentifierLinkConfig } from './config.js';
 import { buildIdentifierIndex, lookupIdentifier } from './identifier-index.js';
 
@@ -166,6 +166,41 @@ describe('buildIdentifierIndex — case-sensitive GlobalId source', () => {
     assert.equal(index.byCode.size, 2);
     assert.equal(lookupIdentifier(index, 'aaaaaaaaaaaaaaaaaaaaaA')[0]?.expressId, 1);
     assert.equal(lookupIdentifier(index, 'aaaaaaaaaaaaaaaaaaaaaB')[0]?.expressId, 2);
+  });
+});
+
+describe('buildIdentifierIndex — composed occurrence keys (type code + Mark)', () => {
+  // Authoring tools commonly export only the TYPE code in Name
+  // ("Family.CC:DD01.02 - desc:id") and keep the per-instance discriminator in
+  // the Revit `Mark` shared parameter; the drawing prints `<type>.<Mark>`.
+  // Minimal real STEP fixture: one door with Mark '03' in a pset.
+  const STEP = `ISO-10303-21;
+HEADER;FILE_DESCRIPTION((''),'2;1');FILE_NAME('t','',(''),(''),'','','');FILE_SCHEMA(('IFC4'));ENDSEC;
+DATA;
+#1=IFCPROJECT('ProjGuid_____________1',$,'P',$,$,$,$,$,$);
+#100=IFCDOOR('DoorGuid_____________1',$,'Family.CC:DD01.02 - Doors:77',$,$,$,$,'77',$,$,$,$,$);
+#200=IFCPROPERTYSINGLEVALUE('Mark',$,IFCLABEL('03'),$);
+#201=IFCPROPERTYSET('PsetGuid_____________1',$,'IFC_Doors',$,(#200));
+#300=IFCRELDEFINESBYPROPERTIES('RelGuid______________1',$,$,$,(#100),#201);
+ENDSEC;
+END-ISO-10303-21;
+`;
+
+  it('registers both the type key and the composed occurrence key', async () => {
+    const buf = new TextEncoder().encode(STEP);
+    const store = await new IfcParser().parseColumnar(
+      buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+    );
+    const index = await buildIdentifierIndex(
+      [{ id: 'm1', ifcDataStore: store }],
+      { ...CONFIG, pattern: '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3})+$' },
+    );
+    assert.equal(index.byCode.get('DD01.02')?.length, 1, 'type-level key');
+    const occ = index.byCode.get('DD01.02.03');
+    assert.equal(occ?.length, 1, 'composed occurrence key');
+    assert.equal(occ?.[0].typeName, 'IfcDoor');
+    // The instance-id-like tail ('77' Tag) must not mint junk keys.
+    assert.equal(index.byCode.get('DD01.02.77'), undefined);
   });
 });
 
