@@ -92,6 +92,22 @@ describe('buildIdentifierIndex', () => {
     assert.deepEqual(targets?.map((t) => t.modelId).sort(), ['arch', 'mep']);
   });
 
+  it('collapses the SAME element (one GUID) appearing in several federated models', async () => {
+    // Federation identity is the IFC GUID (D-044): the same physical door in
+    // the ARCH and coordination models must be ONE link target, mirroring how
+    // the AIM ETL dedupes models into one object row.
+    const index = await buildIdentifierIndex(
+      [
+        makeModel('arch', [{ expressId: 1, type: 'IfcDoor', globalId: 'SAME-GUID', name: 'DD.01.02' }]),
+        makeModel('coord', [{ expressId: 9, type: 'IfcDoor', globalId: 'SAME-GUID', name: 'DD.01.02' }]),
+      ],
+      CONFIG,
+    );
+    const targets = index.byCode.get('DD.01.02');
+    assert.equal(targets?.length, 1, 'one target per GUID across the federation');
+    assert.equal(targets?.[0].modelId, 'arch', 'first-loaded model wins');
+  });
+
   it('falls through a non-matching source to the next one in order', async () => {
     // objectType is empty in the synthetic store, so the first source yields
     // nothing and the name source must win.
