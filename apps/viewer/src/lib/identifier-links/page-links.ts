@@ -170,7 +170,12 @@ export function mergeTextItems(items: readonly PdfTextItemLike[]): PdfTextItemLi
         const r = line[i];
         const h = Math.max(cur.h, r.h);
         const gap = r.along0 - cur.along1;
-        if (gap <= MERGE_JOIN_GAP * h) {
+        // Direct (no-space) concat reconstructs one WORD from glyph runs —
+        // only legitimate when the glyphs share a font size. Different-height
+        // runs that overlap (a bubble's two labels crammed together on a
+        // dense sheet) must never fuse into one pseudo-token.
+        const sameFont = Math.max(cur.h, r.h) <= 1.5 * Math.min(cur.h, r.h);
+        if (gap <= MERGE_JOIN_GAP * h && sameFont) {
           cur.str += r.str;
         } else if (gap <= MERGE_SPACE_GAP * h) {
           cur.str += ` ${r.str}`;
@@ -185,16 +190,21 @@ export function mergeTextItems(items: readonly PdfTextItemLike[]): PdfTextItemLi
       out.push(toItem(cur));
       line = [];
     };
-    let prev: Run | null = null;
+    // Line clustering is ANCHORED to the line's first run, not chained run to
+    // run: a dense sheet has text at nearly every perp value, so consecutive
+    // small gaps would chain distinct physical lines into one band and fuse
+    // unrelated labels (the bug behind bubbles scanning as `02.01DD01`).
+    let anchor: Run | null = null;
     for (const r of group) {
       if (
-        prev &&
-        Math.abs(r.perp - prev.perp) > Math.max(MERGE_LINE_TOL_PT, 0.5 * Math.max(r.h, prev.h))
+        anchor &&
+        Math.abs(r.perp - anchor.perp) > Math.max(MERGE_LINE_TOL_PT, 0.5 * Math.max(r.h, anchor.h))
       ) {
         flushLine();
+        anchor = null;
       }
+      if (!anchor) anchor = r;
       line.push(r);
-      prev = r;
     }
     flushLine();
   }
