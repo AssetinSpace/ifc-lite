@@ -202,6 +202,35 @@ describe('findIdentifierBoxes — proximity join (split label bubbles)', () => {
     assert.equal(boxes[0].layer, 'proximity');
   });
 
+  it('joins the KNOWN model code, not a nearer dimension that also matches', () => {
+    // A door bubble "DD01" over "05.03", with a "900" dimension even closer to
+    // DD01. Both DD01.900 and DD01.05.03 match the pattern, but only the door
+    // exists in the model — known-first pairing must keep the real code.
+    const boxes = findIdentifierBoxes(
+      [
+        item('DD01', 100, 210, 20, 8),
+        item('900', 100, 204, 15, 8), // 6pt below DD01 — nearer
+        item('05.03', 100, 196, 25, 8), // 14pt below DD01 — farther
+      ],
+      PATTERN,
+      (code) => code === 'DD01.05.03',
+    );
+    const joined = boxes.filter((b) => b.layer === 'proximity');
+    assert.ok(
+      joined.some((b) => b.code === 'DD01.05.03'),
+      `expected DD01.05.03, got ${JSON.stringify(joined.map((b) => b.code))}`,
+    );
+    assert.ok(!joined.some((b) => b.code === 'DD01.900'), 'dimension must not steal the label');
+  });
+
+  it('without the known-code hint, falls back to nearest pattern match', () => {
+    const boxes = findIdentifierBoxes(
+      [item('DD01', 100, 210, 20, 8), item('05.03', 100, 196, 25, 8)],
+      PATTERN,
+    );
+    assert.ok(boxes.some((b) => b.code === 'DD01.05.03'));
+  });
+
   it('picks the nearest candidate when several fragments qualify', () => {
     const boxes = findIdentifierBoxes(
       [

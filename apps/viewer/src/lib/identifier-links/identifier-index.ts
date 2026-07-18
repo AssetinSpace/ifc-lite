@@ -269,8 +269,16 @@ export async function buildIdentifierIndex(
             rawValue,
           };
           const list = byCode.get(code);
-          if (list) list.push(target);
-          else byCode.set(code, [target]);
+          if (list) {
+            // Dedupe true duplicates (same element indexed twice, e.g. the
+            // code present in two attributes) by GlobalId; genuinely distinct
+            // elements that share a code are kept (the picker lists them).
+            if (!list.some((t) => t.guid === target.guid && t.modelId === target.modelId)) {
+              list.push(target);
+            }
+          } else {
+            byCode.set(code, [target]);
+          }
           break;
         }
       }

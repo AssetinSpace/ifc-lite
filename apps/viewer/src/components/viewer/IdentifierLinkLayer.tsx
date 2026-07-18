@@ -25,10 +25,13 @@ import { compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
   findIdentifierBoxes,
   resolvePageLinks,
-  type PageLinkBox,
   type ResolvedPageLink,
 } from '@/lib/identifier-links/page-links';
-import { openPdfDocument, getPdfPageTextItems } from '@/lib/pdf/rasterize';
+import {
+  openPdfDocument,
+  getPdfPageTextItems,
+  type PdfPageTextItem as PageTextItem,
+} from '@/lib/pdf/rasterize';
 import { IdentifierLinkBoxes, selectIdentifierTarget } from './IdentifierLinkBoxes';
 
 export { selectIdentifierTarget };
@@ -41,8 +44,8 @@ interface IdentifierLinkLayerProps {
 
 export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps) {
   const { config, index } = useIdentifierLinks();
-  const [boxes, setBoxes] = useState<PageLinkBox[] | null>(null);
-  const [textItems, setTextItems] = useState(0);
+  // Fetch raw text items async; detect boxes in an index-aware memo below.
+  const [items, setItems] = useState<PageTextItem[] | null>(null);
 
   const placement = drawing.placement;
   const page = placement?.page;
@@ -58,11 +61,9 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
       try {
         const doc = await openPdfDocument(drawing.pdfUrl);
         try {
-          const { items } = await getPdfPageTextItems(doc, page);
+          const { items: fetched } = await getPdfPageTextItems(doc, page);
           if (stale) return;
-          const re = compileIdentifierPattern(config.pattern);
-          setTextItems(items.length);
-          setBoxes(re ? findIdentifierBoxes(items, re) : []);
+          setItems(fetched);
         } finally {
           void doc.destroy();
         }
@@ -77,9 +78,16 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
     })();
     return () => {
       stale = true;
-      setBoxes(null);
+      setItems(null);
     };
   }, [config.enabled, config.pattern, drawing.pdfUrl, page, drawing.name]);
+
+  const boxes = useMemo(() => {
+    if (!config.enabled || !items) return null;
+    const re = compileIdentifierPattern(config.pattern);
+    const isKnown = index ? (code: string) => index.byCode.has(code) : undefined;
+    return re ? findIdentifierBoxes(items, re, isKnown) : [];
+  }, [config.enabled, config.pattern, items, index]);
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !boxes) return [];
@@ -93,11 +101,11 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
       source: drawing.name,
       page,
       status: 'done',
-      textItems,
+      textItems: items?.length ?? 0,
       codes: boxes.length,
       matched: links.filter((l) => l.targets.length > 0).length,
     });
-  }, [config.enabled, boxes, links, textItems, drawing.name, page]);
+  }, [config.enabled, boxes, links, items, drawing.name, page]);
 
   if (!config.enabled || !placement) return null;
 

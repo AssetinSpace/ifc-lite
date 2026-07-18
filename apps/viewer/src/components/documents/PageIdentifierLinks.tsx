@@ -24,10 +24,9 @@ import { compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
   findIdentifierBoxes,
   resolvePageLinks,
-  type PageLinkBox,
   type ResolvedPageLink,
 } from '@/lib/identifier-links/page-links';
-import { getPdfPageTextItems } from '@/lib/pdf/rasterize';
+import { getPdfPageTextItems, type PdfPageTextItem as PageTextItem } from '@/lib/pdf/rasterize';
 import { IdentifierLinkBoxes } from '@/components/viewer/IdentifierLinkBoxes';
 
 interface PageIdentifierLinksProps {
@@ -39,11 +38,11 @@ interface PageIdentifierLinksProps {
 
 export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksProps) {
   const { config, index } = useIdentifierLinks();
-  const [scan, setScan] = useState<{
-    boxes: PageLinkBox[];
-    pageSize: [number, number];
-    textItems: number;
-  } | null>(null);
+  // Only the raw text items are fetched async; box detection is a memo below
+  // so it re-runs (index-aware) once the model index is ready.
+  const [text, setText] = useState<{ items: PageTextItem[]; pageSize: [number, number] } | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!config.enabled || !render) return;
@@ -57,9 +56,7 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
       try {
         const { items, pageSizePts } = await getPdfPageTextItems(pdf, page);
         if (stale) return;
-        const re = compileIdentifierPattern(config.pattern);
-        const boxes = re ? findIdentifierBoxes(items, re) : [];
-        setScan({ boxes, pageSize: pageSizePts, textItems: items.length });
+        setText({ items, pageSize: pageSizePts });
       } catch (err) {
         if (stale) return;
         console.error(`identifier links: page ${page} text scan failed`, err);
@@ -71,9 +68,17 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
     })();
     return () => {
       stale = true;
-      setScan(null);
+      setText(null);
     };
   }, [config.enabled, config.pattern, pdf, page, render]);
+
+  const scan = useMemo(() => {
+    if (!config.enabled || !text) return null;
+    const re = compileIdentifierPattern(config.pattern);
+    const isKnown = index ? (code: string) => index.byCode.has(code) : undefined;
+    const boxes = re ? findIdentifierBoxes(text.items, re, isKnown) : [];
+    return { boxes, pageSize: text.pageSize, textItems: text.items.length };
+  }, [config.enabled, config.pattern, text, index]);
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !scan) return [];
