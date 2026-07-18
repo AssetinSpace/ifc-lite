@@ -119,6 +119,43 @@ describe('findIdentifierBoxes — per-glyph CAD output (mergeTextItems)', () => 
     assert.equal(boxes[0].code, 'DD01.02');
   });
 
+  it('does not chain distinct physical lines into one band on a dense sheet', () => {
+    // Regression: a bubble's number (h=9, baseline 200) and its header (h=5.5,
+    // baseline 208.2, overlapping x-range) sit farther apart than the line
+    // tolerance — but a dense sheet has other text at intermediate baselines.
+    // Chained clustering fused them into a pseudo-token like "02.01DD01";
+    // anchored clustering must keep them separate so the proximity join can
+    // form the real code.
+    const filler1 = item('4510', 400, 203.5, 20, 9); // unrelated dimension between the baselines
+    const filler2 = item('2100', 700, 206.5, 20, 9);
+    const number = item('02.01', 100, 200, 15.1, 9);
+    const header: PdfTextItemLike = {
+      str: 'DD01',
+      transform: [1, 0, 0, 1, 103.2, 208.2],
+      width: 8.9,
+      height: 5.5,
+    };
+    const boxes = findIdentifierBoxes([number, filler1, filler2, header], PATTERN);
+    assert.ok(
+      boxes.some((b) => b.code === 'DD01.02.01' && b.layer === 'proximity'),
+      `expected DD01.02.01, got ${JSON.stringify(boxes.map((b) => b.code))}`,
+    );
+  });
+
+  it('never fuses different-font-size runs into one word', () => {
+    // Same baseline band, overlapping x, but 9pt vs 5.5pt glyphs — two labels
+    // crammed together must not concatenate into "02.01DD01".
+    const number = item('02.01', 100, 200, 15.1, 9);
+    const header: PdfTextItemLike = {
+      str: 'DD01',
+      transform: [1, 0, 0, 1, 103.2, 203],
+      width: 8.9,
+      height: 5.5,
+    };
+    const boxes = findIdentifierBoxes([number, header], PATTERN);
+    assert.ok(!boxes.some((b) => b.code.includes('02.01DD01')), 'no fused pseudo-token');
+  });
+
   it('does not merge glyphs across different lines', () => {
     // Same x-range, stacked lines — the bubble case: ZV01 over 02 must stay
     // two runs and join via the proximity layer, not string concatenation.
