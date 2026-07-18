@@ -30,16 +30,42 @@ export interface IdentifierSource {
   propertyName?: string;
 }
 
+/**
+ * How the OCCURRENCE (per-instance) identifier is obtained:
+ *  - `direct`   — the full occurrence code is printed verbatim inside one of
+ *                 the type sources (e.g. Name = "Dvere DD01.02.003").
+ *  - `composed` — the source field carries only the TYPE code and the
+ *                 instance discriminator lives elsewhere (e.g. Revit `Mark`);
+ *                 the occurrence code is `<type code>.<discriminator>`.
+ *  - `auto`     — try both (direct extraction first, composition too);
+ *                 the safe default when the project convention is unknown.
+ */
+export type OccurrenceMode = 'auto' | 'direct' | 'composed';
+
+export interface OccurrenceConfig {
+  mode: OccurrenceMode;
+  /** Anchored-after-strip regex a full OCCURRENCE code must match. */
+  pattern: string;
+  /**
+   * Composed mode: where the instance discriminator lives (fallback order).
+   * A `pset` source with an empty `psetName` searches EVERY pset for the
+   * property (Revit shared params land in per-category psets).
+   */
+  discriminatorSources: IdentifierSource[];
+}
+
 export interface IdentifierLinkConfig {
   /** Master switch — per project; off by default. */
   enabled: boolean;
-  /** Ordered fallback list of identifier sources. */
+  /** Ordered fallback list of TYPE-code sources. */
   sources: IdentifierSource[];
   /**
-   * Regex the full NORMALIZED code must match (see `normalizeIdentifier`).
-   * Compiled anchored — `^`/`$` in the stored pattern are optional.
+   * Regex a TYPE code must match (see `normalizeIdentifier`). Compiled
+   * anchored — `^`/`$` in the stored pattern are optional.
    */
   pattern: string;
+  /** Occurrence-level identifier configuration. */
+  occurrence: OccurrenceConfig;
   /**
    * Debug mode: also outline text recognized as a code but not found in the
    * model, so unmatched codes are visually distinguishable from plain text.
@@ -47,13 +73,23 @@ export interface IdentifierLinkConfig {
   debug: boolean;
 }
 
-/** Matches `DD.01.02.003` / `DD01.06.03` style codes after normalization. */
-export const DEFAULT_IDENTIFIER_PATTERN = '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3})+$';
+/** Matches type codes like `DD01.02` / `SN.05` after normalization. */
+export const DEFAULT_IDENTIFIER_PATTERN = '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3})*$';
+/** Matches full occurrence codes like `DD01.02.003` (type + ≥1 more group). */
+export const DEFAULT_OCCURRENCE_PATTERN = '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3})+$';
+
+export const DEFAULT_OCCURRENCE_CONFIG: OccurrenceConfig = {
+  mode: 'auto',
+  pattern: DEFAULT_OCCURRENCE_PATTERN,
+  // Empty psetName = any pset; 'Mark' is the Revit shared-parameter default.
+  discriminatorSources: [{ kind: 'pset', psetName: '', propertyName: 'Mark' }],
+};
 
 export const DEFAULT_IDENTIFIER_LINK_CONFIG: IdentifierLinkConfig = {
   enabled: false,
   sources: [{ kind: 'name' }],
   pattern: DEFAULT_IDENTIFIER_PATTERN,
+  occurrence: { ...DEFAULT_OCCURRENCE_CONFIG, discriminatorSources: DEFAULT_OCCURRENCE_CONFIG.discriminatorSources.map((s) => ({ ...s })) },
   debug: false,
 };
 
@@ -87,6 +123,15 @@ export function compileIdentifierPattern(pattern: string): RegExp | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Combined page-scan pattern body: a token printed on the drawing may be a
+ * TYPE code or a full OCCURRENCE code — the scanner accepts both shapes.
+ */
+export function combinedPagePattern(config: IdentifierLinkConfig): string {
+  const strip = (p: string) => p.trim().replace(/^\^/, '').replace(/\$$/, '');
+  return `(?:${strip(config.occurrence.pattern)})|(?:${strip(config.pattern)})`;
 }
 
 /** True when the (raw or normalized) value normalizes into a pattern match. */
@@ -160,30 +205,90 @@ function sanitizeSource(value: unknown): IdentifierSource | null {
   return source;
 }
 
-/** Parse a persisted config, falling back to defaults field-by-field. */
+/** Deep-enough clone so default nested objects are never shared/mutated. */
+export function cloneIdentifierLinkConfig(config: IdentifierLinkConfig): IdentifierLinkConfig {
+  return {
+    ...config,
+    sources: config.sources.map((s) => ({ ...s })),
+    occurrence: {
+      ...config.occurrence,
+      discriminatorSources: config.occurrence.discriminatorSources.map((s) => ({ ...s })),
+    },
+  };
+}
+
+/**
+ * Parse a persisted config, falling back to defaults field-by-field. Migrates
+ * the v1 shape (single `pattern` + `sources`, no `occurrence`): the old
+ * pattern covered occurrence codes, so it becomes `occurrence.pattern` while
+ * the type pattern falls back to the default.
+ */
 export function sanitizeIdentifierLinkConfig(value: unknown): IdentifierLinkConfig {
-  if (typeof value !== 'object' || value === null) return { ...DEFAULT_IDENTIFIER_LINK_CONFIG };
+  if (typeof value !== 'object' || value === null) {
+    return cloneIdentifierLinkConfig(DEFAULT_IDENTIFIER_LINK_CONFIG);
+  }
   const v = value as Record<string, unknown>;
   const sources = Array.isArray(v.sources)
     ? v.sources.map(sanitizeSource).filter((s): s is IdentifierSource => s !== null)
     : [];
+
+  const occRaw = typeof v.occurrence === 'object' && v.occurrence !== null
+    ? (v.occurrence as Record<string, unknown>)
+    : null;
+  const discRaw = occRaw && Array.isArray(occRaw.discriminatorSources)
+    ? occRaw.discriminatorSources.map(sanitizeSource).filter((s): s is IdentifierSource => s !== null)
+    : [];
+  const occurrence: OccurrenceConfig = {
+    mode:
+      occRaw?.mode === 'direct' || occRaw?.mode === 'composed' || occRaw?.mode === 'auto'
+        ? occRaw.mode
+        : DEFAULT_OCCURRENCE_CONFIG.mode,
+    pattern:
+      occRaw && typeof occRaw.pattern === 'string' && occRaw.pattern.trim()
+        ? occRaw.pattern
+        : // v1 migration: the old single pattern described occurrence codes.
+          typeof v.pattern === 'string' && v.pattern.trim() && !occRaw
+          ? v.pattern
+          : DEFAULT_OCCURRENCE_PATTERN,
+    discriminatorSources:
+      discRaw.length > 0
+        ? discRaw
+        : DEFAULT_OCCURRENCE_CONFIG.discriminatorSources.map((s) => ({ ...s })),
+  };
+
   return {
     enabled: typeof v.enabled === 'boolean' ? v.enabled : DEFAULT_IDENTIFIER_LINK_CONFIG.enabled,
     sources: sources.length > 0 ? sources : DEFAULT_IDENTIFIER_LINK_CONFIG.sources.map((s) => ({ ...s })),
-    pattern: typeof v.pattern === 'string' && v.pattern.trim() ? v.pattern : DEFAULT_IDENTIFIER_PATTERN,
+    pattern:
+      typeof v.pattern === 'string' && v.pattern.trim() && occRaw
+        ? v.pattern
+        : DEFAULT_IDENTIFIER_PATTERN,
+    occurrence,
     debug: typeof v.debug === 'boolean' ? v.debug : DEFAULT_IDENTIFIER_LINK_CONFIG.debug,
   };
 }
 
+/** True when the project already has a persisted config (skip auto-analysis). */
+export function hasPersistedIdentifierConfig(modelKey: string): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    return localStorage.getItem(identifierConfigStorageKey(modelKey)) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function loadIdentifierLinkConfig(modelKey: string): IdentifierLinkConfig {
-  if (typeof localStorage === 'undefined') return { ...DEFAULT_IDENTIFIER_LINK_CONFIG };
+  if (typeof localStorage === 'undefined') {
+    return cloneIdentifierLinkConfig(DEFAULT_IDENTIFIER_LINK_CONFIG);
+  }
   try {
     const raw = localStorage.getItem(identifierConfigStorageKey(modelKey));
-    if (!raw) return { ...DEFAULT_IDENTIFIER_LINK_CONFIG };
+    if (!raw) return cloneIdentifierLinkConfig(DEFAULT_IDENTIFIER_LINK_CONFIG);
     return sanitizeIdentifierLinkConfig(JSON.parse(raw));
   } catch (err) {
     console.warn('identifier links: failed to load persisted config', err);
-    return { ...DEFAULT_IDENTIFIER_LINK_CONFIG };
+    return cloneIdentifierLinkConfig(DEFAULT_IDENTIFIER_LINK_CONFIG);
   }
 }
 

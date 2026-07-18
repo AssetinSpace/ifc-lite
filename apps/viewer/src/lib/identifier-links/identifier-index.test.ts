@@ -123,11 +123,15 @@ describe('buildIdentifierIndex', () => {
     assert.equal(hit?.[0].sourceKind, 'name');
   });
 
-  it('returns an empty index for an invalid pattern', async () => {
+  it('returns an empty index when both patterns are invalid', async () => {
     const model = makeModel('m1', [
       { expressId: 1, type: 'IfcWall', globalId: 'A', name: 'DD.01.02' },
     ]);
-    const index = await buildIdentifierIndex([model], { ...CONFIG, pattern: '[' });
+    const index = await buildIdentifierIndex([model], {
+      ...CONFIG,
+      pattern: '[',
+      occurrence: { ...CONFIG.occurrence, pattern: '[' },
+    });
     assert.equal(index.byCode.size, 0);
   });
 

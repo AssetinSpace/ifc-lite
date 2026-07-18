@@ -20,7 +20,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { useViewerStore } from '@/store';
 import { useIdentifierLinks } from '@/hooks/useIdentifierLinks';
-import { compileIdentifierPattern } from '@/lib/identifier-links/config';
+import { combinedPagePattern, compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
   findIdentifierBoxes,
   resolvePageLinks,
@@ -80,11 +80,12 @@ export function PageIdentifierLinks({ pdf, page, render, docId }: PageIdentifier
 
   const scan = useMemo(() => {
     if (!config.enabled || !text) return null;
-    const re = compileIdentifierPattern(config.pattern);
+    // A printed token may be a TYPE code or a full OCCURRENCE code.
+    const re = compileIdentifierPattern(combinedPagePattern(config));
     const isKnown = index ? (code: string) => index.byCode.has(code) : undefined;
     const boxes = re ? findIdentifierBoxes(text.items, re, isKnown) : [];
     return { boxes, pageSize: text.pageSize, textItems: text.items.length };
-  }, [config.enabled, config.pattern, text, index]);
+  }, [config, text, index]);
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !scan) return [];
