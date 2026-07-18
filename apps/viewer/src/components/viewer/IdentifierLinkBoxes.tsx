@@ -144,7 +144,13 @@ export function IdentifierLinkBoxes({
                 }}
               >
                 {t.name || t.typeName || t.guid}
-                <span className="ml-1 text-muted-foreground">{t.typeName}</span>
+                <span className="ml-1 text-muted-foreground">
+                  {t.typeName}
+                  {/* Storey + short GUID keep same-name candidates tellable
+                      apart (duplicate tags in the model are a real case). */}
+                  {t.storeyName ? ` · ${t.storeyName}` : ''}
+                  {` · ${t.guid.slice(0, 8)}`}
+                </span>
               </button>
             ))}
             {picker.targets.length > 8 && (

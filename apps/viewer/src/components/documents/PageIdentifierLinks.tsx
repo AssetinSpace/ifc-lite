@@ -34,10 +34,16 @@ interface PageIdentifierLinksProps {
   page: number;
   /** Scan only while the page is inside the reader's render window. */
   render: boolean;
+  /** Owning document id — used to prefer same-storey candidates. */
+  docId: string;
 }
 
-export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksProps) {
+export function PageIdentifierLinks({ pdf, page, render, docId }: PageIdentifierLinksProps) {
   const { config, index } = useIdentifierLinks();
+  // A drawing document knows its storey (D-072 binding) — candidates on that
+  // storey win, so a floor-plan click opens THE door on this floor directly
+  // instead of a picker listing its same-tag siblings on other floors.
+  const docStoreyGuid = useViewerStore((s) => s.viewerDocuments.get(docId)?.storeyGuid ?? undefined);
   // Only the raw text items are fetched async; box detection is a memo below
   // so it re-runs (index-aware) once the model index is ready.
   const [text, setText] = useState<{ items: PageTextItem[]; pageSize: [number, number] } | null>(
@@ -82,8 +88,8 @@ export function PageIdentifierLinks({ pdf, page, render }: PageIdentifierLinksPr
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !scan) return [];
-    return resolvePageLinks(scan.boxes, index);
-  }, [config.enabled, index, scan]);
+    return resolvePageLinks(scan.boxes, index, { preferStoreyGuid: docStoreyGuid ?? undefined });
+  }, [config.enabled, index, scan, docStoreyGuid]);
 
   // Publish scan diagnostics for the settings panel ("why don't I see links?").
   useEffect(() => {

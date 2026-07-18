@@ -22,6 +22,7 @@ function target(overrides: Partial<IdentifierTarget> = {}): IdentifierTarget {
     name: 'Wall',
     typeName: 'IfcWall',
     storeyGuid: 'S1',
+    storeyName: '1NP',
     sourceKind: 'name',
     rawValue: 'DD.01.02.003',
     ...overrides,

@@ -471,6 +471,7 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
                   key={page}
                   pdf={pdf}
                   page={page}
+                  docId={docId}
                   width={pageWidth}
                   rasterWidth={rasterWidth || pageWidth}
                   aspect={aspects.get(page) ?? defaultAspect}
@@ -550,6 +551,8 @@ function lruClearDisconnected(): void {
 interface PdfPageProps {
   pdf: PDFDocumentProxy;
   page: number;
+  /** Owning document id (identifier links prefer this doc's storey). */
+  docId: string;
   /** Layout width (immediate; CSS scales a stale raster until it settles). */
   width: number;
   /** Debounced width the raster is computed from. */
@@ -566,6 +569,7 @@ interface PdfPageProps {
 function PdfPage({
   pdf,
   page,
+  docId,
   width,
   rasterWidth,
   aspect,
@@ -790,7 +794,7 @@ function PdfPage({
       <div ref={hostRef} className="h-full w-full" />
       <div ref={textHostRef} className="pdf-doc-text-layer" />
       {/* Identifier hyperlinks (D-076): clickable element codes on the page. */}
-      <PageIdentifierLinks pdf={pdf} page={page} render={render} />
+      <PageIdentifierLinks pdf={pdf} page={page} render={render} docId={docId} />
     </div>
   );
 }
