@@ -893,7 +893,10 @@ function MobileBottomSheet({
   return (
     <div
       ref={sheetRef}
-      className="absolute inset-x-0 flex flex-col bg-background border-t rounded-t-2xl shadow-2xl z-40 animate-in slide-in-from-bottom duration-300"
+      // z-50: transient sheets sit ABOVE the full-screen content overlays
+      // (document pane / split plan, both z-40) so opening Properties from a
+      // link click while a drawing is full-screen actually surfaces it.
+      className="absolute inset-x-0 flex flex-col bg-background border-t rounded-t-2xl shadow-2xl z-50 animate-in slide-in-from-bottom duration-300"
       style={{ bottom: `${bottomInset}px` }}
     >
       {/* Drag affordance — generously sized for touch */}
