@@ -208,6 +208,46 @@ END-ISO-10303-21;
   });
 });
 
+describe('buildIdentifierIndex — type codes register the defining type entity', () => {
+  // Newer exports print the TYPE code in every instance Name while the wall
+  // type keeps its family name. Clicking the type bubble must open the TYPE's
+  // properties — the instances' defining IfcWallType (IfcRelDefinesByType) is
+  // registered under the type key alongside them.
+  const STEP = `ISO-10303-21;
+HEADER;FILE_DESCRIPTION((''),'2;1');FILE_NAME('t','',(''),(''),'','','');FILE_SCHEMA(('IFC4'));ENDSEC;
+DATA;
+#1=IFCPROJECT('ProjGuid_____________3',$,'P',$,$,$,$,$,$);
+#100=IFCWALL('WallGuid_____________1',$,'SN05.01',$,$,$,$,$,$);
+#101=IFCWALL('WallGuid_____________2',$,'SN05.01',$,$,$,$,$,$);
+#900=IFCWALLTYPE('TypeGuid_____________1',$,'Basic Wall:Murivo 250',$,$,$,$,$,$,.STANDARD.);
+#950=IFCRELDEFINESBYTYPE('RelGuid______________3',$,$,$,(#100,#101),#900);
+ENDSEC;
+END-ISO-10303-21;
+`;
+
+  it('indexes both walls AND their IfcWallType under the type key', async () => {
+    const buf = new TextEncoder().encode(STEP);
+    const store = await new IfcParser().parseColumnar(
+      buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+    );
+    const index = await buildIdentifierIndex(
+      [{ id: 'm1', ifcDataStore: store }],
+      {
+        ...CONFIG,
+        pattern: '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3})?$',
+        occurrence: { ...CONFIG.occurrence, mode: 'auto', pattern: '^[A-Z]{2,3}\\.?\\d{2}(?:\\.\\d{1,3}){2}$' },
+      },
+    );
+    const targets = index.byCode.get('SN05.01');
+    assert.ok(targets, 'type key present');
+    assert.equal(targets.length, 3, 'two walls + the defining type');
+    const typeTarget = targets.find((t) => t.typeName === 'IfcWallType');
+    assert.ok(typeTarget, 'defining IfcWallType registered');
+    assert.equal(typeTarget.guid, 'TypeGuid_____________1');
+    assert.equal(typeTarget.storeyGuid, '', 'types live outside the spatial structure');
+  });
+});
+
 describe('lookupIdentifier', () => {
   it('normalizes the query before the lookup', async () => {
     const model = makeModel('m1', [
