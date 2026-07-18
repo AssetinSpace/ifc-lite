@@ -67,6 +67,18 @@ describe('buildIdentifierIndex', () => {
     assert.equal(index.byCode.get('DD.01.02')?.length, 2);
   });
 
+  it('excludes openings (they inherit the door code but are not targets)', async () => {
+    const model = makeModel('m1', [
+      { expressId: 1, type: 'IfcDoor', globalId: 'A', name: 'DD.01.02' },
+      { expressId: 2, type: 'IfcDoor', globalId: 'B', name: 'DD.01.02' },
+      { expressId: 3, type: 'IfcOpeningElement', globalId: 'C', name: 'DD.01.02' },
+    ]);
+    const index = await buildIdentifierIndex([model], CONFIG);
+    const hits = index.byCode.get('DD.01.02');
+    assert.equal(hits?.length, 2, 'the two doors, not the opening');
+    assert.ok(hits?.every((t) => t.typeName === 'IfcDoor'));
+  });
+
   it('spans multiple models', async () => {
     const index = await buildIdentifierIndex(
       [

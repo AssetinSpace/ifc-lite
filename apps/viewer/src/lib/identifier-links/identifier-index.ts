@@ -61,6 +61,16 @@ export interface BuildIdentifierIndexOptions {
 
 const DEFAULT_CHUNK_SIZE = 20_000;
 
+/**
+ * IFC types that carry a host element's identifier but are never a useful
+ * link target — openings are subtractive voids, not components a user selects.
+ */
+const NON_TARGET_TYPES = new Set([
+  'IFCOPENINGELEMENT',
+  'IFCOPENINGSTANDARDCASE',
+  'IFCVOIDINGFEATURE',
+]);
+
 /** Minimal model shape the builder needs (subset of FederatedModel). */
 export interface IdentifierIndexModel {
   id: string;
@@ -241,13 +251,19 @@ export async function buildIdentifierIndex(
           const code = match?.[0] ?? '';
           if (!code) continue;
 
+          // Openings (the hole cut for a door/window) inherit the host's code
+          // but are never a meaningful link target — skip them so the picker
+          // shows the actual doors, not "IfcOpeningElement".
+          const typeName = table.getTypeName(expressId) ?? '';
+          if (NON_TARGET_TYPES.has(typeName.toUpperCase())) break;
+
           const storeyId = hierarchy?.elementToStorey.get(expressId);
           const target: IdentifierTarget = {
             modelId: model.id,
             expressId,
             guid: strings.get(guidIdx),
             name: nameCol[row] !== 0 ? strings.get(nameCol[row]) : '',
-            typeName: table.getTypeName(expressId) ?? '',
+            typeName,
             storeyGuid: storeyId !== undefined ? table.getGlobalId(storeyId) : '',
             sourceKind: source.kind,
             rawValue,
