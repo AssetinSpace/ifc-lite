@@ -273,10 +273,13 @@ export async function buildIdentifierIndex(
           };
           const list = byCode.get(code);
           if (list) {
-            // Dedupe true duplicates (same element indexed twice, e.g. the
-            // code present in two attributes) by GlobalId; genuinely distinct
-            // elements that share a code are kept (the picker lists them).
-            if (!list.some((t) => t.guid === target.guid && t.modelId === target.modelId)) {
+            // Dedupe by GlobalId ALONE: the IFC GUID is the federation-wide
+            // element identity (the same physical door appears in several
+            // disciplinary models), exactly how the AIM ETL collapses models
+            // into one object row. Only genuinely distinct elements (different
+            // GUIDs) sharing a code remain — an authoring error the candidate
+            // picker then surfaces.
+            if (!list.some((t) => t.guid === target.guid)) {
               list.push(target);
             }
           } else {
