@@ -386,12 +386,20 @@ export function findIdentifierBoxes(
   return boxes;
 }
 
+/** Type-level entity (IfcDoorType, IfcWallType, IfcDoorStyle…)? */
+function isTypeEntity(t: IdentifierTarget): boolean {
+  return /(?:Type|Style)$/.test(t.typeName);
+}
+
 /**
- * Resolve scanned boxes against the identifier index. When multiple elements
- * share a code and `preferStoreyGuid` is set (the storey the drawing is
- * calibrated to), same-storey candidates win — the drawing context
- * disambiguates duplicated codes. Ambiguity that survives is kept: the UI
- * offers a candidate picker.
+ * Resolve scanned boxes against the identifier index.
+ *
+ * A TYPE code's key holds the type entity plus every instance carrying the
+ * code — clicking a type bubble must open THE TYPE's properties, so type
+ * entities win when present. Otherwise, when multiple elements share a code
+ * and `preferStoreyGuid` is set (the storey the drawing is calibrated to),
+ * same-storey candidates win. Ambiguity that survives is kept: the UI offers
+ * a candidate picker.
  */
 export function resolvePageLinks(
   boxes: readonly PageLinkBox[],
@@ -409,6 +417,12 @@ export function resolvePageLinks(
         const seen = new Set(fromCode.map((t) => `${t.modelId}:${t.expressId}`));
         targets = [...fromCode, ...fromExact.filter((t) => !seen.has(`${t.modelId}:${t.expressId}`))];
       }
+    }
+    // Type entities first — BEFORE the storey preference, which would drop
+    // them (types live outside the spatial structure and carry no storey).
+    if (targets.length > 1) {
+      const types = targets.filter(isTypeEntity);
+      if (types.length > 0) targets = types;
     }
     if (prefer && targets.length > 1) {
       const sameStorey = targets.filter((t) => t.storeyGuid === prefer);

@@ -20,6 +20,7 @@ import {
   getAttributeNames,
   type IfcDataStore,
 } from '@ifc-lite/parser';
+import { RelationshipType } from '@ifc-lite/data';
 import {
   compileIdentifierPattern,
   compileIdentifierSearchPattern,
@@ -203,6 +204,36 @@ export async function buildIdentifierIndex(
     const objectTypeCol = table.objectType;
     const hierarchy = store.spatialHierarchy;
 
+    // Instance → its defining IfcElementType (IfcRelDefinesByType). A TYPE
+    // code printed on the drawing must open the TYPE's properties even when
+    // only the instances carry the code — cached per type entity.
+    const typeEntityCache = new Map<number, Omit<IdentifierTarget, 'sourceKind' | 'rawValue'> | null>();
+    const definingTypeOf = (expressId: number): Omit<IdentifierTarget, 'sourceKind' | 'rawValue'> | null => {
+      const typeId = store.relationships?.getRelated(
+        expressId,
+        RelationshipType.DefinesByType,
+        'inverse',
+      )?.[0];
+      if (typeId === undefined) return null;
+      let cached = typeEntityCache.get(typeId);
+      if (cached === undefined) {
+        const guid = table.getGlobalId(typeId);
+        cached = guid
+          ? {
+              modelId: model.id,
+              expressId: typeId,
+              guid,
+              name: table.getName(typeId) ?? '',
+              typeName: table.getTypeName(typeId) ?? '',
+              storeyGuid: '',
+              storeyName: '',
+            }
+          : null;
+        typeEntityCache.set(typeId, cached);
+      }
+      return cached;
+    };
+
     const tagReader = new TagReader(store);
     const psetReaders = new Map<IdentifierSource, PsetValueReader>();
     for (const source of [...config.sources, ...config.occurrence.discriminatorSources]) {
@@ -302,7 +333,26 @@ export async function buildIdentifierIndex(
             }
           };
           if (occCode) register(occCode);
-          if (typeCode && typeCode !== occCode) register(typeCode);
+          if (typeCode && typeCode !== occCode) {
+            register(typeCode);
+            // Register the instance's defining type entity under the same
+            // key, so a type-code bubble resolves to the TYPE directly even
+            // in models where only instances carry the code.
+            const typeEntity = definingTypeOf(expressId);
+            if (typeEntity) {
+              const typeTarget: IdentifierTarget = {
+                ...typeEntity,
+                sourceKind: source.kind,
+                rawValue,
+              };
+              const list = byCode.get(typeCode);
+              if (list) {
+                if (!list.some((t) => t.guid === typeTarget.guid)) list.push(typeTarget);
+              } else {
+                byCode.set(typeCode, [typeTarget]);
+              }
+            }
+          }
 
           // Composed occurrence key: the source field carries only the TYPE
           // code and the instance discriminator lives in a separate field

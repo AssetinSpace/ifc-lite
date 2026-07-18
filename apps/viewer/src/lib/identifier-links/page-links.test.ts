@@ -347,3 +347,50 @@ describe('resolvePageLinks', () => {
     assert.equal(byCode(links, 'DD.01.02.003').targets.length, 2);
   });
 });
+
+describe('resolvePageLinks — type-code bubbles open the type entity', () => {
+  // A TYPE code's key holds the IfcWallType plus every wall instance carrying
+  // the code in Name. Clicking the bubble must open the TYPE directly — and
+  // the storey preference must not drop it (types carry no storey).
+  const typeIndex: IdentifierIndex = {
+    byCode: new Map([
+      ['SN05.01', [
+        target({ expressId: 10, guid: 'W1', typeName: 'IfcWall', storeyGuid: 'S1' }),
+        target({ expressId: 11, guid: 'W2', typeName: 'IfcWall', storeyGuid: 'S1' }),
+        target({ expressId: 90, guid: 'T1', typeName: 'IfcWallType', storeyGuid: undefined }),
+      ]],
+      ['DD01.03', [
+        target({ expressId: 20, guid: 'D1', typeName: 'IfcDoor', storeyGuid: 'S1' }),
+        target({ expressId: 91, guid: 'T2', typeName: 'IfcDoorStyle', storeyGuid: undefined }),
+      ]],
+    ]),
+    scannedEntities: 5,
+    buildTimeMs: 0,
+  };
+  const typeBoxes = findIdentifierBoxes(
+    [item('SN05.01', 100, 240), item('DD01.03', 100, 200)],
+    PATTERN,
+  );
+  const byCode = (links: ReturnType<typeof resolvePageLinks>, code: string) => {
+    const hit = links.find((l) => l.code === code);
+    assert.ok(hit, `link ${code} present`);
+    return hit;
+  };
+
+  it('collapses to the single Type/Style entity when one exists', () => {
+    const links = resolvePageLinks(typeBoxes, typeIndex);
+    const sn = byCode(links, 'SN05.01');
+    assert.equal(sn.targets.length, 1);
+    assert.equal(sn.targets[0].typeName, 'IfcWallType');
+    const dd = byCode(links, 'DD01.03');
+    assert.equal(dd.targets.length, 1);
+    assert.equal(dd.targets[0].typeName, 'IfcDoorStyle', 'IFC2x3 *Style types count too');
+  });
+
+  it('wins over the storey preference — a storey filter must not drop the type', () => {
+    const links = resolvePageLinks(typeBoxes, typeIndex, { preferStoreyGuid: 'S1' });
+    const sn = byCode(links, 'SN05.01');
+    assert.equal(sn.targets.length, 1);
+    assert.equal(sn.targets[0].typeName, 'IfcWallType');
+  });
+});
