@@ -21,6 +21,7 @@ import {
   type IfcDataStore,
 } from '@ifc-lite/parser';
 import {
+  compileIdentifierPattern,
   compileIdentifierSearchPattern,
   isCaseSensitiveSource,
   normalizeIdentifier,
@@ -128,6 +129,26 @@ class TagReader {
 }
 
 /**
+ * Read the element's `Mark` property (any pset). Authoring tools commonly put
+ * only the TYPE code into Name (`Family.CC:DD01.02 - desc:id`) and the
+ * per-instance discriminator into the Revit `Mark` shared parameter — the full
+ * occurrence identifier printed on drawings is COMPOSED: `<type code>.<Mark>`
+ * (e.g. `DD01.02` + `03` → `DD01.02.03`). Gated by `onDemandPropertyMap`, so
+ * only elements that actually carry psets are extracted.
+ */
+function readMarkProperty(store: IfcDataStore, expressId: number): string {
+  if (!store.onDemandPropertyMap?.get(expressId)?.length) return '';
+  const psets = extractPropertiesOnDemand(store, expressId);
+  for (const pset of psets) {
+    const hit = pset.properties.find((p) => p.name === 'Mark');
+    if (hit && hit.value !== null && hit.value !== undefined && hit.value !== '') {
+      return String(hit.value);
+    }
+  }
+  return '';
+}
+
+/**
  * Pset-property reader — extraction is gated by `onDemandPropertyMap` (only
  * entities that HAVE property sets are extracted at all), and the whole build
  * runs once per config change, chunked with event-loop yields.
@@ -170,6 +191,9 @@ export async function buildIdentifierIndex(
   const signal = options.signal;
   // Unanchored: the code may be embedded in a longer value ("Dvere DD02.05.04").
   const re = compileIdentifierSearchPattern(config.pattern);
+  // Anchored twin — validates COMPOSED occurrence keys (code + '.' + Mark) so
+  // an id-like Mark ('1403083') can't mint a junk key via a partial match.
+  const reFull = compileIdentifierPattern(config.pattern);
   const byCode = new Map<string, IdentifierTarget[]>();
   let scannedEntities = 0;
 
@@ -271,19 +295,33 @@ export async function buildIdentifierIndex(
             sourceKind: source.kind,
             rawValue,
           };
-          const list = byCode.get(code);
-          if (list) {
-            // Dedupe by GlobalId ALONE: the IFC GUID is the federation-wide
-            // element identity (the same physical door appears in several
-            // disciplinary models), exactly how the AIM ETL collapses models
-            // into one object row. Only genuinely distinct elements (different
-            // GUIDs) sharing a code remain — an authoring error the candidate
-            // picker then surfaces.
-            if (!list.some((t) => t.guid === target.guid)) {
-              list.push(target);
+          // Dedupe by GlobalId ALONE: the IFC GUID is the federation-wide
+          // element identity (the same physical door appears in several
+          // disciplinary models), exactly how the AIM ETL collapses models
+          // into one object row. Only genuinely distinct elements (different
+          // GUIDs) sharing a code remain — an authoring error the candidate
+          // picker then surfaces.
+          const register = (key: string) => {
+            const list = byCode.get(key);
+            if (list) {
+              if (!list.some((t) => t.guid === target.guid)) list.push(target);
+            } else {
+              byCode.set(key, [target]);
             }
-          } else {
-            byCode.set(code, [target]);
+          };
+          register(code);
+
+          // Occurrence refinement: authoring tools keep only the TYPE code in
+          // the source field and the instance discriminator in `Mark` — the
+          // drawing prints `<type code>.<Mark>`. Register that composite key
+          // too (pattern-validated, so id-like Marks can't produce noise);
+          // type entities carry no Mark and skip this naturally.
+          if (!isCaseSensitiveSource(source.kind) && reFull) {
+            const mark = normalizeIdentifier(readMarkProperty(store, expressId));
+            if (mark) {
+              const composite = `${code}.${mark}`;
+              if (reFull.test(composite)) register(composite);
+            }
           }
           break;
         }
