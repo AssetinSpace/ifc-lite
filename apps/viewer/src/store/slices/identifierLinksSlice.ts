@@ -51,8 +51,11 @@ export interface IdentifierLinksSlice {
   identifierIndexSignature: string | null;
   /** Most recent page-scan diagnostics (null until a page is scanned). */
   identifierScanStats: IdentifierScanStats | null;
+  /** Human-readable findings of the last model-scheme analysis. */
+  identifierSchemeSummary: string | null;
 
   setIdentifierLinkConfig: (config: IdentifierLinkConfig) => void;
+  setIdentifierSchemeSummary: (summary: string | null) => void;
   setIdentifierScanStats: (stats: IdentifierScanStats | null) => void;
   setIdentifierConfigModelKey: (key: string | null) => void;
   setIdentifierIndexBuilding: (signature: string) => void;
@@ -73,8 +76,11 @@ export const createIdentifierLinksSlice: StateCreator<
   identifierIndexStatus: 'idle',
   identifierIndexSignature: null,
   identifierScanStats: null,
+  identifierSchemeSummary: null,
 
   setIdentifierScanStats: (stats) => set({ identifierScanStats: stats }),
+
+  setIdentifierSchemeSummary: (summary) => set({ identifierSchemeSummary: summary }),
 
   setIdentifierLinkConfig: (config) =>
     set({

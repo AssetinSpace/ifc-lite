@@ -15,9 +15,16 @@
 import { useEffect, useMemo } from 'react';
 import { useViewerStore } from '@/store';
 import {
+  hasPersistedIdentifierConfig,
   loadIdentifierLinkConfig,
+  saveIdentifierLinkConfig,
   type IdentifierLinkConfig,
 } from '@/lib/identifier-links/config';
+import {
+  analyzeIdentifierScheme,
+  applySchemeProposal,
+  type SchemeProposal,
+} from '@/lib/identifier-links/analyze';
 import {
   buildIdentifierIndex,
   type IdentifierIndex,
@@ -64,6 +71,18 @@ export function useIdentifierLinks(): UseIdentifierLinksResult {
     return parts.join('|');
   }, [models]);
 
+  // 1b) First contact with a project (no persisted config): propose the
+  // configuration by ANALYZING the model — which fields carry codes, the code
+  // shapes, and whether occurrences are direct or composed via a Mark-like
+  // discriminator. The proposal is persisted (still disabled), so user edits
+  // are never overwritten by a re-run.
+  useEffect(() => {
+    if (!modelKey || modelKey !== configModelKey) return;
+    if (!modelsSignature.includes(':1')) return;
+    if (hasPersistedIdentifierConfig(modelKey)) return;
+    runIdentifierSchemeAnalysis();
+  }, [modelKey, configModelKey, modelsSignature]);
+
   // 2) Build the index when enabled and out of date. An empty model set
   // still "builds" (an empty index) so the page scan + debug outlines work
   // before a model finishes loading.
@@ -72,6 +91,7 @@ export function useIdentifierLinks(): UseIdentifierLinksResult {
     const signature = `${modelsSignature}::${JSON.stringify({
       sources: config.sources,
       pattern: config.pattern,
+      occurrence: config.occurrence,
     })}`;
     const store = useViewerStore.getState();
     if (store.identifierIndexSignature === signature) return;
@@ -91,4 +111,25 @@ export function useIdentifierLinks(): UseIdentifierLinksResult {
   }, [config, models, modelsSignature]);
 
   return { config, index, status, modelKey };
+}
+
+/**
+ * Analyze the loaded models and apply the proposed configuration (keeps
+ * `enabled`/`debug`). Shared by the automatic first-contact run and the
+ * settings panel's "Analyze model" button. Returns the proposal (null when
+ * no codes were found — nothing is changed then).
+ */
+export function runIdentifierSchemeAnalysis(): SchemeProposal | null {
+  const store = useViewerStore.getState();
+  const proposal = analyzeIdentifierScheme(store.models.values());
+  if (!proposal) {
+    store.setIdentifierSchemeSummary('No identifier-shaped codes found in the model fields.');
+    return null;
+  }
+  const next = applySchemeProposal(store.identifierLinkConfig, proposal);
+  store.setIdentifierLinkConfig(next);
+  store.setIdentifierSchemeSummary(proposal.summary);
+  const key = identifierModelKey(store.models);
+  if (key) saveIdentifierLinkConfig(key, next);
+  return proposal;
 }

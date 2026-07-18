@@ -94,11 +94,32 @@ describe('sanitizeIdentifierLinkConfig', () => {
       ],
     });
     assert.equal(cfg.enabled, true);
-    assert.equal(cfg.pattern, 'ABC\\d+');
+    // v1 migration: the old single pattern described OCCURRENCE codes.
+    assert.equal(cfg.occurrence.pattern, 'ABC\\d+');
+    assert.equal(cfg.pattern, DEFAULT_IDENTIFIER_PATTERN);
     assert.equal(cfg.debug, true);
     assert.deepEqual(cfg.sources, [
       { kind: 'tag' },
       { kind: 'pset', psetName: 'Pset_X', propertyName: 'Code' },
+    ]);
+  });
+
+  it('keeps the v2 shape (occurrence block) as-is', () => {
+    const cfg = sanitizeIdentifierLinkConfig({
+      enabled: true,
+      pattern: '^TT\\d{2}$',
+      occurrence: {
+        mode: 'composed',
+        pattern: '^TT\\d{2}\\.\\d{3}$',
+        discriminatorSources: [{ kind: 'pset', psetName: '', propertyName: 'Mark' }],
+      },
+      sources: [{ kind: 'name' }],
+    });
+    assert.equal(cfg.pattern, '^TT\\d{2}$');
+    assert.equal(cfg.occurrence.mode, 'composed');
+    assert.equal(cfg.occurrence.pattern, '^TT\\d{2}\\.\\d{3}$');
+    assert.deepEqual(cfg.occurrence.discriminatorSources, [
+      { kind: 'pset', psetName: '', propertyName: 'Mark' },
     ]);
   });
 

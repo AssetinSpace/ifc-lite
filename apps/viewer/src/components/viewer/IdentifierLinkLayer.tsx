@@ -21,7 +21,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { UnderlayDrawing } from '@/store';
 import { useViewerStore } from '@/store';
 import { useIdentifierLinks } from '@/hooks/useIdentifierLinks';
-import { compileIdentifierPattern } from '@/lib/identifier-links/config';
+import { combinedPagePattern, compileIdentifierPattern } from '@/lib/identifier-links/config';
 import {
   findIdentifierBoxes,
   resolvePageLinks,
@@ -84,10 +84,11 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
 
   const boxes = useMemo(() => {
     if (!config.enabled || !items) return null;
-    const re = compileIdentifierPattern(config.pattern);
+    // A printed token may be a TYPE code or a full OCCURRENCE code.
+    const re = compileIdentifierPattern(combinedPagePattern(config));
     const isKnown = index ? (code: string) => index.byCode.has(code) : undefined;
     return re ? findIdentifierBoxes(items, re, isKnown) : [];
-  }, [config.enabled, config.pattern, items, index]);
+  }, [config, items, index]);
 
   const links = useMemo<ResolvedPageLink[]>(() => {
     if (!config.enabled || !index || !boxes) return [];

@@ -129,29 +129,11 @@ class TagReader {
 }
 
 /**
- * Read the element's `Mark` property (any pset). Authoring tools commonly put
- * only the TYPE code into Name (`Family.CC:DD01.02 - desc:id`) and the
- * per-instance discriminator into the Revit `Mark` shared parameter — the full
- * occurrence identifier printed on drawings is COMPOSED: `<type code>.<Mark>`
- * (e.g. `DD01.02` + `03` → `DD01.02.03`). Gated by `onDemandPropertyMap`, so
- * only elements that actually carry psets are extracted.
- */
-function readMarkProperty(store: IfcDataStore, expressId: number): string {
-  if (!store.onDemandPropertyMap?.get(expressId)?.length) return '';
-  const psets = extractPropertiesOnDemand(store, expressId);
-  for (const pset of psets) {
-    const hit = pset.properties.find((p) => p.name === 'Mark');
-    if (hit && hit.value !== null && hit.value !== undefined && hit.value !== '') {
-      return String(hit.value);
-    }
-  }
-  return '';
-}
-
-/**
  * Pset-property reader — extraction is gated by `onDemandPropertyMap` (only
  * entities that HAVE property sets are extracted at all), and the whole build
- * runs once per config change, chunked with event-loop yields.
+ * runs once per config change, chunked with event-loop yields. An EMPTY pset
+ * name searches every pset for the property (Revit shared parameters land in
+ * per-category psets like `IFC_Dvere`).
  */
 class PsetValueReader {
   constructor(
@@ -161,16 +143,18 @@ class PsetValueReader {
   ) {}
 
   read(expressId: number): string {
-    if (!this.psetName || !this.propertyName) return '';
+    if (!this.propertyName) return '';
     const psetIds = this.store.onDemandPropertyMap?.get(expressId);
     if (!psetIds || psetIds.length === 0) return '';
     const psets = extractPropertiesOnDemand(this.store, expressId);
-    const pset = psets.find((p) => p.name === this.psetName);
-    const prop = pset?.properties.find((p) => p.name === this.propertyName);
-    if (!prop) return '';
-    const v = prop.value;
-    if (typeof v === 'string') return v;
-    if (typeof v === 'number' || typeof v === 'bigint') return String(v);
+    for (const pset of psets) {
+      if (this.psetName && pset.name !== this.psetName) continue;
+      const prop = pset.properties.find((p) => p.name === this.propertyName);
+      if (!prop) continue;
+      const v = prop.value;
+      if (typeof v === 'string' && v !== '') return v;
+      if (typeof v === 'number' || typeof v === 'bigint') return String(v);
+    }
     return '';
   }
 }
@@ -189,15 +173,19 @@ export async function buildIdentifierIndex(
   const start = performance.now();
   const chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
   const signal = options.signal;
-  // Unanchored: the code may be embedded in a longer value ("Dvere DD02.05.04").
-  const re = compileIdentifierSearchPattern(config.pattern);
-  // Anchored twin — validates COMPOSED occurrence keys (code + '.' + Mark) so
-  // an id-like Mark ('1403083') can't mint a junk key via a partial match.
-  const reFull = compileIdentifierPattern(config.pattern);
+  // Unanchored searches: the code may be embedded in a longer value
+  // ("Family.CC:DD01.02 - desc:id"). Type and occurrence shapes are separate,
+  // user-configurable regexes.
+  const typeSearch = compileIdentifierSearchPattern(config.pattern);
+  const occSearch = compileIdentifierSearchPattern(config.occurrence.pattern);
+  // Anchored twin — validates COMPOSED occurrence keys (type code + '.' +
+  // discriminator) so an id-like Mark ('1403083') can't mint a junk key.
+  const occFull = compileIdentifierPattern(config.occurrence.pattern);
+  const occMode = config.occurrence.mode;
   const byCode = new Map<string, IdentifierTarget[]>();
   let scannedEntities = 0;
 
-  if (!re || config.sources.length === 0) {
+  if ((!typeSearch && !occSearch) || config.sources.length === 0) {
     return { byCode, scannedEntities, buildTimeMs: performance.now() - start };
   }
 
@@ -217,7 +205,7 @@ export async function buildIdentifierIndex(
 
     const tagReader = new TagReader(store);
     const psetReaders = new Map<IdentifierSource, PsetValueReader>();
-    for (const source of config.sources) {
+    for (const source of [...config.sources, ...config.occurrence.discriminatorSources]) {
       if (source.kind === 'pset') {
         psetReaders.set(
           source,
@@ -273,9 +261,13 @@ export async function buildIdentifierIndex(
           const haystack = isCaseSensitiveSource(source.kind)
             ? rawValue.trim()
             : normalizeIdentifier(rawValue);
-          const match = haystack ? re.exec(haystack) : null;
-          const code = match?.[0] ?? '';
-          if (!code) continue;
+          if (!haystack) continue;
+          // Direct occurrence extraction first (its pattern is stricter/longer
+          // than the type shape), then the type code.
+          const occCode =
+            occMode !== 'composed' && occSearch ? (occSearch.exec(haystack)?.[0] ?? '') : '';
+          const typeCode = typeSearch ? (typeSearch.exec(haystack)?.[0] ?? '') : '';
+          if (!occCode && !typeCode) continue;
 
           // Openings (the hole cut for a door/window) inherit the host's code
           // but are never a meaningful link target — skip them so the picker
@@ -309,18 +301,26 @@ export async function buildIdentifierIndex(
               byCode.set(key, [target]);
             }
           };
-          register(code);
+          if (occCode) register(occCode);
+          if (typeCode && typeCode !== occCode) register(typeCode);
 
-          // Occurrence refinement: authoring tools keep only the TYPE code in
-          // the source field and the instance discriminator in `Mark` — the
-          // drawing prints `<type code>.<Mark>`. Register that composite key
-          // too (pattern-validated, so id-like Marks can't produce noise);
-          // type entities carry no Mark and skip this naturally.
-          if (!isCaseSensitiveSource(source.kind) && reFull) {
-            const mark = normalizeIdentifier(readMarkProperty(store, expressId));
-            if (mark) {
-              const composite = `${code}.${mark}`;
-              if (reFull.test(composite)) register(composite);
+          // Composed occurrence key: the source field carries only the TYPE
+          // code and the instance discriminator lives in a separate field
+          // (configurable; default the Revit `Mark` shared parameter in any
+          // pset). Pattern-validated so id-like values can't mint junk keys;
+          // type entities carry no discriminator and skip this naturally.
+          if (
+            occMode !== 'direct' &&
+            typeCode &&
+            occFull &&
+            !isCaseSensitiveSource(source.kind)
+          ) {
+            for (const discSource of config.occurrence.discriminatorSources) {
+              const disc = normalizeIdentifier(readSource(discSource, row, expressId));
+              if (!disc) continue;
+              const composite = `${typeCode}.${disc}`;
+              if (occFull.test(composite)) register(composite);
+              break;
             }
           }
           break;
