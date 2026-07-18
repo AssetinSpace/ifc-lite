@@ -281,6 +281,14 @@ function collectTokens(items: readonly PdfTextItemLike[]): PageToken[] {
 export function findIdentifierBoxes(
   items: readonly PdfTextItemLike[],
   pattern: RegExp,
+  /**
+   * Optional "is this code in the model?" predicate. When given, split
+   * fragments are joined KNOWN-code-first: a `DD01` label pairs with its real
+   * `05.03` door code before a nearby `900` dimension can consume it (both
+   * `DD01.900` and `DD01.05.03` match the pattern, but only the door exists).
+   * Without it, all pattern-valid joins compete purely on distance.
+   */
+  isKnownCode?: (code: string) => boolean,
 ): PageLinkBox[] {
   // Reassemble per-glyph CAD output into words first — see mergeTextItems.
   const tokens = collectTokens(mergeTextItems(items));
@@ -307,39 +315,31 @@ export function findIdentifierBoxes(
     (t) => !t.matched && t.raw.length <= MAX_FRAGMENT_CHARS && /[0-9A-Za-z]/.test(t.raw),
   );
   const used = new Set<PageToken>();
-  for (let i = 0; i < fragments.length; i++) {
-    const a = fragments[i];
-    if (used.has(a)) continue;
-    let best: { token: PageToken; dist: number } | null = null;
-    for (let j = 0; j < fragments.length; j++) {
-      if (i === j) continue;
-      const b = fragments[j];
-      if (used.has(b)) continue;
-      const dist = Math.hypot(a.cx - b.cx, a.cy - b.cy);
-      if (dist > PROXIMITY_PT) continue;
-      // Fragments of one label share a text direction (rotated labels too).
-      if (a.ux * b.ux + a.uy * b.uy < 0.9) continue;
-      // Reading order IN THE TEXT'S OWN FRAME: stacks join top→bottom, rows
-      // join left→right — judged along the baseline/up axes, so rotated
-      // labels (whose stack axis is not the viewed y) order correctly.
-      // Only the pair's FIRST fragment initiates the join, so each pair is
-      // considered exactly once with a deterministic order.
-      const dAlong = Math.abs(a.alongC - b.alongC);
-      const dUp = Math.abs(a.upC - b.upC);
-      const aFirst = dUp > dAlong ? a.upC > b.upC : a.alongC < b.alongC;
-      if (!aFirst) continue;
-      if (!matchesEitherForm(pattern, `${a.raw}.${b.raw}`)) continue;
-      if (!best || dist < best.dist) best = { token: b, dist };
-    }
-    if (!best) continue;
-    const b = best.token;
+
+  const pairCode = (a: PageToken, b: PageToken): string | null => {
+    const dist = Math.hypot(a.cx - b.cx, a.cy - b.cy);
+    if (dist > PROXIMITY_PT) return null;
+    // Fragments of one label share a text direction (rotated labels too).
+    if (a.ux * b.ux + a.uy * b.uy < 0.9) return null;
+    // Reading order IN THE TEXT'S OWN FRAME: stacks join top→bottom, rows join
+    // left→right — judged along the baseline/up axes so rotated labels order
+    // correctly. Only the pair's FIRST fragment initiates the join.
+    const dAlong = Math.abs(a.alongC - b.alongC);
+    const dUp = Math.abs(a.upC - b.upC);
+    const aFirst = dUp > dAlong ? a.upC > b.upC : a.alongC < b.alongC;
+    if (!aFirst) return null;
+    const joined = `${a.raw}.${b.raw}`;
+    return matchesEitherForm(pattern, joined) ? joined : null;
+  };
+
+  const emit = (a: PageToken, b: PageToken, joined: string) => {
     used.add(a);
     used.add(b);
     const minX = Math.min(a.x, b.x);
     const minY = Math.min(a.y, b.y);
     boxes.push({
-      code: normalizeIdentifier(`${a.raw}.${b.raw}`),
-      exactKey: `${a.raw}.${b.raw}`,
+      code: normalizeIdentifier(joined),
+      exactKey: joined,
       raw: `${a.raw} ${b.raw}`,
       x: minX,
       y: minY,
@@ -347,7 +347,31 @@ export function findIdentifierBoxes(
       h: Math.max(a.y + a.h, b.y + b.h) - minY,
       layer: 'proximity',
     });
-  }
+  };
+
+  // One pass: pair each still-unused fragment with its nearest unused partner
+  // whose joined code satisfies `accept`. `requireKnown` runs first so real
+  // model codes claim their fragments before dimension-shaped noise can.
+  const joinPass = (accept: (code: string) => boolean) => {
+    for (let i = 0; i < fragments.length; i++) {
+      const a = fragments[i];
+      if (used.has(a)) continue;
+      let best: { token: PageToken; joined: string; dist: number } | null = null;
+      for (let j = 0; j < fragments.length; j++) {
+        if (i === j) continue;
+        const b = fragments[j];
+        if (used.has(b)) continue;
+        const joined = pairCode(a, b);
+        if (!joined || !accept(normalizeIdentifier(joined))) continue;
+        const dist = Math.hypot(a.cx - b.cx, a.cy - b.cy);
+        if (!best || dist < best.dist) best = { token: b, joined, dist };
+      }
+      if (best) emit(a, best.token, best.joined);
+    }
+  };
+
+  if (isKnownCode) joinPass((code) => isKnownCode(code));
+  joinPass(() => true);
 
   return boxes;
 }
