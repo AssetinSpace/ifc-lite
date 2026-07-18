@@ -93,7 +93,15 @@ export function IdentifierLinkSettings() {
                 don't appear. Always shown while enabled so it can't be missed. */}
             {config.enabled && (
               <div className="rounded border border-amber-500/40 bg-amber-500/5 p-1.5 text-[11px] leading-snug">
-                <div className="font-medium">Drawing scan</div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium">Drawing scan</span>
+                  {/* Build stamp here (top, always visible) so the running
+                      version is confirmable without scrolling — stale-cache
+                      triage on mobile where the console isn't reachable. */}
+                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground/70">
+                    build {__BUILD_SHA__}
+                  </span>
+                </div>
                 {!scanStats && (
                   <div className="text-muted-foreground">
                     Open a PDF drawing/document to scan its text for codes.
@@ -273,12 +281,6 @@ export function IdentifierLinkSettings() {
               {status === 'error' && 'Index build failed — see console.'}
               {status === 'idle' && config.enabled && 'Index will build once a model is loaded.'}
               {status === 'idle' && !config.enabled && 'Enable to build the identifier index.'}
-            </p>
-
-            {/* Deployed-build stamp — lets users confirm which version a
-                browser is actually running (stale-cache triage). */}
-            <p className="text-[10px] text-muted-foreground/70">
-              build {__BUILD_SHA__}
             </p>
       </div>
     </div>
