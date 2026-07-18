@@ -39,6 +39,8 @@ export interface IdentifierTarget {
   typeName: string;
   /** GlobalId of the containing storey; '' when not storey-contained. */
   storeyGuid: string;
+  /** Display name of the containing storey (candidate-picker context). */
+  storeyName: string;
   /** Which configured source produced the value. */
   sourceKind: IdentifierSourceKind;
   /** The raw (pre-normalization) identifier value. */
@@ -265,6 +267,7 @@ export async function buildIdentifierIndex(
             name: nameCol[row] !== 0 ? strings.get(nameCol[row]) : '',
             typeName,
             storeyGuid: storeyId !== undefined ? table.getGlobalId(storeyId) : '',
+            storeyName: storeyId !== undefined ? table.getName(storeyId) : '',
             sourceKind: source.kind,
             rawValue,
           };
