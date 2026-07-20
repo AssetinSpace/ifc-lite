@@ -1476,7 +1476,7 @@ export function PropertiesPanel() {
 
       {/* IFC Attributes */}
       {renderedAttributes.length > 0 && (
-        <Collapsible defaultOpen className="border-b">
+        <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
             <Tag className="h-4 w-4 text-muted-foreground" />
             <span className="font-medium text-sm">Attributes</span>
@@ -1511,7 +1511,7 @@ export function PropertiesPanel() {
 
       {/* Spatial Containment - for spatial containers (Project, Site, Building, Storey) */}
       {renderedSpatialContainment && (
-        <Collapsible defaultOpen className="border-b">
+        <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
             <Layers className="h-4 w-4 text-emerald-600" />
             <span className="font-medium text-sm">Structure</span>
