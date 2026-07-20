@@ -1304,6 +1304,7 @@
     "parsePlacement: function",
     "placementWorldCorners: function",
     "serializePlacement: function",
+    "similarityFromAnchor: function",
     "similarityRotation: function",
     "similarityScale: function",
     "solveSimilarityFromCalibration: function",
