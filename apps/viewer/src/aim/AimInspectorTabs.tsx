@@ -15,6 +15,7 @@
 import { create } from 'zustand';
 import { Database, FileBox } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useViewerStore } from '@/store';
 import { useAimPanelStore } from './aimPanelStore';
 import { AimCard } from './AimCard';
 
@@ -44,6 +45,10 @@ export function AimInspectorTabs() {
   const panel = useAimPanelStore((s) => s.panel);
   const tab = useAimInspectorStore((s) => s.tab);
   const setTab = useAimInspectorStore((s) => s.setTab);
+  // On mobile the panel is one scroll column owned by the bottom sheet, so the
+  // AIM card must flow at natural height. A `flex-1` internal scroller would be
+  // squeezed by the header/tab bar above it (same failure the IFC tab hit).
+  const isMobile = useViewerStore((s) => s.isMobile);
 
   // No host / no selection: no tab bar, PropertiesPanel shows native content.
   if (!embedded || panel.status === 'idle') return null;
@@ -71,7 +76,7 @@ export function AimInspectorTabs() {
         </TabsList>
       </Tabs>
       {tab === 'aim' && (
-        <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className={isMobile ? '' : 'flex-1 min-h-0 overflow-y-auto'}>
           <AimCard />
         </div>
       )}
