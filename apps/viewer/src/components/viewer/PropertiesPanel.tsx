@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useMemo, useState, useCallback, useEffect } from 'react';
+import { useMemo, useState, useCallback, useEffect, type ReactNode } from 'react';
 import {
   Copy,
   Check,
@@ -71,6 +71,25 @@ const MATERIAL_DEF_TYPES = new Set([
   'IFCMATERIALCONSTITUENTSET',
   'IFCMATERIALLIST',
 ]);
+
+/**
+ * Scroll host for the Properties/Quantities/bSDD tab body.
+ *
+ * Desktop: a fixed-height Radix ScrollArea (`flex-1`) scrolls the tab content
+ * inside the statically-sized right panel.
+ *
+ * Mobile: the panel lives in a fixed-height bottom sheet whose own container
+ * already scrolls (ViewerLayout's MobileBottomSheet). A nested scroller there
+ * gets squeezed to ~0 by the header / AIM|IFC switch / attributes above it,
+ * making the tab content unreachable — and an auto-height Radix ScrollArea can
+ * collapse outright. So on mobile we render a plain passthrough div and let the
+ * sheet own the single scroll surface. Module-scope so the wrapper identity is
+ * stable across renders (no remount of the tab body).
+ */
+function TabScrollHost({ mobile, children }: { mobile: boolean; children: ReactNode }) {
+  if (mobile) return <div className="bg-white dark:bg-black">{children}</div>;
+  return <ScrollArea className="flex-1 bg-white dark:bg-black">{children}</ScrollArea>;
+}
 
 type DisplayProperty = { name: string; value: unknown; isMutated: boolean; type?: number; dataType?: string };
 type DisplayPropertySet = {
@@ -168,6 +187,14 @@ export function PropertiesPanel() {
   // the user has the merge-layers load setting active so they
   // understand the displayed solid is the aggregated representation.
   const mergeLayersActive = useViewerStore((s) => s.mergeLayers);
+  // On mobile the panel lives inside a fixed-height bottom sheet (see
+  // ViewerLayout's MobileBottomSheet). The desktop layout splits the panel into
+  // a fixed header region + a `flex-1` internal ScrollArea for the tab content —
+  // but in the short sheet the header / AIM|IFC switch / attributes eat the
+  // height and squeeze that inner scroller to ~0, so Properties/Quantities/bSDD
+  // become unreachable. On mobile we collapse the nested scroll and let the
+  // whole panel flow as one column, scrolled by the sheet.
+  const isMobile = useViewerStore((s) => s.isMobile);
   const { query, ifcDataStore, geometryResult, models, getQueryForModel } = useIfc();
 
   // Get model-aware query based on selectedEntity
@@ -1205,7 +1232,7 @@ export function PropertiesPanel() {
   const entityObjectType = renderedEntityObjectType;
 
   return (
-    <div {...tourAnchor(TOUR_ANCHORS.propertiesPanel)} className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+    <div {...tourAnchor(TOUR_ANCHORS.propertiesPanel)} className={`${isMobile ? 'min-h-full' : 'h-full'} flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black`}>
       {/* Entity Header */}
       <div className="p-4 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black space-y-3">
         <div className="flex items-start gap-3">
@@ -1449,7 +1476,7 @@ export function PropertiesPanel() {
 
       {/* IFC Attributes */}
       {renderedAttributes.length > 0 && (
-        <Collapsible defaultOpen className="border-b">
+        <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
             <Tag className="h-4 w-4 text-muted-foreground" />
             <span className="font-medium text-sm">Attributes</span>
@@ -1484,7 +1511,7 @@ export function PropertiesPanel() {
 
       {/* Spatial Containment - for spatial containers (Project, Site, Building, Storey) */}
       {renderedSpatialContainment && (
-        <Collapsible defaultOpen className="border-b">
+        <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
             <Layers className="h-4 w-4 text-emerald-600" />
             <span className="font-medium text-sm">Structure</span>
@@ -1507,7 +1534,7 @@ export function PropertiesPanel() {
       <Tabs
         value={propertiesActiveTab}
         onValueChange={(v) => setPropertiesActiveTab(v as 'properties' | 'quantities' | 'bsdd' | 'raw-step')}
-        className="flex-1 flex flex-col overflow-hidden"
+        className={isMobile ? 'flex flex-col' : 'flex-1 flex flex-col overflow-hidden'}
       >
         <TabsList className="properties-tabs-list w-full shrink-0">
           <TabsTrigger
@@ -1548,7 +1575,7 @@ export function PropertiesPanel() {
           </TabsTrigger>
         </TabsList>
 
-        <ScrollArea className="flex-1 bg-white dark:bg-black">
+        <TabScrollHost mobile={isMobile}>
           <TabsContent value="properties" className="m-0 p-3 overflow-hidden">
             {/* Task edit card — renders when exactly one Gantt task is
                 selected. Shown above any entity properties because the
@@ -1781,7 +1808,7 @@ export function PropertiesPanel() {
               </p>
             )}
           </TabsContent>
-        </ScrollArea>
+        </TabScrollHost>
       </Tabs>
       {/* >>> AIM-FORK: koniec wrappera natívneho obsahu (D-077) */}
       </div>
