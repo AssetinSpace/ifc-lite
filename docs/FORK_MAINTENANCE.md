@@ -81,6 +81,17 @@ a **PR in this repo**. On merge conflicts it still opens the PR (with the
 conflict markers committed) and labels it so a human finishes the merge. It never
 touches `LTplus-AG/ifc-lite`.
 
+**CI workflows are not synced.** After merging, the job restores
+`.github/workflows/` to the fork's version, so the pushed branch never modifies
+workflow files. This is deliberate on two counts: the fork intentionally
+customizes CI (Depot→ubuntu-latest, upstream-only job guards, thin LTO — see the
+sections below), and the built-in `GITHUB_TOKEN` cannot push workflow changes at
+all ("refusing to allow a GitHub App to create or update workflow … without
+`workflows` permission") — which is exactly what made the first scheduled run
+fail. If upstream changed any workflow file, the sync PR body flags it with the
+`git diff HEAD upstream/main -- .github/workflows/` command so you can port
+anything worth keeping by hand.
+
 ## Verify after a sync
 
 ```bash

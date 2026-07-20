@@ -4,6 +4,13 @@
 # nothing is ever pushed to LTplus-AG/ifc-lite. On a clean merge it opens a PR
 # against `main`; on conflicts it commits the conflict markers and opens the PR
 # anyway, labelled so a human finishes the merge (see docs/FORK_MAINTENANCE.md).
+#
+# CI workflow files (.github/workflows/) are deliberately NOT merged from
+# upstream: the fork keeps its own CI (Depot→ubuntu-latest, upstream-only job
+# guards, thin LTO), and the default GITHUB_TOKEN cannot push workflow changes
+# anyway ("refusing to allow a GitHub App to ... without workflows permission").
+# The merge step restores them to our version; if upstream changed them, the PR
+# body flags it so a human can port anything worth keeping.
 name: Upstream sync
 
 on:
@@ -65,14 +72,39 @@ jobs:
         if: steps.check.outputs.up_to_date == 'false'
         id: merge
         run: |
+          BASE_SHA="$(git rev-parse HEAD)"
           git switch -c "${{ steps.vars.outputs.branch }}"
-          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
-            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+
+          # Record whether upstream touched CI workflows (for the PR body). We do
+          # NOT merge those changes — see the restore below.
+          if git diff --quiet "$BASE_SHA" "upstream/$UPSTREAM_BRANCH" -- .github/workflows/; then
+            echo "workflow_changes=false" >> "$GITHUB_OUTPUT"
           else
+            echo "workflow_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            CONFLICTS=false
+          else
+            CONFLICTS=true
+          fi
+
+          # Always keep OUR .github/workflows/. Wipe + restore from base so no
+          # pushed commit modifies workflow files (incl. any upstream newly added),
+          # which would be rejected without the `workflows` token permission.
+          rm -rf .github/workflows
+          git checkout "$BASE_SHA" -- .github/workflows
+          git add -A
+
+          if [ "$CONFLICTS" = "true" ]; then
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
             # Commit the conflicted tree as-is so the PR shows the markers.
-            git add -A
-            git commit --no-edit -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }} (CONFLICTS — needs manual resolution)"
+            git commit --no-edit -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }} (CONFLICTS — needs manual resolution; CI workflows kept from fork)"
+          else
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            # The clean merge auto-committed with upstream's workflow files; fold
+            # the restore into that same commit so the branch never touches them.
+            git commit --amend --no-edit
           fi
 
       - name: Push sync branch
@@ -100,6 +132,9 @@ jobs:
             TITLE="Upstream sync ${{ steps.vars.outputs.upstream_sha }}"
             LABELS="upstream-sync"
             BODY=$'Automated clean merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\nCI gates this PR. Review the diff, then merge → Vercel deploys. See `docs/FORK_MAINTENANCE.md`.'
+          fi
+          if [ "${{ steps.merge.outputs.workflow_changes }}" = "true" ]; then
+            BODY="$BODY"$'\n\n⚙️ **Upstream changed CI workflow files** (`.github/workflows/`) — these were **kept from the fork** and are NOT in this PR (the fork maintains its own CI; the sync token cannot push workflow changes). To review/port anything worth keeping:\n\x60\x60\x60\ngit diff HEAD upstream/'"${UPSTREAM_BRANCH}"$' -- .github/workflows/\n\x60\x60\x60'
           fi
           gh pr create \
             --base "$BASE_BRANCH" \
