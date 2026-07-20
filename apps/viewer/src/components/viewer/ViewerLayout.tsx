@@ -807,8 +807,14 @@ function MobileBottomSheet({
     const h = window.visualViewport?.height ?? window.innerHeight;
     return {
       collapsed: 0,
-      defaultH: Math.round(h * 0.6),
-      expanded: Math.round(h * 0.92),
+      // Open tall by default: panels like Hierarchy split their body into
+      // internally-scrolled sections (Storeys / Models) whose lists are
+      // virtualized, so they need a bounded-but-generous height to be usable.
+      // At 60% those sections collapsed to a couple of rows and read as
+      // "can't scroll"; 85% gives every panel real room. Drag-down still
+      // snaps to a shorter state or dismisses.
+      defaultH: Math.round(h * 0.85),
+      expanded: Math.round(h * 0.95),
     };
   }, []);
 
