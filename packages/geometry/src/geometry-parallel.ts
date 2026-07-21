@@ -31,84 +31,10 @@ import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostic
 import { computeWorkerCount } from './worker-count.js';
 import type { BatchSizingConfig } from './batch-sizing.js';
 import { notifyIfWasmAssetUnavailable, notifyIfWorkerScriptUnavailable } from './wasm-asset-error.js';
-
-/**
- * Compile the geometry engine's `WebAssembly.Module` ONCE per session and share
- * that single compiled module to every geometry + pre-pass worker.
- *
- * Before this, each of the N geometry workers PLUS the pre-pass worker called
- * wasm-bindgen `init()`, which fetches and COMPILES the ~3.9 MB binary
- * independently. Four-to-five parallel compiles of a multi-MB module contend on
- * the CPU, producing a multi-second "WASM ready" stagger (one worker finishes
- * ~3 s, the rest ~8-22 s) before any geometry is meshed — and on large files
- * the extra startup latency tips the geometry stream past the stall watchdog.
- *
- * A `WebAssembly.Module` is structured-cloneable and cheap to instantiate per
- * worker (`initSync`, ~tens of ms), so compiling once on the main thread and
- * broadcasting the module removes the N× compile entirely.
- *
- * Cached module-level so repeated loads in one session (federation, reload,
- * export) reuse the already-compiled module. Resolves to `null` — the caller
- * then leaves each worker on its own `init()` — when the URL can't be resolved
- * or compilation fails, so non-Vite consumers and offline/edge failures degrade
- * to the previous behaviour rather than breaking.
- */
-// Keyed by the RESOLVED wasm URL, not a single global slot: federation / version
-// skew can load a DIFFERENT binary in the same session, and returning the first
-// compiled module for a later, incompatible URL would initialize the worker's
-// wasm-bindgen glue against the wrong module. One promise per distinct binary.
-const sharedWasmModulePromises = new Map<string, Promise<WebAssembly.Module | null>>();
-
-function resolveWasmUrl(explicitUrl?: string): string | URL | null {
-  if (explicitUrl) return explicitUrl;
-  try {
-    // Source-aliased (Vite) build: the sibling `@ifc-lite/wasm` package's
-    // binary, resolved relative to THIS module. Vite statically rewrites this
-    // `new URL(..., import.meta.url)` to the emitted, content-hashed asset URL
-    // — the same asset the worker's wasm-bindgen glue resolves. In a plain
-    // tsc/npm build it resolves against dist/ and may 404, which the caller
-    // treats as "no shared module" and falls back to per-worker init.
-    return new URL('../../wasm/pkg/ifc-lite_bg.wasm', import.meta.url);
-  } catch {
-    return null;
-  }
-}
-
-async function compileSharedWasmModule(explicitUrl?: string): Promise<WebAssembly.Module | null> {
-  if (typeof WebAssembly === 'undefined') return null;
-  const url = resolveWasmUrl(explicitUrl);
-  if (!url) return null;
-  const cacheKey = url instanceof URL ? url.href : url;
-  const cached = sharedWasmModulePromises.get(cacheKey);
-  if (cached) return cached;
-  const p = (async (): Promise<WebAssembly.Module | null> => {
-    try {
-      if (typeof WebAssembly.compileStreaming === 'function') {
-        try {
-          // Compile WHILE the binary downloads (one streaming fetch + compile
-          // for the whole pool).
-          return await WebAssembly.compileStreaming(fetch(url));
-        } catch {
-          // Some static hosts serve `.wasm` with the wrong MIME type, which
-          // rejects compileStreaming — fall through to the buffer path.
-        }
-      }
-      const resp = await fetch(url);
-      if (!resp.ok) return null;
-      return await WebAssembly.compile(await resp.arrayBuffer());
-    } catch (err) {
-      console.warn('[stream] shared wasm compile failed; workers will self-init:', err);
-      return null;
-    }
-  })();
-  sharedWasmModulePromises.set(cacheKey, p);
-  const result = await p;
-  // Don't cache a failure — evict ONLY this URL's entry so the next load retries
-  // (a transient fetch error shouldn't permanently disable the shared-module fast
-  // path for the session), while other URLs' successful modules stay cached.
-  if (result === null) sharedWasmModulePromises.delete(cacheKey);
-  return result;
-}
+// The compiled-module memo lives in its own module so the main-thread
+// `IfcLiteBridge.init()` path can reuse whatever this pool already compiled
+// (and vice versa) instead of fetching the same binary a second time.
+import { compileSharedWasmModule } from './wasm-shared-module.js';
 
 /**
  * Plan content-affinity routing for one chunk: assign each job (by index) to a
