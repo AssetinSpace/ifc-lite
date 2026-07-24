@@ -54,18 +54,36 @@ impl ParseQuery {
 /// Extract file data from multipart request.
 /// Automatically decompresses gzip-compressed files, refusing inputs whose
 /// decompressed size would exceed `max_file_size_mb`.
+///
+/// Reads the `file` field one chunk at a time (rather than buffering the
+/// whole field via `Field::bytes()`) so an oversized upload is caught and
+/// rejected — with a clean `FileTooLarge` -> 413, logged in
+/// `ApiError::into_response` — as soon as the running total crosses
+/// `max_file_size_mb`, instead of only after the entire body has been
+/// received. This also means the raw framework body limit
+/// (`DefaultBodyLimit`, set well above this ceiling in `main.rs`) is a
+/// defense-in-depth backstop, not the thing actually enforcing the limit.
 pub(crate) async fn extract_file(
     multipart: &mut Multipart,
     max_file_size_mb: usize,
 ) -> Result<bytes::Bytes, ApiError> {
     let max_bytes = max_file_size_mb.saturating_mul(1024 * 1024);
 
-    while let Some(field) = multipart.next_field().await? {
+    while let Some(mut field) = multipart.next_field().await? {
         let field_name = field.name().unwrap_or_default();
         tracing::debug!(field_name = %field_name, "Processing multipart field");
 
         if field_name == "file" {
-            let bytes = field.bytes().await?;
+            let mut buf = Vec::new();
+            while let Some(chunk) = field.chunk().await? {
+                if buf.len() + chunk.len() > max_bytes {
+                    return Err(ApiError::FileTooLarge {
+                        max_mb: max_file_size_mb,
+                    });
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            let bytes = bytes::Bytes::from(buf);
             let original_size = bytes.len();
             tracing::debug!(size = original_size, "Extracted file from multipart");
 
@@ -107,13 +125,7 @@ pub(crate) async fn extract_file(
                 );
                 return Ok(bytes::Bytes::from(decompressed));
             } else {
-                if bytes.len() > max_bytes {
-                    return Err(ApiError::FileTooLarge {
-                        max_mb: max_file_size_mb,
-                    });
-                }
-                // Already-buffered multipart Bytes: hand back the same
-                // allocation instead of a full `.to_vec()` copy.
+                // The chunked read loop above already enforces max_bytes.
                 return Ok(bytes);
             }
         }
@@ -215,94 +227,7 @@ fn unwrap_ifczip(
 }
 
 #[cfg(test)]
-mod ifczip_tests {
-    use super::*;
-    use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
+mod extract_file_tests;
 
-    const STEP: &str = "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;";
-    // Deliberately larger than the raw/gzip max the server would apply, so
-    // callers can pass a real ceiling.
-    const BIG: usize = 512 * 1024 * 1024;
-
-    /// Build an in-memory zip from `(name, content)` pairs (Stored so declared
-    /// uncompressed sizes are exact for the zip-bomb test).
-    fn make_zip(entries: &[(&str, &str)]) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = ZipWriter::new(&mut buf);
-            let opts =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            for (name, content) in entries {
-                zip.start_file(*name, opts).unwrap();
-                zip.write_all(content.as_bytes()).unwrap();
-            }
-            zip.finish().unwrap();
-        }
-        buf.into_inner()
-    }
-
-    #[test]
-    fn extracts_the_single_model_entry() {
-        let zip = make_zip(&[("model.ifc", STEP)]);
-        let out = unwrap_ifczip(&zip, BIG, 512).unwrap();
-        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), STEP);
-    }
-
-    #[test]
-    fn matches_ifcxml_case_insensitively_from_a_nested_path() {
-        let zip = make_zip(&[("nested/dir/Model.IFCXML", "<ifcXML/>")]);
-        let out = unwrap_ifczip(&zip, BIG, 512).unwrap();
-        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), "<ifcXML/>");
-    }
-
-    #[test]
-    fn ignores_referenced_resources_alongside_the_model() {
-        let zip = make_zip(&[("model.ifc", STEP), ("resources/texture.png", "not-a-png")]);
-        let out = unwrap_ifczip(&zip, BIG, 512).unwrap();
-        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), STEP);
-    }
-
-    #[test]
-    fn rejects_an_archive_with_no_model_entry() {
-        let zip = make_zip(&[("readme.txt", "hello")]);
-        let err = unwrap_ifczip(&zip, BIG, 512).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("no .ifc/.ifcxml entry")));
-    }
-
-    #[test]
-    fn rejects_an_archive_with_multiple_model_entries() {
-        let zip = make_zip(&[("a.ifc", STEP), ("b.ifc", STEP)]);
-        let err = unwrap_ifczip(&zip, BIG, 512).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("expected exactly one")));
-    }
-
-    #[test]
-    fn rejects_an_entry_over_the_size_ceiling() {
-        // model.ifc is ~60 bytes; a 10-byte ceiling trips the zip-bomb guard
-        // on the declared uncompressed size before decompressing.
-        let zip = make_zip(&[("model.ifc", STEP)]);
-        let err = unwrap_ifczip(&zip, 10, 1).unwrap_err();
-        assert!(matches!(err, ApiError::FileTooLarge { max_mb: 1 }));
-    }
-
-    #[test]
-    fn extracts_a_deflate_compressed_model_entry() {
-        // Real buildingSMART .ifcZIP containers are DEFLATE-compressed, not
-        // Stored. This exercises the actual `deflate` feature path so a
-        // mis-wired Cargo.toml feature fails here instead of only in production
-        // (UnsupportedArchive at decode time).
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = ZipWriter::new(&mut buf);
-            let opts =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-            zip.start_file("model.ifc", opts).unwrap();
-            zip.write_all(STEP.as_bytes()).unwrap();
-            zip.finish().unwrap();
-        }
-        let zip = buf.into_inner();
-        let out = unwrap_ifczip(&zip, BIG, 512).unwrap();
-        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), STEP);
-    }
-}
+#[cfg(test)]
+mod ifczip_tests;
