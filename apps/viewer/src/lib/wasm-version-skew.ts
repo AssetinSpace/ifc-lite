@@ -148,3 +148,128 @@ export function installWasmVersionSkewRecovery(): void {
 export function __resetWasmVersionSkewForTests(): void {
   installed = false;
 }
+
+// ── Telemetry noise suppression ──────────────────────────────────────────────
+// A version-skew wasm error is AUTO-RECOVERED: the handlers above reload the tab
+// onto fresh assets and the engine loads. But the exception is captured (by
+// PostHog autocapture, or our own captureException in the load catch) BEFORE the
+// reload navigates away, so a 100%-recovered condition still files an
+// `$exception` — and every rotated hash mints more. The result is a permanently
+// growing error-tracking issue for a class of failure the user never actually
+// experiences.
+//
+// We drop that noise WITHOUT hiding a genuinely-stuck deploy (new assets also
+// unreachable — CSP-blocked worker, a proxy rewriting every wasm to text/plain).
+// The distinguisher is recurrence: a recovered skew fires once or twice then is
+// gone; a genuine block keeps firing because the reload never fixes it. So we
+// suppress only the first few skew exceptions within a short window and let the
+// rest surface. The count decays, so a genuinely-new skew later in a long
+// session (a second deploy) gets a fresh suppression budget rather than being
+// mistaken for a persistent block.
+const SKEW_NOISE_COUNT_KEY = 'ifclite:wasm-skew-noise-count';
+const SKEW_NOISE_TS_KEY = 'ifclite:wasm-skew-noise-ts';
+// Flood cap for the PRE-reload window only: several workers can each throw the
+// same skew error in the tick before the reload navigates away. Anything after
+// a reload is judged by hasRecentReload above, not by this count.
+const SKEW_NOISE_SUPPRESS_MAX = 3;
+// Reset the counter when the last skew was longer ago than this, so an unrelated
+// later skew is judged on its own recurrence, not a stale count.
+const SKEW_NOISE_RESET_MS = 5 * 60_000;
+
+/** Extract the first exception message string from a PostHog `$exception` event. */
+function exceptionMessageOf(
+  event: { event?: string; properties?: Record<string, unknown> } | null,
+): string | undefined {
+  if (!event || event.event !== '$exception' || !event.properties) return undefined;
+  const list = event.properties.$exception_list;
+  if (Array.isArray(list)) {
+    for (const e of list) {
+      const v = (e as { value?: unknown })?.value;
+      if (typeof v === 'string' && v) return v;
+    }
+  }
+  const values = event.properties.$exception_values;
+  if (Array.isArray(values) && typeof values[0] === 'string') return values[0];
+  return undefined;
+}
+
+/** Storage-backed decaying counter of recent skew-noise exceptions. Injectable for tests. */
+export interface SkewNoiseDeps {
+  now: () => number;
+  read: (key: string) => string | null;
+  write: (key: string, value: string) => void;
+  /** Has a skew-recovery reload already run recently? See recentlyReloaded. */
+  hasRecentReload: (now: number) => boolean;
+}
+
+const defaultNoiseDeps: SkewNoiseDeps = {
+  now: () => Date.now(),
+  read: (k) => {
+    try { return sessionStorage.getItem(k); } catch { return null; }
+  },
+  hasRecentReload: recentlyReloaded,
+  write: (k, v) => {
+    try { sessionStorage.setItem(k, v); } catch { /* blocked storage — see below */ }
+  },
+};
+
+/**
+ * Decide whether a captured PostHog event is an auto-recovered wasm version-skew
+ * exception that should be dropped as noise. Returns `true` to DROP.
+ *
+ * Safe defaults: a non-skew event is never dropped; if the recurrence counter
+ * cannot be persisted (blocked storage) we do NOT suppress — better a little
+ * noise than hiding a failure, and a storage-blocked tab never auto-reloads
+ * anyway (it surfaces the error for a manual reload), so keeping it is correct.
+ */
+export function shouldSuppressWasmSkewNoise(
+  event: { event?: string; properties?: Record<string, unknown> } | null,
+  deps: SkewNoiseDeps = defaultNoiseDeps,
+): boolean {
+  const message = exceptionMessageOf(event);
+  if (message === undefined || !isWasmAssetUnavailableError(message)) return false;
+
+  const now = deps.now();
+
+  // THE decisive signal: a recovery reload has already run for this episode and
+  // we are STILL seeing the error, so the reload did not fix it — this is the
+  // genuinely-stuck deploy (CSP-blocked worker, a proxy rewriting every wasm)
+  // that must reach error tracking. Surface it immediately rather than spending
+  // the suppression budget on it: a stuck user typically hits this once and
+  // gives up, so counting it as "noise" would hide exactly the case this gate
+  // exists to catch.
+  if (deps.hasRecentReload(now)) return false;
+
+  const lastTs = Number(deps.read(SKEW_NOISE_TS_KEY));
+  const decayed = !Number.isFinite(lastTs) || now - lastTs > SKEW_NOISE_RESET_MS;
+  const prior = decayed ? 0 : Number(deps.read(SKEW_NOISE_COUNT_KEY)) || 0;
+  const count = prior + 1;
+
+  // Persist the running count + timestamp, then confirm the write actually
+  // stuck. A blocked store (private mode / sandboxed embed) would otherwise
+  // pin the count at 1 forever and suppress EVERY skew exception — hiding a
+  // genuine persistent block. If we can't bound the count across events we must
+  // not suppress: a storage-blocked tab surfaces the error for a manual reload
+  // (it never auto-reloads either, per the reload veto above), so keeping the
+  // exception is the correct, consistent default.
+  deps.write(SKEW_NOISE_COUNT_KEY, String(count));
+  deps.write(SKEW_NOISE_TS_KEY, String(now));
+  // BOTH reads must confirm. The timestamp is not incidental: if only it fails
+  // to persist, every later call sees no `lastTs`, treats the episode as
+  // decayed, resets the count to 1 and suppresses forever — the same runaway,
+  // just reached through the decay branch instead of the counter.
+  if (
+    deps.read(SKEW_NOISE_COUNT_KEY) !== String(count) ||
+    deps.read(SKEW_NOISE_TS_KEY) !== String(now)
+  ) {
+    return false;
+  }
+
+  return count <= SKEW_NOISE_SUPPRESS_MAX;
+}
+
+/** Test-only: clear the noise counter keys via the given deps. */
+export function __resetWasmSkewNoiseForTests(deps: SkewNoiseDeps = defaultNoiseDeps): void {
+  deps.write(SKEW_NOISE_COUNT_KEY, '0');
+  deps.write(SKEW_NOISE_TS_KEY, '0');
+}
