@@ -10,6 +10,7 @@ import {
   renderFrame,
   renderTitleBlock,
   calculateDrawingTransform,
+  exportToDXF,
   type Drawing2D,
   type DrawingSheet,
   type ElementData,
@@ -21,6 +22,10 @@ import { formatArea, computePolygonCentroid } from '@/components/viewer/tools/co
 import { generateCloudSVGPath } from '@/components/viewer/tools/cloudPathGenerator';
 import type { PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D } from '@/store/slices/drawing2DSlice';
 import type { DxfUnderlayRenderData } from '@/hooks/useDxfUnderlay';
+import type { GeometryResult } from '@ifc-lite/geometry';
+import type { IfcDataStore } from '@ifc-lite/parser';
+import { useViewerStore } from '@/store';
+import { buildDxfExportTransform, resolveDxfExportGeoreference } from '@/hooks/dxfExportGeoref';
 
 /** Map a DXF vertical justification onto an SVG dominant-baseline. */
 function dxfValignToBaseline(valign: 'baseline' | 'bottom' | 'middle' | 'top'): string {
@@ -104,7 +109,7 @@ function buildDxfUnderlaySvg(
 interface UseDrawingExportParams {
   drawing: Drawing2D | null;
   displayOptions: { showHiddenLines: boolean; scale: number };
-  sectionPlane: { axis: 'down' | 'front' | 'side'; position: number; flipped: boolean };
+  sectionPlane: { axis: 'down' | 'front' | 'side'; position: number; flipped: boolean; custom?: unknown };
   activePresetId: string | null;
   entityColorMap: Map<number, [number, number, number, number]>;
   overridesEnabled: boolean;
@@ -117,11 +122,16 @@ interface UseDrawingExportParams {
   activeSheet: DrawingSheet | null;
   /** DXF underlays pre-mapped to drawing space, rendered beneath the drawing (issue #1782) */
   dxfUnderlays: readonly DxfUnderlayRenderData[];
+  /** Legacy single-model data store — the anchor-selection fallback for the DXF georeference lookup (issue #1861); federated models come from the store's `models` map. */
+  ifcDataStore: IfcDataStore | null;
+  /** Geometry coordinate info (RTC offset + origin shift), for the DXF world-coordinate re-derivation (issue #1861). */
+  coordinateInfo: GeometryResult['coordinateInfo'] | undefined;
 }
 
 interface UseDrawingExportResult {
   formatDistance: (distance: number) => string;
   handleExportSVG: () => void;
+  handleExportDXF: () => void;
   handlePrint: () => void;
 }
 
@@ -140,7 +150,21 @@ function useDrawingExport({
   sheetEnabled,
   activeSheet,
   dxfUnderlays,
+  ifcDataStore,
+  coordinateInfo,
 }: UseDrawingExportParams): UseDrawingExportResult {
+  // Georef inputs for the DXF export (PR #1871 review, P1): placement edits
+  // applied in CesiumPlacementEditor live in `georefMutations` (per model
+  // id), not in `ifcDataStore`, and in a federation the georef frame is the
+  // ANCHOR model's, not necessarily the legacy store's. Subscribe to the
+  // same store fields ViewportContainer's Cesium georef memo reads so
+  // `resolveDxfExportGeoreference` sees the identical inputs.
+  const storeModels = useViewerStore((s) => s.models);
+  const anchorModelIdOverride = useViewerStore((s) => s.anchorModelIdOverride);
+  const georefMutations = useViewerStore((s) => s.georefMutations);
+  // Georef edits replace the map, but subscribe to mutationVersion too so the
+  // dependency is explicit (matches ViewportContainer / useAnchorGeoreference).
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
 
   // Generate SVG that matches the canvas rendering exactly
   const generateExportSVG = useCallback((): string | null => {
@@ -741,6 +765,58 @@ function useDrawingExport({
     posthog.capture('drawing_exported', { format: 'svg', axis: sectionPlane.axis, sheet_enabled: sheetEnabled });
   }, [generateExportSVG, generateSheetSVG, sheetEnabled, activeSheet, sectionPlane]);
 
+  // Export DXF (issue #1861). Unlike SVG, DXF has no paper space, so this
+  // always exports the raw model-space drawing (sheet frame/title block are
+  // not represented) — real-world metres, with a plan ('down') section
+  // re-georeferenced to true IFC world coordinates (and further to
+  // map/CRS coordinates when the model has an IfcMapConversion). DXF
+  // reference underlays are not embedded in this export; see PR notes.
+  const handleExportDXF = useCallback(() => {
+    if (!drawing) return;
+    const isCustomPlane = sectionPlane.custom !== undefined;
+    // Anchor-model effective georef, INCLUDING user placement edits
+    // (georefMutations) — see resolveDxfExportGeoreference's docs. The
+    // drawing-frame `coordinateInfo` below is unrelated: it undoes the
+    // render-frame shift and stays the merged drawing's regardless of which
+    // model anchors the georef.
+    const georeference = resolveDxfExportGeoreference({
+      models: storeModels,
+      legacyDataStore: ifcDataStore,
+      legacyCoordinateInfo: coordinateInfo,
+      anchorModelIdOverride,
+      georefMutations,
+    });
+    const coordinateTransform = buildDxfExportTransform({
+      coordinateInfo,
+      sectionAxis: sectionPlane.axis,
+      isCustomPlane,
+      flipped: sectionPlane.flipped,
+      georeference,
+    });
+    const isGeoreferenced = georeference !== null && sectionPlane.axis === 'down' && !isCustomPlane;
+    // R12 has no $INSUNITS (see dxf/writer.ts); state the unit — and the
+    // target CRS when the export is actually map-projected — in the 999
+    // comment every DXF reader shows a human but none need to parse.
+    const metadataComment = isGeoreferenced
+      ? `ifc-lite section export - units: metres, CRS: ${georeference!.projectedCRS.name || 'unknown'}`
+      : undefined;
+    const dxf = exportToDXF(drawing, {
+      showHiddenLines: displayOptions.showHiddenLines,
+      coordinateTransform,
+      metadataComment,
+    });
+    const stem = `section-${sectionPlane.axis}-${sectionPlane.position}`;
+    downloadFile(dxf, `${stem}.dxf`, 'application/dxf');
+    posthog.capture('drawing_exported', {
+      format: 'dxf',
+      axis: sectionPlane.axis,
+      georeferenced: isGeoreferenced,
+    });
+  }, [
+    drawing, displayOptions.showHiddenLines, sectionPlane, ifcDataStore, coordinateInfo,
+    storeModels, anchorModelIdOverride, georefMutations, mutationVersion,
+  ]);
+
   // Print handler
   const handlePrint = useCallback(() => {
     // Use sheet export if enabled, otherwise raw drawing export
@@ -812,6 +888,7 @@ function useDrawingExport({
   return {
     formatDistance,
     handleExportSVG,
+    handleExportDXF,
     handlePrint,
   };
 }
