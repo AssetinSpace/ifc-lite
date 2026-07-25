@@ -26,6 +26,7 @@ import {
   type PointCloudNode,
   type PointCloudNodeMeta,
 } from './point-cloud-node.js';
+import type { PointCloudSpatialIndex } from './point-cloud-spatial-index.js';
 import {
   normalizeClassMask,
   writePointCloudUniforms,
@@ -428,6 +429,35 @@ export class PointCloudRenderer {
         expressId: node.meta.expressId,
         modelIndex: node.meta.modelIndex,
         chunks: node.chunks.map((c) => ({ vertexBuffer: c.vertexBuffer, pointCount: c.pointCount })),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Snapshot of every node's CPU spatial index (issue #1860), for the
+   * measure tool's ray-based point snapping (`RaycastEngine`). Skips
+   * empty nodes, mirroring `getPickNodes`. Each source carries the
+   * CURRENT class visibility bitmask so the query skips points the
+   * splat shader is hiding (#1783) — snapping to invisible scan data
+   * would otherwise silently corrupt measurements.
+   */
+  getRayQuerySources(): Array<{
+    expressId: number;
+    modelIndex?: number;
+    index: PointCloudSpatialIndex;
+    classMask: Uint32Array;
+  }> {
+    const out: Array<{ expressId: number; modelIndex?: number; index: PointCloudSpatialIndex; classMask: Uint32Array }> = [];
+    for (const node of this.nodes.values()) {
+      if (node.spatialIndex.pointCount === 0) continue;
+      out.push({
+        expressId: node.meta.expressId,
+        modelIndex: node.meta.modelIndex,
+        index: node.spatialIndex,
+        // Live reference — read synchronously within one query, and
+        // `setOptions` replaces (never mutates in place) the array.
+        classMask: this.options.classMask,
       });
     }
     return out;
