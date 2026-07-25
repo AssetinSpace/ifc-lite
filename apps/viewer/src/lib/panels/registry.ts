@@ -33,6 +33,7 @@ import {
   Layers as LayersIcon,
   Map as MapIcon,
   Files,
+  Box,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -56,7 +57,8 @@ export type WorkspacePanelId =
   | 'collab'
   | 'layers'
   | 'drawing-underlay'
-  | 'documents';
+  | 'documents'
+  | 'zones';
 
 /** Activity-bar clustering — a divider is drawn whenever the group changes. */
 export type PanelGroup = 'navigate' | 'inspect' | 'review' | 'author' | 'work';
@@ -112,6 +114,9 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Project documents library (D-075 in the AIM repo): PDFs & images open as
   // tabs in the center document pane. APPENDED — frozen Alt mapping untouched.
   { id: 'documents', title: 'Documents', short: 'Docs', Icon: Files, group: 'navigate', region: 'side' },
+  // Location zones (construction sections / takt areas, #1810). APPENDED so
+  // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
+  { id: 'zones', title: 'Location zones', short: 'Zones', Icon: Box, group: 'review', region: 'side' },
 ];
 
 /** The bottom-strip panel ids, mapped to their store visibility flag + setter

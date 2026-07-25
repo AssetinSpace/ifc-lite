@@ -104,6 +104,7 @@ import type {
     PickClipState,
     ClipBox,
     Mesh,
+    BatchedMesh,
     VisualEnhancementOptions,
     ContactShadingQuality,
     SeparationLinesQuality,
@@ -127,6 +128,7 @@ import { PickingManager } from './picking-manager.js';
 import { RaycastEngine } from './raycast-engine.js';
 import { PostProcessor } from './post-processor.js';
 import { InteractionEffectsGovernor } from './interaction-effects-governor.js';
+import { VisibilityEpochTracker } from './visibility-epoch.js';
 import { resolveContributionThresholdPx, projectedAabbRadiusPx, projectedInstancedRadiusPx, type CullCameraState } from './contribution-cull.js';
 import type { FrameStats } from './render-stats.js';
 import { EdlPass } from './edl-pass.js';
@@ -236,6 +238,16 @@ export class Renderer {
     /** Set true at the end of `init()`; gates `whenReady()`. */
     private ready = false;
     private readyWaiters: Array<() => void> = [];
+
+    /**
+     * Set once the GPU device is lost for a non-intentional reason (driver
+     * reset / VRAM exhaustion — see `WebGPUDevice`). Every GPU resource is then
+     * dead, so `render()` becomes a no-op (it would only spew validation errors)
+     * until the host re-initialises the renderer. Consumers learn of this via
+     * `onDeviceLost` and typically respond by reloading the model.
+     */
+    private deviceLost = false;
+    private deviceLostListeners = new Set<(info: { message: string; reason: string }) => void>();
     private deviationPipeline: DeviationPipeline | null = null;
     /**
      * Cache of which mesh-set the BVH was built from. We rebuild on
@@ -259,8 +271,11 @@ export class Renderer {
     private pickingManager: PickingManager;
     private raycastEngine: RaycastEngine;
 
-    // Error rate limiting (log at most once per second)
-    private lastRenderErrorTime: number = 0;
+    // Error rate limiting (log at most once per second). -Infinity, not 0:
+    // performance.now() is below 1000 during the first second of page life, so
+    // a 0 start would silently suppress the FIRST render/device-loss error —
+    // exactly the evidence worth keeping.
+    private lastRenderErrorTime: number = -Infinity;
     private readonly RENDER_ERROR_THROTTLE_MS = 1000;
 
     // Diagnostic counters for mobile debugging
@@ -275,6 +290,39 @@ export class Renderer {
     // Dirty flag: set by requestRender(), consumed by the animation loop.
     // Centralises all render scheduling — callers never call render() directly.
     private _renderRequested: boolean = false;
+
+    // ─── Visibility-change bookkeeping (per-frame perf + leak fixes) ─────────
+    // Hide/isolate changes are detected by CONTENT (snapshot compare in the
+    // tracker), so callers may either mutate the same Set in place or pass a
+    // fresh Set per frame — see the RenderOptions.hiddenIds contract.
+    // `_visibilityVersion` drives the per-batch visibility cache;
+    // `_partialBatchEpoch` additionally folds colour-override changes so the
+    // partial sub-batch cache fast path stays correct.
+    private readonly _visibilityEpochs = new VisibilityEpochTracker();
+    private _visibilityVersion: number = 0;
+    private _partialBatchEpoch: number = 0;
+    private _lastColorOverrideGen: number = -1;
+    private _lastHadVisibilityFiltering: boolean = false;
+    // Cached per-batch visibility, valid only while `_batchVisibilityEpoch`
+    // matches `_visibilityVersion`. Avoids the O(total element count) recompute
+    // (+ per-batch visible-id Set allocation) every frame while hide/isolate
+    // holds. Keyed by batch object (immutable expressIds per instance); a
+    // rebuilt batch is a new object → recomputed lazily. WeakMap, not Map:
+    // residency eviction/restore churn while ONE filter epoch holds (e.g. a
+    // schedule animation) would otherwise pin every dead batch object until
+    // the next visibility change.
+    private _batchVisibilityEpoch: number = -1;
+    private _batchVisibilityCache = new WeakMap<
+        BatchedMesh,
+        { visible: boolean; fullyVisible: boolean; visibleIds?: Set<number> }
+    >();
+    // Selection snapshot from the previous frame — a change triggers disposal of
+    // now-unselected hydrated meshes (leak + double-draw fix). The model index
+    // is part of the snapshot: federated models can share express ids, so a
+    // same-id selection in ANOTHER model is still a change that must free the
+    // old model's hydrated mesh.
+    private _prevHydratedSelection: Set<number> = new Set();
+    private _prevHydratedSelectionModelIndex: number | undefined = undefined;
 
     // One-shot log guard — prints Y-up clip bounds on first section-enable so
     // users can confirm the slider is operating on the intended range.
@@ -309,6 +357,13 @@ export class Renderer {
      * Initialize renderer
      */
     async init(): Promise<void> {
+        // Clear the lost flag so a re-init (destroy()+init() on the same instance)
+        // resumes rendering instead of staying a permanent no-op from an earlier loss.
+        this.deviceLost = false;
+        // Subscribe before the device exists so a loss during the first frames
+        // is never missed — the handler is only invoked when `device.lost`
+        // actually resolves (a real fault), long after init in practice.
+        this.device.onDeviceLost((info) => this.handleDeviceLost(info));
         await this.device.init(this.canvas);
 
         // Get canvas dimensions (use pixel dimensions if set, otherwise use CSS dimensions)
@@ -400,6 +455,11 @@ export class Renderer {
                 },
             };
         });
+        // Let the CPU raycast engine (measure tool / snap) query each
+        // point-cloud asset's spatial index (#1860) — a separate concern
+        // from the GPU click-pick provider above, since raycastScene* is
+        // synchronous CPU code while pick() is an async GPU readback.
+        this.raycastEngine.setPointCloudProvider(() => this.pointCloudRenderer?.getRayQuerySources() ?? []);
 
         this.markReady();
     }
@@ -422,6 +482,40 @@ export class Renderer {
         const waiters = this.readyWaiters;
         this.readyWaiters = [];
         for (const w of waiters) w();
+    }
+
+    /**
+     * Subscribe to non-intentional GPU device loss (driver reset / VRAM
+     * exhaustion — NOT an intentional `destroy()`). Fired at most once per
+     * device. After it fires, `render()` is a no-op until the renderer is
+     * re-initialised, so the typical response is to dispose this renderer and
+     * reload the model. Returns an unsubscribe function.
+     *
+     * Camera and model state live on the CPU (JS) and survive device loss, so a
+     * reload restores the model at its current orientation — the loss is a GPU
+     * event, not a data loss.
+     */
+    onDeviceLost(listener: (info: { message: string; reason: string }) => void): () => void {
+        this.deviceLostListeners.add(listener);
+        return () => this.deviceLostListeners.delete(listener);
+    }
+
+    /** True once the GPU device has been lost for a non-intentional reason. */
+    isDeviceLost(): boolean {
+        return this.deviceLost;
+    }
+
+    private handleDeviceLost(info: { message: string; reason: string }): void {
+        if (this.deviceLost) return;
+        this.deviceLost = true;
+        console.warn('[Renderer] GPU device lost — halting rendering until re-init:', info.message);
+        for (const listener of this.deviceLostListeners) {
+            try {
+                listener(info);
+            } catch (e) {
+                console.error('[Renderer] onDeviceLost listener threw:', e);
+            }
+        }
     }
 
     /**
@@ -1009,7 +1103,10 @@ export class Renderer {
         });
         device.queue.writeBuffer(indexBuffer, 0, meshData.indices);
 
-        // Add to scene with identity transform (positions already in world space)
+        // Add to scene with identity transform (positions already in world space).
+        // Flagged `hydrated` so it can be freed when its entity leaves the
+        // selection — these duplicate geometry already drawn by a batch and would
+        // otherwise accumulate + double-draw (see Scene.disposeHydratedMeshesExcept).
         this.scene.addMesh({
             expressId: meshData.expressId,
             modelIndex: meshData.modelIndex,  // Preserve modelIndex for multi-model selection
@@ -1018,6 +1115,71 @@ export class Renderer {
             indexCount: meshData.indices.length,
             transform: MathUtils.identity(),
             color: meshData.color,
+            hydrated: true,
+        });
+    }
+
+    /**
+     * On a selection change, free the hydrated (pick/selection-highlight)
+     * individual meshes whose entity is no longer selected. These duplicate
+     * geometry already drawn by a batch; without this they accumulate in
+     * scene.meshes (VRAM grows with selection history) and — for transparent
+     * entities — re-draw every frame on top of their still-drawn batch copy
+     * (double alpha-blend darkens glass). Currently-selected entities keep their
+     * hydrated meshes so the highlight pass doesn't rebuild them each change.
+     * No-op when the selection set is unchanged to avoid per-frame buffer churn.
+     * Selection identity is the (modelIndex, expressId) PAIR: federated models
+     * can share express ids, so re-selecting the same id in a different model
+     * must still free the previous model's hydrated mesh (it would otherwise
+     * stay resident and keep drawing unhighlighted).
+     */
+    private syncHydratedSelectionMeshes(
+        selected: ReadonlySet<number>,
+        selectedModelIndex: number | undefined,
+    ): void {
+        const prev = this._prevHydratedSelection;
+        let changed = selected.size !== prev.size
+            || selectedModelIndex !== this._prevHydratedSelectionModelIndex;
+        if (!changed) {
+            for (const id of selected) {
+                if (!prev.has(id)) { changed = true; break; }
+            }
+        }
+        if (!changed) return;
+        this._prevHydratedSelection = new Set(selected);
+        this._prevHydratedSelectionModelIndex = selectedModelIndex;
+        this.scene.disposeHydratedMeshesExcept(selected, selectedModelIndex);
+    }
+
+    /**
+     * Pop the frame's validation error scope, recording any captured validation
+     * error into the device diagnostics (getDiagnostics().gpuErrors). The pop
+     * itself REJECTS when the GPU device is lost while the scope is pending —
+     * often the only evidence of the loss — so the rejection is logged
+     * (throttled) and the context invalidated, never swallowed silently. Used
+     * by every render() exit path that pushed a scope, so push/pop stay
+     * balanced even on skipped or throwing frames.
+     */
+    private drainErrorScope(device: GPUDevice): void {
+        device.popErrorScope().then((error) => {
+            if (error) {
+                const msg = error.message || String(error);
+                console.error('[WebGPU] Validation error in render pass:', msg);
+                this.device._lastUncapturedError = `VALIDATION: ${msg}`;
+                this.device._uncapturedErrorCount++;
+            }
+        }).catch((error: unknown) => {
+            // popErrorScope() rejects (e.g. "Instance dropped in popErrorScope")
+            // when the GPU device is lost while the scope is still pending. This
+            // escapes the surrounding synchronous try/catch and would otherwise
+            // surface as an unhandled rejection. Treat it like any other device
+            // loss: invalidate the context so it reconfigures next frame.
+            this.device.invalidateContext();
+            const now = performance.now();
+            if (now - this.lastRenderErrorTime > this.RENDER_ERROR_THROTTLE_MS) {
+                this.lastRenderErrorTime = now;
+                console.warn('[WebGPU] popErrorScope rejected (device likely lost):', error);
+            }
         });
     }
 
@@ -1101,6 +1263,12 @@ export class Renderer {
 
     render(options: RenderOptions = {}): void {
         this._renderCallCount++;
+        // A lost device leaves every pipeline/buffer dead; rendering would only
+        // emit a stream of validation errors. Stay quiet until re-init.
+        if (this.deviceLost) {
+            this._renderSkipCount++;
+            return;
+        }
         if (!this.device.isInitialized() || !this.pipeline) {
             this._renderSkipCount++;
             return;
@@ -1195,12 +1363,37 @@ export class Renderer {
             && visualEnhancement.separationLines.quality !== 'off';
         const needsObjectIdPass = contactEnabled || separationEnabled;
 
-        let meshes = this.scene.getMeshes();
-
         // Check if visibility filtering is active
         const hasHiddenFilter = options.hiddenIds && options.hiddenIds.size > 0;
         const hasIsolatedFilter = options.isolatedIds !== null && options.isolatedIds !== undefined;
         const hasVisibilityFiltering = hasHiddenFilter || hasIsolatedFilter;
+
+        // ─── Visibility / override epoch bookkeeping ────────────────────────
+        // The tracker compares hide/isolate CONTENT against a snapshot, so both
+        // in-place mutation of the caller's Set and a fresh identical Set per
+        // frame behave correctly (see RenderOptions.hiddenIds). Bumping
+        // `_visibilityVersion` invalidates the per-batch visibility cache; the
+        // partial sub-batch cache additionally depends on colour-override
+        // promotion, so its epoch bumps on either.
+        const newVisibilityVersion = this._visibilityEpochs.update(options.hiddenIds, options.isolatedIds);
+        const visibilityChanged = newVisibilityVersion !== this._visibilityVersion;
+        this._visibilityVersion = newVisibilityVersion;
+        const colorOverrideGen = this.scene.getColorOverrideGeneration();
+        if (visibilityChanged || colorOverrideGen !== this._lastColorOverrideGen) {
+            this._lastColorOverrideGen = colorOverrideGen;
+            this._partialBatchEpoch++;
+        }
+
+        // When hide/isolate turns fully OFF (back to all-visible), release the
+        // partial sub-batch clones built while filtering. They are excluded from
+        // the GPU residency budget and are otherwise only freed on clear()/
+        // finalize/evict — never here — so ~model-sized clone VRAM would stay
+        // pinned until the next model reload. Any override-promotion sub-batches
+        // dropped alongside are rebuilt on demand next frame (cache miss).
+        if (this._lastHadVisibilityFiltering && !hasVisibilityFiltering) {
+            this.scene.dropAllPartialCaches();
+        }
+        this._lastHadVisibilityFiltering = hasVisibilityFiltering;
 
         // Build the selected-id set once per frame so the X-Ray override paths
         // can keep highlighted entities at full alpha without per-site checks.
@@ -1217,6 +1410,15 @@ export class Renderer {
             }
         }
         const hasSelected = selectedExpressIds.size > 0;
+
+        // Free hydrated (pick/selection) individual meshes whose entity is no
+        // longer selected BEFORE we snapshot the mesh list, so stale glass
+        // doesn't double-draw over its batch copy or accumulate until clear().
+        // Only acts on a selection change (avoids per-frame buffer churn) and
+        // never touches authored (non-hydrated) or batch geometry.
+        this.syncHydratedSelectionMeshes(selectedExpressIds, selectedModelIndex);
+
+        let meshes = this.scene.getMeshes();
 
         // Keep the GPU-instanced occurrences' per-instance selected flag in sync.
         // The Scene diff makes this a no-op (no writeBuffer) when the set is
@@ -1333,15 +1535,27 @@ export class Renderer {
         }
 
         // Push a validation error scope to capture the EXACT error (for mobile debugging)
-        // Only do this for the first few renders to avoid performance overhead
+        // Only do this for the first few renders to avoid performance overhead.
+        // Tracked with a flag (not just captureGpuError) so EVERY exit path below
+        // pops it exactly once — an unpopped scope silently swallows all later
+        // validation errors and blinds getDiagnostics().gpuErrors.
         const captureGpuError = this._renderCallCount <= 5;
+        let errorScopePushed = false;
         if (captureGpuError) {
             device.pushErrorScope('validation');
+            errorScopePushed = true;
         }
 
         // Get current texture safely - may return null if context needs reconfiguration
         const currentTexture = this.device.getCurrentTexture();
         if (!currentTexture) {
+            // Balance the pushed scope before bailing so it doesn't leak into
+            // the next frame; drainErrorScope logs a rejection (device loss)
+            // instead of swallowing the evidence.
+            if (errorScopePushed) {
+                errorScopePushed = false;
+                this.drainErrorScope(device);
+            }
             return; // Skip this frame, context will be reconfigured next frame
         }
 
@@ -1807,30 +2021,41 @@ export class Renderer {
                     };
                 }
 
-                // Pre-compute visibility for each batch (only when filtering is active)
-                // A batch is visible if ANY of its elements are visible
-                // A batch is fully visible if ALL of its elements are visible
-                const batchVisibility = new Map<typeof allBatchedMeshes[number], { visible: boolean; fullyVisible: boolean }>();
-
-                if (hasVisibilityFiltering) {
-                    for (const batch of allBatchedMeshes) {
-                        let visibleCount = 0;
-                        const total = batch.expressIds.length;
-
-                        for (const expressId of batch.expressIds) {
-                            const isHidden = options.hiddenIds?.has(expressId) ?? false;
-                            const isIsolated = !hasIsolatedFilter || options.isolatedIds!.has(expressId);
-                            if (!isHidden && isIsolated) {
-                                visibleCount++;
-                            }
-                        }
-
-                        batchVisibility.set(batch, {
-                            visible: visibleCount > 0,
-                            fullyVisible: visibleCount === total,
-                        });
-                    }
+                // Per-batch visibility (only meaningful while filtering is active).
+                // A batch is visible if ANY of its elements are visible, fully
+                // visible if ALL are. Cached across frames keyed by the visibility
+                // version so the O(total element count) scan + per-batch visible-id
+                // Set allocation happens once per visibility change, not per frame.
+                // The cache map is keyed by batch object (immutable expressIds per
+                // instance); a rebuilt batch is a new object → recomputed lazily.
+                if (this._batchVisibilityEpoch !== this._visibilityVersion) {
+                    this._batchVisibilityCache = new WeakMap();
+                    this._batchVisibilityEpoch = this._visibilityVersion;
                 }
+                const batchVisibilityCache = this._batchVisibilityCache;
+                const getBatchVisibility = (
+                    batch: typeof allBatchedMeshes[number],
+                ): { visible: boolean; fullyVisible: boolean; visibleIds?: Set<number> } => {
+                    let vis = batchVisibilityCache.get(batch);
+                    if (vis) return vis;
+                    const total = batch.expressIds.length;
+                    // Build the visible-id set in one pass; drop it for fully-visible
+                    // batches (they draw from their own buffers, no subset needed).
+                    const visibleIds = new Set<number>();
+                    for (const expressId of batch.expressIds) {
+                        const isHidden = options.hiddenIds?.has(expressId) ?? false;
+                        const isIsolated = !hasIsolatedFilter || options.isolatedIds!.has(expressId);
+                        if (!isHidden && isIsolated) visibleIds.add(expressId);
+                    }
+                    const fullyVisible = visibleIds.size === total;
+                    vis = {
+                        visible: visibleIds.size > 0,
+                        fullyVisible,
+                        visibleIds: fullyVisible ? undefined : visibleIds,
+                    };
+                    batchVisibilityCache.set(batch, vis);
+                    return vis;
+                };
 
                 // Separate batches into opaque and transparent, filtering by visibility
                 // IMPORTANT: Only render FULLY visible batches - partially visible batches
@@ -1927,18 +2152,15 @@ export class Renderer {
 
                     // Check visibility
                     if (hasVisibilityFiltering) {
-                        const vis = batchVisibility.get(batch);
-                        if (!vis || !vis.visible) continue; // Skip completely hidden batches
+                        const vis = getBatchVisibility(batch);
+                        if (!vis.visible) continue; // Skip completely hidden batches
 
                         // Handle partially visible batches - create sub-batches instead of individual meshes
                         if (!vis.fullyVisible) {
-                            const visibleIds = new Set<number>();
-                            for (const expressId of batch.expressIds) {
-                                const isHidden = options.hiddenIds?.has(expressId) ?? false;
-                                const isIsolated = !hasIsolatedFilter || options.isolatedIds!.has(expressId);
-                                if (!isHidden && isIsolated) visibleIds.add(expressId);
-                            }
-                            if (visibleIds.size > 0) {
+                            // The visible subset was computed once for this
+                            // visibility epoch (cached) — reuse it, don't rebuild.
+                            const visibleIds = vis.visibleIds;
+                            if (visibleIds && visibleIds.size > 0) {
                                 pushVisibleAsPartial(batch, visibleIds, nativelyTransparent);
                             }
                             // A COLD parent has no CPU meshData, so the partial
@@ -2238,7 +2460,8 @@ export class Renderer {
                             colorKey,
                             visibleIds,
                             device,
-                            this.pipeline
+                            this.pipeline,
+                            this._partialBatchEpoch
                         );
 
                         if (subBatch) {
@@ -2729,29 +2952,19 @@ export class Renderer {
             this.scene.enforceGpuBudget();
 
             // Pop validation error scope and capture the exact error
-            if (captureGpuError) {
-                device.popErrorScope().then((error) => {
-                    if (error) {
-                        const msg = error.message || String(error);
-                        console.error('[WebGPU] Validation error in render pass:', msg);
-                        this.device._lastUncapturedError = `VALIDATION: ${msg}`;
-                        this.device._uncapturedErrorCount++;
-                    }
-                }).catch((error: unknown) => {
-                    // popErrorScope() rejects (e.g. "Instance dropped in popErrorScope")
-                    // when the GPU device is lost while the scope is still pending. This
-                    // escapes the surrounding synchronous try/catch and would otherwise
-                    // surface as an unhandled rejection. Treat it like any other device
-                    // loss: invalidate the context so it reconfigures next frame.
-                    this.device.invalidateContext();
-                    const now = performance.now();
-                    if (now - this.lastRenderErrorTime > this.RENDER_ERROR_THROTTLE_MS) {
-                        this.lastRenderErrorTime = now;
-                        console.warn('[WebGPU] popErrorScope rejected (device likely lost):', error);
-                    }
-                });
+            if (errorScopePushed) {
+                errorScopePushed = false;
+                this.drainErrorScope(device);
             }
         } catch (error) {
+            // Balance the validation scope if we threw before popping it above —
+            // an unpopped scope would capture every later frame's errors silently.
+            // drainErrorScope logs a pop rejection (device loss) rather than
+            // swallowing it.
+            if (errorScopePushed) {
+                errorScopePushed = false;
+                this.drainErrorScope(device);
+            }
             this._renderErrorCount++;
             this._lastRenderError = error instanceof Error ? error.message : String(error);
             // Handle WebGPU errors (e.g., device lost, invalid state)
@@ -3279,10 +3492,24 @@ export class Renderer {
     }
 
     /**
-     * Get the GPU device (returns null if not initialized)
+     * Get the GPU device (returns null if not initialized, or if the device
+     * has been lost).
+     *
+     * The device-lost check is load-bearing, not defensive tidiness. A lost
+     * device is NOT torn down: `WebGPUDevice.destroy()` is the only thing that
+     * nulls the handle and it is never called for an involuntary loss (TDR /
+     * GPU-process crash / driver reset), so `isInitialized()` stays true and
+     * this used to keep handing out a zombie `GPUDevice`. Every caller then
+     * called `createBuffer()` on it, which throws — bypassing both `render()`'s
+     * own deviceLost guard and the `onDeviceLost` listeners entirely.
+     *
+     * Returning null instead routes into the `if (!device) return` check that
+     * every call site already has, so a lost device degrades to "stop
+     * uploading" rather than an uncaught throw. See `isDeviceLost()` /
+     * `onDeviceLost()` for the recovery contract.
      */
     getGPUDevice(): GPUDevice | null {
-        if (!this.device.isInitialized()) {
+        if (!this.device.isInitialized() || this.deviceLost) {
             return null;
         }
         return this.device.getDevice();
@@ -3371,6 +3598,14 @@ export class Renderer {
 
         // Snap detector geometry cache
         this.raycastEngine.clearCaches();
+
+        // Finally, release the GPU device itself. Every buffer/pipeline/texture
+        // above was created from it and has already been destroyed, so nothing
+        // will touch the device after this. Without it, an app that spins up a
+        // renderer per model keeps N live devices (and their VRAM) alive. The
+        // lost-handler special-cases reason 'destroyed' so this is not reported
+        // as a fault. render() early-returns while the device is uninitialised.
+        this.device.destroy();
     }
 
     /**

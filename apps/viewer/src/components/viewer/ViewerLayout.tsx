@@ -9,6 +9,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
 import { MobileToolbar } from './MobileToolbar';
+import { RibbonToolbar } from './ribbon/RibbonToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
 import { PropertiesPanel } from './PropertiesPanel';
 import { AddElementPanel } from './AddElementPanel';
@@ -108,8 +109,14 @@ export function ViewerLayout() {
   // original landing-page-iframe behaviour). `?models=<URL>,<URL>,…` loads a
   // federation (AIM: ASR + VZT) — the URLs load sequentially through addModel so
   // every model shares the first model's RTC origin + georef anchor (see
-  // useIfcFederation: shared RTC + alignGeometryToReference). Same-origin or
-  // CORS-friendly URLs only.
+  // useIfcFederation: shared RTC + alignGeometryToReference).
+  //
+  // SECURITY (merged from upstream): `?model=`/`?models=` are fully attacker-
+  // controllable (any link can set them), so honouring an arbitrary cross-origin
+  // URL is a drive-by model-injection vector — a crafted link would silently pull
+  // an attacker's file into the victim's viewer. We resolve EACH param against
+  // the current document and require its origin to match window.location.origin;
+  // a cross-origin (or malformed) URL is skipped, never fetched.
   const { addModel: autoloadAddModel } = useIfc();
   const autoloadDoneRef = useRef(false);
   useEffect(() => {
@@ -124,14 +131,27 @@ export function ViewerLayout() {
       // Sequential: the WASM parser isn't re-entrant, and federated adds must
       // observe the earlier model's RTC/anchor before they finalize.
       for (const modelUrl of urls) {
+        // Resolve (supports relative paths) and enforce same-origin PER URL
+        // before fetching; a cross-origin/malformed entry is skipped, not fatal,
+        // so one bad federation member can't block the rest.
+        let resolvedUrl: URL;
         try {
-          const res = await fetch(modelUrl);
+          resolvedUrl = new URL(modelUrl, window.location.href);
+        } catch {
+          console.error('[viewer] autoload refused: malformed URL', modelUrl);
+          continue;
+        }
+        if (resolvedUrl.origin !== window.location.origin) {
+          console.error(
+            `[viewer] autoload refused: cross-origin URL (${resolvedUrl.origin}) - only same-origin models are auto-loaded`,
+          );
+          continue;
+        }
+        try {
+          const res = await fetch(resolvedUrl.href);
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
           const blob = await res.blob();
-          const filename = (() => {
-            try { return new URL(modelUrl, window.location.href).pathname.split('/').pop() || 'model.ifc'; }
-            catch { return 'model.ifc'; }
-          })();
+          const filename = resolvedUrl.pathname.split('/').pop() || 'model.ifc';
           const file = new File([blob], filename, { type: blob.type || 'application/x-step' });
           await autoloadAddModel(file);
         } catch (err) {
@@ -203,6 +223,8 @@ export function ViewerLayout() {
 
   // Initialize theme on mount
   const theme = useViewerStore((s) => s.theme);
+  // Desktop toolbar style (issue #1686): classic strip or tabbed ribbon.
+  const toolbarStyle = useViewerStore((s) => s.toolbarStyle);
   const isMobile = useViewerStore((s) => s.isMobile);
   const setIsMobile = useViewerStore((s) => s.setIsMobile);
   const leftPanelCollapsed = useViewerStore((s) => s.leftPanelCollapsed);
@@ -466,8 +488,13 @@ export function ViewerLayout() {
         <SearchModal />
         <TourHost />
 
-        {/* Main Toolbar — use compact MobileToolbar on mobile */}
-        {isMobile ? <MobileToolbar /> : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
+        {/* Main Toolbar — compact MobileToolbar on mobile; on desktop the
+            user picks classic strip vs tabbed ribbon (issue #1686). */}
+        {isMobile
+          ? <MobileToolbar />
+          : toolbarStyle === 'ribbon'
+            ? <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />
+            : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
 
         {/* Main Content Area - Desktop Layout */}
         {!isMobile && (

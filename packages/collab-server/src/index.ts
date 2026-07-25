@@ -117,6 +117,7 @@ export {
   signRoomToken,
   verifyRoomToken,
   createRoomTokenAuthenticator,
+  createRoomTokenRegistryAuthorizer,
   handleTokenMintRequest,
   handleRevokeRequest,
   handleKickRequest,
@@ -131,13 +132,31 @@ export {
   type MintRequestBody,
 } from './room-token.js';
 export {
+  createAccessControl,
+  type AccessControl,
+  type AccessControlOptions,
+} from './access-control.js';
+export {
+  assertPushableLayer,
+  assertReportDigest,
+  CONTENT_DIGEST_REGEX,
   LayerPushError,
   MemoryLayerRegistry,
   type LayerRegistryStore,
+  type MemoryLayerRegistryLimits,
   type RegistryReview,
   type RegistryReviewDecision,
   type RegistryReviewStatus,
+  type RegistryReviewTopic,
 } from './layer-registry.js';
+export { FsLayerRegistry } from './layer-registry-fs.js';
+export {
+  emitRegistryEvent,
+  signRegistryEvent,
+  type RegistryWebhook,
+  type RegistryEvent,
+  type RegistryEventType,
+} from './registry-webhooks.js';
 export {
   handleLayerRegistryRequest,
   type LayerRegistryRouteOptions,

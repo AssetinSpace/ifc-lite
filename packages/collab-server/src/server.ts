@@ -7,7 +7,7 @@
  */
 
 import * as http from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { RoomManager, type PeerConnection } from './room-manager.js';
 import { FilePersistence, MemoryPersistence, type Persistence } from './persistence.js';
@@ -30,6 +30,7 @@ import {
   type KickEndpointOptions,
 } from './room-token.js';
 import { MemoryLayerRegistry, type LayerRegistryStore } from './layer-registry.js';
+import type { RegistryWebhook } from './registry-webhooks.js';
 import {
   handleLayerRegistryRequest,
   type RegistryAuthorizeFn,
@@ -128,6 +129,13 @@ export interface StartCollabServerOptions {
    */
   authorizeBlob?: BlobAuthorizeFn | null;
   /**
+   * Registry authorizer override. The default adapts `authenticate` with a
+   * pseudo-room, which room-BOUND token schemes can never satisfy — those
+   * deployments supply their own (see `createRoomTokenRegistryAuthorizer`).
+   * `null` disables auth (anonymous registry).
+   */
+  authorizeRegistry?: RegistryAuthorizeFn | null;
+  /**
    * Require a bearer token (compared against this shared secret) for the
    * `/metrics` diagnostics endpoint, which labels gauges with raw room
    * IDs. `/healthz` stays open for liveness probes but omits room detail
@@ -185,7 +193,7 @@ export interface StartCollabServerOptions {
    * capability, and the principal's userId becomes the acting resolver
    * for merges and waivers.
    */
-  layerRegistry?: boolean | { store?: LayerRegistryStore; maxBytes?: number };
+  layerRegistry?: boolean | { store?: LayerRegistryStore; maxBytes?: number; webhooks?: RegistryWebhook[] };
 }
 
 export interface CollabServerHandle {
@@ -227,9 +235,11 @@ export async function startCollabServer(
       ? opts.layerRegistry.store
       : new MemoryLayerRegistry()
     : undefined;
-  const authorizeRegistry: RegistryAuthorizeFn | undefined = layerRegistry
-    ? makeRegistryAuthorizer(authenticate)
-    : undefined;
+  const authorizeRegistry: RegistryAuthorizeFn | undefined = !layerRegistry
+    ? undefined
+    : opts.authorizeRegistry === null
+      ? undefined
+      : opts.authorizeRegistry ?? makeRegistryAuthorizer(authenticate);
   const metricsToken = opts.metricsToken ?? process.env.COLLAB_METRICS_TOKEN;
   const metrics = opts.metrics ?? defaultMetrics;
   const peersGauge = metrics.gauge(
@@ -338,6 +348,9 @@ export async function startCollabServer(
             authorize: authorizeRegistry,
             ...(typeof opts.layerRegistry === 'object' && opts.layerRegistry.maxBytes !== undefined
               ? { maxBytes: opts.layerRegistry.maxBytes }
+              : {}),
+            ...(typeof opts.layerRegistry === 'object' && opts.layerRegistry.webhooks !== undefined
+              ? { webhooks: opts.layerRegistry.webhooks }
               : {}),
           });
           if (handled) return;
@@ -575,10 +588,12 @@ function isMetricsAuthorized(
 ): boolean {
   const presented = extractDiagToken(req);
   if (typeof presented !== 'string') return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(metricsToken);
-  // timingSafeEqual throws on length mismatch; guard first.
-  if (a.length !== b.length) return false;
+  // Compare in constant time WITHOUT branching on length first: returning early
+  // on a length mismatch is a timing/length oracle. Hash both sides to a fixed
+  // 32-byte digest so `timingSafeEqual` always runs on equal-length buffers and
+  // the comparison time is independent of the presented token's length/content.
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(metricsToken).digest();
   return timingSafeEqual(a, b);
 }
 

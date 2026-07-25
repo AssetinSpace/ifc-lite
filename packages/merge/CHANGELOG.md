@@ -1,5 +1,17 @@
 # @ifc-lite/merge
 
+## 0.3.1
+
+### Patch Changes
+
+- [#1742](https://github.com/LTplus-AG/ifc-lite/pull/1742) [`da19eb6`](https://github.com/LTplus-AG/ifc-lite/commit/da19eb6e6f56384112b71344178d0a317b9986c5) Thanks [@louistrue](https://github.com/louistrue)! - Merging a candidate that is already on the target ref now no-ops (fast-forward with the ref unchanged) instead of refusing with unrelated-base. Published drafts land on their home ref with a declared base equal to the composition they were authored against, which need not be representable on the ref, so re-merging them previously dead-ended. Registry merge previews now also report `ancestor_matched` so clients can warn before an execute would be refused.
+
+## 0.3.0
+
+### Minor Changes
+
+- [#1732](https://github.com/LTplus-AG/ifc-lite/pull/1732) [`5e90494`](https://github.com/LTplus-AG/ifc-lite/commit/5e904942e3fd167d0d0e1a9c37b391d638eb6932) Thanks [@louistrue](https://github.com/louistrue)! - Registry webhooks + auto-merge (08-review.md §8.7, 10-registry.md §10.4): the registry emits HMAC-SHA256-signed events (layer pushed, ref moved/merged, review opened/updated/commented) to configured consumers, and `RefPolicy.autoMerge` merges conflict-free, all-checks-green candidates with a declared base unattended on push — fail-closed with `requireHumanApproval` and for baseless candidates.
+
 ## 0.2.0
 
 ### Minor Changes

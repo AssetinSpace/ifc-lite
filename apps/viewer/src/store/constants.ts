@@ -141,6 +141,9 @@ export const AUTO_LOWEST_TIER_MB = 150; // >= this → 'lowest'
 /** localStorage key for the load-time geometry fidelity mode (mirrors merge-layers). */
 export const GEOMETRY_MODE_STORAGE_KEY = 'ifc-lite-geometry-mode';
 
+/** localStorage key for the active Hierarchy view mode. */
+export const HIERARCHY_MODE_STORAGE_KEY = 'hierarchy-mode';
+
 /**
  * Load-time geometry fidelity mode — a user-facing, persistent switch that
  * mirrors the merge-layers load-time input (sticky in localStorage, folded into
@@ -320,6 +323,76 @@ export function resolveLoadTessellationTier(
   return undefined;
 }
 
+/**
+ * localStorage key for the desktop toolbar style (issue #1686). `classic`
+ * is the original single-strip toolbar; `ribbon` is the tabbed,
+ * IFCFlux-style ribbon. Same sticky-preference pattern as the theme.
+ */
+export const TOOLBAR_STYLE_STORAGE_KEY = 'ifc-lite-toolbar-style';
+
+export type ToolbarStyle = 'classic' | 'ribbon';
+
+/**
+ * Resolve the initial toolbar style from localStorage; default `ribbon`.
+ *
+ * The ribbon is the default toolbar. Only an explicitly stored `classic`
+ * wins, so a user who switched back keeps the classic strip forever while
+ * everyone else (and every new browser) lands on the ribbon. Exported for
+ * the unit test - the module-level `UI_DEFAULTS` is computed once at import
+ * and cannot be re-seeded from a test.
+ */
+export function resolveInitialToolbarStyle(): ToolbarStyle {
+  if (typeof window === 'undefined') return 'ribbon';
+  try {
+    return localStorage.getItem(TOOLBAR_STYLE_STORAGE_KEY) === 'classic' ? 'classic' : 'ribbon';
+  } catch (err) {
+    // Blocked storage (Safari private mode): fall back to the default so the
+    // toolbar still renders, but say why the preference didn't stick.
+    console.warn('[toolbar-style] storage unavailable; using ribbon', err);
+    return 'ribbon';
+  }
+}
+
+/** Ribbon tab strip contexts, in strip order. */
+export type RibbonTabId = 'file' | 'home' | 'view' | 'elements' | 'analyze' | 'author';
+
+/** Home first: it holds the everyday tool and camera loop. */
+export const RIBBON_DEFAULT_TAB: RibbonTabId = 'home';
+
+/**
+ * localStorage key for contextual ribbon tabs (Revit-style: a selection
+ * opens Elements, edit mode opens Author, and clearing the context returns
+ * you to where you were). On by default; the escape hatch lives in the
+ * ribbon's View tab because auto-switching under the cursor is exactly the
+ * kind of help some people want turned off.
+ */
+export const RIBBON_CONTEXTUAL_TABS_STORAGE_KEY = 'ifc-lite-ribbon-contextual-tabs';
+
+/** Resolve contextual tab following from localStorage; default on. */
+function getInitialRibbonContextualTabs(): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    return localStorage.getItem(RIBBON_CONTEXTUAL_TABS_STORAGE_KEY) !== 'false';
+  } catch (err) {
+    console.warn('[ribbon-contextual-tabs] storage unavailable; using on', err);
+    return true;
+  }
+}
+
+/** localStorage key for the ribbon's collapsed state (tab strip only). */
+export const RIBBON_COLLAPSED_STORAGE_KEY = 'ifc-lite-ribbon-collapsed';
+
+/** Resolve the initial ribbon collapsed state from localStorage; default expanded. */
+function getInitialRibbonCollapsed(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return localStorage.getItem(RIBBON_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch (err) {
+    console.warn('[ribbon-collapsed] storage unavailable; using expanded', err);
+    return false;
+  }
+}
+
 export const UI_DEFAULTS = {
   /** Default active tool */
   ACTIVE_TOOL: 'select',
@@ -361,6 +434,18 @@ export const UI_DEFAULTS = {
    * `exact` for full display/measure/export fidelity.
    */
   GEOMETRY_MODE: getInitialGeometryMode(),
+  /**
+   * Desktop toolbar style (issue #1686): the tabbed `ribbon` (default) or
+   * the original `classic` single strip. Read from localStorage on boot so
+   * the choice survives reloads.
+   */
+  TOOLBAR_STYLE: resolveInitialToolbarStyle(),
+  /** Ribbon band collapsed to the tab strip only. */
+  RIBBON_COLLAPSED: getInitialRibbonCollapsed(),
+  /** Ribbon tab open on boot; session-local, never persisted. */
+  RIBBON_TAB: RIBBON_DEFAULT_TAB,
+  /** Ribbon tabs follow the working context (selection, edit mode, model). */
+  RIBBON_CONTEXTUAL_TABS: getInitialRibbonContextualTabs(),
 } as const;
 
 // ============================================================================

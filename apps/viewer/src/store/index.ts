@@ -59,6 +59,7 @@ import { createPointCloudSlice, type PointCloudSlice, POINT_CLOUD_DEFAULTS } fro
 import { createUnitDisplaySlice, type UnitDisplaySlice } from './slices/unitDisplaySlice.js';
 import { createSpaceMouseSlice, type SpaceMouseSlice } from './slices/spaceMouseSlice.js';
 import { createLayerStackSlice, type LayerStackSlice } from './slices/layerStackSlice.js';
+import { createZonesSlice, type ZonesSlice } from './slices/zonesSlice.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
 
 // Import constants for reset function
@@ -69,12 +70,14 @@ export type * from './types.js';
 
 // Explicitly re-export multi-model types that need to be imported by name
 export type { EntityRef, SchemaVersion, FederatedModel, MeasurementConstraintEdge, OrthogonalAxis, SectionCapStyle, SectionCapHatchId, SectionPlane, SectionPlaneAxis } from './types.js';
+export type { HierarchyMode } from './slices/uiSlice.js';
+export type { RibbonTabId, ToolbarStyle } from './constants.js';
 
 // Re-export utility functions for entity references
 export { entityRefToString, stringToEntityRef, entityRefEquals, isIfcxDataStore } from './types.js';
 
-// Re-export single source of truth for globalId → EntityRef resolution
-export { resolveEntityRef } from './resolveEntityRef.js';
+// Re-export single source of truth for renderer ID → IFC entity resolution.
+export { resolveEntityRef, resolveGlobalId } from './resolveEntityRef.js';
 export { fromGlobalIdFromModels, toGlobalIdFromModels, toGlobalIdForRef } from './globalId.js';
 export type { ForwardModelMapLike } from './globalId.js';
 
@@ -178,6 +181,7 @@ export type ViewerState = LoadingSlice &
   PointCloudSlice &
   UnitDisplaySlice &
   SpaceMouseSlice &
+  ZonesSlice &
   ExtensionsSlice & {
     resetViewerState: () => void;
     /**
@@ -268,6 +272,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createPointCloudSlice(...args),
   ...createUnitDisplaySlice(...args),
   ...createSpaceMouseSlice(...args),
+  ...createZonesSlice(...args),
   ...createExtensionsSlice(...args),
 
   // Reset all viewer state when loading new file
@@ -331,6 +336,20 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       compareSelectedKey: null,
       compareRunning: false,
       compareError: null,
+
+      // Zones (#1810): keep the user-authored zone SETS (they persist across
+      // model loads, like clash presets), but drop the computed assignments —
+      // they're keyed by the OUTGOING model's global ids, and the single-model
+      // fallback (globalId === expressId) means the incoming model's ids can
+      // collide and read the old model's zone membership until the debounced
+      // recompute fires. Same stale-model-reference class as compareResult
+      // above; `useZoneAssignmentSync` recomputes against the new scene.
+      zoneAssignments: new Map(),
+      zoneAssignmentTiming: null,
+      // ... and drop any in-flight zone-edit session: leaving `editingZone`
+      // set would hand the incoming model live gizmo handles + picking for
+      // a zone the user was editing against the outgoing model.
+      editingZone: null,
 
       // Hover/Context
       hoverState: { entityId: null, screenX: 0, screenY: 0 },
@@ -520,6 +539,10 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       lensPanelVisible: false,
       lensColorMap: new Map<number, string>(),
       lensHiddenIds: new Set<number>(),
+      // Ownership bookkeeping for the shared hidden/isolation channels — those
+      // channels are wiped above, so stale claims must not survive the reset.
+      lensAppliedHiddenIds: [] as number[],
+      lensRuleIsolation: null,
       lensRuleCounts: new Map<string, number>(),
       lensRuleEntityIds: new Map<string, number[]>(),
 

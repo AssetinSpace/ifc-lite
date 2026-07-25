@@ -10,6 +10,7 @@ import {
   renderFrame,
   renderTitleBlock,
   calculateDrawingTransform,
+  exportToDXF,
   type Drawing2D,
   type DrawingSheet,
   type ElementData,
@@ -20,11 +21,95 @@ import { formatDistance } from '@/components/viewer/tools/formatDistance';
 import { formatArea, computePolygonCentroid } from '@/components/viewer/tools/computePolygonArea';
 import { generateCloudSVGPath } from '@/components/viewer/tools/cloudPathGenerator';
 import type { PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D } from '@/store/slices/drawing2DSlice';
+import type { DxfUnderlayRenderData } from '@/hooks/useDxfUnderlay';
+import type { GeometryResult } from '@ifc-lite/geometry';
+import type { IfcDataStore } from '@ifc-lite/parser';
+import { useViewerStore } from '@/store';
+import { buildDxfExportTransform, resolveDxfExportGeoreference } from '@/hooks/dxfExportGeoref';
+
+/** Map a DXF vertical justification onto an SVG dominant-baseline. */
+function dxfValignToBaseline(valign: 'baseline' | 'bottom' | 'middle' | 'top'): string {
+  switch (valign) {
+    case 'bottom': return 'text-after-edge';
+    case 'middle': return 'central';
+    case 'top': return 'text-before-edge';
+    default: return 'alphabetic';
+  }
+}
+
+/**
+ * Render DXF reference underlays as an SVG group (issue #1782). Geometry
+ * arrives pre-mapped to drawing space (render-frame shift, flipped-section
+ * mirror, and user placement applied by useDxfUnderlaysForDrawing — plan
+ * sections only); `mapPoint` converts a drawing-space point into the
+ * export's coordinate system (identity for the direct export, paper mm for
+ * the sheet export). `strokeWidthForMm` and `fontScale` are in export units.
+ */
+function buildDxfUnderlaySvg(
+  underlays: readonly DxfUnderlayRenderData[],
+  mapPoint: (x: number, y: number) => { x: number; y: number },
+  strokeWidthForMm: (mm: number) => number,
+  fontScale: number,
+  escapeXml: (s: string) => string,
+): string {
+  const visibleUnderlays = underlays.filter((u) => u.opacity > 0);
+  if (visibleUnderlays.length === 0) return '';
+
+  let svg = '  <g id="dxf-underlays">\n';
+  for (const data of visibleUnderlays) {
+    svg += `    <g data-dxf-underlay="${escapeXml(data.id)}" opacity="${data.opacity.toFixed(2)}">\n`;
+
+    for (const fill of data.fills) {
+      let d = '';
+      for (const ring of fill.loops) {
+        if (ring.length < 3) continue;
+        const first = mapPoint(ring[0].x, ring[0].y);
+        d += `${d ? ' ' : ''}M ${first.x.toFixed(4)} ${first.y.toFixed(4)}`;
+        for (let i = 1; i < ring.length; i++) {
+          const p = mapPoint(ring[i].x, ring[i].y);
+          d += ` L ${p.x.toFixed(4)} ${p.y.toFixed(4)}`;
+        }
+        d += ' Z';
+      }
+      if (!d) continue;
+      svg += `      <path d="${d}" fill="${fill.color}" fill-opacity="${fill.pattern ? 0.25 : 1}" fill-rule="evenodd" stroke="none"/>\n`;
+    }
+
+    for (const line of data.lines) {
+      if (line.points.length < 2) continue;
+      const pts = line.points.map((p) => mapPoint(p.x, p.y));
+      const pointsAttr = pts.map((p) => `${p.x.toFixed(4)},${p.y.toFixed(4)}`).join(' ');
+      const tag = line.closed ? 'polygon' : 'polyline';
+      const strokeWidth = strokeWidthForMm(line.widthMm ?? 0.18);
+      const dash = line.dashed ? ` stroke-dasharray="${(strokeWidth * 6).toFixed(4)} ${(strokeWidth * 4).toFixed(4)}"` : '';
+      svg += `      <${tag} points="${pointsAttr}" fill="none" stroke="${line.color}" stroke-width="${strokeWidth.toFixed(4)}" stroke-linecap="round"${dash}/>\n`;
+    }
+
+    for (const text of data.texts) {
+      const anchor = mapPoint(text.x, text.y);
+      const tip = mapPoint(text.x + text.dirX, text.y + text.dirY);
+      const angle = (Math.atan2(tip.y - anchor.y, tip.x - anchor.x) * 180) / Math.PI;
+      const fontSize = text.height * fontScale;
+      if (fontSize <= 0) continue;
+      const anchorAttr = text.align === 'center' ? 'middle' : text.align === 'right' ? 'end' : 'start';
+      // Multiline MTEXT stacks with tspans, matching the canvas layout.
+      const content = text.text
+        .split('\n')
+        .map((line, i) => `<tspan x="${anchor.x.toFixed(4)}" dy="${i === 0 ? 0 : (fontSize * 1.3).toFixed(4)}">${escapeXml(line)}</tspan>`)
+        .join('');
+      svg += `      <text x="${anchor.x.toFixed(4)}" y="${anchor.y.toFixed(4)}" font-family="Arial, sans-serif" font-size="${fontSize.toFixed(4)}" fill="${text.color}" text-anchor="${anchorAttr}" dominant-baseline="${dxfValignToBaseline(text.valign)}" transform="rotate(${angle.toFixed(2)} ${anchor.x.toFixed(4)} ${anchor.y.toFixed(4)})">${content}</text>\n`;
+    }
+
+    svg += '    </g>\n';
+  }
+  svg += '  </g>\n';
+  return svg;
+}
 
 interface UseDrawingExportParams {
   drawing: Drawing2D | null;
   displayOptions: { showHiddenLines: boolean; scale: number };
-  sectionPlane: { axis: 'down' | 'front' | 'side'; position: number; flipped: boolean };
+  sectionPlane: { axis: 'down' | 'front' | 'side'; position: number; flipped: boolean; custom?: unknown };
   activePresetId: string | null;
   entityColorMap: Map<number, [number, number, number, number]>;
   overridesEnabled: boolean;
@@ -35,11 +120,18 @@ interface UseDrawingExportParams {
   cloudAnnotations2D: CloudAnnotation2D[];
   sheetEnabled: boolean;
   activeSheet: DrawingSheet | null;
+  /** DXF underlays pre-mapped to drawing space, rendered beneath the drawing (issue #1782) */
+  dxfUnderlays: readonly DxfUnderlayRenderData[];
+  /** Legacy single-model data store — the anchor-selection fallback for the DXF georeference lookup (issue #1861); federated models come from the store's `models` map. */
+  ifcDataStore: IfcDataStore | null;
+  /** Geometry coordinate info (RTC offset + origin shift), for the DXF world-coordinate re-derivation (issue #1861). */
+  coordinateInfo: GeometryResult['coordinateInfo'] | undefined;
 }
 
 interface UseDrawingExportResult {
   formatDistance: (distance: number) => string;
   handleExportSVG: () => void;
+  handleExportDXF: () => void;
   handlePrint: () => void;
 }
 
@@ -57,7 +149,22 @@ function useDrawingExport({
   cloudAnnotations2D,
   sheetEnabled,
   activeSheet,
+  dxfUnderlays,
+  ifcDataStore,
+  coordinateInfo,
 }: UseDrawingExportParams): UseDrawingExportResult {
+  // Georef inputs for the DXF export (PR #1871 review, P1): placement edits
+  // applied in CesiumPlacementEditor live in `georefMutations` (per model
+  // id), not in `ifcDataStore`, and in a federation the georef frame is the
+  // ANCHOR model's, not necessarily the legacy store's. Subscribe to the
+  // same store fields ViewportContainer's Cesium georef memo reads so
+  // `resolveDxfExportGeoreference` sees the identical inputs.
+  const storeModels = useViewerStore((s) => s.models);
+  const anchorModelIdOverride = useViewerStore((s) => s.anchorModelIdOverride);
+  const georefMutations = useViewerStore((s) => s.georefMutations);
+  // Georef edits replace the map, but subscribe to mutationVersion too so the
+  // dependency is explicit (matches ViewportContainer / useAnchorGeoreference).
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
 
   // Generate SVG that matches the canvas rendering exactly
   const generateExportSVG = useCallback((): string | null => {
@@ -145,6 +252,17 @@ function useDrawingExport({
      viewBox="${viewBoxMinX.toFixed(4)} ${viewBoxMinY.toFixed(4)} ${viewWidth.toFixed(4)} ${viewHeight.toFixed(4)}">
   <rect x="${viewBoxMinX.toFixed(4)}" y="${viewBoxMinY.toFixed(4)}" width="${viewWidth.toFixed(4)}" height="${viewHeight.toFixed(4)}" fill="#FFFFFF"/>
 `;
+
+    // 0. DXF REFERENCE UNDERLAYS (issue #1782) - beneath everything. Data
+    // exists only for plan ('down') sections, where the direct export has
+    // no axis flips, so the identity mapping matches the canvas.
+    svg += buildDxfUnderlaySvg(
+      dxfUnderlays,
+      (x, y) => ({ x, y }),
+      mmToModel,
+      1, // text height is already in model units (metres)
+      escapeXml,
+    );
 
     // 1. FILL CUT POLYGONS (with color from IFC materials or override engine)
     svg += '  <g id="polygon-fills">\n';
@@ -390,7 +508,7 @@ function useDrawingExport({
 
     svg += '</svg>';
     return svg;
-  }, [drawing, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine, measure2DResults, polygonArea2DResults, textAnnotations2D, cloudAnnotations2D, sectionPlane.axis]);
+  }, [drawing, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine, measure2DResults, polygonArea2DResults, textAnnotations2D, cloudAnnotations2D, sectionPlane.axis, dxfUnderlays]);
 
   // Generate SVG with drawing sheet (frame, title block, scale bar)
   // This generates coordinates directly in paper mm space (like the canvas rendering)
@@ -490,6 +608,17 @@ function useDrawingExport({
       }
       return path;
     };
+
+    // DXF reference underlays (issue #1782) - beneath everything. Data
+    // exists only for plan ('down') sections, where the sheet mapping has
+    // no axis flips, so the plain drawing→paper transform matches the canvas.
+    svg += buildDxfUnderlaySvg(
+      dxfUnderlays,
+      (x, y) => ({ x: x * scaleFactor + translateX, y: y * scaleFactor + translateY }),
+      (mm) => mm * 0.3, // mm on paper, matching the model outline convention
+      scaleFactor, // metres -> mm on paper
+      escapeXml,
+    );
 
     // Render polygon fills
     svg += '    <g id="polygon-fills">\n';
@@ -622,7 +751,7 @@ function useDrawingExport({
 
     svg += '</svg>';
     return svg;
-  }, [drawing, activeSheet, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine]);
+  }, [drawing, activeSheet, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine, dxfUnderlays]);
 
   // Export SVG
   const handleExportSVG = useCallback(() => {
@@ -635,6 +764,58 @@ function useDrawingExport({
     downloadFile(svg, `${stem}.svg`, 'image/svg+xml');
     posthog.capture('drawing_exported', { format: 'svg', axis: sectionPlane.axis, sheet_enabled: sheetEnabled });
   }, [generateExportSVG, generateSheetSVG, sheetEnabled, activeSheet, sectionPlane]);
+
+  // Export DXF (issue #1861). Unlike SVG, DXF has no paper space, so this
+  // always exports the raw model-space drawing (sheet frame/title block are
+  // not represented) — real-world metres, with a plan ('down') section
+  // re-georeferenced to true IFC world coordinates (and further to
+  // map/CRS coordinates when the model has an IfcMapConversion). DXF
+  // reference underlays are not embedded in this export; see PR notes.
+  const handleExportDXF = useCallback(() => {
+    if (!drawing) return;
+    const isCustomPlane = sectionPlane.custom !== undefined;
+    // Anchor-model effective georef, INCLUDING user placement edits
+    // (georefMutations) — see resolveDxfExportGeoreference's docs. The
+    // drawing-frame `coordinateInfo` below is unrelated: it undoes the
+    // render-frame shift and stays the merged drawing's regardless of which
+    // model anchors the georef.
+    const georeference = resolveDxfExportGeoreference({
+      models: storeModels,
+      legacyDataStore: ifcDataStore,
+      legacyCoordinateInfo: coordinateInfo,
+      anchorModelIdOverride,
+      georefMutations,
+    });
+    const coordinateTransform = buildDxfExportTransform({
+      coordinateInfo,
+      sectionAxis: sectionPlane.axis,
+      isCustomPlane,
+      flipped: sectionPlane.flipped,
+      georeference,
+    });
+    const isGeoreferenced = georeference !== null && sectionPlane.axis === 'down' && !isCustomPlane;
+    // R12 has no $INSUNITS (see dxf/writer.ts); state the unit — and the
+    // target CRS when the export is actually map-projected — in the 999
+    // comment every DXF reader shows a human but none need to parse.
+    const metadataComment = isGeoreferenced
+      ? `ifc-lite section export - units: metres, CRS: ${georeference!.projectedCRS.name || 'unknown'}`
+      : undefined;
+    const dxf = exportToDXF(drawing, {
+      showHiddenLines: displayOptions.showHiddenLines,
+      coordinateTransform,
+      metadataComment,
+    });
+    const stem = `section-${sectionPlane.axis}-${sectionPlane.position}`;
+    downloadFile(dxf, `${stem}.dxf`, 'application/dxf');
+    posthog.capture('drawing_exported', {
+      format: 'dxf',
+      axis: sectionPlane.axis,
+      georeferenced: isGeoreferenced,
+    });
+  }, [
+    drawing, displayOptions.showHiddenLines, sectionPlane, ifcDataStore, coordinateInfo,
+    storeModels, anchorModelIdOverride, georefMutations, mutationVersion,
+  ]);
 
   // Print handler
   const handlePrint = useCallback(() => {
@@ -649,9 +830,18 @@ function useDrawingExport({
       return;
     }
 
-    const title = (sheetEnabled && activeSheet)
+    const rawTitle = (sheetEnabled && activeSheet)
       ? `${activeSheet.name} - ${sectionPlane.axis} at ${sectionPlane.position}%`
       : `Section Drawing - ${sectionPlane.axis} at ${sectionPlane.position}%`;
+    // The sheet name is user-controlled and interpolated into the <title> of a
+    // same-origin window. Without escaping, a sheet named `</title><script>…`
+    // would break out of the title and execute script. Escape it (the SVG body
+    // is already escaped via escapeXml; the title was the one unescaped sink).
+    const title = rawTitle
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
 
     // Write print-friendly HTML with the SVG
     printWindow.document.write(`
@@ -698,6 +888,7 @@ function useDrawingExport({
   return {
     formatDistance,
     handleExportSVG,
+    handleExportDXF,
     handlePrint,
   };
 }

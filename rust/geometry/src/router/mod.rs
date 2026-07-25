@@ -14,11 +14,12 @@ mod instancing;
 mod layers;
 mod processing;
 mod rtc_offset;
+mod textured;
 mod transforms;
 mod voids;
 
 pub use transforms::local_frame_set_enabled_override;
-pub use voids::RectParam;
+pub use voids::{take_bool2d_stats, take_prism_defers, take_prism_stats, RectParam};
 pub use diagnostics::{
     GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION,
     aggregate_diagnostics, ClassificationStats, ClassificationSummary, GeometryDiagnostics,

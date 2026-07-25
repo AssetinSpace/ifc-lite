@@ -18,7 +18,8 @@ import { getGeomWorkerOverride, resolveLoadTessellationTier, isMeshOnlyCacheEnab
 import { planCacheWrite, decideMeshOnlyCacheHit } from './cacheTier.js';
 import { computeSourceFingerprint } from './sourceFingerprint.js';
 import { computeFullSourceHash } from '../utils/sourceContentHash.js';
-import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, detectFormat, unwrapIfcZipWithResources, type IfcDataStore } from '@ifc-lite/parser';
+import { decodeTextureResources, attachTextureBitmaps, type TextureBitmapStore } from '../utils/textureResources.js';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
 import {
@@ -28,7 +29,9 @@ import {
   type MeshData,
   type CoordinateInfo,
   type GeometryResult,
+  type TessellationQuality,
 } from '@ifc-lite/geometry';
+import { resolveResourceRetryTier } from '../lib/resource-retry.js';
 import { acquireFileBuffer, type AcquiredBuffer } from '../utils/acquireFileBuffer.js';
 import { buildSpatialIndexGuarded, buildSpatialIndexForModel } from '../utils/loadingUtils.js';
 import { buildGeometryCacheKey } from './geometryCacheKey.js';
@@ -57,7 +60,7 @@ import { extractModelGeoref, alignGeometryToReference, findReferenceGeorefModel 
 import { toast } from '../components/ui/toast.js';
 import { posthog } from '../lib/analytics.js';
 import { reportRenderStats } from '../utils/renderStatsReport.js';
-import { classifyLoadError, formatLoadError } from '../lib/load-errors.js';
+import { classifyLoadError, formatLoadError, type LoadErrorKind } from '../lib/load-errors.js';
 
 /**
  * The skip-tiny-cuts flag is no longer a hard constant: it is derived per-load
@@ -181,7 +184,18 @@ export function useIfcLoader() {
   // Latest `loadFile`, so the background revalidation can reload without being a
   // dependency of `loadFile` itself (avoids a definition cycle). Kept current by
   // the effect below.
-  const loadFileRef = useRef<((file: File, target?: LoadTarget) => Promise<void>) | null>(null);
+  const loadFileRef = useRef<
+    | ((
+        file: File,
+        target?: LoadTarget,
+        options?: {
+          sourceHandle?: FileSystemFileHandle;
+          tierOverride?: TessellationQuality;
+          isResourceRetry?: boolean;
+        },
+      ) => Promise<void>)
+    | null
+  >(null);
 
   /**
    * Background revalidation for a SERVED source-decoupled (mesh-only) cache hit:
@@ -223,7 +237,14 @@ export function useIfcLoader() {
   const loadFile = useCallback(async (
     file: File,
     target: LoadTarget = { kind: 'primary' },
-    options?: { sourceHandle?: FileSystemFileHandle },
+    options?: {
+      sourceHandle?: FileSystemFileHandle;
+      // Auto-retry-at-lower-detail (resource-retry.ts): when a resource-limit
+      // failure re-invokes loadFile, it forces this tier and marks the attempt
+      // so a second failure surfaces instead of looping.
+      tierOverride?: TessellationQuality;
+      isResourceRetry?: boolean;
+    },
   ) => {
     const { resetViewerState, clearAllModels } = useViewerStore.getState();
     // Only a primary (destructive, replace-everything) load bumps the session.
@@ -258,6 +279,62 @@ export function useIfcLoader() {
 
     // Track total elapsed time for complete user experience
     const totalStartTime = performance.now();
+
+    // Records the tier the WASM tessellation path actually ran at, for the
+    // resource-retry decision in the catch. Declared out here (not in the try)
+    // so the catch can read it. Stays `null` until that path runs (a GLB /
+    // point-cloud / server / cache load never sets it), so a lower IFC tier is
+    // never pointlessly retried for a load it cannot help.
+    let attemptedTessellationTier: TessellationQuality | null | undefined = null;
+
+    /**
+     * Resource-limit recovery, shared by BOTH failure paths.
+     *
+     * The geometry-streaming loop has its own inner catch (it must close the
+     * WASM iterator and swallow the orphaned parser promise), and it RETURNS
+     * rather than rethrowing — so the stall / worker-crash failures this
+     * recovery exists for never reach the outer catch. Both call sites go
+     * through here so the policy lives in one place.
+     *
+     * Returns true when a retry was started, in which case the caller must
+     * return immediately: the retry owns the model's terminal state.
+     */
+    const tryResourceRetry = async (
+      err: unknown,
+      kind: LoadErrorKind,
+      context: string,
+    ): Promise<boolean> => {
+      const retryTier = resolveResourceRetryTier({
+        kind,
+        attemptedTier: attemptedTessellationTier,
+        isPrimary: target.kind === 'primary',
+        alreadyRetried: options?.isResourceRetry === true,
+      });
+      if (retryTier === null) return false;
+      // Still report the original failure so the memory wall stays visible in
+      // analytics — the retry only gives the user a shot at a result first.
+      posthog.captureException(err, { context, error_kind: kind, resource_retry: retryTier });
+      void import('@/components/ui/toast')
+        .then((m) => {
+          m.toast.info(
+            `"${file.name}" was too detailed for this device — retrying at lower detail…`,
+          );
+        })
+        // Best-effort notice; a failed chunk load must never turn into an
+        // unhandled rejection that masks the retry itself.
+        .catch(() => { /* no toast — the retry still proceeds */ });
+      setGeometryStreamingActive(false);
+      // Awaited, not fire-and-forget: callers await loadFile to know the load
+      // finished, so the original promise must stay pending until the
+      // replacement load settles. loadFile never rethrows (both its catches
+      // return), so this cannot throw back into the caller.
+      await loadFileRef.current?.(file, target, {
+        ...options,
+        tierOverride: retryTier,
+        isResourceRetry: true,
+      });
+      return true;
+    };
 
     try {
       // Reset all viewer state before loading new file — PRIMARY ONLY. A
@@ -374,7 +451,16 @@ export function useIfcLoader() {
           const maxExpressId = getMaxExpressId(dataStore, geometryResult.meshes);
           const idOffset = registerModelOffset(modelId, maxExpressId);
           if (idOffset > 0) {
-            for (const mesh of geometryResult.meshes) mesh.expressId = mesh.expressId + idOffset;
+            for (const mesh of geometryResult.meshes) {
+              mesh.expressId = mesh.expressId + idOffset;
+              // #1781: textureId is an express id too — offset it with the same
+              // shift so two federated models can't collide in the renderer's
+              // shared-texture registry (model B's texture #34 must never sample
+              // model A's image).
+              if (mesh.textureRef) {
+                mesh.textureRef = { ...mesh.textureRef, textureId: mesh.textureRef.textureId + idOffset };
+              }
+            }
             for (const asset of geometryResult.pointClouds ?? []) asset.expressId = asset.expressId + idOffset;
           }
           if (idOffset > 0 && patch?.pointCloudHandleId !== undefined) {
@@ -481,8 +567,17 @@ export function useIfcLoader() {
       // server unwraps `.ifcZIP` itself (apps/server extract_file), so a zipped
       // upload can still take the server fast-path; the local WASM path
       // consumes the now-unwrapped `buffer`.
+      let textureBitmaps: TextureBitmapStore | null = null;
       if (!pointCloudFormat) {
-        buffer = await unwrapIfcZip(buffer);
+        const zipContents = await unwrapIfcZipWithResources(buffer);
+        buffer = zipContents.model;
+        // #1781: decode sibling texture images (IfcImageTexture targets) once,
+        // up front — mesh batches attach the shared bitmaps synchronously as
+        // they arrive. Empty/no-zip loads resolve to null and pay nothing.
+        textureBitmaps = await decodeTextureResources(zipContents.resources);
+        if (textureBitmaps) {
+          console.log(`[useIfc] Decoded ${textureBitmaps.size} .ifcZIP texture image(s)`);
+        }
       }
 
       // IFCX/IFC5 vs IFC4 STEP vs GLB resolved from the full buffer; point
@@ -508,6 +603,7 @@ export function useIfcLoader() {
         setGeometryStreamingActive(false);
         const blob = file;
         const incCount = useViewerStore.getState().incrementPointCloudAssetCount;
+        const setClassCounts = useViewerStore.getState().setPointCloudClassCounts;
         const ingest = ingestPointCloud({
           format,
           blob,
@@ -516,6 +612,15 @@ export function useIfcLoader() {
           renderer,
           onProgress: setProgress,
           onAssetCountDelta: incCount,
+          // Session-guard the histogram writes: a superseded stream
+          // keeps publishing periodic counts until `done` settles, and
+          // an unguarded write would repopulate phantom classes after
+          // a newer load reset the store.
+          onClassCounts: (handleId, counts) => {
+            if (loadSessionRef.current === currentSession) {
+              setClassCounts(handleId, counts);
+            }
+          },
         });
         // Expose cancellation to the UI (StatusBar shows a Cancel
         // button while this is non-null). Cleared via the
@@ -547,6 +652,10 @@ export function useIfcLoader() {
               err,
             );
             renderer.removePointCloudAsset(ingest.rendererHandle);
+            // The stale asset never registers as a model, so the
+            // lifecycle hook can't drop its classification histogram —
+            // clear it here or the classes panel shows phantom counts.
+            setClassCounts(ingest.rendererHandle.id, null);
             clearOwnedCanceller();
             return;
           }
@@ -577,8 +686,11 @@ export function useIfcLoader() {
         if (loadSessionRef.current !== currentSession) {
           // A newer load already began. Drop our streamed asset and
           // skip every store/UI mutation so we don't overwrite the
-          // newer model's state.
+          // newer model's state. The completed stream already published
+          // its histogram under this handle and no model was registered
+          // for the lifecycle hook to clean up, so drop the counts too.
           renderer.removePointCloudAsset(ingest.rendererHandle);
+          setClassCounts(ingest.rendererHandle.id, null);
           return;
         }
         // Primary owns the active-model slots; a federated add must not touch
@@ -689,7 +801,13 @@ export function useIfcLoader() {
       // model-weight signal available pre-geometry, so the key stays
       // deterministic at cache-check time). `undefined` = engine default
       // (medium). `exact` never auto-lowers.
-      const loadTessellationTier = resolveLoadTessellationTier(fileSizeMB, geometryModeAtLoad);
+      // An auto-retry after a resource-limit failure forces the tier (lowest);
+      // otherwise resolve it from the mode + file size as usual. Forcing it here
+      // (before the cache key) keeps the key and the live tessellation in
+      // agreement, so the retry re-meshes at the lower density instead of
+      // serving the failed attempt's cached bytes.
+      const loadTessellationTier = options?.tierOverride ??
+        resolveLoadTessellationTier(fileSizeMB, geometryModeAtLoad);
       // Desktop Tauri cache commands only accept [A-Za-z0-9_-], so the key
       // stays filename-safe and independent of the original filename. Pinned
       // to FORMAT_VERSION so a format bump invalidates stale entries (e.g. v5
@@ -719,7 +837,11 @@ export function useIfcLoader() {
 
       // Cache + server are PRIMARY-ONLY: a federated add is WASM-only with no
       // cache/server round-trip (matches the former parseStepBufferViewerModel).
-      if (target.kind === 'primary' && cachePlan.shouldCache) {
+      // Texture-carrying .ifcZIPs also bypass the cache READ (#1781): the format
+      // cannot persist UVs/textures, so any existing entry — including one
+      // written before texture support shipped — would serve the model
+      // permanently untextured. Mirrors the cache-write skip below.
+      if (target.kind === 'primary' && cachePlan.shouldCache && !textureBitmaps) {
         setProgress({ phase: 'Checking cache', percent: 5 });
         const cacheResult = await getCached(cacheKey);
         if (cacheResult) {
@@ -803,7 +925,10 @@ export function useIfcLoader() {
       // A .ifcZIP source is fine on the server path: loadFromServer uploads the
       // original `file` object (still zipped) and the server unwraps the
       // container itself (apps/server extract_file, issue #1494) before parsing.
-      if (target.kind === 'primary' && format === 'ifc' && !mergeLayersAtLoad && USE_SERVER && SERVER_URL && SERVER_URL !== '') {
+      // EXCEPT texture-carrying containers (#1781): the server mesh wire format
+      // doesn't transport UVs/texture refs yet, so the server fast-path would
+      // silently render the model untextured — route those through local WASM.
+      if (target.kind === 'primary' && format === 'ifc' && !mergeLayersAtLoad && !textureBitmaps && USE_SERVER && SERVER_URL && SERVER_URL !== '') {
         // Pass buffer directly - server uses File object for parsing, buffer is only for size checks
         const serverSuccess = await loadFromServer(file, buffer, () => loadSessionRef.current !== currentSession);
         if (serverSuccess) {
@@ -825,6 +950,11 @@ export function useIfcLoader() {
       if (target.kind === 'primary') {
         setGeometryStreamingActive(true);
       }
+
+      // From here the WASM tessellation path runs, so a resource-limit failure
+      // downstream (stall / worker crash / OOM) is one a lower tier can help —
+      // record the tier we attempted for the retry decision in the catch.
+      attemptedTessellationTier = loadTessellationTier;
 
       // Initialize geometry processor first (WASM init is fast if already loaded)
       // Reuses the merge-layers snapshot taken above for the cache key so the
@@ -1143,6 +1273,35 @@ export function useIfcLoader() {
           const event = nextResult.value;
           const eventReceived = performance.now();
 
+          // Stale-session guard for the streaming loop. A new PRIMARY load
+          // (e.g. the `ifc-lite:load-file` event) bumps loadSessionRef and
+          // resets the active model; without this, a superseded PRIMARY load's
+          // stream keeps mutating the NEW active model — appendGeometryBatch
+          // (batch + complete), updateMeshColors, updateCoordinateInfo and the
+          // loop's setProgress calls — producing mixed meshes and a wrong
+          // RTC/coordinate frame. A superseded FEDERATED add never touches the
+          // active slot, but its streaming branch still writes the shared
+          // progress UI (clobbering the new load's progress) and burns the
+          // geometry workers the new load needs, so it stops too — matching
+          // the documented intent that a primary bump "aborts any in-flight
+          // federated adds". A federated add during a primary load does NOT
+          // abort anything: federated loads never bump the session, so both
+          // sessions stay current. Every other deferred write in this file
+          // already guards on the session (see finalize/post-stream below).
+          // Stop the loop and clean up the reader (closeGeometryIterator
+          // releases WASM; it is idempotent via geometryIteratorClosed, so the
+          // post-loop call is a no-op) so no more shared-state writes happen.
+          if (loadSessionRef.current !== currentSession) {
+            console.warn(`[useIfc] ${target.kind} stream ABORTED: stale session (mine=${currentSession}, current=${loadSessionRef.current}) - superseded by a newer load`);
+            await closeGeometryIterator();
+            // 'complete' never ran, so nothing is chained on dataStorePromise.
+            // The orphaned parser worker self-terminates on its own watchdog
+            // and may reject it — swallow that so the abort doesn't surface as
+            // an unhandled rejection (mirrors the catch path below).
+            void dataStorePromise.catch(() => {});
+            break;
+          }
+
           switch (event.type) {
             case 'start':
               estimatedTotal = event.totalEstimate;
@@ -1187,6 +1346,12 @@ export function useIfcLoader() {
               // Track time to first geometry
               if (batchCount === 1) {
               }
+
+              // #1781: resolve external texture references against the decoded
+              // .ifcZIP sibling images BEFORE the meshes fan out to the
+              // renderer / geometryResult / spatial index — all share these
+              // same objects.
+              attachTextureBitmaps(event.meshes, textureBitmaps);
 
               // Collect meshes for BVH building (use loop to avoid stack overflow with large batches)
               for (let i = 0; i < event.meshes.length; i++) allMeshes.push(event.meshes[i]);
@@ -1380,8 +1545,18 @@ export function useIfcLoader() {
                 //    accessors. The hit is validated by the strengthened cache key,
                 //    so repeat opens have no main-thread hash stall.
                 // Files above 400MB (or with the mesh-only kill switch set) are not cached.
+                // Textured models are NOT cached (#1781): the binary cache
+                // format doesn't persist UVs/textures yet, so a cache hit would
+                // silently strip every texture on the second open. Re-processing
+                // each load keeps the render correct until the cache format
+                // learns texture sections.
+                const hasTexturedMeshes = allMeshes.some((m) => m.texture || m.textureRef);
+                if (hasTexturedMeshes) {
+                  console.log('[useIfc] Skipping cache write: model carries surface textures the cache format does not persist yet (#1781)');
+                }
                 if (
                   cachePlan.shouldCache &&
+                  !hasTexturedMeshes &&
                   allMeshes.length > 0 &&
                   finalCoordinateInfo
                 ) {
@@ -1414,6 +1589,14 @@ export function useIfcLoader() {
                   cumulativeColorUpdates.clear();
                 }, 5000);
               }).catch(err => {
+                // A superseded load's finalize failure is not this user's
+                // problem anymore: the old primary model record was cleared by
+                // the new load (updateModel would no-op) and a stale federated
+                // toast would misattribute an error to the CURRENT load.
+                if (loadSessionRef.current !== currentSession) {
+                  console.warn('[useIfc] finalize error ignored - superseded load (stale session):', err);
+                  return;
+                }
                 // Data model parsing failed - spatial index and caching skipped
                 console.warn('[useIfc] Skipping spatial index/cache - data model unavailable:', err);
                 if (target.kind === 'federated') {
@@ -1449,10 +1632,13 @@ export function useIfcLoader() {
         // here as a cryptic `compile on 'WebAssembly'` TypeError — humanise it
         // and tag the captured exception so it is filterable in error tracking.
         const kind = classifyLoadError(err);
+        // The stall / worker-crash / OOM failures land HERE, not in the outer
+        // catch — retry once at lower detail before surfacing a dead end.
+        if (await tryResourceRetry(err, kind, 'geometry_processing')) return;
         setError(formatLoadError(err, file.name));
-        posthog.captureException(err, {
-          additional_properties: { context: 'geometry_processing', error_kind: kind },
-        });
+        // Flat properties: posthog-js spreads this object onto the event, so a
+        // wrapper key would bury `error_kind` in an unfilterable nested blob.
+        posthog.captureException(err, { context: 'geometry_processing', error_kind: kind });
         setLoading(false);
         setGeometryStreamingActive(false);
         return;
@@ -1538,15 +1724,19 @@ export function useIfcLoader() {
       console.error(`[useIfc] loadFile THREW (session=${currentSession}, current=${loadSessionRef.current}):`, err);
       if (loadSessionRef.current !== currentSession) return;
       const kind = classifyLoadError(err);
+
+      // Resource-limit recovery — see tryResourceRetry. A failure that reaches
+      // this outer catch (rather than the streaming loop's inner one) still
+      // qualifies, e.g. an allocation failure outside the stream.
+      if (await tryResourceRetry(err, kind, 'ifc_model_load')) return;
+
       const friendly = formatLoadError(err, file.name);
       updateModel(modelId, {
         loadState: 'error',
         loadError: friendly,
       });
       setError(friendly);
-      posthog.captureException(err, {
-        additional_properties: { context: 'ifc_model_load', error_kind: kind },
-      });
+      posthog.captureException(err, { context: 'ifc_model_load', error_kind: kind });
       setLoading(false);
       setGeometryStreamingActive(false);
     }
