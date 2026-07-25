@@ -57,6 +57,7 @@ import { boundedIteratorReturn } from './ingest/streamCleanup.js';
 import { detectPointCloudFormat, ingestPointCloud } from './ingest/pointCloudIngest.js';
 import { getGlobalRenderer } from './useBCF.js';
 import { extractModelGeoref, alignGeometryToReference, findReferenceGeorefModel } from './ingest/federationAlign.js';
+import { computePointCloudAlignment, unregisterPointCloudAlignment, hasRegisteredPointCloudAlignment } from './ingest/pointCloudAlignment.js';
 import { toast } from '../components/ui/toast.js';
 import { posthog } from '../lib/analytics.js';
 import { reportRenderStats } from '../utils/renderStatsReport.js';
@@ -408,6 +409,30 @@ export function useIfcLoader() {
         schemaVersion: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5',
         patch?: { loadState?: 'pending' | 'streaming-geometry' | 'hydrating-metadata' | 'complete' | 'error'; cacheState?: 'none' | 'hit' | 'miss' | 'writing'; loadError?: string | null; pointCloudHandleId?: number },
       ): Promise<void> => {
+        // Ordering notice (issue #1804): alignment is baked into a scan at
+        // ITS load time (an f64 decode-time offset — it cannot be applied
+        // retroactively to already-quantised f32 GPU positions). If this
+        // IFC model brings a usable IfcMapConversion while scans are
+        // already loaded WITHOUT any alignment, tell the user the fix is
+        // to reload the scan — silently leaving it misplaced looks like
+        // the feature doesn't work. Skipped for point-cloud finalizes
+        // (patch.pointCloudHandleId) — those never carry a georef.
+        if (patch?.pointCloudHandleId === undefined && dataStore && geometryResult) {
+          const st = useViewerStore.getState();
+          if (st.pointCloudAssetCount > 0 && !hasRegisteredPointCloudAlignment()) {
+            const ownGeoref = extractModelGeoref(
+              dataStore,
+              geometryResult.coordinateInfo,
+              st.georefMutations.get(modelId),
+            );
+            if (ownGeoref && computePointCloudAlignment(ownGeoref)) {
+              toast.info(
+                'Point clouds loaded before this model keep their raw coordinates — '
+                + 'reload the scan to align it with the model georeference.',
+              );
+            }
+          }
+        }
         if (target.kind === 'federated') {
           if (!dataStore || !geometryResult) {
             throw new Error('Federated model is missing its data store or geometry');
@@ -604,6 +629,28 @@ export function useIfcLoader() {
         const blob = file;
         const incCount = useViewerStore.getState().incrementPointCloudAssetCount;
         const setClassCounts = useViewerStore.getState().setPointCloudClassCounts;
+        // IfcMapConversion alignment (issue #1804): reuse the SAME
+        // reference-model georef federated IFC loads already align to
+        // (`findReferenceGeorefModel`) — a point cloud aligns to whichever
+        // model is the federation anchor, not necessarily the one just
+        // dropped. `null` (no loaded model has a usable IfcMapConversion)
+        // leaves the scan at its raw native coordinates, unchanged from
+        // before this feature existed. LAS/LAZ only: other decoders can't
+        // consume the decode-time offset (ingestPointCloud gates too);
+        // tell the user instead of silently skipping.
+        const alignmentSupported = format === 'las' || format === 'laz';
+        const reference = findReferenceGeorefModel();
+        const alignment = reference && alignmentSupported
+          ? computePointCloudAlignment(reference.georef)
+          : null;
+        if (reference && !alignmentSupported && computePointCloudAlignment(reference.georef)) {
+          toast.info(
+            `Georeference alignment currently supports LAS/LAZ only — this ${format.toUpperCase()} `
+            + 'scan loads at its raw coordinates.',
+          );
+        }
+        const setAlignmentAvailable = useViewerStore.getState().setPointCloudAlignmentAvailable;
+        const alignmentEnabled = useViewerStore.getState().pointCloudAlignmentEnabled;
         const ingest = ingestPointCloud({
           format,
           blob,
@@ -612,6 +659,8 @@ export function useIfcLoader() {
           renderer,
           onProgress: setProgress,
           onAssetCountDelta: incCount,
+          alignment: alignment ?? undefined,
+          alignmentEnabled,
           // Session-guard the histogram writes: a superseded stream
           // keeps publishing periodic counts until `done` settles, and
           // an unguarded write would repopulate phantom classes after
@@ -622,6 +671,12 @@ export function useIfcLoader() {
             }
           },
         });
+        // Availability is derived from the live registry AFTER ingest
+        // (registration is synchronous inside ingestPointCloud): the
+        // panel's toggle shows iff at least one loaded scan actually has
+        // an alignment registered — never for e.g. a PLY-only session or
+        // after a sync ingest failure already rolled the registration back.
+        setAlignmentAvailable(hasRegisteredPointCloudAlignment());
         // Expose cancellation to the UI (StatusBar shows a Cancel
         // button while this is non-null). Cleared via the
         // `clearOwnedCanceller` helper below so a later load that
@@ -656,6 +711,8 @@ export function useIfcLoader() {
             // lifecycle hook can't drop its classification histogram —
             // clear it here or the classes panel shows phantom counts.
             setClassCounts(ingest.rendererHandle.id, null);
+            unregisterPointCloudAlignment(ingest.rendererHandle.id);
+            setAlignmentAvailable(hasRegisteredPointCloudAlignment());
             clearOwnedCanceller();
             return;
           }
@@ -691,6 +748,8 @@ export function useIfcLoader() {
           // for the lifecycle hook to clean up, so drop the counts too.
           renderer.removePointCloudAsset(ingest.rendererHandle);
           setClassCounts(ingest.rendererHandle.id, null);
+          unregisterPointCloudAlignment(ingest.rendererHandle.id);
+          setAlignmentAvailable(hasRegisteredPointCloudAlignment());
           return;
         }
         // Primary owns the active-model slots; a federated add must not touch

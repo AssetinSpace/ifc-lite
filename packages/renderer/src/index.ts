@@ -657,6 +657,27 @@ export class Renderer {
     }
 
     /**
+     * Set (or clear, with `null`) a streamed point-cloud asset's per-vertex
+     * GPU model matrix (column-major, 16 floats) — issue #1804's
+     * `IfcMapConversion` alignment toggle. Cheap: takes effect on the next
+     * frame's uniform write, no GPU buffer rewrite.
+     */
+    setPointCloudTransform(
+        handle: import('./pointcloud/point-cloud-renderer.js').PointCloudAssetHandle,
+        matrix: Float32Array | null,
+    ): void {
+        this.pointCloudRenderer?.setAssetTransform(handle, matrix);
+        // The asset's world-space extents just moved: re-fold the (now
+        // matrix-aware) point-cloud bounds into the scene bounds and push
+        // them to the camera (matching every other bounds-mutating
+        // point-cloud method) so framing / zoom-to-fit targets where the
+        // points actually render.
+        this.recomputeModelBounds();
+        this.camera.setSceneBounds(this.modelBounds);
+        this.requestRender();
+    }
+
+    /**
      * Compute BIM ↔ scan deviation for every loaded point cloud asset.
      *
      * Walks every triangle in the scene (individual + batched meshes,
@@ -719,6 +740,12 @@ export class Renderer {
                     deviationsBuffer: chunk.deviationBuffer,
                     pointCount: chunk.pointCount,
                     maxRange,
+                    // #1804: chunk positions are stored in the asset's
+                    // decode-shifted local frame when IfcMapConversion
+                    // alignment is active; the BVH triangles are world
+                    // space, so the compute pass must apply the same
+                    // per-asset matrix the splat shader renders with.
+                    model: node.model,
                 });
                 if (ok) {
                     chunksProcessed++;
