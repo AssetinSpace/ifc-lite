@@ -20,6 +20,7 @@ import type {
   ListGroup,
   ListGrouping,
   ListSummary,
+  ListScheduleRow,
   CellValue,
   PropertyCondition,
   ColumnDefinition,
@@ -202,6 +203,33 @@ export function summariseListRows(
  */
 export function groupPathKey(path: string[]): string {
   return JSON.stringify(path);
+}
+
+/**
+ * Project a flat pre-order `ListGroup[]` (as returned by `summariseListRows`)
+ * down to a `schedule` / pivot presentation (issue #1790 round 2): ONE row
+ * per group-value tuple — the LEAF groups only, in the same order they
+ * appear in `groups`. Because `groups` is a pre-order flattening of the
+ * group tree, every parent's leaf descendants stay contiguous, so the result
+ * is already in the right order for a Bonsai-style schedule table (rows for
+ * one outer group value sit together) without re-sorting here.
+ *
+ * `levelCount` is the number of active grouping columns — typically
+ * `groupingColumnIds(grouping).filter(id => columns still has id).length`.
+ * With 0 levels (nothing to pivot on) or no `groups` at all, this returns
+ * `[]` rather than inventing a single all-rows row.
+ */
+export function toScheduleRows(groups: ListGroup[] | undefined, levelCount: number): ListScheduleRow[] {
+  if (!groups || levelCount <= 0) return [];
+  const leafLevel = levelCount - 1;
+  return groups
+    // `level` is optional on ListGroup. Defaulting a missing one to 0 would
+    // put EVERY group at level 0, so a hand-built multi-level set (the public
+    // API allows one — `summariseListRows` always fills `level` in) would
+    // match no leaf at all and pivot to nothing. Fall back to the depth its
+    // own `path` implies before assuming the outermost level.
+    .filter((g) => (g.level ?? (g.path ? g.path.length - 1 : 0)) === leafLevel)
+    .map((g) => ({ key: g.key, path: g.path ?? [g.label], count: g.count, sums: g.sums }));
 }
 
 // ============================================================================

@@ -33,9 +33,11 @@ import { columnToAutoColor } from '@/lib/lists/columnToAutoColor';
 import { AUTO_COLOR_FROM_LIST_ID } from '@/store/slices/lensSlice';
 import { ColumnHeaderMenu } from './ColumnHeaderMenu';
 import { ListGroupingBar } from './ListGroupingBar';
+import { ListScheduleTable } from './ListScheduleTable';
 import {
   formatCellValue, compareCells, detectNumericColumns, autoColumnWidth,
-  buildGroupedView, flatTotals, type DisplayItem, type Totals,
+  buildGroupedView, flatTotals, buildScheduleRows, rebuildGrouping,
+  type DisplayItem, type Totals, type ScheduleRow,
 } from './list-table-utils';
 
 interface ListResultsTableProps {
@@ -145,6 +147,35 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
       return { id, label: c ? (c.label ?? c.propertyName) : id };
     }),
     [groupColumnIds, columns]);
+  const sumChips = useMemo(
+    () => sumColumnIds.map((id) => {
+      const c = columns.find((c) => c.id === id);
+      return { id, label: c ? (c.label ?? c.propertyName) : id };
+    }),
+    [sumColumnIds, columns]);
+  const showSumRow = sumColumnIds.length > 0;
+
+  // Result presentation (issue #1790 round 2): `schedule` swaps the nested
+  // collapsible tree for a Bonsai-style pivot table — one row per group-value
+  // tuple, grouping columns first, then a first-class Count column, then any
+  // configured sums. Only meaningful once grouped.
+  const scheduleMode = isGrouped && grouping?.view === 'schedule';
+  const scheduleRows = useMemo<ScheduleRow[]>(() => {
+    if (!scheduleMode) return [];
+    const sort = sortCol === null ? null : { colIdx: sortCol, dir: sortDir };
+    return buildScheduleRows(
+      displayRows, columns,
+      { columnId: groupColumnIds[0], columnIds: groupColumnIds, sumColumnIds },
+      sort,
+    );
+  }, [scheduleMode, displayRows, columns, groupColumnIds, sumColumnIds, sortCol, sortDir]);
+  // The pivot header/body/footer live in `ListScheduleTable` — see the note
+  // there on role-qualified column keys.
+
+  const handleViewChange = useCallback((next: 'nested' | 'schedule') => {
+    if (!onGroupingChange || !grouping) return;
+    onGroupingChange({ ...grouping, view: next });
+  }, [onGroupingChange, grouping]);
 
   const { items, groupCount, totals, groupKeys } = useMemo<{
     items: DisplayItem[]; groupCount: number; totals: Totals; groupKeys: string[];
@@ -172,11 +203,12 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
   const totalWidth = useMemo(() => columnWidths.reduce((a, b) => a + b, 0), [columnWidths]);
 
   const virtualizer = useVirtualizer({
-    count: items.length,
+    count: scheduleMode ? scheduleRows.length : items.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (i) => (items[i]?.kind === 'group' ? 30 : 28),
+    estimateSize: (i) => (scheduleMode ? 28 : (items[i]?.kind === 'group' ? 30 : 28)),
     overscan: 18,
     getItemKey: (i) => {
+      if (scheduleMode) return `s:${scheduleRows[i]?.key ?? i}`;
       const it = items[i];
       if (it?.kind === 'group') return `g:${it.key}`;
       const r = (it as { row: ListRow }).row;
@@ -199,24 +231,24 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
 
   // Toggling a column in/out of the grouping: a second (third, …) column adds
   // a nesting level (multi-criteria grouping, issue #1790). `columnId` is kept
-  // in sync with the first level for pre-multi-level consumers.
+  // in sync with the first level for pre-multi-level consumers. `rebuildGrouping`
+  // spreads the previous grouping so fields it doesn't touch — `view`, issue
+  // #1790 round 2 — survive instead of silently resetting (bug found in QA:
+  // removing a grouping level or toggling a sum column used to drop the
+  // active schedule view back to nested).
   const toggleGroupBy = useCallback((colId: string) => {
     if (!onGroupingChange) return;
     const next = groupColumnIds.includes(colId)
       ? groupColumnIds.filter((x) => x !== colId)
       : [...groupColumnIds, colId];
-    onGroupingChange((next.length || sumColumnIds.length)
-      ? { columnId: next[0] ?? '', columnIds: next, sumColumnIds }
-      : undefined);
-  }, [onGroupingChange, groupColumnIds, sumColumnIds]);
+    onGroupingChange(rebuildGrouping(grouping, next, sumColumnIds));
+  }, [onGroupingChange, grouping, groupColumnIds, sumColumnIds]);
 
   const toggleSum = useCallback((colId: string) => {
     if (!onGroupingChange) return;
     const next = sumColumnIds.includes(colId) ? sumColumnIds.filter((x) => x !== colId) : [...sumColumnIds, colId];
-    onGroupingChange((groupColumnIds.length || next.length)
-      ? { columnId: groupColumnIds[0] ?? '', columnIds: groupColumnIds, sumColumnIds: next }
-      : undefined);
-  }, [onGroupingChange, groupColumnIds, sumColumnIds]);
+    onGroupingChange(rebuildGrouping(grouping, groupColumnIds, next));
+  }, [onGroupingChange, grouping, groupColumnIds, sumColumnIds]);
 
   const toggleGroupExpand = useCallback((key: string) => {
     setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
@@ -226,10 +258,12 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
     setExpandedGroups(allExpanded ? new Set() : new Set(groupKeys));
   }, [allExpanded, groupKeys]);
 
-  const startResize = useCallback((e: React.MouseEvent, colId: string, colIdx: number) => {
+  // `startWidth` is passed in (rather than looked up here) so the SAME
+  // resize handler works for both the normal column header and the schedule
+  // (pivot) header, which index into different width arrays.
+  const startResize = useCallback((e: React.MouseEvent, colId: string, startWidth: number) => {
     e.preventDefault(); e.stopPropagation();
     const startX = e.clientX;
-    const startWidth = columnWidths[colIdx];
     const onMove = (ev: MouseEvent) => setWidthOverrides((p) => ({ ...p, [colId]: Math.max(56, startWidth + (ev.clientX - startX)) }));
     const onUp = () => {
       window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp);
@@ -237,7 +271,7 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
     };
     window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
     document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
-  }, [columnWidths]);
+  }, []);
 
   // Export honours the on-screen view: configured columns, the active
   // grouping (sections + per-group count/sums), and the grand totals.
@@ -291,14 +325,6 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
     if (idx === undefined) return;
     onMultiSelect(selectableItems, idx, e);
   }, [rowIndexByKey, selectableItems, onMultiSelect]);
-
-  const sumChips = useMemo(
-    () => sumColumnIds.map((id) => {
-      const c = columns.find((c) => c.id === id);
-      return { id, label: c ? (c.label ?? c.propertyName) : id };
-    }),
-    [sumColumnIds, columns]);
-  const showSumRow = sumColumnIds.length > 0;
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -358,11 +384,29 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
           onRemoveGroup={(id) => toggleGroupBy(id)}
           onRemoveSum={(id) => toggleSum(id)}
           onToggleExpandAll={toggleExpandAll}
+          view={isGrouped ? (grouping?.view ?? 'nested') : undefined}
+          onViewChange={isGrouped ? handleViewChange : undefined}
         />
       )}
 
       {/* Table */}
       <div ref={parentRef} className="flex-1 overflow-auto min-h-0">
+      {scheduleMode ? (
+        <ListScheduleTable
+          scheduleRows={scheduleRows}
+          groupChips={groupChips}
+          sumChips={sumChips}
+          columns={columns}
+          sortCol={sortCol}
+          sortDir={sortDir}
+          totals={totals}
+          widthOverrides={widthOverrides}
+          setWidthOverrides={setWidthOverrides}
+          startResize={startResize}
+          onHeaderClick={handleHeaderClick}
+          virtualizer={virtualizer}
+        />
+      ) : (
         <div style={{ minWidth: totalWidth }}>
           {/* Header */}
           <div className="flex sticky top-0 z-10 bg-muted/80 backdrop-blur-sm border-b">
@@ -407,7 +451,7 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
                     />
                   )}
                   <div
-                    onMouseDown={(e) => startResize(e, col.id, colIdx)}
+                    onMouseDown={(e) => startResize(e, col.id, columnWidths[colIdx])}
                     onClick={(e) => e.stopPropagation()}
                     onDoubleClick={() => setWidthOverrides((p) => { const n = { ...p }; delete n[col.id]; return n; })}
                     className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40"
@@ -497,6 +541,7 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
             </div>
           )}
         </div>
+      )}
       </div>
     </div>
   );
