@@ -56,6 +56,7 @@ import { createPointCloudSlice, type PointCloudSlice, POINT_CLOUD_DEFAULTS } fro
 import { createUnitDisplaySlice, type UnitDisplaySlice } from './slices/unitDisplaySlice.js';
 import { createSpaceMouseSlice, type SpaceMouseSlice } from './slices/spaceMouseSlice.js';
 import { createLayerStackSlice, type LayerStackSlice } from './slices/layerStackSlice.js';
+import { createZonesSlice, type ZonesSlice } from './slices/zonesSlice.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
 
 // Import constants for reset function
@@ -170,6 +171,7 @@ export type ViewerState = LoadingSlice &
   PointCloudSlice &
   UnitDisplaySlice &
   SpaceMouseSlice &
+  ZonesSlice &
   ExtensionsSlice & {
     resetViewerState: () => void;
     /**
@@ -257,6 +259,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createPointCloudSlice(...args),
   ...createUnitDisplaySlice(...args),
   ...createSpaceMouseSlice(...args),
+  ...createZonesSlice(...args),
   ...createExtensionsSlice(...args),
 
   // Reset all viewer state when loading new file
@@ -314,6 +317,20 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       compareSelectedKey: null,
       compareRunning: false,
       compareError: null,
+
+      // Zones (#1810): keep the user-authored zone SETS (they persist across
+      // model loads, like clash presets), but drop the computed assignments —
+      // they're keyed by the OUTGOING model's global ids, and the single-model
+      // fallback (globalId === expressId) means the incoming model's ids can
+      // collide and read the old model's zone membership until the debounced
+      // recompute fires. Same stale-model-reference class as compareResult
+      // above; `useZoneAssignmentSync` recomputes against the new scene.
+      zoneAssignments: new Map(),
+      zoneAssignmentTiming: null,
+      // ... and drop any in-flight zone-edit session: leaving `editingZone`
+      // set would hand the incoming model live gizmo handles + picking for
+      // a zone the user was editing against the outgoing model.
+      editingZone: null,
 
       // Hover/Context
       hoverState: { entityId: null, screenX: 0, screenY: 0 },
