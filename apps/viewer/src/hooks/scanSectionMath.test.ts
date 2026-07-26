@@ -387,3 +387,140 @@ describe('mergeScanBandSelections', () => {
     assert.strictEqual(merged.points.length, 6);
   });
 });
+
+/**
+ * Aligned-scan reconciliation for the 2D overlay (#1804 x #1805).
+ *
+ * The scan cache holds RAW decoder points; an aligned asset is drawn
+ * through its GPU matrix. Without folding that matrix in here, the 2D
+ * section overlay selects a band around pre-alignment coordinates while
+ * the 3D view shows the scan aligned to the building — the two views
+ * disagree about where the same scan is.
+ */
+describe('selectScanBand with an aligned point cloud', () => {
+  /** Column-major 4x4: identity rotation/scale, translation only. */
+  function translation(x: number, y: number, z: number): Float32Array {
+    return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+  }
+
+  const plane: ScanSectionPlane = { axis: 'y', position: 5, flipped: false };
+
+  it('selects the band around the RENDERED position, not the raw one', () => {
+    // Raw point at y=0. The asset is drawn +5 in y, so it renders at y=5
+    // and must fall inside a band centred on y=5.
+    const sample: ScanPointSample = { positions: new Float32Array([0, 0, 0]), count: 1 };
+    const aligned = selectScanBand({
+      sample, coordinateInfo: undefined, plane, thickness: 0.2, model: translation(0, 5, 0),
+    });
+    assert.strictEqual(aligned.totalInBand, 1, 'aligned point must be in band at its rendered height');
+  });
+
+  it('does not select the stale raw position once aligned', () => {
+    // Same asset, but the band sits at the RAW height (y=0). Nothing is
+    // rendered there any more, so nothing should be selected.
+    const sample: ScanPointSample = { positions: new Float32Array([0, 0, 0]), count: 1 };
+    const atRaw = selectScanBand({
+      sample,
+      coordinateInfo: undefined,
+      plane: { axis: 'y', position: 0, flipped: false },
+      thickness: 0.2,
+      model: translation(0, 5, 0),
+    });
+    assert.strictEqual(atRaw.totalInBand, 0, 'pre-alignment position must no longer be selected');
+  });
+
+  it('is unchanged when no matrix is supplied (unaligned fast path)', () => {
+    const sample: ScanPointSample = { positions: new Float32Array([0, 5, 0]), count: 1 };
+    const bare = selectScanBand({ sample, coordinateInfo: undefined, plane, thickness: 0.2 });
+    const identity = selectScanBand({
+      sample, coordinateInfo: undefined, plane, thickness: 0.2, model: translation(0, 0, 0),
+    });
+    assert.strictEqual(bare.totalInBand, 1);
+    assert.strictEqual(identity.totalInBand, 1);
+    assert.deepStrictEqual(identity.points[0].point, bare.points[0].point);
+  });
+
+  it('emits the transformed point, so the count pass and the collect pass agree', () => {
+    // Both passes must read the point through the same transform; if only
+    // the band test were transformed, totalInBand and points.length would
+    // disagree (or the drawn dot would be at the untransformed spot).
+    const sample: ScanPointSample = { positions: new Float32Array([3, 0, 0]), count: 1 };
+    const out = selectScanBand({
+      sample, coordinateInfo: undefined, plane, thickness: 0.2, model: translation(0, 5, 0),
+    });
+    assert.strictEqual(out.totalInBand, 1);
+    assert.strictEqual(out.points.length, 1);
+    close(out.points[0].point.x, 3);
+  });
+});
+
+/**
+ * Double-shift regression (#1889 review, Codex P1).
+ *
+ * `computePointCloudAlignment` folds the ENTIRE viewer shift into
+ * `decodeOriginOffset`, so `alignedMatrix` lands directly in the render
+ * frame with a zero translation column. Applying the render-frame shift on
+ * top of it subtracts that shift twice and displaces the overlay by the
+ * model's full RTC/origin offset — which, at map magnitudes, means the
+ * section selects nothing at all.
+ *
+ * The original tests for the aligned path all passed
+ * `coordinateInfo: undefined`, making the shift zero and the double
+ * subtraction invisible. These use a NON-ZERO shift on purpose.
+ */
+describe('selectScanBand — aligned matrices must not be shifted twice', () => {
+  const coordinateInfo = {
+    wasmRtcOffset: { x: 1000, y: 2000, z: 5 },
+    originShift: { x: 3, y: 9, z: -7 },
+  } as never;
+
+  function translation(x: number, y: number, z: number): Float32Array {
+    return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+  }
+
+  it('an aligned matrix output is used as-is (already render-frame)', () => {
+    // The matrix puts the point at render-frame y=5, so a band at y=5
+    // must select it — with the shift applied again it would land at
+    // y = 5 - shift.y and be missed entirely.
+    const sample: ScanPointSample = { positions: new Float32Array([0, 0, 0]), count: 1 };
+    const out = selectScanBand({
+      sample,
+      coordinateInfo,
+      plane: { axis: 'y', position: 5, flipped: false },
+      thickness: 0.2,
+      model: translation(0, 5, 0),
+      modelOutputsRenderFrame: true,
+    });
+    assert.strictEqual(out.totalInBand, 1, 'aligned output must not be shifted a second time');
+    close(out.points[0].point.x, 0);
+  });
+
+  it('an UNALIGNED matrix output still gets the render-frame shift', () => {
+    // `unalignedMatrix` restores absolute native coordinates, so the
+    // world -> render-frame shift still applies. Point lands at
+    // render-frame y = 5 - shift.y, where shift.y = rtc.z + originShift.y.
+    const shift = pointCloudRenderFrameShift(coordinateInfo);
+    const sample: ScanPointSample = { positions: new Float32Array([0, 0, 0]), count: 1 };
+    const out = selectScanBand({
+      sample,
+      coordinateInfo,
+      plane: { axis: 'y', position: 5 - shift.y, flipped: false },
+      thickness: 0.2,
+      model: translation(0, 5, 0),
+      modelOutputsRenderFrame: false,
+    });
+    assert.strictEqual(out.totalInBand, 1, 'unaligned output must still be shifted into the render frame');
+  });
+
+  it('no matrix at all is unaffected by the flag', () => {
+    const shift = pointCloudRenderFrameShift(coordinateInfo);
+    const sample: ScanPointSample = { positions: new Float32Array([0, 5, 0]), count: 1 };
+    const out = selectScanBand({
+      sample,
+      coordinateInfo,
+      plane: { axis: 'y', position: 5 - shift.y, flipped: false },
+      thickness: 0.2,
+    });
+    assert.strictEqual(out.totalInBand, 1, 'raw cached points still take the render-frame shift');
+  });
+});
