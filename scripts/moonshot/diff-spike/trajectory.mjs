@@ -150,7 +150,7 @@ export async function commitState(x, scenario) {
   return { params, quantities, paramsHash, qHash, root, numeric, maxViolation };
 }
 
-function stateRefs(k, committed) {
+export function stateRefs(k, committed) {
   const ids = nodeIds(k);
   return [
     { nodeId: ids.params, hash: committed.paramsHash },

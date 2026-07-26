@@ -28,18 +28,20 @@
  *                      certificate are honestly recomputed - only the
  *                      kernel RE-MEASUREMENT catches it
  *
+ * This file holds the v1 battery and the CLI; the v2 (checkpointed) cases
+ * live in tamper-v2.mjs and the shared endpoint forgery in
+ * tamper-common.mjs. Dispatch is on the chain's version tag.
+ *
  * Usage: node scripts/moonshot/diff-spike/tamper-test.mjs CHAIN.json [--full]
  */
 
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { verifyChain } from './verify-trajectory.mjs';
-import { endpointKernelPayload, endpointRootPayload } from './trajectory.mjs';
-import { REPO_ROOT } from './build-ifc.mjs';
-
-const { computeNodeHash, createCertificate } = await import(
-  path.join(REPO_ROOT, 'packages/provenance/dist/index.js')
-);
+import { CHAIN_VERSION } from './trajectory.mjs';
+import { CHAIN_VERSION_V2 } from './chain-v2.mjs';
+import { consistentEndpointTamper } from './tamper-common.mjs';
+import { runV2Battery } from './tamper-v2.mjs';
 
 function midStepIndex(chain) {
   const stepPositions = chain.records
@@ -114,27 +116,6 @@ function findPrevParams(chain, recIdx) {
   return chain.startParams;
 }
 
-/** The hard case: fake the kernel numbers and recompute every hash and the
- *  endpoint certificate honestly. Only re-measurement can catch this. */
-async function consistentEndpointTamper(chain) {
-  const ep = chain.endpoint;
-  ep.kernel.carbon -= 1000;
-  ep.kernelHash = await computeNodeHash('property-set', endpointKernelPayload(ep));
-  ep.endpointRoot = await computeNodeHash(
-    'element', endpointRootPayload(ep.stateRoot, ep.kernelHash));
-  ep.certificate = createCertificate({
-    kernelVersion: chain.kernelVersion,
-    trustRoot: chain.trustRoot,
-    reads: ep.certificate.reads,
-    writes: [
-      { nodeId: 'endpoint/kernel', hash: ep.kernelHash },
-      { nodeId: 'endpoint/root', hash: ep.endpointRoot },
-    ],
-    claims: ep.certificate.claims,
-  });
-  return 'endpoint: kernel carbon -= 1000 kgCO2e with ALL hashes + certificate recomputed consistently';
-}
-
 async function main() {
   const argv = process.argv.slice(2);
   const chainPath = argv.find((a) => !a.startsWith('-'));
@@ -144,6 +125,23 @@ async function main() {
     process.exit(2);
   }
   const original = JSON.parse(readFileSync(chainPath, 'utf8'));
+
+  if (original.version === CHAIN_VERSION_V2) {
+    const sidecarPath = path.join(path.dirname(chainPath), original.sidecar.file);
+    const sidecarLines = readFileSync(sidecarPath, 'utf8').split('\n').filter((l) => l.length > 0);
+    const { failures, tampers } = await runV2Battery(original, sidecarLines, full);
+    console.log('---');
+    if (failures === 0) {
+      console.log(`tamper test PASS (v2): controls verified, ${tampers} tamper cases behaved as specified`);
+      process.exit(0);
+    }
+    console.error(`tamper test FAIL (v2): ${failures} problem(s)`);
+    process.exit(1);
+  }
+  if (original.version !== CHAIN_VERSION) {
+    console.error(`unsupported chain version "${original.version}"`);
+    process.exit(2);
+  }
   let failures = 0;
 
   // Control: the untampered chain must verify (fast mode: endpoint hashes

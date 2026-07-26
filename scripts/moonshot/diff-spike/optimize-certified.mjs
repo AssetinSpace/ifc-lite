@@ -18,17 +18,22 @@
  *      certificate, so the chain terminates in a kernel-validated,
  *      hash-committed artifact.
  *
- * The chain is written as JSON next to the optimum IFC. Verify it
- * independently with verify-trajectory.mjs (which re-derives everything
- * from the start parameters without trusting this script).
+ * The chain is written next to the optimum IFC in the checkpointed v2
+ * format (trajectory-chain-v2.json + trajectory-steps-v2.jsonl sidecar);
+ * `--emit-v1` additionally writes the v1 one-certificate-per-step chain
+ * (trajectory-chain.json) for comparison. Verify either independently with
+ * verify-trajectory.mjs (which re-derives everything from the start
+ * parameters without trusting this script).
  *
  * Usage:
  *   node scripts/moonshot/diff-spike/optimize-certified.mjs \
- *     [--scenario baseline|strict] [--out DIR] [--rounds N] [--max-iter M]
+ *     [--scenario baseline|strict] [--out DIR] [--rounds N] [--max-iter M] \
+ *     [--segment N] [--emit-v1]
  *
  * `--rounds` / `--max-iter` shrink the optimizer budget for a short smoke
  * run; the chain stays fully verifiable (the verifier replays recorded
- * events, however many there are).
+ * events, however many there are). `--segment` sets the v2 checkpoint size
+ * and `--emit-v1` additionally writes the per-step v1 chain.
  */
 
 import path from 'node:path';
@@ -38,6 +43,18 @@ import { PARAMS, NPARAMS, evaluateNumeric } from './carbon-model.mjs';
 import { optimize, endpointChecks, SCENARIOS, G_SCALE } from './optimize.mjs';
 import { buildChain, attachEndpoint, getKernelIdentity } from './trajectory.mjs';
 import { SEEDED_BUILD_SPEC } from './build-ifc.mjs';
+import { chainToV2, DEFAULT_SEGMENT_SIZE } from './chain-v2.mjs';
+
+function intFlag(argv, flag, fallback) {
+  const i = argv.indexOf(flag);
+  if (i < 0) return fallback;
+  const v = Number(argv[i + 1]);
+  if (!Number.isInteger(v) || v < 1) {
+    console.error(`${flag} needs a positive integer, got "${argv[i + 1]}"`);
+    process.exit(2);
+  }
+  return v;
+}
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -55,21 +72,13 @@ async function main() {
     ? outValue
     : path.join(tmpdir(), 'ifc-lite-diff-spike-certified', scenarioName);
   mkdirSync(outDir, { recursive: true });
+  const segmentSize = intFlag(argv, '--segment', DEFAULT_SEGMENT_SIZE);
+  const maxIter = intFlag(argv, '--max-iter', 2000);
+  const emitV1 = argv.includes('--emit-v1');
 
   console.log(`scenario: ${scenarioName} ${JSON.stringify(scenario)}`);
 
-  const intFlag = (name, def) => {
-    const i = argv.indexOf(name);
-    if (i < 0) return def;
-    const v = Number(argv[i + 1]);
-    if (!Number.isInteger(v) || v <= 0) {
-      console.error(`${name} must be a positive integer`);
-      process.exit(2);
-    }
-    return v;
-  };
-  const rounds = intFlag('--rounds', 12);
-  const maxIter = intFlag('--max-iter', 2000);
+  const rounds = intFlag(argv, '--rounds', 12);
 
   // ---- 1. Optimize, recording every accepted step ----
   const events = [];
@@ -132,14 +141,28 @@ async function main() {
   console.log(`endpoint certificate: root ${endpoint.endpointRoot}`);
   console.log(`  ifc ${endpoint.ifcSha256} (${endpoint.ifcBytes} bytes, seeded build: raw hash re-derivable)`);
 
-  // ---- 4. Persist ----
-  const chainPath = path.join(outDir, 'trajectory-chain.json');
-  const json = JSON.stringify(chain);
-  writeFileSync(chainPath, json);
+  // ---- 4. Convert to the checkpointed v2 format and persist ----
+  const tv0 = performance.now();
+  const { chainV2, sidecarText } = await chainToV2(chain, { segmentSize });
+  const v2Ms = performance.now() - tv0;
+  const chainV2Path = path.join(outDir, 'trajectory-chain-v2.json');
+  const sidecarPath = path.join(outDir, chainV2.sidecar.file);
+  const v2Json = JSON.stringify(chainV2);
+  writeFileSync(chainV2Path, v2Json);
+  writeFileSync(sidecarPath, sidecarText);
   console.log('---');
-  console.log(`chain written: ${chainPath} (${(json.length / 1e6).toFixed(1)} MB, ` +
-    `${chain.records.length} records)`);
-  console.log(`verify with: node scripts/moonshot/diff-spike/verify-trajectory.mjs ${chainPath}`);
+  console.log(`v2 chain written: ${chainV2Path} (${(v2Json.length / 1e3).toFixed(1)} KB, ` +
+    `${chainV2.segments.length} segments of <= ${segmentSize} steps, built in ${(v2Ms / 1000).toFixed(1)}s)`);
+  console.log(`v2 sidecar written: ${sidecarPath} (${(sidecarText.length / 1e3).toFixed(1)} KB, ` +
+    `${chainV2.sidecar.records} records)`);
+  if (emitV1) {
+    const chainPath = path.join(outDir, 'trajectory-chain.json');
+    const json = JSON.stringify(chain);
+    writeFileSync(chainPath, json);
+    console.log(`v1 chain written: ${chainPath} (${(json.length / 1e6).toFixed(1)} MB, ` +
+      `${chain.records.length} records)`);
+  }
+  console.log(`verify with: node scripts/moonshot/diff-spike/verify-trajectory.mjs ${chainV2Path}`);
 }
 
 main().then(() => process.exit(0)).catch((err) => {
