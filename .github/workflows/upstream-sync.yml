@@ -31,6 +31,12 @@ env:
   UPSTREAM_REPO: https://github.com/LTplus-AG/ifc-lite
   UPSTREAM_BRANCH: main
   BASE_BRANCH: main
+  # `gh` derives its base repo from the git remotes and PREFERS the one named
+  # `upstream` — which the "Fetch upstream" step below adds, pointing at
+  # LTplus-AG/ifc-lite. Without this pin every gh call (labels, PR) targets the
+  # upstream repo: 403 at best, a pull request opened against them at worst.
+  # The fork relationship is strictly one-way — see docs/FORK_MAINTENANCE.md.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   sync:
