@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.112.4",
-    "@assetinspace/design-kit": "github:AssetinSpace/design-kit#main",
+    "@assetinspace/design-kit": "https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz",
     "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/lang-javascript": "^6.2.5",

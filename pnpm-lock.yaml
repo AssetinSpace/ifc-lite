@@ -72,8 +72,8 @@ importers:
         specifier: ^0.112.4
         version: 0.112.4(zod@4.4.3)
       '@assetinspace/design-kit':
-        specifier: github:AssetinSpace/design-kit#main
-        version: git+https://git@github.com:AssetinSpace/design-kit.git#d41bbbb0472923d1cdc5104565a423898b7a7a1b
+        specifier: https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz
+        version: https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b
       '@codemirror/autocomplete':
         specifier: ^6.20.3
         version: 6.20.3
@@ -1413,8 +1413,8 @@ packages:
       zod:
         optional: true
 
-  '@assetinspace/design-kit@git+https://git@github.com:AssetinSpace/design-kit.git#d41bbbb0472923d1cdc5104565a423898b7a7a1b':
-    resolution: {commit: d41bbbb0472923d1cdc5104565a423898b7a7a1b, repo: git@github.com:AssetinSpace/design-kit.git, type: git}
+  '@assetinspace/design-kit@https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b':
+    resolution: {tarball: https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b}
     version: 0.1.0
 
   '@automerge/automerge@3.3.2':
@@ -5590,7 +5590,7 @@ snapshots:
     optionalDependencies:
       zod: 4.4.3
 
-  '@assetinspace/design-kit@git+https://git@github.com:AssetinSpace/design-kit.git#d41bbbb0472923d1cdc5104565a423898b7a7a1b': {}
+  '@assetinspace/design-kit@https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b': {}
 
   '@automerge/automerge@3.3.2': {}
 
