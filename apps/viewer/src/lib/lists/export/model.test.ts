@@ -51,6 +51,110 @@ describe('buildExportModel grouped-section order honours the on-screen sort (#14
   });
 });
 
+// Multi-criteria grouping in exports (issue #1790): nested sections in
+// pre-order, per-group counts at every level, member rows on leaves only.
+describe('buildExportModel multi-criteria grouping (#1790)', () => {
+  const cols3: ColumnDefinition[] = [
+    { id: 'building', source: 'spatial', propertyName: 'Building' },
+    { id: 'storey', source: 'spatial', propertyName: 'Storey' },
+    { id: 'qty', source: 'quantity', propertyName: 'Qty' },
+  ];
+  const rows3: ListRow[] = ([
+    ['A', 'L0', 1], ['A', 'L0', 2], ['A', 'L1', 3], ['B', 'L0', 4],
+  ] as [string, string, number][]).map(([b, s, q], i) => ({ entityId: i + 1, modelId: 'm', values: [b, s, q] }));
+  const input = {
+    title: 'List',
+    columns: cols3,
+    rows: rows3,
+    numericCols: [false, false, true],
+    columnWidths: [120, 120, 120],
+    generatedAt: 'now',
+    grouping: { columnId: 'building', columnIds: ['building', 'storey'], sumColumnIds: ['qty'] },
+  };
+
+  it('emits pre-order nested groups with level, path and per-group count', () => {
+    const m = buildExportModel({ ...input });
+    assert.deepStrictEqual(
+      m.groups?.map((g) => [g.level, g.label, g.count, g.rows.length]),
+      [
+        [0, 'A', 3, 0],
+        [1, 'L0', 2, 2],
+        [1, 'L1', 1, 1],
+        [0, 'B', 1, 0],
+        [1, 'L0', 1, 1],
+      ],
+    );
+    assert.deepStrictEqual(m.groups?.[1].path, ['A', 'L0']);
+    assert.deepStrictEqual(m.groupColumnIds, ['building', 'storey']);
+    assert.strictEqual(m.groupColumnId, 'building');
+    // Subtotals at both levels; grand totals not double-counted.
+    assert.strictEqual(m.groups?.[0].sums.qty, 6);
+    assert.strictEqual(m.groups?.[1].sums.qty, 3);
+    assert.strictEqual(m.totals.sums.qty, 10);
+    assert.strictEqual(m.totals.count, 4);
+  });
+
+  it('single-level grouping keeps rows on every group (all groups are leaves)', () => {
+    const m = buildExportModel({ ...input, grouping: { columnId: 'building', sumColumnIds: [] } });
+    assert.deepStrictEqual(m.groups?.map((g) => [g.level, g.label, g.rows.length]), [[0, 'A', 3], [0, 'B', 1]]);
+    assert.deepStrictEqual(m.groupColumnIds, ['building']);
+  });
+
+  it('schedule is null when grouping.view is not "schedule" (default nested behaviour unchanged)', () => {
+    const m = buildExportModel({ ...input });
+    assert.strictEqual(m.schedule, null);
+  });
+});
+
+// Schedule / pivot presentation (issue #1790 round 2): grouping columns
+// become leading columns, one row per group-value tuple, Count as a
+// first-class column — the CSV/XLSX/PDF arrangement the reporter asked for.
+describe('buildExportModel schedule view (#1790 round 2)', () => {
+  const cols3: ColumnDefinition[] = [
+    { id: 'building', source: 'spatial', propertyName: 'Building' },
+    { id: 'storey', source: 'spatial', propertyName: 'Storey' },
+    { id: 'qty', source: 'quantity', propertyName: 'Qty' },
+  ];
+  const rows3: ListRow[] = ([
+    ['A', 'L0', 1], ['A', 'L0', 2], ['A', 'L1', 3], ['B', 'L0', 4],
+  ] as [string, string, number][]).map(([b, s, q], i) => ({ entityId: i + 1, modelId: 'm', values: [b, s, q] }));
+  const input = {
+    title: 'List',
+    columns: cols3,
+    rows: rows3,
+    numericCols: [false, false, true],
+    columnWidths: [120, 120, 120],
+    generatedAt: 'now',
+    grouping: { columnId: 'building', columnIds: ['building', 'storey'], sumColumnIds: ['qty'], view: 'schedule' as const },
+  };
+
+  it('emits one row per LEAF group-value tuple: group columns, Count, then sums', () => {
+    const m = buildExportModel(input);
+    assert.deepStrictEqual(m.schedule?.columns.map((c) => c.label), ['Building', 'Storey', 'Count', 'Qty']);
+    assert.deepStrictEqual(m.schedule?.rows, [
+      ['A', 'L0', 2, 3],
+      ['A', 'L1', 1, 3],
+      ['B', 'L0', 1, 4],
+    ]);
+  });
+
+  it('does not lose the nested `groups` field either — both are populated so a caller can choose', () => {
+    const m = buildExportModel(input);
+    assert.ok(m.groups && m.groups.length > 0);
+  });
+
+  it('single-criterion schedule: every top-level group IS a leaf row', () => {
+    const m = buildExportModel({ ...input, grouping: { columnId: 'building', sumColumnIds: ['qty'], view: 'schedule' as const } });
+    assert.deepStrictEqual(m.schedule?.rows, [['A', 3, 6], ['B', 1, 4]]);
+  });
+
+  it('schedule view with no sum columns still carries the Count column', () => {
+    const m = buildExportModel({ ...input, grouping: { columnId: 'building', columnIds: ['building', 'storey'], sumColumnIds: [], view: 'schedule' as const } });
+    assert.deepStrictEqual(m.schedule?.columns.map((c) => c.label), ['Building', 'Storey', 'Count']);
+    assert.deepStrictEqual(m.schedule?.rows, [['A', 'L0', 2], ['A', 'L1', 1], ['B', 'L0', 1]]);
+  });
+});
+
 // #1573: quantity/measure columns export converted into the user's
 // display-unit override, with the resolved symbol folded into the header.
 describe('buildExportModel display-unit conversion (#1573)', () => {

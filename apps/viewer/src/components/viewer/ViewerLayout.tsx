@@ -9,6 +9,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
 import { MobileToolbar } from './MobileToolbar';
+import { RibbonToolbar } from './ribbon/RibbonToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
 import { PropertiesPanel } from './PropertiesPanel';
 import { AddElementPanel } from './AddElementPanel';
@@ -108,15 +109,23 @@ export function ViewerLayout() {
   // original landing-page-iframe behaviour). `?models=<URL>,<URL>,…` loads a
   // federation (AIM: ASR + VZT) — the URLs load sequentially through addModel so
   // every model shares the first model's RTC origin + georef anchor (see
-  // useIfcFederation: shared RTC + alignGeometryToReference). Same-origin or
-  // CORS-friendly URLs only.
+  // useIfcFederation: shared RTC + alignGeometryToReference).
+  //
+  // SECURITY: both params are attacker-controllable, so an arbitrary URL here is
+  // a drive-by model-injection vector. Upstream answers that with a strict
+  // same-origin rule; we cannot — the AIM host serves its models from object
+  // storage on another origin. The equivalent gate lives in
+  // `parseAutoloadUrls` instead: http(s) only, a count cap, and same-origin OR
+  // an explicit allowlist (`VITE_AIM_MODEL_ORIGINS`), applied to `?model=` and
+  // `?models=` alike. Anything else is refused before any fetch happens.
   const { addModel: autoloadAddModel } = useIfc();
   const autoloadDoneRef = useRef(false);
   useEffect(() => {
     if (autoloadDoneRef.current) return;
-    // http(s)-only + count cap — the viewer fetches these on the user's
-    // behalf, so a crafted link must not smuggle data:/blob: URLs or queue
-    // dozens of parses (see lib/autoload.ts).
+    // http(s)-only, count cap, and same-origin-or-allowlisted — the viewer
+    // fetches these on the user's behalf, so a crafted link must not smuggle
+    // data:/blob: URLs, queue dozens of parses, or pull in a foreign model
+    // (see lib/autoload.ts). Everything rejected here is never fetched.
     const urls = parseAutoloadUrls(window.location.search, window.location.href);
     if (urls.length === 0) return;
     autoloadDoneRef.current = true;
@@ -203,6 +212,8 @@ export function ViewerLayout() {
 
   // Initialize theme on mount
   const theme = useViewerStore((s) => s.theme);
+  // Desktop toolbar style (issue #1686): classic strip or tabbed ribbon.
+  const toolbarStyle = useViewerStore((s) => s.toolbarStyle);
   const isMobile = useViewerStore((s) => s.isMobile);
   const setIsMobile = useViewerStore((s) => s.setIsMobile);
   const leftPanelCollapsed = useViewerStore((s) => s.leftPanelCollapsed);
@@ -466,8 +477,13 @@ export function ViewerLayout() {
         <SearchModal />
         <TourHost />
 
-        {/* Main Toolbar — use compact MobileToolbar on mobile */}
-        {isMobile ? <MobileToolbar /> : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
+        {/* Main Toolbar — compact MobileToolbar on mobile; on desktop the
+            user picks classic strip vs tabbed ribbon (issue #1686). */}
+        {isMobile
+          ? <MobileToolbar />
+          : toolbarStyle === 'ribbon'
+            ? <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />
+            : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
 
         {/* Main Content Area - Desktop Layout */}
         {!isMobile && (

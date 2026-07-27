@@ -76,6 +76,11 @@
 // re-exports below, so those modules are `pub(crate)` (see #C3.2).
 pub(crate) mod alignment;
 pub(crate) mod bool2d;
+/// General 2D booleans over contour sets (union/difference/intersection),
+/// keeping every disjoint output shape. Distinct from `bool2d`, which is the
+/// fixed single-`Profile2D` void-subtraction path. Reached through the
+/// root-level re-exports below, so it stays `pub(crate)` per #C3.2.
+pub(crate) mod contour_bool2d;
 /// Deterministic Constrained Delaunay Triangulation + bounded Ruppert
 /// min-angle refinement. Backs the quality triangulators in `triangulation`.
 mod cdt;
@@ -117,6 +122,9 @@ pub mod projection_outline;
 pub mod rect_fast;
 pub use rect_fast::RectFastStats;
 pub(crate) mod router;
+/// Per-element mesh simplification for the demesher (cavity removal, grid
+/// vertex-clustering decimation, bounding-box collapse).
+pub mod simplify;
 pub(crate) mod tessellation;
 pub mod space_dcel;
 pub(crate) mod transform;
@@ -128,7 +136,10 @@ pub use nalgebra::{Point2, Point3, Vector2, Vector3};
 
 pub use bool2d::{
     compute_signed_area, ensure_ccw, ensure_cw, is_valid_contour, point_in_contour, subtract_2d,
-    subtract_multiple_2d,
+    subtract_multiple_2d, subtract_multiple_2d_counted,
+};
+pub use contour_bool2d::{
+    boolean_2d, resolve_2d, sanitize as sanitize_contours, BooleanOp2D, ContourSet, Ring2D,
 };
 pub use csg::{calculate_normals, ClippingProcessor, Plane, Triangle};
 pub use diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
@@ -150,14 +161,16 @@ pub use mesh_orient::orient_mesh_outward;
 pub use processors::{
     AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
     ExtrudedAreaSolidTaperedProcessor, FaceBasedSurfaceModelProcessor, FacetedBrepProcessor,
-    build_texture_index, MeshTexture, PolygonalFaceSetProcessor,
-    ResolvedTextureMap, RevolvedAreaSolidProcessor, SurfaceOfLinearExtrusionProcessor,
+    build_texture_index, ImageTextureRef, MeshTexture, PolygonalFaceSetProcessor,
+    ResolvedTextureMap, RevolvedAreaSolidProcessor, TextureAttachment, TextureSource, SurfaceOfLinearExtrusionProcessor,
     SweptDiskSolidProcessor, TriangulatedFaceSetProcessor,
 };
 pub use alignment::{AlignmentCurve, AlignmentFrame};
 pub use profile::{Profile2D, Profile2DWithVoids, ProfileType, VoidInfo};
 pub use profile_extractor::{extract_profiles, ExtractedProfile};
 pub use profiles::ProfileProcessor;
+pub use router::take_bool2d_stats;
+pub use router::{take_prism_defers, take_prism_stats};
 pub use router::{
     aggregate_diagnostics, local_frame_set_enabled_override, ClassificationStats,
     GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION,
@@ -174,6 +187,7 @@ pub use router::{
 /// decision. (Other 10 km checks carry their own local constant of the same
 /// value.)
 pub const LARGE_COORD_THRESHOLD_METERS: f64 = 10000.0;
+pub use simplify::{simplify_mesh, SimplifyOptions, SimplifyStats};
 pub use tessellation::{scale_segments, TessellationQuality};
 pub use transform::{
     parse_axis2_placement_3d, parse_axis2_placement_3d_from_id, parse_cartesian_point,

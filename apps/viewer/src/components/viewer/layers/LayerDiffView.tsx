@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { StackDiff } from '@ifc-lite/merge';
 import { useViewerStore } from '@/store';
+import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
 import type { LayerStackEntry } from '@/store/slices/layerStackSlice';
 import { pathTail } from '@/lib/layers/stack';
 import { Ghost } from 'lucide-react';
@@ -88,8 +89,11 @@ export function LayerDiffView({ entry, diff }: { entry: LayerStackEntry; diff: S
         if (id !== undefined) ids.add(id);
       }
       if (ids.size === 0) return false;
-      ownedGhostSet.current = ids;
       state.setGhostExceptEntities(ids);
+      // The slice stores a defensive COPY of the set — own THAT copy, or
+      // the identity checks below (and the unmount cleanup) never match
+      // and the ghost leaks until "Show All".
+      ownedGhostSet.current = useViewerStore.getState().ghostExceptEntities;
       return true;
     });
   }, [diff]);
@@ -121,7 +125,10 @@ export function LayerDiffView({ entry, diff }: { entry: LayerStackEntry; diff: S
   ];
 
   return (
-    <div className="animate-in fade-in slide-in-from-top-1 rounded-md border bg-card/30 p-2">
+    <div
+      className="animate-in fade-in slide-in-from-top-1 rounded-md border bg-card/30 p-2"
+      {...tourAnchor(TOUR_ANCHORS.layersDiff)}
+    >
       <div className="flex items-center justify-between gap-2 pb-1.5">
         <span className="truncate text-[11px] font-medium" title={entry.name}>
           Changes by {entry.name}

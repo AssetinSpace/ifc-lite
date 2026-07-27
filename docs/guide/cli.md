@@ -523,7 +523,7 @@ ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
 | `--group <g>` | BCF topic grouping: `cluster` (default), `rule`, `typePair`, `element` |
 | `--bcf-status <s>` | Topic status for exported BCF topics |
 | `--max-topics <N>` | Cap the number of BCF topics |
-| `--json` | JSON output |
+| `--json` | JSON output (stdout carries exactly one JSON document; progress and geometry diagnostics go to stderr) |
 
 ---
 
@@ -782,6 +782,7 @@ Checks:
 - Building storeys existence
 - GlobalId uniqueness
 - Named elements
+- Reference integrity (every `#N` attribute reference must point at an entity that exists in the file; each dangling reference is reported with the referencing entity, attribute slot, and missing target — detailed up to the first 50, after which a single rollup issue reports the count of remaining dangling references)
 
 Returns exit code 0 (valid) or 1 (errors found).
 
@@ -1002,6 +1003,62 @@ ifc-lite mcp model.ifc --viewer          # also start the 3D viewer
 | `--viewer-port <N>` | Preferred viewer port (0 = auto) |
 | `--open` | Auto-open the viewer and open the URL in the browser |
 
+### `simplify` - Demesher
+
+Selectively simplify element meshes and write a lighter IFC (geometry is
+re-authored as `IfcTriangulatedFaceSet`; IFC2X3 input is upconverted to IFC4):
+
+```bash
+ifc-lite simplify model.ifc --out light.ifc --level 3
+ifc-lite simplify model.ifc --out light.ifc --level 5 --ids 12,44,107 --json
+```
+
+| Option | Description |
+|--------|-------------|
+| `--out <file>` | Output IFC path (required) |
+| `--level <1..5>` | Aggressiveness: 1-4 = cavity removal + decimation (target 50/25/10/3 % of triangles), 5 = bounding-box collapse (default 1) |
+| `--ids <a,b,...>` | Only simplify these express ids (default: all meshed elements) |
+| `--json` | Machine-readable report |
+
+What "lighter" means: the goal is TRIANGLE COUNT (viewer/render load), and
+on tessellation-heavy elements the reduction is large. It is not guaranteed
+per element: meshes below 32 triangles pass through levels 1-4 unchanged,
+and level 5 always emits a 12-triangle box, which can exceed a smaller
+input. File size usually drops on tessellation-heavy models (scans, CAD
+imports), but small parametric models can GROW in bytes, since verbose
+explicit tessellation replaces compact swept solids. Check the reported
+`trianglesBefore`/`trianglesAfter` and output size for your workload.
+
+### `gym` - Reset/Step/Reward Environment Loop
+
+A prototype environment API for RL-style consumers: wrap a model, apply
+data-mutation ops over stdin, and get each step scored against the same
+schema/clash/ids checks that `validate`, `clash`, and `ids` run.
+
+```bash
+ifc-lite gym --model model.ifc --checks schema,clash
+ifc-lite gym --model model.ifc --checks schema,clash,ids --ids rules.ids
+ifc-lite gym --seed 42 --checks schema,clash   # generated episode (repo checkout only)
+```
+
+The protocol is newline-delimited JSON, one object per line in both
+directions: `gym` opens with a `reset` line (observation + baseline reward
+channels), the consumer sends `step` messages with ops
+(`setProperty`/`setAttribute`/`deleteProperty`, mirroring `bim.mutate`'s
+method names), and `gym` replies with a `reward` line per step. `reset`
+reloads the pristine model, `close` exits. Malformed input yields a
+structured `error` line, never a crash. The same model plus the same op
+sequence produces byte-identical reward lines.
+
+`--seed <n>` (plus optional `--family`, `--corrupt`/`--no-corrupt`/
+`--corrupt-rate`) generates a deterministic world-gym episode in-process
+instead of loading a file; mid-session `{"type":"reset","seed":8}` swaps to
+a fresh generated episode. Episode generation dynamically imports
+`tools/world-gym/` from a repo checkout; the published npm package prints a
+clear error for `--seed` while `--model` keeps working. See the
+[`@ifc-lite/cli` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/cli#gym)
+for the full protocol reference.
+
 ## Output Modes
 
 Every command supports structured output:
@@ -1136,8 +1193,10 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `view` | Interactive 3D viewer in browser (default bind 127.0.0.1) |
 | `analyze` | Query + visualize analysis results |
 | `lod` | Generate lightweight LOD artifacts |
+| `simplify` | Demesher: simplify meshes, write lighter IFC |
 | `mcp` | Start an MCP server bound to one or more IFC files |
 | `ext` | Manage IFClite extensions (Phase 0 — validate, init) |
 | `layer` | Layered change tracking over a local store (.ifc-lite/) |
 | `ref` | Manage named refs in the layer store |
+| `gym` | reset/step/reward environment loop (JSONL over stdin/stdout) |
 <!-- END GENERATED: cli-commands -->

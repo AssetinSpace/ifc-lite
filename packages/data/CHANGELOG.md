@@ -1,5 +1,41 @@
 # @ifc-lite/data
 
+## 2.8.0
+
+### Minor Changes
+
+- [#1800](https://github.com/LTplus-AG/ifc-lite/pull/1800) [`3441fb9`](https://github.com/LTplus-AG/ifc-lite/commit/3441fb9e902daea8ed7d6f1a692e75618bbecb7e) Thanks [@louistrue](https://github.com/louistrue)! - Preserve the STEP token kind (Enum vs quoted String) through the columnar parser ([#1799](https://github.com/LTplus-AG/ifc-lite/issues/1799)). `EntityExtractor` now records which top-level attributes were bare enumeration tokens (`.USERDEFINED.`) in a new optional `IfcEntity.enumAttrIndices` side channel — the value representation is unchanged (enums are still stored as dotted strings), so existing consumers are unaffected. `extractRootAttributesFromEntity` rejects enum tokens on the unknown-type fixed-index fallback by token KIND instead of the [#1779](https://github.com/LTplus-AG/ifc-lite/issues/1779) dotted-string shape heuristic: a quoted string that merely looks like an enum (`'.USERDEFINED.'`) now survives, exactly matching the Rust server path's `AttributeValue::String` / `AttributeValue::Enum` split, while a bare `PredefinedType` enum landing on a fallback slot (e.g. IFC4X3 `IfcAlignment` attr 7) is still blanked.
+
+## 2.7.0
+
+### Minor Changes
+
+- [#1769](https://github.com/LTplus-AG/ifc-lite/pull/1769) [`2a7c7ff`](https://github.com/LTplus-AG/ifc-lite/commit/2a7c7ffe0ac27a8cc315e5d4a633c56469646cf0) Thanks [@Blogbotana](https://github.com/Blogbotana)! - Demesher: selective per-element mesh simplification with lightweight IFC re-export ([#1767](https://github.com/LTplus-AG/ifc-lite/issues/1767)). `@ifc-lite/export` gains `DemeshSession` — pick elements (usually the heaviest, see `heaviest(n)`), escalate simplification one level per `simplify()` call (levels 1-4 = internal-cavity removal + vertex-clustering decimation at target ratios 0.5/0.25/0.10/0.03, level 5 = bounding-box collapse) with render-ready replacement meshes for live scene updates, then export a lighter IFC separately via `exportIfc()`, which authors `IfcTriangulatedFaceSet` geometry and prunes the replaced representation subgraphs (IFC2X3 input auto-upconverts to IFC4). Also exported: `applySimplifiedGeometry` and the supporting types.
+
+  `@ifc-lite/geometry` gains `GeometryProcessor.simplifyMeshes()` backed by the new wasm `simplifyMeshes` API (`SimplifiedMeshes`). `@ifc-lite/cli` gains `ifc-lite simplify <file.ifc> --level 1..5 [--ids ...] --out light.ifc [--json]` for dev/testing. `@ifc-lite/data` / `@ifc-lite/mutations` widen `IfcAttributeValue` with a write-only `{ real: number }` marker (serialized by `stepReal()` in `@ifc-lite/export`) so tessellation coordinates always carry a decimal point.
+
+- [#1785](https://github.com/LTplus-AG/ifc-lite/pull/1785) [`7194c95`](https://github.com/LTplus-AG/ifc-lite/commit/7194c95002f2c84cd3c9444d710a50190a976a90) Thanks [@louistrue](https://github.com/louistrue)! - IDS validation on server-parsed models now matches candidate values for multi-valued properties (enumerated / bounded / list / table), for INSTANCE-attached properties, identically to the in-browser path ([#1766](https://github.com/LTplus-AG/ifc-lite/issues/1766)). The server emits the same `values[]` candidate array `parsePropertyValue` produces — enumerated/list members, bounded lower/upper/setPoint (deduped), table defining-then-defined values — as a JSON-encoded nullable `values_json` column (data-model cache v4 → v5, sparse: only multi-value rows). The decoder parses it, `convertServerDataModel`'s `materializeProp` attaches it to the property entry, and the existing IDS bridge (`projectProperty` → facet `candidateValues`) consumes it unchanged, so a facet passes when the constraint matches ANY candidate (not just the joined display value). `@ifc-lite/data`'s `Property` gains an optional `values?: string[]`.
+
+## 2.6.0
+
+### Minor Changes
+
+- [#1778](https://github.com/LTplus-AG/ifc-lite/pull/1778) [`564a800`](https://github.com/LTplus-AG/ifc-lite/commit/564a800e997322d863aac84127497ef4f8310ac3) Thanks [@louistrue](https://github.com/louistrue)! - Server-parse path now resolves the Lists attribute columns `Description`, `ObjectType`, `PredefinedType`, and `Tag` identically to the in-browser (WASM) path ([#1765](https://github.com/LTplus-AG/ifc-lite/issues/1765)). The server extracts them at the SAME schema-registry positions the WASM path resolves attribute names against — via a Rust index table generated from `@ifc-lite/parser`'s `SCHEMA_REGISTRY` (`scripts/generate-server-attr-indices.mjs`) — so the traps hold on both paths: `IfcSite` attr 7 (LongName) never surfaces as Tag, `IfcWallType` attr 4 (ApplicableOccurrence) never surfaces as ObjectType, and `CompositionType` enums never leak into PredefinedType. Data-model payload bumped to v4 with nullable `description`/`object_type`/`tag`/`predefined_type` entity columns; `@ifc-lite/data`'s `EntityTable` gains optional `getTag`/`getPredefinedType` accessors (server-parsed stores implement them; the WASM path keeps its on-demand source extraction).
+
+- [#1772](https://github.com/LTplus-AG/ifc-lite/pull/1772) [`cc92f17`](https://github.com/LTplus-AG/ifc-lite/commit/cc92f171661eb8e27170bcc0360336df819f9ab7) Thanks [@louistrue](https://github.com/louistrue)! - Fix STEP REAL serialization and string-attribute quoting.
+
+  `toStepReal` / `serializePropertyValue` (export) and `serializeValue` (data) appended a bare `.` to JavaScript's exponent notation, emitting invalid ISO-10303-21 literals (`5e-8` -> `5e-8.`, `1e21` -> `1e+21.`) and leaving a nonconforming lowercase `e` (`1.5e-7`). A single shared `formatStepReal` helper now performs the mantissa/`E` rewrite (`5.E-8`, `1.E+21`, `1.5E-7`), and `toStepRealScaled` reuses it.
+
+  `serializeAttributeValue` (export) now always emits a quoted+escaped STEP string when the edited attribute's source token is a quoted string, so user free-text like `[#12](https://github.com/LTplus-AG/ifc-lite/issues/12)`, `$`, `*`, or `.FOO.` can no longer be reinterpreted as an entity reference, null/derived marker, or enum.
+
+### Patch Changes
+
+- [#1772](https://github.com/LTplus-AG/ifc-lite/pull/1772) [`cc92f17`](https://github.com/LTplus-AG/ifc-lite/commit/cc92f171661eb8e27170bcc0360336df819f9ab7) Thanks [@louistrue](https://github.com/louistrue)! - Fix deterministic GlobalId first character and STEP header escape round-trip.
+
+  `deterministicGlobalId` masked its first output character with the full 6-bit alphabet, but a valid 22-char IFC GlobalId encodes only 2 bits in its first character (128 = 2 + 21\*6). The id is now stamped from the hash's 128-bit state MSB-first exactly like `uuidToIfcGuid`'s compression, so it always decodes to a well-formed 128-bit UUID and re-encodes bit-exactly. This also fixes a severe entropy loss in the previous stamping: it read each state word's LOW 6 bits while evolving it with a 32-bit multiply (which never propagates high bits downward), leaving ~24 bits of effective entropy and real collisions at ~10k seeds; the full-state stamping is collision-free across 100k adversarial seeds.
+
+  Header string round-trip no longer corrupts ISO-10303-21 escapes: `parseSourceHeader` now decodes `\X2\`, `\X\`, `\S\` and `\Px\` directives to real Unicode (via the canonical `decodeIfcString`) instead of leaving them for the writer's backslash-doubling escaper to mangle (`Tr\X2\00FC\X0\mpler` no longer becomes `Tr\\X2\\00FC\\X0\\mpler`), and collapses the `\\` escape to a single literal backslash first, so `C:\temp` is byte-stable across repeated write/read cycles instead of growing backslashes. The shared STEP string escaper (data) also collapses control characters to a space so a header/attribute value can never inject a physical line break.
+
 ## 2.5.3
 
 ### Patch Changes

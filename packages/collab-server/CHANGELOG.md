@@ -1,5 +1,47 @@
 # @ifc-lite/collab-server
 
+## 0.5.0
+
+### Minor Changes
+
+- [#1774](https://github.com/LTplus-AG/ifc-lite/pull/1774) [`8a0b09f`](https://github.com/LTplus-AG/ifc-lite/commit/8a0b09f161fffbc3302e173bd639a5aa85074e59) Thanks [@louistrue](https://github.com/louistrue)! - Harden the collab server, MCP path guard, and point-cloud decoders against abuse and hostile input.
+
+  - collab-server: rate-limit the unauthenticated fresh-room token-mint path per client IP (authenticated admin re-mints are exempt) and cap `claimedRooms` growth (`COLLAB_MAX_CLAIMED_ROOMS`, default 100k). `X-Forwarded-For` is IGNORED by default when deriving the rate-limit IP (a spoofable header would hand every request its own bucket); set `COLLAB_TRUST_PROXY=1` (or `tokenEndpoint.trustForwardedFor`) behind a trusted reverse proxy, which then uses the LAST header entry (the hop the proxy itself appended).
+  - collab-server: access-control persistence (revocations + claimed rooms) is now debounced, written atomically (temp file + rename, no torn state file on crash), and flushed on SIGINT/SIGTERM; `flush()` rejects (and the CLI exits non-zero, loudly) when the state never reached disk. Startup is fail-closed: a present-but-unreadable or malformed state file throws instead of running open, and a MISSING state file on a data dir that already has persisted rooms marks those rooms claimed (admins re-mint with their still-valid admin bearers; squatters cannot first-claim them). Revocations now persist as `jti -> exp` (the legacy `revoked: string[]` shape still loads) and are pruned once the revoked token would have expired anyway, so the deny-list stays bounded without ever evicting a live revocation. The policy moved from `bin.ts` into an exported `createAccessControl` for reuse and testing.
+  - collab-server: a ref that requires human approval now refuses approvals when its reviewer allowlist is empty (previously any non-author principal could self-approve past the merge gate).
+  - collab-server: metrics-token comparison hashes both sides to fixed-length digests before `timingSafeEqual`, removing the length oracle; startup without `COLLAB_TOKEN_SECRET` on a non-loopback host logs an explicit OPEN-server warning; idle rooms unload after `COLLAB_IDLE_UNLOAD_MS` (default 5 min) so long-lived deployments can't wedge at `maxRooms`.
+  - mcp: the safe-path guard now also refuses shell startup/persistence files (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`, …) and the `~/.config` tree for both read and write.
+  - pointcloud: E57/PCD/PLY decoders reject header-declared record/point/vertex counts (and LZF uncompressed sizes) that the actual body bytes cannot back, so a small hostile file can no longer force multi-GB allocations before the first read fails; ascii floors allow EOF-terminated final records. The PCD LZF expansion bound is format-derived (90x, above LZF's real 88x back-reference maximum, so genuinely repetitive valid files decode) plus an absolute 1 GiB uncompressed ceiling; PCD field SIZE/COUNT must be positive safe integers and the accumulated stride may not overflow. PLY element counts are parsed strictly, and list-valued properties on the vertex element (variable-length records the fixed-stride readers cannot walk) are rejected up front.
+
+## 0.4.1
+
+### Patch Changes
+
+- [#1742](https://github.com/LTplus-AG/ifc-lite/pull/1742) [`da19eb6`](https://github.com/LTplus-AG/ifc-lite/commit/da19eb6e6f56384112b71344178d0a317b9986c5) Thanks [@louistrue](https://github.com/louistrue)! - Merging a candidate that is already on the target ref now no-ops (fast-forward with the ref unchanged) instead of refusing with unrelated-base. Published drafts land on their home ref with a declared base equal to the composition they were authored against, which need not be representable on the ref, so re-merging them previously dead-ended. Registry merge previews now also report `ancestor_matched` so clients can warn before an execute would be refused.
+
+- Updated dependencies [[`da19eb6`](https://github.com/LTplus-AG/ifc-lite/commit/da19eb6e6f56384112b71344178d0a317b9986c5)]:
+  - @ifc-lite/merge@0.3.1
+
+## 0.4.0
+
+### Minor Changes
+
+- [#1726](https://github.com/LTplus-AG/ifc-lite/pull/1726) [`e092198`](https://github.com/LTplus-AG/ifc-lite/commit/e092198070cd4311cbfe0a85a4dbd88c702d2919) Thanks [@louistrue](https://github.com/louistrue)! - Durable layer registry: `FsLayerRegistry` persists content-addressed layers, refs (with policies), and review objects to disk under the collab data dir, so a registry survives restarts. The deployed binary mounts it with `COLLAB_LAYER_REGISTRY=1`. Shared push-integrity gate extracted as `assertPushableLayer`.
+
+- [#1727](https://github.com/LTplus-AG/ifc-lite/pull/1727) [`7dac702`](https://github.com/LTplus-AG/ifc-lite/commit/7dac702db0092a3a3d6a447b2e49bc9591f5dfc4) Thanks [@louistrue](https://github.com/louistrue)! - Check evidence becomes fetchable (08-review.md §8.4): the registry gains `PUT/GET /api/v1/reports/<digest>` (blake3-verified, content-addressed, durable on the fs store), `ifc-lite layer publish --check` keeps the spec/report bytes in the local store, and the new `ifc-lite layer push` uploads a ref's stack (or one layer) plus its evidence to a registry.
+
+- [#1732](https://github.com/LTplus-AG/ifc-lite/pull/1732) [`5e90494`](https://github.com/LTplus-AG/ifc-lite/commit/5e904942e3fd167d0d0e1a9c37b391d638eb6932) Thanks [@louistrue](https://github.com/louistrue)! - Registry webhooks + auto-merge (08-review.md §8.7, 10-registry.md §10.4): the registry emits HMAC-SHA256-signed events (layer pushed, ref moved/merged, review opened/updated/commented) to configured consumers, and `RefPolicy.autoMerge` merges conflict-free, all-checks-green candidates with a declared base unattended on push — fail-closed with `requireHumanApproval` and for baseless candidates.
+
+- [#1729](https://github.com/LTplus-AG/ifc-lite/pull/1729) [`b54f704`](https://github.com/LTplus-AG/ifc-lite/commit/b54f70478a7b92055750f11267ffe7fa47ed7da1) Thanks [@louistrue](https://github.com/louistrue)! - Review comments as BCF topics (08-review.md §8.6): registry reviews gain `GET/POST /api/v1/reviews/:id/topics` — topics bound to (entity, componentKey?) with server-derived authors, optional viewpoints, and the named-reviewers write gate. The MCP review loop matches: new `add_review_topic` tool, and `get_review_feedback` returns the topics.
+
+### Patch Changes
+
+- [#1728](https://github.com/LTplus-AG/ifc-lite/pull/1728) [`e3b3c53`](https://github.com/LTplus-AG/ifc-lite/commit/e3b3c5316fcd845d531265c11e0fb86cf526e778) Thanks [@louistrue](https://github.com/louistrue)! - The registry merge route accepts edit-in-place resolutions (`{ path, component_key, choice: "edited", attributes }`), strictly validated, with the engine's edited-target rules surfaced as 400s. Completes the conflict-queue spec (08-review.md §8.3) alongside the viewer's new edit choice and bulk actions.
+
+- Updated dependencies [[`c1695d7`](https://github.com/LTplus-AG/ifc-lite/commit/c1695d777263483110460df767ec86ca691048ab), [`5e90494`](https://github.com/LTplus-AG/ifc-lite/commit/5e904942e3fd167d0d0e1a9c37b391d638eb6932)]:
+  - @ifc-lite/collab@0.4.0
+  - @ifc-lite/merge@0.3.0
+
 ## 0.3.0
 
 ### Minor Changes
