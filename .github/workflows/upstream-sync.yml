@@ -4,6 +4,13 @@
 # nothing is ever pushed to LTplus-AG/ifc-lite. On a clean merge it opens a PR
 # against `main`; on conflicts it commits the conflict markers and opens the PR
 # anyway, labelled so a human finishes the merge (see docs/FORK_MAINTENANCE.md).
+#
+# Runs on a PAT (secret UPSTREAM_SYNC_TOKEN), not the default GITHUB_TOKEN: a
+# sync that carries upstream changes under .github/workflows/ is rejected at push
+# ("refusing to allow a GitHub App to create or update workflow ... without
+# `workflows` permission"), and no `permissions:` entry can grant it — the
+# workflows scope simply does not exist for GITHUB_TOKEN. See
+# docs/FORK_MAINTENANCE.md → "Sync token".
 name: Upstream sync
 
 on:
@@ -29,11 +36,24 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # Fail fast and readably: without the PAT the run dies much later, at the
+      # push, with a message that reads like a permissions bug in this file.
+      - name: Check sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret UPSTREAM_SYNC_TOKEN is not set. The default GITHUB_TOKEN cannot push files under .github/workflows/, so any upstream sync touching CI is rejected. Create the token as described in docs/FORK_MAINTENANCE.md → 'Sync token'."
+            exit 1
+          fi
+
       - name: Checkout fork (full history)
         uses: actions/checkout@v4
         with:
           ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
+          # Persisted for the later `git push` — that is the whole point.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -82,7 +102,7 @@ jobs:
       - name: Ensure labels exist
         if: steps.check.outputs.up_to_date == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           gh label create upstream-sync --color 1d76db --description "Automated merge from upstream LTplus-AG/ifc-lite" || true
           gh label create needs-manual-merge --color d93f0b --description "Merge conflicts require manual resolution" || true
@@ -90,8 +110,16 @@ jobs:
       - name: Open pull request
         if: steps.check.outputs.up_to_date == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
+          BRANCH="${{ steps.vars.outputs.branch }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING is already open for $BRANCH — branch updated, nothing else to do."
+            exit 0
+          fi
+
           if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
             TITLE="⚠️ Upstream sync ${{ steps.vars.outputs.upstream_sha }} — CONFLICTS, needs manual merge"
             LABELS="upstream-sync,needs-manual-merge"
@@ -103,7 +131,7 @@ jobs:
           fi
           gh pr create \
             --base "$BASE_BRANCH" \
-            --head "${{ steps.vars.outputs.branch }}" \
+            --head "$BRANCH" \
             --title "$TITLE" \
             --label "$LABELS" \
-            --body "$BODY" || echo "PR may already exist for this branch."
+            --body "$BODY"

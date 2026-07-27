@@ -81,6 +81,39 @@ a **PR in this repo**. On merge conflicts it still opens the PR (with the
 conflict markers committed) and labels it so a human finishes the merge. It never
 touches `LTplus-AG/ifc-lite`.
 
+### Sync token (`UPSTREAM_SYNC_TOKEN`)
+
+The workflow authenticates with a **PAT**, not the default `GITHUB_TOKEN`. This is
+not a preference — it is the only thing that works:
+
+> `! [remote rejected] sync/upstream-2026-07-27 (refusing to allow a GitHub App to`
+> `create or update workflow .github/workflows/wide-arithmetic.yml without`
+> `` `workflows` permission)``
+
+Upstream regularly adds or edits files under `.github/workflows/`, and a push
+carrying such a change is rejected for `GITHUB_TOKEN` **no matter what the
+`permissions:` block says** — there is no `workflows` scope to grant it. A sync
+week that happens not to touch CI succeeds; the next one that does fails. A PAT
+belongs to a user account and carries the scope, so the push goes through. It also
+means the sync PR **triggers CI** — PRs opened by `GITHUB_TOKEN` deliberately do not.
+
+Create a **fine-grained PAT** scoped to `AssetinSpace/ifc-lite` only, with:
+
+| Repository permission | Level | Needed for |
+|---|---|---|
+| Contents | Read and write | pushing the `sync/upstream-*` branch |
+| Workflows | Read and write | the upstream `.github/workflows/` changes in that branch |
+| Pull requests | Read and write | `gh pr create` |
+| Issues | Read and write | creating and applying the sync labels |
+
+Store it as repository secret **`UPSTREAM_SYNC_TOKEN`** (Settings → Secrets and
+variables → Actions). The workflow checks for it up front and fails with a pointer
+to this section if it is missing, rather than dying later at the push.
+
+Fine-grained PATs expire (max 1 year). When the token lapses the sync fails with a
+403 on push — regenerate it and update the secret; nothing in the workflow changes.
+Worth a calendar reminder a week before expiry.
+
 ## Verify after a sync
 
 ```bash
