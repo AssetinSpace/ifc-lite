@@ -129,11 +129,11 @@ jobs:
           if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
             TITLE="⚠️ Upstream sync ${{ steps.vars.outputs.upstream_sha }} — CONFLICTS, needs manual merge"
             LABELS="upstream-sync,needs-manual-merge"
-            BODY=$'Automated merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\n**Merge conflicts were committed as-is.** Resolve them (keep our \`AIM-FORK\` blocks — see `docs/FORK_MAINTENANCE.md`), then let CI run.\n\n\x60\x60\x60\ngit grep -n "<<<<<<<"\ngit grep -n "AIM-FORK"\n\x60\x60\x60'
+            BODY=$'Automated merge of \x60upstream/${{ env.UPSTREAM_BRANCH }}\x60 (\x60${{ steps.vars.outputs.upstream_sha }}\x60).\n\n**Merge conflicts were committed as-is.** Resolve them (keep our \x60AIM-FORK\x60 blocks — see \x60docs/FORK_MAINTENANCE.md\x60), then let CI run.\n\n\x60\x60\x60\ngit grep -n "<<<<<<<"\ngit grep -n "AIM-FORK"\n\x60\x60\x60'
           else
             TITLE="Upstream sync ${{ steps.vars.outputs.upstream_sha }}"
             LABELS="upstream-sync"
-            BODY=$'Automated clean merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\nCI gates this PR. Review the diff, then merge → Vercel deploys. See `docs/FORK_MAINTENANCE.md`.'
+            BODY=$'Automated clean merge of \x60upstream/${{ env.UPSTREAM_BRANCH }}\x60 (\x60${{ steps.vars.outputs.upstream_sha }}\x60).\n\nCI gates this PR. Review the diff, then merge → Vercel deploys. See \x60docs/FORK_MAINTENANCE.md\x60.'
           fi
           gh pr create \
             --base "$BASE_BRANCH" \

@@ -81,6 +81,14 @@ a **PR in this repo**. On merge conflicts it still opens the PR (with the
 conflict markers committed) and labels it so a human finishes the merge. It never
 touches `LTplus-AG/ifc-lite`.
 
+> **Careful when editing that workflow:** `gh` picks its base repo from the git
+> remotes and **prefers one named `upstream`** — which the workflow adds itself,
+> pointing at `LTplus-AG/ifc-lite`. Every `gh` call there must therefore stay
+> pinned to our fork (the workflow sets `GH_REPO: ${{ github.repository }}` once,
+> at the top). Without that pin `gh label create` and `gh pr create` target the
+> upstream repo — a 403 if the token is scoped to our fork, and a pull request
+> opened against LTplus-AG if it isn't. The relationship is one-way; keep it that way.
+
 ### Sync token (`UPSTREAM_SYNC_TOKEN`)
 
 The workflow authenticates with a **PAT**, not the default `GITHUB_TOKEN`. This is
