@@ -18,12 +18,8 @@
     "check:templates": "tsc -p src/lib/scripts/templates/tsconfig.json --noEmit"
   },
   "dependencies": {
-<<<<<<< HEAD
-    "@anthropic-ai/sdk": "^0.112.4",
-    "@assetinspace/design-kit": "https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz",
-=======
     "@anthropic-ai/sdk": "^0.115.0",
->>>>>>> upstream/main
+    "@assetinspace/design-kit": "https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz",
     "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/lang-javascript": "^6.2.5",
@@ -90,20 +86,12 @@
     "lucide-react": "^1.27.0",
     "maplibre-gl": "^6.0.0",
     "parquet-wasm": "^0.7.2",
-<<<<<<< HEAD
     "pdfjs-dist": "^5.4.54",
-    "postcss": "^8.5.21",
-    "posthog-js": "^1.405.3",
-    "proj4": "^2.20.9",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-=======
     "postcss": "^8.5.24",
     "posthog-js": "^1.407.6",
     "proj4": "^2.21.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
->>>>>>> upstream/main
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^4.12.2",
     "remark-gfm": "^4.0.0",

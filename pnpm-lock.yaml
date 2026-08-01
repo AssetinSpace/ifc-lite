@@ -69,16 +69,11 @@ importers:
   apps/viewer:
     dependencies:
       '@anthropic-ai/sdk':
-<<<<<<< HEAD
-        specifier: ^0.112.4
-        version: 0.112.4(zod@4.4.3)
+        specifier: ^0.115.0
+        version: 0.115.0(zod@4.4.3)
       '@assetinspace/design-kit':
         specifier: https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz
         version: https://codeload.github.com/AssetinSpace/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b
-=======
-        specifier: ^0.115.0
-        version: 0.115.0(zod@4.4.3)
->>>>>>> upstream/main
       '@codemirror/autocomplete':
         specifier: ^6.20.3
         version: 6.20.3
@@ -6280,7 +6275,6 @@ snapshots:
 
   '@marijn/find-cluster-break@1.0.3': {}
 
-<<<<<<< HEAD
   '@napi-rs/canvas-android-arm64@0.1.100':
     optional: true
 
@@ -6329,15 +6323,6 @@ snapshots:
       '@napi-rs/canvas-win32-x64-msvc': 0.1.100
     optional: true
 
-  '@napi-rs/wasm-runtime@1.1.6(@emnapi/core@1.11.0)(@emnapi/runtime@1.11.0)':
-    dependencies:
-      '@emnapi/core': 1.11.0
-      '@emnapi/runtime': 1.11.0
-      '@tybys/wasm-util': 0.10.3
-    optional: true
-
-=======
->>>>>>> upstream/main
   '@napi-rs/wasm-runtime@1.1.6(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)':
     dependencies:
       '@emnapi/core': 1.11.1
