@@ -18,7 +18,7 @@
  * original ViewerApi shape.
  */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { parsePlacement, serializePlacement } from '@ifc-lite/drawing-underlay';
 import { useBim } from '../sdk/BimProvider.js';
 import { useViewerStore } from '../store/index.js';
@@ -251,6 +251,18 @@ export function AimBridge() {
     );
   };
   const autoloadingRef = useRef(false);
+  // Veil počas ?models= autoloadu v embede: sekvenčný download beží s
+  // `loading === false` (fetch fáza), takže by v iframe hosta preblikla
+  // IFClite welcome obrazovka, kým sa nenačíta prvý model. Kým autoload
+  // beží a scéna je prázdna, prekryjeme viewer neutrálnym loadingom;
+  // po prvom modeli sa odkryje progresívne (zvyšok federácie sa doťahuje
+  // už nad viditeľnou scénou). AUTOLOAD_COMPLETE_EVENT fire-uje vždy, aj
+  // keď všetky URL zlyhajú — veil teda nemôže visieť navždy.
+  const [autoloadVeil, setAutoloadVeil] = useState(
+    () =>
+      window.parent !== window &&
+      parseAutoloadUrls(window.location.search, window.location.href).length > 0,
+  );
   useEffect(() => {
     if (!embeddedRef.current) return;
     autoloadingRef.current =
@@ -260,6 +272,7 @@ export function AimBridge() {
       // Autoload skončil — od tejto chvíle prípadné ďalšie (manuálne) loady
       // ohlasuje štandardný 0 → N latch nižšie.
       autoloadingRef.current = false;
+      setAutoloadVeil(false);
       announceModels();
     };
     window.addEventListener(AUTOLOAD_COMPLETE_EVENT, onAutoloadComplete);
@@ -323,5 +336,15 @@ export function AimBridge() {
     }
   }, [selectedEntity]);
 
+  // Veil (viď vyššie): render nad celým viewerom, kým autoload nedodá prvý
+  // model. `modelCount === 0` ho zhodí hneď, ako je čo ukázať.
+  if (autoloadVeil && modelCount === 0) {
+    return (
+      <div className="fixed inset-0 z-[9999] flex flex-col items-center justify-center gap-4 bg-white dark:bg-black">
+        <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+        <p className="font-mono text-sm text-zinc-500 dark:text-[#565f89]">Loading model…</p>
+      </div>
+    );
+  }
   return null;
 }
