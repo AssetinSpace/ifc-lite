@@ -138,13 +138,18 @@ jobs:
             # Any side works as a starting point; pnpm rewrites the file. It
             # just has to be valid YAML, which a conflicted file is not.
             git checkout --theirs pnpm-lock.yaml
-            if pnpm install --lockfile-only --no-frozen-lockfile; then
+            # `--fix-lockfile` is load-bearing: without it pnpm judges the lock
+            # "up to date" by comparing importer specifiers against package.json
+            # alone, skips resolution entirely and leaves broken entries in place.
+            # Referential integrity is not part of that check.
+            if pnpm install --lockfile-only --no-frozen-lockfile --fix-lockfile \
+               && pnpm install --frozen-lockfile; then
               git add -A
               git commit --no-edit
               echo "conflicts=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "::warning::pnpm-lock.yaml regeneration failed — falling back to a manual-merge PR. Resolve the lock by running 'pnpm install --lockfile-only' locally on the sync branch."
+            echo "::warning::pnpm-lock.yaml regeneration failed — falling back to a manual-merge PR. Fix the lock with 'pnpm install --lockfile-only --fix-lockfile' on the sync branch, or dispatch the Relock workflow against it."
             git checkout -m pnpm-lock.yaml
           fi
 
