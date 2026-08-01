@@ -19,6 +19,7 @@ import { ExtensionHostProvider } from './sdk/ExtensionHostProvider';
 import { AimBridge } from './aim/AimBridge';
 // <<< AIM-FORK
 import { Toaster } from './components/ui/toast';
+import { ChunkErrorBoundary } from './components/ChunkErrorBoundary';
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Analytics } from '@vercel/analytics/react';
 
@@ -65,12 +66,19 @@ export function App() {
   const normalizedPath = pathname.length > 1 && pathname.endsWith('/')
     ? pathname.slice(0, -1)
     : pathname;
+  // The two MCP branches below return the same fragment shape, so React
+  // reconciles their ChunkErrorBoundary as ONE instance by type + position and
+  // carries `state.error` across a route change: a failed playground chunk would
+  // leave the fallback up on /mcp, whose chunk is a different file that may well
+  // load. Keying by route makes each one its own instance.
   if (normalizedPath === '/mcp/playground') {
     return (
       <>
-        <Suspense fallback={<RouteFallback />}>
-          <McpPlayground />
-        </Suspense>
+        <ChunkErrorBoundary key={normalizedPath} label="MCP playground" tone="night">
+          <Suspense fallback={<RouteFallback />}>
+            <McpPlayground />
+          </Suspense>
+        </ChunkErrorBoundary>
         <Toaster />
         <Analytics />
       </>
@@ -79,9 +87,11 @@ export function App() {
   if (normalizedPath === '/mcp' || normalizedPath.startsWith('/mcp/')) {
     return (
       <>
-        <Suspense fallback={<RouteFallback />}>
-          <McpLanding />
-        </Suspense>
+        <ChunkErrorBoundary key={normalizedPath} label="MCP page" tone="night">
+          <Suspense fallback={<RouteFallback />}>
+            <McpLanding />
+          </Suspense>
+        </ChunkErrorBoundary>
         <Toaster />
         <Analytics />
       </>

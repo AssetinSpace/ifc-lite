@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyLoadError, formatLoadError } from './load-errors.js';
+import { classifyLoadError, errorCaptureProps, formatLoadError } from './load-errors.js';
 
 describe('classifyLoadError', () => {
   it('classifies the wasm-bindgen non-OK HTTP status as wasm_engine_load', () => {
@@ -167,6 +167,126 @@ describe('classifyLoadError', () => {
     assert.equal(classifyLoadError(undefined), 'unknown');
     assert.equal(classifyLoadError({ nope: true }), 'unknown');
   });
+
+  // Issue #1903: a fetch that fails at the transport layer rejects with the
+  // browser's bare house phrasing and an EMPTY stack, so `unknown` was the one
+  // bucket it could never leave — no fingerprint, no severity, no triage.
+  it('classifies a bare transport failure as network_unavailable', () => {
+    assert.equal(classifyLoadError(new TypeError('Load failed')), 'network_unavailable'); // WebKit
+    assert.equal(classifyLoadError(new TypeError('Failed to fetch')), 'network_unavailable'); // Chromium
+    assert.equal(
+      classifyLoadError(new TypeError('NetworkError when attempting to fetch resource.')),
+      'network_unavailable',
+    ); // Gecko
+    assert.equal(
+      classifyLoadError(new Error('The network connection was lost.')),
+      'network_unavailable',
+    );
+    assert.equal(
+      classifyLoadError(new Error('The Internet connection appears to be offline.')),
+      'network_unavailable',
+    );
+  });
+
+  // A failure that named itself must keep its own, more actionable kind — the
+  // network bucket is checked last precisely so it cannot swallow them.
+  // A rotated JS chunk after a redeploy is OUR breakage, not the user's
+  // connection. Its Chromium wording contains "Failed to fetch", so without an
+  // explicit exclusion `network_unavailable` claims it — which both fingerprints
+  // it together with genuine offline blips AND hands it to the benign-severity
+  // downgrade in analytics-scrub.ts, silencing a real deploy failure that
+  // survived main.tsx's one-shot chunk-reload budget.
+  it('never buckets a failed module import as network_unavailable', () => {
+    for (const message of [
+      'Failed to fetch dynamically imported module: https://example.test/assets/Viewport-Bq3x.js',
+      'error loading dynamically imported module: https://example.test/assets/Viewport-Bq3x.js',
+      'Importing a module script failed.', // WebKit
+    ]) {
+      assert.notEqual(classifyLoadError(new TypeError(message)), 'network_unavailable');
+      assert.notEqual(classifyLoadError(new TypeError(message)), 'cancelled');
+    }
+    // …but the ENGINE BINARY's own dynamic-import failure still self-identifies,
+    // because isWasmEngineLoadError claims `.wasm` messages before this bucket.
+    assert.equal(
+      classifyLoadError(
+        new TypeError(
+          'Failed to fetch dynamically imported module: https://example.test/assets/ifc-lite_bg-Bq3x.wasm',
+        ),
+      ),
+      'wasm_engine_load',
+    );
+  });
+
+  it('does not let network_unavailable outrank a self-identifying failure', () => {
+    assert.equal(
+      classifyLoadError(
+        new Error('Failed to load the WASM engine binary (ifc-lite_bg.wasm) in ifc-lite-bridge: Load failed'),
+      ),
+      'wasm_engine_load',
+    );
+    // The worker pool's wrapper is itself an attribution, so it wins too — and
+    // once the worker's own init attributes the binary (#1903), the wrapped
+    // form carries the more specific engine-load kind.
+    assert.equal(
+      classifyLoadError(new Error('Geometry worker error: Failed to fetch')),
+      'geometry_worker_crash',
+    );
+    assert.equal(
+      classifyLoadError(
+        new Error(
+          'Geometry worker error: Failed to load the WASM engine binary (ifc-lite_bg.wasm) in geometry.worker: Failed to fetch',
+        ),
+      ),
+      'wasm_engine_load',
+    );
+  });
+
+  // #1903: only `.name` is stable on an aborted fetch: WebKit words the message
+  // "Fetch is aborted", Chromium "The user aborted a request." — neither of
+  // which the message matcher can be keyed on.
+  it('classifies an AbortError by its stable name as cancelled', () => {
+    assert.equal(
+      classifyLoadError(new DOMException('Fetch is aborted', 'AbortError')),
+      'cancelled',
+    );
+  });
+});
+
+describe('errorCaptureProps', () => {
+  // #1903: the properties that make a STACKLESS exception triageable — the
+  // reported event had no `stacktrace` key at all. Flat by contract:
+  // posthog-js takes them as the event's own properties.
+  it('reports the throwable identity even when the message says nothing', () => {
+    const props = errorCaptureProps(new TypeError('Load failed'));
+    assert.equal(props.error_kind, 'network_unavailable');
+    assert.equal(props.error_type, 'TypeError');
+  });
+
+  it('prefers a DOMException\'s stable name over its constructor', () => {
+    const props = errorCaptureProps(new DOMException('Fetch is aborted', 'AbortError'));
+    assert.equal(props.error_type, 'AbortError');
+    assert.equal(props.error_kind, 'cancelled');
+  });
+
+  it('survives a thrown non-Error', () => {
+    const props = errorCaptureProps('something went sideways');
+    assert.equal(props.error_kind, 'unknown');
+    assert.equal(props.error_type, 'String');
+  });
+
+  // Key naming is load-bearing — `scrubProperties` deletes any key with a
+  // `_`-delimited `name` / `url` / `path` word, so it must never be
+  // `error_name`, and no URL may be attached. See analytics-scrub.ts.
+  it('emits no key the privacy scrub would delete', () => {
+    const props = errorCaptureProps(new TypeError('Load failed'));
+    for (const key of Object.keys(props)) {
+      assert.doesNotMatch(
+        key,
+        /(?:^|_)(?:name|filename|model|title|label|path|url|uri|href|message)(?:$|_)/i,
+        `errorCaptureProps key "${key}" would be deleted by the analytics privacy scrub`,
+      );
+    }
+  });
 });
 
 describe('formatLoadError', () => {
@@ -217,5 +337,100 @@ describe('formatLoadError', () => {
   it('works without a file name', () => {
     const msg = formatLoadError(new Error('boom'));
     assert.match(msg, /the model/);
+  });
+
+  // #1903: the user saw `Failed to load "x.ifc": Load failed`, which explains
+  // nothing and suggests nothing.
+  it('gives connection guidance for a bare transport failure instead of dumping it', () => {
+    const msg = formatLoadError(new TypeError('Load failed'), 'tower.ifc');
+    assert.match(msg, /"tower\.ifc"/);
+    assert.match(msg, /connection/i);
+    assert.doesNotMatch(msg, /Load failed/);
+  });
+
+  it('routes the attributed engine-binary failure to the reload guidance', () => {
+    const msg = formatLoadError(
+      new Error('Failed to load the WASM engine binary (ifc-lite_bg.wasm) in ifc-lite-bridge: Load failed'),
+      'tower.ifc',
+    );
+    assert.match(msg, /geometry engine/i);
+    assert.match(msg, /reload/i);
+  });
+});
+
+// ── #1898: wasm runtime traps must be a bucket of their own ────────────────
+//
+// The reported occurrence was recorded as `error_kind: unknown` with an
+// internal sentence ("…recreate the worker process before calling init()
+// again") shown to the user, because a bare wasm trap matched none of the
+// buckets above.
+describe('wasm runtime traps (#1898)', () => {
+  it('classifies a bare WebAssembly trap as wasm_runtime_crashed', () => {
+    assert.equal(
+      classifyLoadError(new WebAssembly.RuntimeError('unreachable')),
+      'wasm_runtime_crashed',
+    );
+  });
+
+  it('classifies a cross-realm trap by its stable .name', () => {
+    // Re-raised out of a worker: `instanceof` fails, `.name` survives.
+    const crossRealm = new Error('unreachable');
+    crossRealm.name = 'RuntimeError';
+    assert.equal(classifyLoadError(crossRealm), 'wasm_runtime_crashed');
+  });
+
+  it('keeps a stringified trap unknown, so #1196 stays settled', () => {
+    // The analytics path only ever sees text. Matching trap phrasing there
+    // would sweep other viewer wasm (space-plate, parquet) into this family's
+    // single issue fingerprint — the exact mis-bucketing #1196 forbids.
+    assert.equal(classifyLoadError('RuntimeError: unreachable executed'), 'unknown');
+    assert.equal(classifyLoadError(new Error('unreachable')), 'unknown');
+  });
+
+  it('classifies the engine unrecoverable marker', () => {
+    assert.equal(
+      classifyLoadError(
+        new Error('WASM_RUNTIME_UNRECOVERABLE: … (underlying wasm trap: unreachable)'),
+      ),
+      'wasm_runtime_crashed',
+    );
+  });
+
+  it('does not steal a worker-attributed trap from the worker bucket', () => {
+    assert.equal(
+      classifyLoadError(new Error('Geometry worker error: unreachable')),
+      'geometry_worker_crash',
+    );
+  });
+
+  it('does not steal an explicit OOM from the memory bucket', () => {
+    assert.equal(
+      classifyLoadError(new WebAssembly.RuntimeError('memory access out of bounds')),
+      'out_of_memory',
+    );
+  });
+
+  it('offers a reload for an unrecoverable engine crash, without the internal text', () => {
+    const msg = formatLoadError(
+      new Error(
+        'WASM_RUNTIME_UNRECOVERABLE: the IFC-Lite WebAssembly geometry engine trapped during ' +
+          'init, so this document has no working engine instance. Reload the page to get a ' +
+          'fresh one. (underlying wasm trap: unreachable)',
+      ),
+      'tower.ifc',
+    );
+    assert.match(msg, /reload the page/i);
+    // The user must never see the engine's internal prose — no diagnostic code,
+    // no raw trap text, no "call init() again"/"recreate the worker process".
+    assert.doesNotMatch(msg, /WASM_RUNTIME_UNRECOVERABLE|underlying wasm trap|unreachable/i);
+    assert.doesNotMatch(msg, /wasm-bindgen|init\(\)|worker process/i);
+  });
+
+  it('explains a recoverable operation trap without demanding a reload first', () => {
+    const msg = formatLoadError(new WebAssembly.RuntimeError('unreachable'), 'tower.ifc');
+    assert.match(msg, /"tower\.ifc"/);
+    assert.match(msg, /geometry engine crashed/i);
+    assert.match(msg, /memory/i);
+    assert.doesNotMatch(msg, /unreachable/);
   });
 });
