@@ -35,7 +35,29 @@ import { posthog } from '@/lib/analytics';
 let maplibrePromise: Promise<typeof import('maplibre-gl')> | null = null;
 function loadMaplibre() {
   if (!maplibrePromise) {
-    maplibrePromise = import('maplibre-gl');
+    const pending = import('maplibre-gl').then(ml => {
+      // Defence in depth against a namespace that resolves without throwing.
+      // Vite's preload helper returns `undefined` from a failed import whenever
+      // a `vite:preloadError` listener calls `preventDefault()` (ours no longer
+      // does - see lib/chunk-version-skew.ts), and every consumer below reads
+      // `.Map` / `.Marker` off this value. Failing here routes the problem into
+      // the `.catch` backstop, which degrades the panel with the right reason,
+      // instead of throwing a bare "Cannot read properties of undefined
+      // (reading 'Map')" that the WebGL try/catch misreads as a dead GPU.
+      if (!ml) throw new Error('Failed to load the maplibre-gl module');
+      return ml;
+    });
+    // A rejected promise stays rejected, so memoising one would make a single
+    // transient chunk failure permanent for the rest of the session - every
+    // later remount would degrade instantly without retrying. Drop the memo on
+    // failure so the next mount gets a real attempt.
+    maplibrePromise = pending;
+    void pending.catch((err) => {
+      if (maplibrePromise === pending) maplibrePromise = null;
+      // Logged per the no-silent-catch rule. This handler exists only to clear
+      // the memo; `pending` itself stays rejected for its real callers.
+      console.warn('[location-map] maplibre module load failed; a retry will be allowed:', err);
+    });
   }
   return maplibrePromise;
 }
@@ -375,7 +397,13 @@ export function LocationMap({
     if (!editableRef.current) return;
     const pos = { lat: e.lngLat.lat, lon: e.lngLat.lng };
     setPickedLatLon(pos);
-    loadMaplibre().then(ml => updatePickedMarker(pos, ml));
+    // These two chains reach maplibre only to move a marker, so a failed chunk
+    // is not worth degrading the panel for: the pin state above is already set
+    // and the coordinate readout still updates. Without a handler the rejection
+    // would surface as an uncaught error (see lib/chunk-version-skew.ts).
+    loadMaplibre()
+      .then(ml => updatePickedMarker(pos, ml))
+      .catch(err => console.warn('[location-map] could not update the picked marker:', err));
   }, [updatePickedMarker]);
 
   // Handle search result selection
@@ -386,10 +414,12 @@ export function LocationMap({
     setSearchQuery('');
     setSearchResults([]);
 
-    loadMaplibre().then(ml => {
-      updatePickedMarker(pos, ml);
-      mapRef.current?.flyTo({ center: [pos.lon, pos.lat], zoom: 16, duration: 1200 });
-    });
+    loadMaplibre()
+      .then(ml => {
+        updatePickedMarker(pos, ml);
+        mapRef.current?.flyTo({ center: [pos.lon, pos.lat], zoom: 16, duration: 1200 });
+      })
+      .catch(err => console.warn('[location-map] could not move to the search result:', err));
   }, [updatePickedMarker]);
 
   // Handle apply position (waits for elevation to finish loading)
