@@ -1,0 +1,96 @@
+# Regenerate pnpm-lock.yaml on a branch and push the result.
+#
+# Why this exists: a textually merged pnpm-lock.yaml is not necessarily a VALID
+# one. Git can merge both sides cleanly and still produce importer entries whose
+# `version:` strings match no snapshot — pnpm then refuses the install with
+# ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY ("probably caused by a badly resolved
+# merge conflict"). That is exactly what happened on the 2026-08-01 sync, in a
+# region that had no conflict markers at all, so resolving the marked conflicts
+# by hand was not enough.
+#
+# D-071's rule is therefore "the lock is REGENERATED, never merged". The sync
+# workflow does that automatically when the lock is the only conflict; this
+# workflow is the manual escape hatch for every other case — a conflicted sync
+# a human is finishing, a dependency bump, a rebase that scrambled the lock.
+#
+# It also solves a practical problem: regenerating needs to reach the registry
+# AND github.com (the design-kit tarball), which a sandboxed dev environment may
+# not be able to do. A runner can.
+name: Relock
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to regenerate pnpm-lock.yaml on'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relock-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  relock:
+    runs-on: ubuntu-latest
+    steps:
+      # Same PAT as the sync workflow: the branch may carry upstream changes
+      # under .github/workflows/, which GITHUB_TOKEN is not allowed to push.
+      - name: Check sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret UPSTREAM_SYNC_TOKEN is not set — see docs/FORK_MAINTENANCE.md → 'Sync token'."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Refuse to run on a tree with conflict markers
+        run: |
+          # A half-resolved tree would be locked in with its markers. Only the
+          # lockfile is regenerated here; the rest must already be resolved.
+          if git grep -nE '^(<{7}|={7}|>{7})( |$)' -- . ':!*script-edit-ops*'; then
+            echo "::error::Conflict markers are still present. Resolve them first — this workflow only regenerates pnpm-lock.yaml."
+            exit 1
+          fi
+          echo "No conflict markers."
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Regenerate lockfile
+        run: pnpm install --lockfile-only --no-frozen-lockfile
+
+      - name: Verify the result actually installs
+        run: pnpm install --frozen-lockfile
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet -- pnpm-lock.yaml; then
+            echo "pnpm-lock.yaml already up to date — nothing to push."
+            exit 0
+          fi
+          git config user.name "aim-upstream-sync[bot]"
+          git config user.email "aim-upstream-sync@users.noreply.github.com"
+          git add pnpm-lock.yaml
+          git commit -m "chore(deps): regenerate pnpm-lock.yaml
+
+          A merged lockfile is not necessarily a valid one — git can merge both
+          sides cleanly and still leave importer versions that match no snapshot.
+          Regenerated with 'pnpm install --lockfile-only' per D-071."
+          git push origin "HEAD:${{ inputs.branch }}"
