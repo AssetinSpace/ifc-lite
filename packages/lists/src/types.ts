@@ -48,11 +48,33 @@ export interface ListDataProvider {
   getEntityTag(expressId: number): string;
   /** Get IFC type name (e.g., "IfcWall") by express ID */
   getEntityTypeName(expressId: number): string;
+  /** Name of the element's IfcTypeProduct (e.g. "WT-Standard" on an
+   *  IfcWallType), resolved via IfcRelDefinesByType — the `Type` attribute
+   *  column (issue #1754). Distinct from `getEntityTypeName` (the IFC class)
+   *  and `getEntityObjectType` (the instance's own ObjectType attribute).
+   *  Optional: providers built before this return no Type name. '' when the
+   *  element has no type. */
+  getEntityDefiningTypeName?(expressId: number): string;
 
   /** Get all property sets for an entity (handles on-demand extraction) */
   getPropertySets(expressId: number): PropertySet[];
   /** Get all quantity sets for an entity (handles on-demand extraction) */
   getQuantitySets(expressId: number): QuantitySet[];
+
+  /**
+   * Property sets inherited from the element's IfcTypeProduct (via
+   * IfcRelDefinesByType), for the automatic Type-property fallback (issue
+   * #1745): when a `property` column/condition finds nothing on the instance,
+   * the engine consults these so a value defined once on the type (e.g.
+   * Pset_WallCommon.FireRating on IfcWallType) still resolves on every
+   * instance row. Optional — providers built before this existed simply have
+   * no fallback (behaviour unchanged). Returns [] when the element has no type.
+   */
+  getTypePropertySets?(expressId: number): PropertySet[];
+  /** Quantity sets inherited from the element's IfcTypeProduct — the quantity
+   *  counterpart of {@link getTypePropertySets} (e.g. type-level
+   *  Qto_WallBaseQuantities). Same optional Type fallback semantics. */
+  getTypeQuantitySets?(expressId: number): QuantitySet[];
 
   // ── Optional accessors (added for richer list targeting / columns) ──
   // Implementers built before these existed keep working: the engine
@@ -102,6 +124,24 @@ export interface ListDataProvider {
    * when absent, callers fall back to the type-sampled `discoverColumns()`.
    */
   discoverAllColumns?(): DiscoveredColumns;
+
+  /**
+   * Location-zone assignment (issue #1810) for `zoneSetId` — a viewer-side
+   * classification computed from 3D boxes the user draws, not from IFC pset
+   * data. `null` when no assignment has been computed yet (e.g. no zones
+   * defined) or `zoneSetId` doesn't resolve. `touchedZoneNames` lists every
+   * zone the element's bounds overlap, in the same order the assignment
+   * engine found them — non-empty only when `straddles` is true. Optional:
+   * providers built before zones existed simply have no `zone` column data.
+   */
+  getZoneAssignment?(expressId: number, zoneSetId: string): {
+    zoneName: string | null;
+    straddles: boolean;
+    touchedZoneNames: string[];
+  } | null;
+  /** Every zone set currently defined, for the column/condition picker to
+   *  offer by name while storing the durable id. */
+  getZoneSetNames?(): Array<{ id: string; name: string }>;
 }
 
 /** A classification reference exposed to the list engine (code + name). */
@@ -150,8 +190,30 @@ export interface ListDefinition {
 export interface ListGrouping {
   /** Column id to group rows by (e.g. a Type / Material / Storey column). */
   columnId: string;
+  /**
+   * Multi-criteria grouping (issue #1790): ordered column ids to group by,
+   * outermost first (e.g. Building, then Storey). When present and non-empty
+   * this takes precedence over `columnId`; `columnId` is kept in sync with the
+   * first entry for consumers built before multi-level grouping existed.
+   */
+  columnIds?: string[];
   /** Column ids whose numeric values are summed per group and overall. */
   sumColumnIds: string[];
+  /**
+   * Result presentation for a grouped list (issue #1790 round 2 — the
+   * reporter's follow-up: Count as a first-class column, and a pivot/schedule
+   * layout like Bonsai's, not a nested tree):
+   * - `nested` (default) — the existing collapsible tree: one header per
+   *   (sub)group with a count badge next to the label, per-element rows
+   *   underneath.
+   * - `schedule` — a pivot/schedule table: ONE row per group-value tuple (a
+   *   leaf group combination), the grouping columns repeated as leading
+   *   columns, followed by a first-class `Count` column and any configured
+   *   sums. No per-element detail rows.
+   * Optional so lists persisted before this existed keep their prior (nested)
+   * behaviour — `undefined` is treated as `nested`.
+   */
+  view?: 'nested' | 'schedule';
 }
 
 // ============================================================================
@@ -168,12 +230,17 @@ export interface PropertyCondition {
    * - `spatial` — a spatial-container name; `propertyName` selects the level
    *   (`Container`, `Storey` (default), `Building`, `Site`, or `Project`)
    * - `model` — the source model / file name (federation identity)
+   * - `zone` — a location-zone assignment (issue #1810); `psetName` holds the
+   *   zone-SET id, `propertyName` selects `Zone` (default, the zone name —
+   *   or the straddled zones joined when the element crosses a boundary) or
+   *   `Straddles` (boolean)
    */
-  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial' | 'model';
-  /** Property set name (for property/quantity sources) */
+  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial' | 'model' | 'zone';
+  /** Property set name (for property/quantity sources); the zone-SET id for `zone`. */
   psetName?: string;
-  /** Attribute / property / quantity name, or the spatial level for `spatial`
-   *  (`Container` | `Storey` | `Building` | `Site` | `Project`). Ignored for
+  /** Attribute / property / quantity name, the spatial level for `spatial`
+   *  (`Container` | `Storey` | `Building` | `Site` | `Project`), or the zone
+   *  display mode for `zone` (`Zone` (default) | `Straddles`). Ignored for
    *  material/classification/model. */
   propertyName: string;
   operator: ConditionOperator;
@@ -201,13 +268,16 @@ export interface ColumnDefinition {
    * multi-valued (joined with ", "); `spatial` is a spatial-container name at
    * the level named by `propertyName` (`Container` | `Storey` (default) |
    * `Building` | `Site` | `Project`); `model` is the source model / file name
-   * (federation identity).
+   * (federation identity); `zone` is a location-zone assignment (issue
+   * #1810) — see `PropertyCondition.source` for the exact `psetName`/
+   * `propertyName` contract, shared verbatim between conditions and columns.
    */
-  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial' | 'model';
-  /** For property: pset name. For quantity: qset name. */
+  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial' | 'model' | 'zone';
+  /** For property: pset name. For quantity: qset name. For zone: the zone-SET id. */
   psetName?: string;
-  /** Attribute / property / quantity name, or the spatial level for `spatial`
-   *  (`Container` | `Storey` | `Building` | `Site` | `Project`). Ignored for
+  /** Attribute / property / quantity name, the spatial level for `spatial`
+   *  (`Container` | `Storey` | `Building` | `Site` | `Project`), or the zone
+   *  display mode for `zone` (`Zone` (default) | `Straddles`). Ignored for
    *  material/classification/model. */
   propertyName: string;
   /** Display label override */
@@ -248,21 +318,49 @@ export interface ListResult {
   summary?: ListSummary;
 }
 
-/** One group in a grouped list result. */
+/** One group in a grouped list result. With multi-criteria grouping (issue
+ *  #1790) groups are emitted as a FLAT pre-order list: each parent group is
+ *  immediately followed by its subgroups (`level` gives the nesting depth). */
 export interface ListGroup {
-  /** Group-by value, stringified. Empty values group under `label`. */
+  /** Opaque unique group key - the JSON encoding of `path` (see
+   *  `groupPathKey`), collision-free even when a model-derived label contains
+   *  separator-like characters. */
   key: string;
-  /** Display label for the group header. */
+  /** Display label for the group header (this level's value only). */
   label: string;
-  /** Number of rows in the group. */
+  /** Number of rows in the group (the Count aggregate, issue #1790). */
   count: number;
   /** columnId → summed numeric value, for the configured sum columns. */
   sums: Record<string, number>;
+  /** 0-based nesting depth (0 = outermost grouping column). Always emitted by
+   *  `summariseListRows`; optional for backward type compatibility. */
+  level?: number;
+  /** Group-by labels from the outermost level down to this group. */
+  path?: string[];
 }
 
 /** Whole-result aggregates. */
 export interface ListSummary {
   count: number;
+  sums: Record<string, number>;
+}
+
+/**
+ * One row of the `schedule` presentation (issue #1790 round 2) — a single
+ * group-value tuple (a leaf group combination) carrying its Count and sums,
+ * projected from the LEAF entries of `ListGroup[]` (see `toScheduleRows`).
+ * Unlike `ListGroup`, a schedule row is never a parent: there is exactly one
+ * row per distinct combination of group-by values, matching Bonsai's
+ * "Building | Storey | Type | Count" schedule format.
+ */
+export interface ListScheduleRow {
+  /** Collision-free key — `groupPathKey(path)`, matching the source `ListGroup.key`. */
+  key: string;
+  /** Group-by values, outermost first — one per active grouping level. */
+  path: string[];
+  /** Count aggregate: number of matched elements in this group combination. */
+  count: number;
+  /** columnId -> summed numeric value, for the configured sum columns. */
   sums: Record<string, number>;
 }
 
@@ -295,6 +393,7 @@ export const ENTITY_ATTRIBUTES = [
   'Name',
   'GlobalId',
   'Class',
+  'Type',
   'Description',
   'ObjectType',
   'PredefinedType',

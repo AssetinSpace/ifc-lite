@@ -1,5 +1,76 @@
 # @ifc-lite/parser
 
+## 3.10.1
+
+### Patch Changes
+
+- [#1800](https://github.com/LTplus-AG/ifc-lite/pull/1800) [`3441fb9`](https://github.com/LTplus-AG/ifc-lite/commit/3441fb9e902daea8ed7d6f1a692e75618bbecb7e) Thanks [@louistrue](https://github.com/louistrue)! - Preserve the STEP token kind (Enum vs quoted String) through the columnar parser ([#1799](https://github.com/LTplus-AG/ifc-lite/issues/1799)). `EntityExtractor` now records which top-level attributes were bare enumeration tokens (`.USERDEFINED.`) in a new optional `IfcEntity.enumAttrIndices` side channel — the value representation is unchanged (enums are still stored as dotted strings), so existing consumers are unaffected. `extractRootAttributesFromEntity` rejects enum tokens on the unknown-type fixed-index fallback by token KIND instead of the [#1779](https://github.com/LTplus-AG/ifc-lite/issues/1779) dotted-string shape heuristic: a quoted string that merely looks like an enum (`'.USERDEFINED.'`) now survives, exactly matching the Rust server path's `AttributeValue::String` / `AttributeValue::Enum` split, while a bare `PredefinedType` enum landing on a fallback slot (e.g. IFC4X3 `IfcAlignment` attr 7) is still blanked.
+
+- Updated dependencies [[`3441fb9`](https://github.com/LTplus-AG/ifc-lite/commit/3441fb9e902daea8ed7d6f1a692e75618bbecb7e), [`eb414a4`](https://github.com/LTplus-AG/ifc-lite/commit/eb414a4aa62f81434911df41a7b1d6ccf6f054c3)]:
+  - @ifc-lite/data@2.8.0
+  - @ifc-lite/wasm@4.1.1
+
+## 3.10.0
+
+### Minor Changes
+
+- [#1793](https://github.com/LTplus-AG/ifc-lite/pull/1793) [`502c61b`](https://github.com/LTplus-AG/ifc-lite/commit/502c61bc7c0ae1ac313ed93ab335fdd942471c72) Thanks [@louistrue](https://github.com/louistrue)! - Render IFC4 `IfcImageTexture` surface textures from `.ifcZIP` containers ([#1781](https://github.com/LTplus-AG/ifc-lite/issues/1781)).
+
+  - parser: new `unwrapIfcZipWithResources` surfaces sibling raster images (the files `IfcImageTexture.URLReference` points at) alongside the model entry, keyed by lowercased basename; `unwrapIfcZip` is unchanged.
+  - geometry/wasm: `IfcImageTexture` now resolves to a lightweight reference (`textureId` = the `IfcSurfaceTexture` express id, URL, repeat flags) instead of being dropped — the host decodes the image once per id, so a 4096² JPEG shared by dozens of face sets is decoded and uploaded exactly once. `IfcIndexedTriangleTextureMap` with a null `TexCoordIndex` (the SketchUp IFC Manager export shape) now maps UVs 1:1 with the face set's coordinates per spec. Textured face sets on ORDINARY occurrences (direct `Body` items, not just type-product representation maps) now carry UVs + texture through the sub-mesh path, and blob/pixel texture decodes are Arc-shared instead of cloned per face set.
+  - renderer: textured meshes with an external image reference render through the existing WebGPU textured pipeline via a refcounted shared-texture registry (one GPU texture per `textureId`, uploaded from the viewer-decoded `ImageBitmap`); per-mesh [#961](https://github.com/LTplus-AG/ifc-lite/issues/961) blob/pixel uploads are unchanged.
+  - viewer: `.ifcZIP` loads decode sibling images with `createImageBitmap` and attach them to arriving meshes; textured models skip the binary geometry cache (which cannot persist textures yet) instead of silently losing textures on the second open.
+
+- [#1762](https://github.com/LTplus-AG/ifc-lite/pull/1762) [`05c8bdf`](https://github.com/LTplus-AG/ifc-lite/commit/05c8bdf348c5afae8978293cd324d45104e24940) Thanks [@louistrue](https://github.com/louistrue)! - Material association hardening (follow-up to [#1755](https://github.com/LTplus-AG/ifc-lite/issues/1755)):
+
+  - **Multiple `IfcRelAssociatesMaterial` per element** are no longer lost. New `resolveAllMaterialDefIds` / `extractAllMaterialsOnDemand` surface every association (relationship-graph backed, ordered by rel express id). The single-entry `onDemandMaterialMap` "primary" is now deterministic — the association with the LOWEST rel express id wins — and the viewer cache rebuild applies the same rule, so a cache load can no longer disagree with a fresh parse. Models where the old last-wins rule picked a later association may report a different primary material in single-value surfaces (MCP/CLI/SDK).
+  - `buildMaterialUsageIndex` lists elements under EVERY associated material, so the By Material tab and per-material totals include secondary associations.
+  - `extractMaterialPropertiesOnDemand` aggregates `Pset_Material*` across all associations instead of only the primary.
+  - **IDS**: material facets now check every association — a requirement satisfied only by an element's second association no longer false-fails.
+  - **Constituent-set fractions**: constituents without an authored `Fraction` receive an equal share of the unallocated remainder instead of weight 0, so they contribute to per-material quantity totals.
+
+### Patch Changes
+
+- [#1797](https://github.com/LTplus-AG/ifc-lite/pull/1797) [`6102a22`](https://github.com/LTplus-AG/ifc-lite/commit/6102a222a6a71afcdab89855f1dcfa9437d3994f) Thanks [@louistrue](https://github.com/louistrue)! - Fix `extractRootAttributesFromEntity` leaking STEP bare-enum tokens into string display attributes for types the schema registry doesn't recognise ([#1779](https://github.com/LTplus-AG/ifc-lite/issues/1779)). On the unknown-type fixed-index fallback, a PredefinedType enum landing on attribute 7 (e.g. IFC4X3 `IfcAlignment`) is stored by the extractor as a dotted string (`.USERDEFINED.`) and used to surface as the element's `Tag`. It's now rejected (rendered blank), mirroring the Rust server path — so the `Tag`, `Description`, and `ObjectType` list columns match across parse paths. Known types are unaffected (their schema indices point at genuine string slots).
+
+- Updated dependencies [[`2a7c7ff`](https://github.com/LTplus-AG/ifc-lite/commit/2a7c7ffe0ac27a8cc315e5d4a633c56469646cf0), [`502c61b`](https://github.com/LTplus-AG/ifc-lite/commit/502c61bc7c0ae1ac313ed93ab335fdd942471c72), [`7194c95`](https://github.com/LTplus-AG/ifc-lite/commit/7194c95002f2c84cd3c9444d710a50190a976a90)]:
+  - @ifc-lite/wasm@4.1.0
+  - @ifc-lite/data@2.7.0
+  - @ifc-lite/ifcx@2.3.1
+
+## 3.9.1
+
+### Patch Changes
+
+- [#1757](https://github.com/LTplus-AG/ifc-lite/pull/1757) [`7ef3622`](https://github.com/LTplus-AG/ifc-lite/commit/7ef36225d863ec64dfb254cf0767d4ab9d034849) Thanks [@louistrue](https://github.com/louistrue)! - Fix By Material tab / material totals missing materials associated to TYPE entities ([#1755](https://github.com/LTplus-AG/ifc-lite/issues/1755)). `buildMaterialUsageIndex` now expands `IfcRelAssociatesMaterial` targets that are type entities (e.g. `IfcDoorType`) to their occurrences via forward `IfcRelDefinesByType` edges, with occurrence-level associations taking precedence (IFC semantics) and no double counting. Previously the usage index keyed such materials to the type entity itself, which the viewer's By Material tree dropped via its geometry filter and the totals panel mis-attributed.
+
+- [#1772](https://github.com/LTplus-AG/ifc-lite/pull/1772) [`cc92f17`](https://github.com/LTplus-AG/ifc-lite/commit/cc92f171661eb8e27170bcc0360336df819f9ab7) Thanks [@louistrue](https://github.com/louistrue)! - Fix deterministic GlobalId first character and STEP header escape round-trip.
+
+  `deterministicGlobalId` masked its first output character with the full 6-bit alphabet, but a valid 22-char IFC GlobalId encodes only 2 bits in its first character (128 = 2 + 21\*6). The id is now stamped from the hash's 128-bit state MSB-first exactly like `uuidToIfcGuid`'s compression, so it always decodes to a well-formed 128-bit UUID and re-encodes bit-exactly. This also fixes a severe entropy loss in the previous stamping: it read each state word's LOW 6 bits while evolving it with a 32-bit multiply (which never propagates high bits downward), leaving ~24 bits of effective entropy and real collisions at ~10k seeds; the full-state stamping is collision-free across 100k adversarial seeds.
+
+  Header string round-trip no longer corrupts ISO-10303-21 escapes: `parseSourceHeader` now decodes `\X2\`, `\X\`, `\S\` and `\Px\` directives to real Unicode (via the canonical `decodeIfcString`) instead of leaving them for the writer's backslash-doubling escaper to mangle (`Tr\X2\00FC\X0\mpler` no longer becomes `Tr\\X2\\00FC\\X0\\mpler`), and collapses the `\\` escape to a single literal backslash first, so `C:\temp` is byte-stable across repeated write/read cycles instead of growing backslashes. The shared STEP string escaper (data) also collapses control characters to a space so a header/attribute value can never inject a physical line break.
+
+- [#1773](https://github.com/LTplus-AG/ifc-lite/pull/1773) [`0d400ed`](https://github.com/LTplus-AG/ifc-lite/commit/0d400edd61a71108c2affd0923fb561affbfe9fe) Thanks [@louistrue](https://github.com/louistrue)! - Harden IFC string decoding, material-usage resolution, the worker scanner, and the binary cache.
+
+  - encoding: `decodeIfcString` no longer throws a `RangeError` on a `\X4\` sequence whose 8-hex value exceeds the Unicode maximum (`0x10FFFF`); it now emits U+FFFD instead. The previous throw propagated uncaught through the columnar batch-name path and aborted the entire model load. Surrogate values in `\X4\` and lone surrogates in `\X2\` also decode to U+FFFD now (surrogate pairs split across `\X2\` groups still combine), matching the Rust decoder (`char::from_u32` / `String::from_utf16_lossy`) so both parse paths yield identical strings.
+  - parser: `onDemandMaterialMap` is now list-valued, so a second `IfcRelAssociatesMaterial` targeting the same element is preserved instead of last-wins overwritten. `buildMaterialUsageIndex` gains a relationship-graph fallback for server-loaded stores: it works on the real server store shape (empty `source` buffer, facade relationship graph with closure-only accessors), with `collectMaterialLeaves` surfacing each definition as one opaque full-weight leaf when no source is available. An empty index built from a store with no material inputs at all is no longer memoised (so a later-populated store can rebuild). `IfcMaterialConstituent` weights now always sum to 1: siblings without an explicit `Fraction` share the remainder instead of collapsing to weight 0, sets where explicit fractions already fill the whole are renormalised (`{1.0, unset}` -> 2/3, 1/3 rather than 1.5x totals), and non-finite or non-positive fractions/layer thicknesses are treated as unset.
+  - parser: the inline worker scanner's type-name cache now byte-verifies on a hit (matching `tokenizer.ts`), so a 32-bit hash collision can no longer alias two distinct type names on the default scan path.
+  - parser: batch GlobalId+Name extraction now collapses STEP doubled single-quotes (`''` -> `'`), matching `EntityExtractor`, so names like `John''s Wall` render correctly.
+  - cache: the writer no longer sets the dead `HasSpatial` header flag (no Spatial section is written or read), and the string-table read path preserves positions via `StringTable.fromArray` instead of re-interning (which deduped, shifting later indices when a duplicate was present). On-disk format is unchanged.
+
+- Updated dependencies [[`cc92f17`](https://github.com/LTplus-AG/ifc-lite/commit/cc92f171661eb8e27170bcc0360336df819f9ab7), [`0d400ed`](https://github.com/LTplus-AG/ifc-lite/commit/0d400edd61a71108c2affd0923fb561affbfe9fe), [`2d2a2fb`](https://github.com/LTplus-AG/ifc-lite/commit/2d2a2fb672bba182bc57e3f59c2da4909583fa49), [`564a800`](https://github.com/LTplus-AG/ifc-lite/commit/564a800e997322d863aac84127497ef4f8310ac3), [`cc92f17`](https://github.com/LTplus-AG/ifc-lite/commit/cc92f171661eb8e27170bcc0360336df819f9ab7), [`2cd5f43`](https://github.com/LTplus-AG/ifc-lite/commit/2cd5f439d202894fde34961cc4b3bfbe9ad2d140)]:
+  - @ifc-lite/data@2.6.0
+  - @ifc-lite/encoding@1.14.11
+  - @ifc-lite/wasm@4.0.1
+
+## 3.9.0
+
+### Minor Changes
+
+- [#1748](https://github.com/LTplus-AG/ifc-lite/pull/1748) [`ae6079f`](https://github.com/LTplus-AG/ifc-lite/commit/ae6079f0d2d8a3dbc923dfd468817c7f3e2f9b4a) Thanks [@louistrue](https://github.com/louistrue)! - Lists/Schedules now resolve Type-level properties and quantities on instance rows ([#1745](https://github.com/LTplus-AG/ifc-lite/issues/1745)). A column mapped to a pset/qto that lives on an element's `IfcTypeProduct` (via `IfcRelDefinesByType`) — e.g. `Pset_WallCommon.FireRating` or `Qto_WallBaseQuantities.Width` defined once on `IfcWallType` — now falls back to the type when the instance has no local value, so it no longer renders a blank cell. Instance-level values still take precedence, and the same fallback applies to list filter conditions.
+
+  `@ifc-lite/parser` gains `extractTypeQuantitiesOnDemand` (and the `extractQsetsFromIds` helper) mirroring the existing `extractTypePropertiesOnDemand`. `@ifc-lite/lists` gains optional `getTypePropertySets` / `getTypeQuantitySets` accessors on `ListDataProvider`; providers that don't implement them keep their previous behaviour (no fallback).
+
 ## 3.8.5
 
 ### Patch Changes

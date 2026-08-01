@@ -52,6 +52,16 @@ export const TOUR_ANCHORS = {
   clashFocusMode: 'clash-focus-mode',
   /** ClashPanel "BCF topic" button in the results toolbar (result with clashes). */
   clashBcf: 'clash-bcf',
+  /** LayersPanel empty-state "Load demo stack" button (only while no stack). */
+  layersDemo: 'layers-demo',
+  /** LayersPanel strata list container (only while a stack is loaded). */
+  layersStrata: 'layers-strata',
+  /** LayersPanel Draft section wrapper (stack loaded). */
+  layersDraft: 'layers-draft',
+  /** LayersPanel Merge section wrapper (stack loaded, candidates exist). */
+  layersMerge: 'layers-merge',
+  /** LayerDiffView root (only while a contribution diff is open). */
+  layersDiff: 'layers-diff',
   /** ComparePanel A/B model-select grid (only with two loaded models). */
   compareAb: 'compare-ab',
   /** ComparePanel "Run comparison" button (only with two loaded models). */
@@ -85,6 +95,14 @@ export const TOUR_ANCHORS = {
   bcfCaptureViewpoint: 'bcf-capture-viewpoint',
   /** BCFPanel header Export BCF button (disabled until a topic exists). */
   bcfExport: 'bcf-export',
+  /** RibbonToolbar tab strip (ribbon style only; the classic strip has none). */
+  ribbonTabs: 'ribbon-tabs',
+  /** Ribbon collapse/expand chevron in the tab strip. */
+  ribbonCollapse: 'ribbon-collapse',
+  /** ViewTab "Classic bar" button (only while the View tab is open). */
+  ribbonClassicSwitch: 'ribbon-classic-switch',
+  /** ViewTab "Follow work" contextual-tabs toggle (View tab open). */
+  ribbonFollowWork: 'ribbon-follow-work',
 } as const;
 
 /** Activity-bar rail button for a panel (one templated attribute serves

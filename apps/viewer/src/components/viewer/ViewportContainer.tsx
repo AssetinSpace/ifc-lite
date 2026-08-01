@@ -4,6 +4,7 @@
 
 import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useLevelDisplayEffect } from '@/hooks/useLevelDisplayEffect';
+import { ingestDxfFiles, splitDxfFiles } from '@/hooks/ingest/dxfIngest';
 import { Viewport } from './Viewport';
 import {
   initialDragOverlayState,
@@ -16,6 +17,7 @@ import { MergeLayersBanner } from './MergeLayersBanner';
 import { GeometryModeBanner } from './GeometryModeBanner';
 import { LevelDisplayIndicator } from './LevelDisplayIndicator';
 import { ToolOverlays } from './ToolOverlays';
+import { ZoneOverlay, ZoneAssignmentSyncMount } from './tools/ZoneOverlay';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
 // >>> AIM-FORK: Reality Capture pin billboard (D-073)
 import { CapturePinLayer } from '../../aim/CapturePinLayer';
@@ -50,7 +52,7 @@ import { toast } from '@/components/ui/toast';
 import { TourInvite } from '@/components/tours/TourInvite';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
 import { describeUnsupportedFormat } from '@/hooks/ingest/pointCloudIngest';
-import { Upload, MousePointer, Layers, Info, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus } from 'lucide-react';
+import { Upload, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus, GitMerge } from 'lucide-react';
 import { createBlankIfcFile } from '@/utils/createBlankIfc';
 import type { MeshData, CoordinateInfo, GeometryResult, PointCloudAsset } from '@ifc-lite/geometry';
 import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
@@ -521,8 +523,14 @@ export function ViewportContainer() {
     // once this handler returns, so this must run before any await.
     const handlesPromise = handlesFromDataTransfer(e.dataTransfer);
 
+    // DXF reference underlays split off before model routing (issue #1782):
+    // a dropped site plan must never replace or federate with the model.
+    const allDropped0 = Array.from(e.dataTransfer.files);
+    const { dxfFiles, modelFiles: allDropped } = splitDxfFiles(allDropped0);
+    if (dxfFiles.length > 0) void ingestDxfFiles(dxfFiles);
+    if (allDropped.length === 0) return;
+
     // Filter to supported files (IFC, IFCX, GLB, point clouds)
-    const allDropped = Array.from(e.dataTransfer.files);
     const supportedFiles = allDropped.filter(isSupportedFile);
 
     if (supportedFiles.length === 0) {
@@ -561,11 +569,18 @@ export function ViewportContainer() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
+    // DXF reference underlays split off before model routing (issue #1782).
+    const { dxfFiles, modelFiles } = splitDxfFiles(Array.from(files));
+    if (dxfFiles.length > 0) void ingestDxfFiles(dxfFiles);
+
     // Filter to supported files (IFC, IFCX, GLB). The <input> path yields no
     // live handle, so these models are not refreshable.
-    const supportedFiles = Array.from(files).filter(isSupportedFile);
+    const supportedFiles = modelFiles.filter(isSupportedFile);
 
-    if (supportedFiles.length === 0) return;
+    if (supportedFiles.length === 0) {
+      e.target.value = '';
+      return;
+    }
 
     recordRecentFiles(supportedFiles.map((file) => ({ name: file.name, size: file.size })));
     void cacheFileBlobs(supportedFiles);
@@ -588,6 +603,9 @@ export function ViewportContainer() {
     }
     const opened = await openIfcFilesWithHandles();
     if (!opened) return;
+    // DXF reference underlays split off before model routing (issue #1782).
+    const dxfPicked = opened.filter((o) => o.file.name.toLowerCase().endsWith('.dxf'));
+    if (dxfPicked.length > 0) void ingestDxfFiles(dxfPicked.map((o) => o.file));
     const supported = opened.filter((o) => isSupportedFile(o.file));
     if (supported.length === 0) return;
 
@@ -977,7 +995,7 @@ export function ViewportContainer() {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz"
+          accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz,.dxf"
           multiple
           onChange={handleFileSelect}
           className="hidden"
@@ -1108,8 +1126,14 @@ export function ViewportContainer() {
           </div>
         )}
 
-        {/* Empty state content — mobile-optimized padding and scrollable */}
-        <div className="absolute inset-0 flex flex-col items-center justify-center p-4 md:p-8 z-10 overflow-auto">
+        {/* Empty state content — mobile-optimized padding and scrollable.
+            The scroll container must NOT center via justify-center: a flex
+            child taller than an overflow-auto parent gets its top clipped
+            beyond scroll reach (the logo used to vanish under the toolbar
+            on short viewports). Instead an inner min-h-full column centers
+            when there is room and grows scrollably from the top when not. */}
+        <div className="absolute inset-0 z-10 overflow-auto p-4 md:p-8">
+          <div className="min-h-full w-full flex flex-col items-center justify-center">
 
           {/* Main Card */}
           <div {...tourAnchor(TOUR_ANCHORS.emptyStateCard)} className="max-w-md w-full bg-white dark:bg-[#16161e] border border-zinc-300 dark:border-[#3b4261] p-8 flex flex-col items-center transition-transform hover:-translate-y-1 duration-200 shadow-lg">
@@ -1251,31 +1275,44 @@ export function ViewportContainer() {
             )}
           </div>
 
-          {/* Feature Grid — hidden on mobile to save viewport space */}
-          <div className="mt-16 hidden md:grid grid-cols-1 md:grid-cols-3 gap-6 max-w-3xl w-full">
-            {[
-              { icon: MousePointer, label: "Select", desc: "Inspect elements", accentClass: 'text-blue-500 dark:text-[#7aa2f7]' },
-              { icon: Layers, label: "Filter", desc: "Isolate storeys", accentClass: 'text-purple-500 dark:text-[#bb9af7]' },
-              { icon: Info, label: "Analyze", desc: "View properties", accentClass: 'text-cyan-500 dark:text-[#7dcfff]' }
-            ].map((feature, i) => (
-              <div 
-                key={i} 
-                className="p-4 flex items-center gap-4 bg-zinc-100 dark:bg-[#1f2335] border border-zinc-300 dark:border-[#3b4261]"
-              >
-                <div className={`p-2 bg-white dark:bg-[#16161e] border border-zinc-300 dark:border-[#3b4261] ${feature.accentClass}`}>
-                  <feature.icon className="h-5 w-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold uppercase text-sm tracking-wide text-zinc-900 dark:text-[#a9b1d6]">{feature.label}</h3>
-                  <p className="text-xs font-mono text-zinc-500 dark:text-[#565f89]">{feature.desc}</p>
-                </div>
-              </div>
-            ))}
-          </div>
+          {/* The old Select / Filter / Analyze feature-card grid was
+              dropped: it repeated toolbar affordances without offering an
+              action, and its height pushed the welcome card off-screen. */}
 
-          {/* Footer chips — left: discovery link to the marketing site for first-time
-              visitors, right: shortcuts cue for power users. Both desktop-only. */}
-          <div className="absolute bottom-8 left-8 hidden md:block">
+          {/* Moonshot callout (#1717): Layer PRs are brand new - nobody knows
+              to multi-drop .ifcx files, so the welcome screen sells the demo. */}
+          <button
+            type="button"
+            onClick={() => {
+              void import('@/lib/layers/demo-stack')
+                .then((m) => m.loadDemoLayerStack())
+                .catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)));
+            }}
+            className="group mt-6 hidden md:flex items-center gap-3 max-w-3xl w-full p-3 bg-zinc-100 dark:bg-[#1f2335] border border-primary/40 hover:border-primary transition-colors text-left"
+          >
+            <div className="p-2 bg-white dark:bg-[#16161e] border border-zinc-300 dark:border-[#3b4261] text-primary">
+              <GitMerge className="h-5 w-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h3 className="font-bold uppercase text-sm tracking-wide text-zinc-900 dark:text-[#a9b1d6]">
+                <span className="mr-2 rounded-sm bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">New</span>
+                Layers
+              </h3>
+              <p className="text-xs font-mono text-zinc-500 dark:text-[#565f89]">
+                Version your model like code: layers, drafts, merges, reviews
+              </p>
+            </div>
+            <span className="text-xs font-mono font-bold text-primary group-hover:translate-x-0.5 transition-transform">
+              Try the demo stack &rarr;
+            </span>
+          </button>
+
+          {/* Footer chips - left: discovery link to the marketing site for first-time
+              visitors, right: shortcuts cue for power users. Both desktop-only.
+              IN FLOW, not absolute: the welcome column scrolls on short
+              viewports, and absolutely-anchored chips ride the scroll and
+              land on top of the content (#1736 follow-up). */}
+          <div className="mt-10 hidden w-full max-w-3xl items-center justify-between gap-4 md:flex">
             <a
               href="https://ifclite.dev"
               target="_blank"
@@ -1285,8 +1322,6 @@ export function ViewportContainer() {
               <span>New here?</span>
               <span className="font-bold text-primary group-hover:translate-x-0.5 transition-transform">ifclite.dev →</span>
             </a>
-          </div>
-          <div className="absolute bottom-8 right-8 hidden md:block">
             <div className="flex items-center gap-2 text-xs font-mono px-3 py-1.5 bg-zinc-100 dark:bg-[#1f2335] border border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#565f89]">
               <Command className="h-3 w-3" />
               <span>SHORTCUTS</span>
@@ -1294,6 +1329,7 @@ export function ViewportContainer() {
             </div>
           </div>
 
+          </div>
         </div>
       </div>
     );
@@ -1381,6 +1417,8 @@ export function ViewportContainer() {
       <GeometryModeBanner onReload={handleGeometryModeReload} />
       <LevelDisplayIndicator />
       <ToolOverlays />
+      <ZoneOverlay />
+      <ZoneAssignmentSyncMount />
       <BasketPresentationDock />
       <Section2DPanel
         mergedGeometry={mergedGeometryResult}

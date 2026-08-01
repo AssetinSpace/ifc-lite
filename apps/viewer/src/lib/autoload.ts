@@ -14,6 +14,36 @@
 export const AUTOLOAD_MAX_MODELS = 16;
 
 /**
+ * Origins the autoload params may fetch from, besides the viewer's own.
+ *
+ * Upstream restricts `?model=` to strictly same-origin, because the param is
+ * attacker-controllable: a crafted link would otherwise pull an arbitrary file
+ * into the victim's viewer. We keep that intent but cannot keep the strict rule
+ * — the AIM host federates models from its object storage, a different origin by
+ * construction. So the rule here is "same-origin plus an explicit allowlist",
+ * applied uniformly to `?model=` and `?models=`.
+ *
+ * Configure per deployment with `VITE_AIM_MODEL_ORIGINS` (comma-separated).
+ * The default is the AIM storage bucket the host app serves from, so a stock
+ * fork deployment federates without extra configuration.
+ */
+export const DEFAULT_MODEL_ORIGINS = ['https://acwoupricatirhlfkhvk.supabase.co'];
+
+/** Allowlist from the build-time env, falling back to {@link DEFAULT_MODEL_ORIGINS}. */
+export function configuredModelOrigins(): string[] {
+  // `import.meta.env` only exists under Vite; the unit tests run this module in
+  // plain node, so read it defensively rather than assuming a bundler.
+  const raw = (import.meta as { env?: Record<string, string | undefined> }).env
+    ?.VITE_AIM_MODEL_ORIGINS;
+  if (!raw) return DEFAULT_MODEL_ORIGINS;
+  const parsed = raw
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : DEFAULT_MODEL_ORIGINS;
+}
+
+/**
  * Window event dispatched by the ViewerLayout autoload loop after EVERY
  * requested model has been attempted (loaded or failed — it always fires, so
  * listeners can't deadlock on a broken URL). The AIM bridge keys its
@@ -31,7 +61,11 @@ export const AUTOLOAD_COMPLETE_EVENT = 'ifc-lite:autoload-complete';
  * they're resolved against `baseUrl` for validation only; the original
  * entry is returned untouched for the actual fetch.
  */
-export function parseAutoloadUrls(search: string, baseUrl: string): string[] {
+export function parseAutoloadUrls(
+  search: string,
+  baseUrl: string,
+  allowedOrigins: string[] = configuredModelOrigins(),
+): string[] {
   const params = new URLSearchParams(search);
   const multi = params.get('models');
   const single = params.get('model');
@@ -39,16 +73,33 @@ export function parseAutoloadUrls(search: string, baseUrl: string): string[] {
     .map((u) => u.trim())
     .filter(Boolean);
 
-  const valid = entries.filter((entry) => {
+  const selfOrigin = (() => {
     try {
-      const proto = new URL(entry, baseUrl).protocol;
-      if (proto === 'http:' || proto === 'https:') return true;
-      console.warn('[viewer] autoload: skipping non-http(s) model URL', entry);
-      return false;
+      return new URL(baseUrl).origin;
+    } catch {
+      return null;
+    }
+  })();
+
+  const valid = entries.filter((entry) => {
+    let url: URL;
+    try {
+      url = new URL(entry, baseUrl);
     } catch {
       console.warn('[viewer] autoload: skipping unparseable model URL', entry);
       return false;
     }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      console.warn('[viewer] autoload: skipping non-http(s) model URL', entry);
+      return false;
+    }
+    // Same-origin (covers relative paths) or explicitly allowlisted. Anything
+    // else is a crafted-link model injection — refuse, never fetch.
+    if (url.origin === selfOrigin || allowedOrigins.includes(url.origin)) return true;
+    console.error(
+      `[viewer] autoload: refusing model from disallowed origin (${url.origin}) — allow it via VITE_AIM_MODEL_ORIGINS`,
+    );
+    return false;
   });
 
   if (valid.length > AUTOLOAD_MAX_MODELS) {

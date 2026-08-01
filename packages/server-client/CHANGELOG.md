@@ -1,5 +1,27 @@
 # @ifc-lite/server-client
 
+## 1.20.0
+
+### Minor Changes
+
+- [#1785](https://github.com/LTplus-AG/ifc-lite/pull/1785) [`7194c95`](https://github.com/LTplus-AG/ifc-lite/commit/7194c95002f2c84cd3c9444d710a50190a976a90) Thanks [@louistrue](https://github.com/louistrue)! - IDS validation on server-parsed models now matches candidate values for multi-valued properties (enumerated / bounded / list / table), for INSTANCE-attached properties, identically to the in-browser path ([#1766](https://github.com/LTplus-AG/ifc-lite/issues/1766)). The server emits the same `values[]` candidate array `parsePropertyValue` produces — enumerated/list members, bounded lower/upper/setPoint (deduped), table defining-then-defined values — as a JSON-encoded nullable `values_json` column (data-model cache v4 → v5, sparse: only multi-value rows). The decoder parses it, `convertServerDataModel`'s `materializeProp` attaches it to the property entry, and the existing IDS bridge (`projectProperty` → facet `candidateValues`) consumes it unchanged, so a facet passes when the constraint matches ANY candidate (not just the joined display value). `@ifc-lite/data`'s `Property` gains an optional `values?: string[]`.
+
+## 1.19.0
+
+### Minor Changes
+
+- [#1778](https://github.com/LTplus-AG/ifc-lite/pull/1778) [`564a800`](https://github.com/LTplus-AG/ifc-lite/commit/564a800e997322d863aac84127497ef4f8310ac3) Thanks [@louistrue](https://github.com/louistrue)! - Server-parse path now resolves the Lists attribute columns `Description`, `ObjectType`, `PredefinedType`, and `Tag` identically to the in-browser (WASM) path ([#1765](https://github.com/LTplus-AG/ifc-lite/issues/1765)). The server extracts them at the SAME schema-registry positions the WASM path resolves attribute names against — via a Rust index table generated from `@ifc-lite/parser`'s `SCHEMA_REGISTRY` (`scripts/generate-server-attr-indices.mjs`) — so the traps hold on both paths: `IfcSite` attr 7 (LongName) never surfaces as Tag, `IfcWallType` attr 4 (ApplicableOccurrence) never surfaces as ObjectType, and `CompositionType` enums never leak into PredefinedType. Data-model payload bumped to v4 with nullable `description`/`object_type`/`tag`/`predefined_type` entity columns; `@ifc-lite/data`'s `EntityTable` gains optional `getTag`/`getPredefinedType` accessors (server-parsed stores implement them; the WASM path keeps its on-demand source extraction).
+
+- [#1759](https://github.com/LTplus-AG/ifc-lite/pull/1759) [`e49a1a0`](https://github.com/LTplus-AG/ifc-lite/commit/e49a1a020eaafd397af626e88a058b69122a1bd9) Thanks [@louistrue](https://github.com/louistrue)! - Server-parse path now resolves Type-level properties/QTOs in Lists/Schedules identically to the in-browser (WASM) path ([#1751](https://github.com/LTplus-AG/ifc-lite/issues/1751)), and adds a `Type` list column showing the element's IfcTypeProduct name ([#1754](https://github.com/LTplus-AG/ifc-lite/issues/1754)).
+
+  Two things were broken on the server path and are fixed together:
+
+  - **Every text/boolean property was garbled.** The server's property extractor only matched bare strings/numbers, so STEP's typed wrappers (`IFCLABEL('X')`, `IFCBOOLEAN(.T.)`) fell through to a Rust `Debug` string typed `"unknown"`. It now mirrors the WASM `parsePropertyValue` — resolving canonical value + kind (`string`/`boolean`/`logical`/`integer`/`real`) and carrying the raw measure tag (`data_type`, e.g. `IFCLENGTHMEASURE`) — so numeric cells sum/sort and unit conversion ([#1573](https://github.com/LTplus-AG/ifc-lite/issues/1573)) works. `@ifc-lite/server-client`'s `Property` gains an optional `data_type` (data-model payload bumped to v3).
+
+  - **Type sets never reached the client.** The server dropped `IfcRelDefinesByType` and never read a type's `HasPropertySets`. It now emits the type→element relationship plus a synthetic `TYPEHASPROPERTYSETS` edge per type-owned set, and the viewer merges those onto the type id (own sets first, name-deduped) — matching the WASM path exactly.
+
+  `@ifc-lite/lists` adds a `Type` attribute column and an optional `getEntityDefiningTypeName` accessor on `ListDataProvider`. A cross-path parity test asserts identical `executeList` rows, column metadata, and group sums for the same file through both parse paths.
+
 ## 1.18.3
 
 ### Patch Changes

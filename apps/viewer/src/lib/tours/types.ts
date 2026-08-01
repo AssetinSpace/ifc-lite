@@ -11,7 +11,7 @@
  * skippable, so a tour can never trap the user.
  */
 
-import type { ViewerState, EntityRef, CameraViewpoint, SectionPlaneAxis } from '@/store';
+import type { ViewerState, EntityRef, CameraViewpoint, RibbonTabId, SectionPlaneAxis, ToolbarStyle } from '@/store';
 import type { SidebarMode } from '@/store';
 import type { WorkspacePanelId, BottomPanelId } from '@/lib/panels/registry';
 import type { TourAnchorId } from './anchors';
@@ -98,6 +98,8 @@ export interface TourPrerequisites {
   modelLoaded?: boolean;
   /** At least two fully loaded models (compare tour). */
   secondModel?: boolean;
+  /** A composed .ifcx layer stack of 2+ layers (layers tour). */
+  layerStack?: boolean;
 }
 
 /** Snapshot fields a tour may keep applied after a successful finish. */
@@ -183,6 +185,15 @@ export interface UiSnapshot {
     custom: ViewerState['sectionPlane']['custom'];
   };
   activeLensId: string | null;
+  /**
+   * Toolbar style, open ribbon tab, and collapsed state. Captured because
+   * the ribbon tour moves all three to teach them: a classic-toolbar user
+   * who starts it from the Learn hub gets their strip back when it ends,
+   * and someone who keeps the band collapsed gets it collapsed again.
+   */
+  toolbarStyle: ToolbarStyle;
+  ribbonTab: RibbonTabId;
+  ribbonCollapsed: boolean;
   /** May be null before the renderer registered camera callbacks. */
   camera: CameraViewpoint | null;
   /** Restore of camera/selection is skipped when this set changed mid-run. */

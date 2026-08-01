@@ -10,6 +10,7 @@
 import { createLogger } from '@ifc-lite/data';
 import type { KmzAltitudeMode, TessellationQuality } from './types.js';
 import type { GeometryDiagnostics } from './diagnostics.js';
+import { getStartedSharedWasmModule } from './wasm-shared-module.js';
 import init, {
   IfcAPI,
   SymbolicRepresentationCollection,
@@ -129,10 +130,20 @@ export class IfcLiteBridge {
         const wasmPath: string = requireFromHere.resolve('@ifc-lite/wasm/ifc-lite_bg.wasm');
         wasmInitArg = (await nodeFs.readFile(wasmPath)) as BufferSource;
       }
+      // Reuse the shared compiled module when some other consumer (an idle
+      // prewarm, or the N-worker pool on an earlier load) already fetched this
+      // binary — passing the `WebAssembly.Module` skips the network entirely and
+      // skips a redundant compile of the same ~3.9 MB. `getStartedSharedWasmModule`
+      // never *starts* a compile, so when nothing else did, this path is exactly
+      // what it was before: wasm-bindgen fetches from import.meta.url itself.
+      // Node is excluded — it hands over bytes it read off disk.
+      const sharedModule = wasmInitArg ? null : await (getStartedSharedWasmModule() ?? null);
+
       // Browser: init() with no arg fetches from import.meta.url. Node: pass the
       // bytes via the modern object form ({ module_or_path }) to avoid the
       // deprecated positional-bytes signature.
-      await init(wasmInitArg ? { module_or_path: wasmInitArg } : undefined);
+      const initArg = wasmInitArg ?? sharedModule ?? undefined;
+      await init(initArg ? { module_or_path: initArg } : undefined);
 
       // The WASM bundle has no in-WASM thread pool; rayon `par_iter()`
       // (e.g. FacetedBrep preprocessing) runs sequentially on the main
@@ -502,6 +513,46 @@ export class IfcLiteBridge {
       );
     } catch (error) {
       log.error('Failed to exportGlbFromMeshes', error, { operation: 'exportGlbFromMeshes' });
+      if (this.isWasmRuntimeError(error)) {
+        this.markFatalWasmRuntimeError();
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Demesher: simplify already-produced element meshes (flattened parallel
+   * arrays, one record per MeshData entry) at per-element levels 1-5. Returns
+   * the wasm `SimplifiedMeshes` result object (render meshes in the boundary
+   * Y-up convention + IFC-local file-unit geometry per element).
+   */
+  simplifyMeshes(
+    expressIds: Uint32Array,
+    levels: Uint8Array,
+    positions: Float32Array,
+    normals: Float32Array,
+    indices: Uint32Array,
+    vertexCounts: Uint32Array,
+    indexCounts: Uint32Array,
+    origins: Float64Array,
+    localToWorld: Float64Array,
+    localToWorldPresent: Uint8Array,
+    rtcX: number,
+    rtcY: number,
+    rtcZ: number,
+    unitScale: number,
+    yUp: boolean,
+  ) {
+    if (!this.ifcApi) {
+      throw new Error('IFC-Lite not initialized. Call init() first.');
+    }
+    try {
+      return this.ifcApi.simplifyMeshes(
+        expressIds, levels, positions, normals, indices, vertexCounts, indexCounts,
+        origins, localToWorld, localToWorldPresent, rtcX, rtcY, rtcZ, unitScale, yUp,
+      );
+    } catch (error) {
+      log.error('Failed to simplifyMeshes', error, { operation: 'simplifyMeshes' });
       if (this.isWasmRuntimeError(error)) {
         this.markFatalWasmRuntimeError();
       }

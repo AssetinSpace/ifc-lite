@@ -42,6 +42,7 @@ Each `ColumnDefinition` has a `source` that says where the value comes from:
 | `classification` | Classification references (joined with `", "`) | `Uniclass Ss_25_10` |
 | `spatial` | Containing spatial element name; `propertyName` picks the level (`Storey` (default), `Building`, `Site`, `Project`) | `Level 2` |
 | `model` | Source file name | `office.ifc` |
+| `zone` | Location-zone assignment (user-defined 3D zone boxes, viewer-computed); `psetName` holds the zone-set id, `propertyName` picks `Zone` (default, the zone name — straddling elements show every touched zone joined with `", "`) or `Straddles` (boolean) | `Section A` |
 
 A column looks like:
 
@@ -97,9 +98,52 @@ const csv = listResultToCSV(result);
 
 `listResultToCSV` guards against spreadsheet formula injection (CWE-1236): any cell that starts with `=`, `+`, `-`, `@`, tab, or carriage return is prefixed with a single quote so Excel and Google Sheets treat it as text rather than a formula. Standard CSV quoting (double quotes, `""` escaping) is applied on top.
 
+## Grouping, Aggregation & Schedules
+
+Set `grouping` on a `ListDefinition` to bucket rows by one or more columns (outermost first) and sum numeric columns per group:
+
+```typescript
+import { executeList, summariseListRows, toScheduleRows, LIST_PRESETS } from '@ifc-lite/lists';
+
+const definition = {
+  ...LIST_PRESETS[0], // Wall Schedule
+  grouping: {
+    columnId: 'attr-name',       // legacy single-column field, kept in sync with columnIds[0]
+    columnIds: ['attr-name'],    // ordered group-by columns, outermost first
+    sumColumnIds: ['quant-qto_wallbasequantities-length'],
+  },
+};
+
+const result = executeList(definition, provider);
+
+// result.groups is a flat PRE-ORDER list: each parent group is immediately
+// followed by its subgroups. Every group carries a Count aggregate (`count`)
+// and per-column sums (`sums`).
+for (const group of result.groups ?? []) {
+  console.log(group.label, group.count, group.sums);
+}
+
+// A Bonsai-style schedule/pivot table — one row per group-value tuple (the
+// LEAF groups only) instead of a nested tree. `levelCount` must be the number
+// of grouping columns that were ACTUALLY applied: the engine drops grouping
+// ids whose column is no longer in the definition (a stale persisted grouping
+// is the common case), so passing the raw `columnIds.length` can ask for a
+// deeper leaf level than the groups have — and `toScheduleRows` then matches
+// nothing and returns no rows.
+const activeGroupIds = definition.grouping.columnIds.filter(
+  (id) => definition.columns.some((c) => c.id === id),
+);
+const scheduleRows = toScheduleRows(result.groups, activeGroupIds.length);
+for (const row of scheduleRows) {
+  console.log(row.path, row.count, row.sums); // e.g. ["Wall-01"], 1, { ... }
+}
+```
+
+`summariseListRows(definition, rows)` is what `executeList` calls internally to build `groups`/`summary`; call it directly when you already have rows from elsewhere (e.g. merged across federated models) and just need to re-derive the grouping.
+
 ## The Data Provider
 
-`executeList` reads model data through the `ListDataProvider` interface, so the package has no hard dependency on how you parsed the model. Required methods include `getEntitiesByType`, `getEntityName`, `getEntityGlobalId`, `getPropertySets`, and `getQuantitySets`; optional methods (`getMaterialNames`, `getClassifications`, `getStoreyName`, `getProjectName`, ...) unlock the `material`, `classification`, `spatial`, and `model` column sources, and the engine degrades gracefully when they are absent.
+`executeList` reads model data through the `ListDataProvider` interface, so the package has no hard dependency on how you parsed the model. Required methods include `getEntitiesByType`, `getEntityName`, `getEntityGlobalId`, `getPropertySets`, and `getQuantitySets`; optional methods (`getMaterialNames`, `getClassifications`, `getStoreyName`, `getProjectName`, `getZoneAssignment`, `getZoneSetNames`, ...) unlock the `material`, `classification`, `spatial`, `model`, and `zone` column sources, and the engine degrades gracefully when they are absent (a `zone` column simply resolves to `null` on a provider without zone data).
 
 ## Discovering Columns
 
@@ -134,7 +178,9 @@ Conditions and lookups that match by name accept either an exact string or a reg
 |--------|-------------|
 | `executeList(definition, provider, modelId?)` | Run a list definition, returns `ListResult` |
 | `listResultToCSV(result, delimiter?)` | CSV export with formula-injection guard |
-| `summariseListRows` | Aggregate rows into group summaries |
+| `summariseListRows` | Aggregate rows into group summaries (`ListGroup[]` + whole-result `ListSummary`) |
+| `groupingColumnIds(grouping)` | Resolve a grouping config's ordered group-by column ids |
+| `toScheduleRows(groups, levelCount)` | Project grouped `ListGroup[]` to a schedule/pivot `ListScheduleRow[]` — one row per group-value tuple |
 | `discoverColumns(providers, entityTypes)` | Sample available attributes/properties/quantities |
 | `compileNameMatcher(pattern)` / `isNamePattern(pattern)` | Exact-or-regex name matching |
 | `LIST_PRESETS` | Built-in schedule definitions |

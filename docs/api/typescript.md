@@ -10,7 +10,7 @@ ifc-lite ships 36 public npm packages: 35 scoped `@ifc-lite/*` packages plus the
 | Package | Description |
 |---------|-------------|
 | [`@ifc-lite/parser`](#ifc-liteparser) | IFC/STEP parser for IFC-Lite |
-| [`@ifc-lite/geometry`](#ifc-litegeometry) | Geometry processing bridge for IFC-Lite - 1.9x faster than web-ifc |
+| [`@ifc-lite/geometry`](#ifc-litegeometry) | Geometry processing bridge for IFC-Lite - exact-arithmetic CSG, streamed across workers |
 | [`@ifc-lite/data`](#ifc-litedata) | Columnar data structures for IFC-Lite |
 | [`@ifc-lite/query`](#ifc-litequery) | Query system for IFC-Lite |
 | [`@ifc-lite/spatial`](#ifc-litespatial) | Spatial indexing for IFC-Lite |
@@ -729,7 +729,30 @@ interface ProjectParams {
   LengthUnit?: string;  // 'METRE' (default), 'MILLIMETRE', 'FOOT'
   Author?: string;
   Organization?: string;
+  Timestamp?: number | Date;   // fixed creation instant (header + owner history); default: wall clock
+  GuidSource?: () => string;   // deterministic GlobalId source; default: platform CSPRNG
 }
+```
+
+For byte-reproducible output (fixtures, snapshot tests, generated corpora), pin both entropy sources — the timestamp and the GlobalId stream:
+
+```typescript
+import { IfcCreator } from '@ifc-lite/create';
+import { generateIfcGuid, type RandomSource } from '@ifc-lite/encoding';
+
+// Any seeded () => number in [0, 1) works; a tiny LCG shown here.
+let seed = 42;
+const rng: RandomSource = () => {
+  seed = (seed * 1103515245 + 12345) % 2147483648;
+  return seed / 2147483648;
+};
+
+const creator = new IfcCreator({
+  Name: 'My Project',
+  Timestamp: Date.UTC(2024, 0, 1),
+  GuidSource: () => generateIfcGuid(rng),
+});
+// Two runs with the same seed now produce byte-identical .ifc content.
 ```
 
 Parameter interfaces for every element type live in `packages/create/src/types.ts` (e.g. `WallParams` with `Start`, `End`, `Thickness`, `Height`, optional `Openings`).
@@ -766,8 +789,15 @@ interface SpatialAnchor {
   bodyContextId: number;     // 'Body' subcontext (or parent context fallback)
   storeyId: number;
   storeyPlacementId: number; // the storey's own IfcLocalPlacement
+  guidRandom?: RandomSource; // optional seeded [0,1) source: pins the emitted
+                             // GlobalIds for reproducible in-store builds
+                             // (counterpart of ProjectParams.GuidSource)
 }
 ```
+
+`duplicateInStore` takes the same knob as `options.guidRandom` (it has no anchor), and `generateSpacesFromWalls` / `generateSpaces` forward `options.guidRandom` to the spaces they emit.
+
+For byte-reproducible **exported files**, seed the exporter too: builders that attach property or quantity sets (e.g. `addSpaceToStore`) park them in the mutation overlay, and `StepExporter` mints the `IfcPropertySet` / `IfcElementQuantity` / `IfcRelDefinesByProperties` GlobalIds itself at export time. Pass the same source as `StepExportOptions.guidRandom`, plus `timeStamp` to pin the STEP header instant.
 
 ---
 

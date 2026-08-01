@@ -22,6 +22,14 @@ import type { MergeConflict, MergePlan, ResolutionInput } from './types.js';
 export interface RefPolicy {
   requireHumanApproval?: boolean;
   requiredChecks?: string[];
+  /**
+   * Merge conflict-free, all-checks-green candidates unattended
+   * (10-registry.md §10.4). Consumed by the registry on push; ignored by
+   * the local CLI flow (the operator IS the merge decision there).
+   * Combined with `requireHumanApproval`, auto-merge never fires — an
+   * unattended merge cannot satisfy an approval requirement (fail closed).
+   */
+  autoMerge?: boolean;
 }
 
 export interface RefEntry {
@@ -183,6 +191,22 @@ export function mergeIntoRef(store: LayerRefStore, init: MergeInit): MergeOutcom
   const oursIds = [...entry.layers];
   const waivers = init.waivers ?? [];
   const resolver = init.principal ?? 'unknown';
+
+  // A candidate already ON the ref is a completed merge, not a mismatch:
+  // publishing appends the draft to its home ref, so re-merging that
+  // layer into the same ref must no-op instead of refusing as
+  // unrelated-base (its declared base is the composition it was authored
+  // against, which need not be representable on the ref).
+  if (oursIds.includes(candidateId)) {
+    if (init.preview) {
+      return {
+        status: 'preview',
+        plan: { autoOps: [], conflicts: [], stats: { touched: 0, autoMerged: 0, conflicting: 0 } },
+        ancestorMatched: true,
+      };
+    }
+    return { status: 'fast-forward', refLayers: oursIds, ancestorMatched: true };
+  }
 
   // Fast path: candidate authored against the ref's current stack. A
   // merge that consumes a waiver falls through to the three-way path so
