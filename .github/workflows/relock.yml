@@ -74,7 +74,15 @@ jobs:
           cache: pnpm
 
       - name: Regenerate lockfile
-        run: pnpm install --lockfile-only --no-frozen-lockfile
+        # `--fix-lockfile` is the load-bearing flag. Without it pnpm judges the
+        # lockfile "up to date" purely by comparing importer specifiers against
+        # package.json, prints "Lockfile is up to date, resolution step is
+        # skipped", exits in about a second and leaves the broken entries exactly
+        # where they were. That is what the first Relock run did on 2026-08-01:
+        # the regenerate step "succeeded" and the verify step then failed on the
+        # very error it was supposed to repair. Referential integrity is not part
+        # of pnpm's up-to-date check.
+        run: pnpm install --lockfile-only --no-frozen-lockfile --fix-lockfile
 
       - name: Verify the result actually installs
         run: pnpm install --frozen-lockfile
