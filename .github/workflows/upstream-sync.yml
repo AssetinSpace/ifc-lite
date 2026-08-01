@@ -98,6 +98,19 @@ jobs:
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Only needed to regenerate pnpm-lock.yaml on a lockfile-only conflict
+      # (see the merge step). Cheap enough to set up unconditionally.
+      - name: Setup pnpm
+        if: steps.check.outputs.up_to_date == 'false'
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Setup Node.js
+        if: steps.check.outputs.up_to_date == 'false'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
       - name: Merge upstream
         if: steps.check.outputs.up_to_date == 'false'
         id: merge
@@ -105,12 +118,47 @@ jobs:
           git switch -c "${{ steps.vars.outputs.branch }}"
           if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
             echo "conflicts=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "conflicts=true" >> "$GITHUB_OUTPUT"
-            # Commit the conflicted tree as-is so the PR shows the markers.
-            git add -A
-            git commit --no-edit -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }} (CONFLICTS — needs manual resolution)"
+            exit 0
           fi
+
+          UNMERGED=$(git diff --name-only --diff-filter=U)
+          echo "Conflicted paths:"; printf '%s\n' "$UNMERGED"
+
+          # pnpm-lock.yaml conflicts on nearly every sync: upstream bumps
+          # dependencies constantly and we carry two of our own (design-kit,
+          # pdfjs-dist), so the lock diverges even when no source file does.
+          # Parking the whole sync on a human for that means a manual merge
+          # almost every week — which is exactly how the fork once fell three
+          # weeks behind. D-071 already says the lock is REGENERATED, never
+          # merged; do that instead. Only when it is the ONLY conflict: if any
+          # real file also conflicts, package.json may be broken and pnpm would
+          # resolve against a tree nobody has reviewed.
+          if [ "$UNMERGED" = "pnpm-lock.yaml" ]; then
+            echo "Lockfile-only conflict — regenerating instead of asking a human."
+            # Any side works as a starting point; pnpm rewrites the file. It
+            # just has to be valid YAML, which a conflicted file is not.
+            git checkout --theirs pnpm-lock.yaml
+            if pnpm install --lockfile-only --no-frozen-lockfile; then
+              git add -A
+              git commit --no-edit
+              echo "conflicts=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::pnpm-lock.yaml regeneration failed — falling back to a manual-merge PR. Resolve the lock by running 'pnpm install --lockfile-only' locally on the sync branch."
+            git checkout -m pnpm-lock.yaml
+          fi
+
+          echo "conflicts=true" >> "$GITHUB_OUTPUT"
+          # Commit the conflicted tree as-is so the PR shows the markers.
+          #
+          # `[skip ci]` on purpose: this tree carries conflict markers, so
+          # apps/viewer/package.json is invalid JSON and `pnpm install` cannot
+          # even start — every job in the matrix fails for one reason we already
+          # know. Running CI here produces nothing but a wall of red mail, which
+          # trains people to ignore red. CI runs when the human pushes the
+          # resolution, which is the only moment the result means anything.
+          git add -A
+          git commit --no-edit -m "chore(sync): merge upstream/${{ env.UPSTREAM_BRANCH }} (CONFLICTS — needs manual resolution) [skip ci]"
 
       - name: Push sync branch
         if: steps.check.outputs.up_to_date == 'false'

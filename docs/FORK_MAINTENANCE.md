@@ -98,7 +98,23 @@ What happens next depends on the merge:
 | Merge | What the workflow does | What you do |
 |---|---|---|
 | **clean** | opens the PR, waits for CI, merges it (merge commit), deletes the branch | nothing |
-| **conflicts** | commits the markers, opens the PR labelled `needs-manual-merge`, stops | resolve it — keep our `AIM-FORK` blocks |
+| **only `pnpm-lock.yaml` conflicts** | regenerates the lock (`pnpm install --lockfile-only`) and continues as if clean — so it also auto-merges | nothing |
+| **anything else conflicts** | commits the markers, opens the PR labelled `needs-manual-merge`, stops | resolve it — keep our `AIM-FORK` blocks |
+
+> **Why the lock is regenerated, not merged.** It conflicts on nearly every sync — upstream
+> bumps dependencies constantly and we carry two of our own (`design-kit`, `pdfjs-dist`), so
+> the lock diverges even when no source file does. Sending that to a human means a manual
+> merge almost every week, which is how the fork once fell three weeks behind. This is the
+> same rule D-071 already states. It only applies when the lock is the **only** conflict: if a
+> real file conflicts too, `package.json` may be broken and pnpm would resolve against a tree
+> nobody has reviewed.
+
+> **Why a conflicted sync commit carries `[skip ci]`.** That tree has conflict markers in it,
+> so `apps/viewer/package.json` is invalid JSON and `pnpm install` cannot even start — every
+> job in the matrix fails for one reason we already know, and the only output is a wall of red
+> notification mail. Red that always means the same thing trains people to ignore red, which
+> is the failure mode this whole workflow exists to prevent. CI runs when you push the
+> resolution. The `needs-manual-merge` label is the signal that the PR is waiting, not CI.
 
 Every run also rewrites a single issue titled **`Upstream sync status`** with how many
 commits we are behind, which upstream commit `main` actually contains, and whether the
