@@ -2,19 +2,36 @@
 #
 # This runs entirely inside AssetinSpace/ifc-lite. It only READS from upstream —
 # nothing is ever pushed to LTplus-AG/ifc-lite. On a clean merge it opens a PR
-# against `main`; on conflicts it commits the conflict markers and opens the PR
-# anyway, labelled so a human finishes the merge (see docs/FORK_MAINTENANCE.md).
+# against `main`, waits for CI and merges it; on conflicts it commits the
+# conflict markers and opens the PR anyway, labelled so a human finishes the
+# merge (see docs/FORK_MAINTENANCE.md).
+#
+# Runs on a PAT (secret UPSTREAM_SYNC_TOKEN), not the default GITHUB_TOKEN: a
+# sync that carries upstream changes under .github/workflows/ is rejected at push
+# ("refusing to allow a GitHub App to create or update workflow ... without
+# `workflows` permission"), and no `permissions:` entry can grant it — the
+# workflows scope simply does not exist for GITHUB_TOKEN. See
+# docs/FORK_MAINTENANCE.md → "Sync token".
+#
+# Nothing here is allowed to fail quietly. Every `gh` call either succeeds or
+# fails the run — an earlier version swallowed a 403 with `|| true` and reported
+# "success" for a run that never opened a PR at all.
 name: Upstream sync
 
 on:
   schedule:
     # 06:00 UTC every Monday. Adjust cadence as needed.
+    #
+    # NOTE: GitHub disables scheduled workflows after 60 days with no activity in
+    # the repository. If syncs silently stop arriving, check Actions → this
+    # workflow for the "disabled" banner before debugging anything else.
     - cron: '0 6 * * 1'
   workflow_dispatch: {}
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: upstream-sync
@@ -24,16 +41,36 @@ env:
   UPSTREAM_REPO: https://github.com/LTplus-AG/ifc-lite
   UPSTREAM_BRANCH: main
   BASE_BRANCH: main
+  STATUS_ISSUE_TITLE: 'Upstream sync status'
+  # `gh` derives its base repo from the git remotes and PREFERS the one named
+  # `upstream` — which the "Fetch upstream" step below adds, pointing at
+  # LTplus-AG/ifc-lite. Without this pin every gh call (labels, PR) targets the
+  # upstream repo: 403 at best, a pull request opened against them at worst.
+  # The fork relationship is strictly one-way — see docs/FORK_MAINTENANCE.md.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # Fail fast and readably: without the PAT the run dies much later, at the
+      # push, with a message that reads like a permissions bug in this file.
+      - name: Check sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret UPSTREAM_SYNC_TOKEN is not set. The default GITHUB_TOKEN cannot push files under .github/workflows/, so any upstream sync touching CI is rejected. Create the token as described in docs/FORK_MAINTENANCE.md → 'Sync token'."
+            exit 1
+          fi
+
       - name: Checkout fork (full history)
         uses: actions/checkout@v4
         with:
           ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
+          # Persisted for the later `git push` — that is the whole point.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -82,28 +119,169 @@ jobs:
       - name: Ensure labels exist
         if: steps.check.outputs.up_to_date == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
-          gh label create upstream-sync --color 1d76db --description "Automated merge from upstream LTplus-AG/ifc-lite" || true
-          gh label create needs-manual-merge --color d93f0b --description "Merge conflicts require manual resolution" || true
+          # Create-if-missing, but let a real API error (403, network) fail the
+          # run — `gh label create ... || true` used to hide exactly that.
+          existing=$(gh label list --limit 200 --json name --jq '.[].name')
+          ensure() {
+            if ! printf '%s\n' "$existing" | grep -qxF "$1"; then
+              gh label create "$1" --color "$2" --description "$3"
+            fi
+          }
+          ensure upstream-sync 1d76db "Automated merge from upstream LTplus-AG/ifc-lite"
+          ensure needs-manual-merge d93f0b "Merge conflicts require manual resolution"
 
       - name: Open pull request
+        id: pr
         if: steps.check.outputs.up_to_date == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
+          BRANCH="${{ steps.vars.outputs.branch }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING is already open for $BRANCH — branch updated, nothing else to do."
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
             TITLE="⚠️ Upstream sync ${{ steps.vars.outputs.upstream_sha }} — CONFLICTS, needs manual merge"
             LABELS="upstream-sync,needs-manual-merge"
-            BODY=$'Automated merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\n**Merge conflicts were committed as-is.** Resolve them (keep our \`AIM-FORK\` blocks — see `docs/FORK_MAINTENANCE.md`), then let CI run.\n\n\x60\x60\x60\ngit grep -n "<<<<<<<"\ngit grep -n "AIM-FORK"\n\x60\x60\x60'
+            BODY=$'Automated merge of \x60upstream/${{ env.UPSTREAM_BRANCH }}\x60 (\x60${{ steps.vars.outputs.upstream_sha }}\x60).\n\n**Merge conflicts were committed as-is.** Resolve them (keep our \x60AIM-FORK\x60 blocks — see \x60docs/FORK_MAINTENANCE.md\x60), then let CI run.\n\nMerge this with a **merge commit** — never squash or rebase, or the next sync re-conflicts the whole tree.\n\n\x60\x60\x60\ngit grep -n "<<<<<<<"\ngit grep -n "AIM-FORK"\n\x60\x60\x60'
           else
             TITLE="Upstream sync ${{ steps.vars.outputs.upstream_sha }}"
             LABELS="upstream-sync"
-            BODY=$'Automated clean merge of \`upstream/${{ env.UPSTREAM_BRANCH }}\` (\`${{ steps.vars.outputs.upstream_sha }}\`).\n\nCI gates this PR. Review the diff, then merge → Vercel deploys. See `docs/FORK_MAINTENANCE.md`.'
+            BODY=$'Automated clean merge of \x60upstream/${{ env.UPSTREAM_BRANCH }}\x60 (\x60${{ steps.vars.outputs.upstream_sha }}\x60).\n\nThis workflow waits for CI and merges it automatically (merge commit). See \x60docs/FORK_MAINTENANCE.md\x60.'
           fi
-          gh pr create \
+          URL=$(gh pr create \
             --base "$BASE_BRANCH" \
-            --head "${{ steps.vars.outputs.branch }}" \
+            --head "$BRANCH" \
             --title "$TITLE" \
             --label "$LABELS" \
-            --body "$BODY" || echo "PR may already exist for this branch."
+            --body "$BODY")
+          echo "Opened $URL"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+
+      # Conflict-free syncs merge themselves. The failure mode this exists to
+      # remove is human, not technical: a green sync PR sat unmerged for five
+      # days while the fork drifted 27 further commits behind.
+      #
+      # CI is awaited HERE rather than via `gh pr merge --auto` + branch
+      # protection: `--auto` merges the instant the PR is mergeable, so without
+      # required status checks configured on `main` it would merge before CI has
+      # said anything — and the sync PAT has no Administration scope to verify
+      # that they are configured. Watching the checks in-job is unconditional and
+      # cannot merge early.
+      - name: Wait for CI, then merge (clean syncs only)
+        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflicts == 'false' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          # Checks are not registered the instant the PR is created; wait for at
+          # least one before watching, otherwise `gh pr checks` exits on
+          # "no checks reported".
+          for _ in $(seq 1 30); do
+            n=$(gh pr checks "$PR" --json name --jq 'length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then break; fi
+            sleep 10
+          done
+
+          gh pr checks "$PR" --watch --fail-fast --interval 30
+
+          # MERGE COMMIT, never squash or rebase. Squashing an upstream merge
+          # throws away the merge-base, so every later sync would re-conflict the
+          # entire tree — this is the mechanical reason behind the "merge, never
+          # rebase" rule in D-071.
+          gh pr merge "$PR" --merge --delete-branch
+
+      # Runs even when something above failed — a broken sync is exactly when the
+      # status has to be visible. This issue is the single place to check weekly.
+      - name: Update status issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          UP_TO_DATE: ${{ steps.check.outputs.up_to_date }}
+          TOKEN_EXPIRES: ${{ vars.UPSTREAM_SYNC_TOKEN_EXPIRES }}
+        run: |
+          git fetch origin "$BASE_BRANCH" --quiet
+          git fetch upstream "$UPSTREAM_BRANCH" --quiet
+
+          BEHIND=$(git rev-list --count "origin/$BASE_BRANCH..upstream/$UPSTREAM_BRANCH")
+          MB=$(git merge-base "origin/$BASE_BRANCH" "upstream/$UPSTREAM_BRANCH")
+          MB_SHORT=$(git rev-parse --short "$MB")
+          MB_DATE=$(git log -1 --format=%cs "$MB")
+          UP_SHORT=$(git rev-parse --short "upstream/$UPSTREAM_BRANCH")
+          UP_DATE=$(git log -1 --format=%cs "upstream/$UPSTREAM_BRANCH")
+
+          if [ "$BEHIND" -eq 0 ]; then
+            HEADLINE="✅ **Up to date** with \`LTplus-AG/ifc-lite\`."
+          else
+            HEADLINE="⚠️ **$BEHIND commit(s) behind** \`LTplus-AG/ifc-lite\`."
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            LAST_RUN="✅ success"
+          else
+            LAST_RUN="❌ $JOB_STATUS — **the sync is broken, this will not fix itself**"
+          fi
+
+          OUTCOME="no changes to take"
+          if [ "$UP_TO_DATE" = "false" ]; then
+            if [ "$CONFLICTS" = "true" ]; then
+              OUTCOME="conflicts — PR #${PR_NUMBER:-?} is waiting for a human (\`needs-manual-merge\`)"
+            elif [ -n "$PR_NUMBER" ]; then
+              OUTCOME="clean merge — PR #$PR_NUMBER opened and auto-merged after CI"
+            else
+              OUTCOME="run did not get as far as opening a PR"
+            fi
+          fi
+
+          TOKEN_LINE="_\`UPSTREAM_SYNC_TOKEN\` expiry unknown — set the repository variable \`UPSTREAM_SYNC_TOKEN_EXPIRES\` (YYYY-MM-DD) so this issue can warn before it lapses._"
+          if [ -n "$TOKEN_EXPIRES" ]; then
+            DAYS=$(( ( $(date -d "$TOKEN_EXPIRES" +%s) - $(date +%s) ) / 86400 ))
+            if [ "$DAYS" -lt 0 ]; then
+              TOKEN_LINE="🚨 \`UPSTREAM_SYNC_TOKEN\` **expired** on $TOKEN_EXPIRES — every sync push will 403 until it is replaced."
+            elif [ "$DAYS" -lt 30 ]; then
+              TOKEN_LINE="⏳ \`UPSTREAM_SYNC_TOKEN\` expires on $TOKEN_EXPIRES (**$DAYS days**) — renew it, see \`docs/FORK_MAINTENANCE.md\` → 'Sync token'."
+            else
+              TOKEN_LINE="\`UPSTREAM_SYNC_TOKEN\` expires on $TOKEN_EXPIRES ($DAYS days)."
+            fi
+          fi
+
+          cat > /tmp/status.md <<EOF
+          $HEADLINE
+
+          | | |
+          |---|---|
+          | Commits behind upstream | **$BEHIND** |
+          | Upstream \`main\` | \`$UP_SHORT\` ($UP_DATE) |
+          | Last upstream commit merged into our \`$BASE_BRANCH\` | \`$MB_SHORT\` ($MB_DATE) |
+          | Last sync run | $LAST_RUN ([log]($RUN_URL)) |
+          | Outcome | $OUTCOME |
+
+          $TOKEN_LINE
+
+          ---
+
+          Rewritten by \`.github/workflows/upstream-sync.yml\` on every run (Mondays 06:00 UTC,
+          or on manual dispatch). Recipe and troubleshooting: \`docs/FORK_MAINTENANCE.md\`.
+          Do not close this issue — it is reused, and closing it makes the next run open a new one.
+          EOF
+
+          NUMBER=$(gh issue list --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"$STATUS_ISSUE_TITLE\")] | .[0].number // empty")
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --body-file /tmp/status.md
+            echo "Updated status issue #$NUMBER"
+          else
+            gh issue create --title "$STATUS_ISSUE_TITLE" --body-file /tmp/status.md --label upstream-sync
+            echo "Created the status issue — pin it once (Issues → ⋯ → Pin issue) so it stays at the top."
+          fi
