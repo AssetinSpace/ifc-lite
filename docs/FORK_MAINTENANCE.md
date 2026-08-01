@@ -106,6 +106,21 @@ last run passed. **That issue is the one thing to check weekly** — pin it once
 ⋯ → Pin issue) and it stays pinned, because the workflow reuses it instead of opening a
 new one. Don't close it.
 
+> **Requires Issues to be enabled.** GitHub ships forks with the Issues feature **off**,
+> and `gh issue list` then fails with `the '<repo>' repository has disabled issues` — which
+> is how we found out (the 2026-08-01 run merged upstream and opened PR #37 fine, then died
+> on the status step). Turn them on in **Settings → General → Features → Issues**. Until
+> then the step emits a warning and the status goes only to the run's **job summary**; the
+> sync itself is unaffected. The same status is written to the job summary either way.
+
+### Repository settings this workflow expects
+
+| Setting | Where | Why |
+|---|---|---|
+| **Issues enabled** | Settings → General → Features | the `Upstream sync status` issue; off by default on forks |
+| Secret `UPSTREAM_SYNC_TOKEN` | Settings → Secrets and variables → Actions → Secrets | pushing `.github/workflows/` changes — see "Sync token" below |
+| Variable `UPSTREAM_SYNC_TOKEN_EXPIRES` | same page → Variables | `YYYY-MM-DD`; drives the expiry countdown in the status issue |
+
 > **Why clean syncs merge themselves.** The failure this removes is human, not technical:
 > PR #35 sat green and unmerged for five days while the fork drifted 27 further commits
 > behind. Automation that opens a PR nobody merges is not automation.

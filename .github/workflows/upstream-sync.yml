@@ -276,8 +276,27 @@ jobs:
           Do not close this issue — it is reused, and closing it makes the next run open a new one.
           EOF
 
-          NUMBER=$(gh issue list --state open --limit 100 --json number,title \
-            --jq "[.[] | select(.title == \"$STATUS_ISSUE_TITLE\")] | .[0].number // empty")
+          # The job summary always gets the status — it needs no repository
+          # feature to be turned on, so it is the one surface that cannot fail.
+          cat /tmp/status.md >> "$GITHUB_STEP_SUMMARY"
+
+          # The issue is the weekly-check surface, but it must never be the
+          # reason an otherwise-working sync reports red. Forks ship with Issues
+          # DISABLED, which is exactly how this was found: the 2026-08-01 run
+          # merged upstream, opened PR #37 and then failed on `gh issue list`.
+          # Only that one condition is tolerated — every other gh failure still
+          # fails the run, per the no-silent-failures rule above.
+          if ! ISSUES=$(gh issue list --state open --limit 100 --json number,title 2>&1); then
+            if printf '%s' "$ISSUES" | grep -q 'has disabled issues'; then
+              echo "::warning::Issues are disabled on this repository, so the '$STATUS_ISSUE_TITLE' issue cannot be maintained — the status is in this run's job summary instead. Turn them on in Settings → General → Features → Issues (forks have them off by default), then this step starts working on its own. See docs/FORK_MAINTENANCE.md."
+              exit 0
+            fi
+            echo "::error::gh issue list failed: $ISSUES"
+            exit 1
+          fi
+
+          NUMBER=$(printf '%s' "$ISSUES" \
+            | jq -r "[.[] | select(.title == \"$STATUS_ISSUE_TITLE\")] | .[0].number // empty")
           if [ -n "$NUMBER" ]; then
             gh issue edit "$NUMBER" --body-file /tmp/status.md
             echo "Updated status issue #$NUMBER"
