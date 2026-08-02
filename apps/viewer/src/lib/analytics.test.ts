@@ -5,6 +5,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { scrubEvent } from './analytics-scrub.js';
+import { beforeSend } from './analytics.js';
+import { __setChunkReloadPendingForTests } from './chunk-version-skew.js';
 
 // `scrubEvent` is the single `before_send` gate every captured event passes
 // through: it drops unactionable third-party noise, tags the geometry
@@ -133,6 +135,101 @@ describe('scrubEvent — noise filter + PII guard (regression)', () => {
     // Guard against the noise regexes being too greedy.
     assert.notEqual(scrubEvent(exceptionEvent('Failed to load Script error handler module')), null);
     assert.notEqual(scrubEvent(exceptionEvent('Object Not Found in scene graph')), null);
+  });
+
+  // ── MapLibre "no WebGL context" (issue #1914) ─────────────────────────────
+  // Both strings are verbatim from error tracking: one user, one session, two
+  // DIFFERENT driver messages, both recorded as UNCAUGHT. The LocationMap now
+  // catches these at the source; this is the net under the one path that can
+  // still escape — MapLibre re-running `_setupPainter()` from a DOM listener
+  // while restoring a lost context.
+  const WEBGL_MISSING_EXTENSION = JSON.stringify({
+    requestedAttributes: {
+      antialias: false, preserveDrawingBuffer: false,
+      powerPreference: 'high-performance', failIfMajorPerformanceCaveat: false,
+      desynchronized: false, alpha: true, depth: true, stencil: true,
+      premultipliedAlpha: true,
+    },
+    statusMessage: 'OES_packed_depth_stencil support is required.',
+    type: 'webglcontextcreationerror',
+    message: 'Failed to initialize WebGL',
+  });
+
+  const WEBGL_GPU_CONTENTION = JSON.stringify({
+    requestedAttributes: {
+      antialias: false, preserveDrawingBuffer: false,
+      powerPreference: 'high-performance', failIfMajorPerformanceCaveat: false,
+      desynchronized: false, alpha: true, depth: true, stencil: true,
+      premultipliedAlpha: true,
+    },
+    statusMessage:
+      'Could not create a WebGL context, VENDOR = 0x1002, DEVICE = 0x1638, '
+      + 'GL_VENDOR = Google Inc. (AMD), GL_RENDERER = ANGLE (AMD, AMD Radeon(TM) '
+      + 'Graphics, D3D11), Sandboxed = yes, ErrorMessage = BindToCurrentSequence failed: .',
+    type: 'webglcontextcreationerror',
+    message: 'Failed to initialize WebGL',
+  });
+
+  /** As posthog-js records an autocaptured (uncaught) exception. */
+  const uncaught = (value: string): CaptureEvent => ({
+    event: '$exception',
+    properties: {
+      $exception_list: [{
+        type: 'Error',
+        value,
+        mechanism: { handled: false, synthetic: false, type: 'generic' },
+      }],
+    },
+  });
+
+  it('drops the UNCAUGHT MapLibre WebGL-unavailable exception (both driver messages)', () => {
+    assert.equal(scrubEvent(uncaught(WEBGL_MISSING_EXTENSION)), null);
+    assert.equal(scrubEvent(uncaught(WEBGL_GPU_CONTENTION)), null);
+    // MapLibre's other shape: no detail object, so it throws the bare message.
+    assert.equal(scrubEvent(uncaught('Failed to initialize WebGL')), null);
+  });
+
+  it('KEEPS an unrelated error that merely MENTIONS the WebGL phrase', () => {
+    // #1914: the bare-message arm is anchored, not a substring test. Dropping
+    // is irreversible, so a matcher loose enough to eat someone else's WebGL
+    // failure would blind us exactly where it matters. Neither of these is
+    // MapLibre's refusal and both must survive.
+    assert.notEqual(
+      scrubEvent(uncaught('Failed to initialize WebGL renderer for the section overlay')),
+      null,
+    );
+    assert.notEqual(
+      scrubEvent(uncaught('SectionOverlay: Failed to initialize WebGL')),
+      null,
+    );
+  });
+
+  it('KEEPS the LocationMap\'s own handled report of the same condition', () => {
+    // The whole point of the fix is to convert this failure from an uncaught
+    // error into a deliberate, once-per-session handled report. If the drop
+    // rule above also swallowed that, we would be blind to the condition.
+    const handled: CaptureEvent = {
+      event: '$exception',
+      properties: {
+        $exception_list: [{
+          type: 'Error',
+          value: WEBGL_MISSING_EXTENSION,
+          mechanism: { handled: true, type: 'generic' },
+        }],
+        context: 'location_map_webgl',
+        map_unavailable_reason: 'map_construction_failed',
+      },
+    };
+    const out = scrubEvent(handled);
+    assert.notEqual(out, null);
+    assert.equal(out?.properties?.context, 'location_map_webgl');
+    assert.equal(out?.properties?.map_unavailable_reason, 'map_construction_failed');
+  });
+
+  it('keeps an unrelated WebGL failure that merely mentions the words', () => {
+    // Narrowness guard: an actionable WebGL bug of ours must not be dropped.
+    assert.notEqual(scrubEvent(uncaught('Failed to initialize WebGPU adapter')), null);
+    assert.notEqual(scrubEvent(uncaught('WebGL warning: drawArrays: no program bound')), null);
   });
 });
 
@@ -328,5 +425,136 @@ describe('scrubEvent — nested + message redaction', () => {
   it('leaves a null-valued property alone', () => {
     const out = scrubEvent({ event: 'custom', properties: { thing: null } } as CaptureEvent);
     assert.equal(out?.properties?.thing, null);
+  });
+});
+
+// Issue #1903. A transient user-side network drop reached error tracking at
+// `$exception_level: 'error'` with `error_kind: 'unknown'` and no fingerprint —
+// indistinguishable from the app being broken. These pin the new contract:
+// recognise it, group it, downgrade it, and drop only the provably-offline case.
+describe('scrubEvent — benign network failures (#1903)', () => {
+  // The exact event shape captured in production: bare WebKit phrasing, no
+  // `stacktrace` key at all (a fetch rejection has no frames of ours).
+  const safariLoadFailed = (extraProps: Record<string, unknown> = {}): CaptureEvent => ({
+    event: '$exception',
+    properties: {
+      $exception_list: [{ type: 'TypeError', value: 'Load failed', mechanism: { handled: true } }],
+      $exception_level: 'error',
+      context: 'ifc_model_load',
+      ...extraProps,
+    },
+  });
+
+  it('recognises and fingerprints a bare transport failure', () => {
+    const out = scrubEvent(safariLoadFailed());
+    assert.equal(out?.properties?.error_kind, 'network_unavailable');
+    assert.equal(out?.properties?.$exception_fingerprint, 'ifc-lite:network_unavailable');
+  });
+
+  it('downgrades it from error to warning', () => {
+    const out = scrubEvent(safariLoadFailed());
+    assert.equal(out?.properties?.$exception_level, 'warning');
+  });
+
+  it('downgrades a cancellation too', () => {
+    const out = scrubEvent(exceptionEvent('The operation was aborted', {
+      $exception_level: 'error',
+    }));
+    assert.equal(out?.properties?.error_kind, 'cancelled');
+    assert.equal(out?.properties?.$exception_level, 'warning');
+  });
+
+  it('drops the event entirely when the browser reported the user offline', () => {
+    assert.equal(scrubEvent(safariLoadFailed({ online: false })), null);
+    // Online is kept: a dead CDN edge reads identically to a client, and that
+    // one IS ours to fix.
+    assert.notEqual(scrubEvent(safariLoadFailed({ online: true })), null);
+  });
+
+  it('keeps a real engine-binary failure LOUD (a broken deploy must not be muted)', () => {
+    const out = scrubEvent(exceptionEvent(
+      'Failed to load the WASM engine binary (ifc-lite_bg.wasm) in ifc-lite-bridge: Load failed',
+      { $exception_level: 'error', online: false },
+    ));
+    assert.notEqual(out, null);
+    assert.equal(out?.properties?.error_kind, 'wasm_engine_load');
+    assert.equal(out?.properties?.$exception_level, 'error');
+    // `wasm` is not a model extension, so the privacy scrub leaves the binary
+    // name — which is the whole point of the attribution — intact.
+    assert.match(
+      (out?.properties?.$exception_list as { value: string }[])[0].value,
+      /ifc-lite_bg\.wasm/,
+    );
+  });
+
+  it('never clobbers a level deliberately chosen at the capture site', () => {
+    const out = scrubEvent(safariLoadFailed({ $exception_level: 'fatal' }));
+    assert.equal(out?.properties?.$exception_level, 'fatal');
+  });
+
+  it('keeps every discriminating capture-site property (key-naming contract)', () => {
+    const out = scrubEvent(safariLoadFailed({
+      error_type: 'TypeError',
+      load_stage: 'engine-init',
+      is_retry: false,
+      online: true,
+    }));
+    assert.equal(out?.properties?.context, 'ifc_model_load');
+    assert.equal(out?.properties?.error_type, 'TypeError');
+    assert.equal(out?.properties?.load_stage, 'engine-init');
+    assert.equal(out?.properties?.is_retry, false);
+    assert.equal(out?.properties?.online, true);
+    // …whereas `error_name` would be deleted outright. This is why the property
+    // is `error_type`. Do not rename it.
+    const named = scrubEvent(safariLoadFailed({ error_name: 'TypeError' }));
+    assert.equal(named?.properties?.error_name, undefined);
+  });
+});
+
+// ── before_send wiring ──────────────────────────────────────────────────────
+// The two skew gates are unit-tested in isolation (chunk-version-skew.test.ts,
+// wasm-skew-noise.test.ts). What only a test of `beforeSend` itself can catch is
+// the gate being DISCONNECTED from the pipeline: delete the call in analytics.ts
+// and every isolated test still passes while the noise silently returns.
+describe('beforeSend - chunk-skew gate wiring', () => {
+  it('drops an exception captured while a chunk-skew reload is in flight', () => {
+    __setChunkReloadPendingForTests(Date.now());
+    try {
+      // The collateral from #1926/#1938/#1941: an arbitrary TypeError from a
+      // consumer still awaiting the chunk that just 404'd.
+      const dropped = beforeSend(
+        exceptionEvent("Cannot read properties of undefined (reading 'Map')"),
+      );
+      assert.equal(dropped, null);
+    } finally {
+      __setChunkReloadPendingForTests(null);
+    }
+  });
+
+  it('keeps the same exception when no reload is in flight', () => {
+    __setChunkReloadPendingForTests(null);
+    const kept = beforeSend(
+      exceptionEvent("Cannot read properties of undefined (reading 'Map')"),
+    );
+    assert.notEqual(kept, null);
+  });
+
+  it('still runs the scrub on events the gates let through', () => {
+    // Ordering guard: a `return null` accidentally placed before scrubEvent, or
+    // a gate that short-circuits the pipeline, would lose the tagging that the
+    // rest of error tracking is grouped by.
+    __setChunkReloadPendingForTests(null);
+    const out = beforeSend(exceptionEvent('Geometry worker error: unreachable'));
+    assert.equal(out?.properties?.error_kind, 'geometry_worker_crash');
+  });
+
+  it('never drops a non-exception event, even mid-reload', () => {
+    __setChunkReloadPendingForTests(Date.now());
+    try {
+      const kept = beforeSend({ event: 'ifc_model_loaded', properties: {} });
+      assert.notEqual(kept, null);
+    } finally {
+      __setChunkReloadPendingForTests(null);
+    }
   });
 });

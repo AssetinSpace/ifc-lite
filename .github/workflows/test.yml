@@ -47,7 +47,7 @@ jobs:
       # job and scripts/ci-wasm-prebuilt-eligible.sh.
       wasm_prebuilt: ${{ steps.wasm.outputs.eligible }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
@@ -83,6 +83,9 @@ jobs:
               - 'apps/server/Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/test.yml'
+              # The watertightness census sweeps the fixture set named here, so a
+              # corpus change moves its pinned counts even with no code change.
+              - 'tests/models/manifest.json'
             plato:
               - 'tools/plato/**'
               - 'rust/clash/src/generated/**'
@@ -129,7 +132,7 @@ jobs:
     # <<< AIM-FORK
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Fixtures live in a GitHub Release (see tests/models/manifest.json
           # and AGENTS.md §9). The repo no longer uses Git LFS — explicitly
@@ -266,7 +269,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -291,7 +294,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -315,7 +318,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -387,7 +390,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -446,7 +449,7 @@ jobs:
     # <<< AIM-FORK
     timeout-minutes: 28
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -467,12 +470,67 @@ jobs:
         # The fixtures script is pure Node (no npm deps) so we skip the
         # pnpm install dance Rust-only jobs don't need.
         run: node scripts/fixtures/fetch-fixtures.mjs
+      # Cheap (resolve only, no compile) and it catches a failure mode that
+      # otherwise stays invisible for weeks: a release bumps the manifests but
+      # leaves Cargo.lock recording the old member versions, so every `--locked`
+      # command refuses to run and every local build silently dirties the lock.
+      # `scripts/sync-versions.js` keeps the two in step; this is the gate that
+      # notices if that ever stops being true.
+      - name: Cargo.lock is in sync with the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
       # Workspace exclusions:
       #   - ifc-lite-wasm: dev-deps on wasm-bindgen-test; tests target wasm32.
       - name: Clippy (lint gate)
         run: cargo clippy --workspace --exclude ifc-lite-wasm --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test --workspace --exclude ifc-lite-wasm
+
+  # Geometry watertightness / triangulation-invariance census.
+  #
+  # Its own job, not a step in `rust-tests`: the sweep runs the whole fixture
+  # manifest and takes ~20 min, which pushed that lane past its 28-minute timeout
+  # and cancelled it. Here it runs concurrently instead of serially, so neither
+  # lane's wall-clock depends on the other.
+  #
+  # Feature-gated because it links a second ear-clipper as a differential oracle,
+  # so `cargo test --workspace` does not run it — without this job the suite
+  # early-returns and its pinned baselines gate nothing.
+  #
+  # `geometry`, not `rust`: only rust/geometry, rust/processing or the fixture
+  # manifest can move its numbers.
+  geometry-census:
+    name: Geometry watertightness census
+    needs: changes
+    if: needs.changes.outputs.geometry == 'true'
+    # >>> AIM-FORK: Depot runners are upstream-only — on the fork this job would
+    # sit queued forever with runner_id 0, and the PR would never go green.
+    # Same guard as `build` and `rust` above; see docs/FORK_MAINTENANCE.md →
+    # "Depot runners → ubuntu-latest on the fork".
+    runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
+    # <<< AIM-FORK
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          persist-credentials: false
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        run: rustup show
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: ci-rust-census
+      - name: Cache test fixtures
+        id: fixtures-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/models
+          key: ci-fixtures-${{ runner.os }}-${{ hashFiles('tests/models/manifest.json') }}
+      - name: Fetch fixtures
+        if: steps.fixtures-cache.outputs.cache-hit != 'true'
+        run: node scripts/fixtures/fetch-fixtures.mjs
+      - name: Census
+        run: cargo test -p ifc-lite-geometry --features triangulation-alt --test triangulation_invariance -- --nocapture
 
   # Plato clash-math single-source freshness gate. The clash narrow-phase math
   # is written once in Plato and transpiled to Rust + TypeScript; the committed
@@ -490,7 +548,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -536,7 +594,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: false
           persist-credentials: false
@@ -559,7 +617,7 @@ jobs:
   # out); fails the moment any dependency fails or is cancelled.
   test:
     name: Build + WASM + Rust + Node
-    needs: [changes, build, typecheck, lint, node-tests, viewer-e2e, rust-tests, plato-check, docs-checks]
+    needs: [changes, build, typecheck, lint, node-tests, viewer-e2e, rust-tests, geometry-census, plato-check, docs-checks]
     if: always()
     # Free runner — the gate just inspects upstream job results.
     runs-on: ubuntu-latest
@@ -573,6 +631,7 @@ jobs:
             [node-tests]="${{ needs.node-tests.result }}"
             [viewer-e2e]="${{ needs.viewer-e2e.result }}"
             [rust-tests]="${{ needs.rust-tests.result }}"
+            [geometry-census]="${{ needs.geometry-census.result }}"
             [plato-check]="${{ needs.plato-check.result }}"
             [docs-checks]="${{ needs.docs-checks.result }}"
           )
