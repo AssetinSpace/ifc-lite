@@ -8,6 +8,7 @@
 
 import type { TypeVisibility } from './types.js';
 import type { TessellationQuality } from '@ifc-lite/geometry';
+import { readIsMobileViewport } from '../lib/viewport.js';
 
 // ============================================================================
 // Camera Defaults
@@ -385,11 +386,32 @@ function getInitialRibbonContextualTabs(): boolean {
 /** localStorage key for the ribbon's collapsed state (tab strip only). */
 export const RIBBON_COLLAPSED_STORAGE_KEY = 'ifc-lite-ribbon-collapsed';
 
-/** Resolve the initial ribbon collapsed state from localStorage; default expanded. */
+/**
+ * Decide the ribbon's opening state from the stored choice and the screen.
+ *
+ * A stored choice always wins. Without one, a small screen opens on the tab
+ * strip alone: the band is 88px of a phone, which is most of what a hand
+ * holds in landscape, and Office does the same on narrow windows. Tapping
+ * a tab still expands it for the session — on a phone that expansion is
+ * deliberately not stored (see `RibbonToolbar.handleTabClick`), so the
+ * chevron stays the only way to pin the band across reloads.
+ *
+ * Exported for the unit test — `UI_DEFAULTS` is computed once at import and
+ * cannot be re-seeded from a test.
+ */
+export function resolveInitialRibbonCollapsed(stored: string | null, smallScreen: boolean): boolean {
+  if (stored !== null) return stored === 'true';
+  return smallScreen;
+}
+
+/** Resolve the initial ribbon collapsed state; see `resolveInitialRibbonCollapsed`. */
 function getInitialRibbonCollapsed(): boolean {
   if (typeof window === 'undefined') return false;
   try {
-    return localStorage.getItem(RIBBON_COLLAPSED_STORAGE_KEY) === 'true';
+    return resolveInitialRibbonCollapsed(
+      localStorage.getItem(RIBBON_COLLAPSED_STORAGE_KEY),
+      readIsMobileViewport(),
+    );
   } catch (err) {
     console.warn('[ribbon-collapsed] storage unavailable; using expanded', err);
     return false;

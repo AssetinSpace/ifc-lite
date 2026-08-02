@@ -997,6 +997,19 @@ body {
   background-color: color-mix(in srgb, var(--color-muted-foreground) 50%, transparent);
 }
 
+/* Scrollable, but no track: for strips where the scrollbar would cost more
+   height than the content can spare (the ribbon tab strip and its band on a
+   phone, where the gesture is a swipe and needs no visible track). */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
 /* Panel resize handle */
 .resize-handle {
   background: transparent;

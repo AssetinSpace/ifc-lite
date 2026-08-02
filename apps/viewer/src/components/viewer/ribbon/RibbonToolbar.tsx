@@ -15,6 +15,15 @@
  * to collapse the band to the tab strip; the collapsed state persists.
  * The active tab also follows the working context (see
  * `useRibbonContextualTab`), which the user can turn off in View.
+ *
+ * Narrow screens (`uiSlice.isMobile`) get the same ribbon, sized for a
+ * thumb: a 44px strip with 36px hit targets, a tab strip that scrolls
+ * horizontally instead of squeezing its tabs (seven of them do not fit a
+ * phone, and squeezing pushed the theme/help/collapse cluster off-screen),
+ * and a progress readout stripped to the bar. There it also opens
+ * collapsed (`UI_DEFAULTS.RIBBON_COLLAPSED`) and a tab tap expands it only
+ * for the session, so the toolbar costs 44px until the chevron pins the
+ * band open — less than the mobile strip it replaced.
  */
 
 import React from 'react';
@@ -65,8 +74,19 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
   const setActiveTab = useViewerStore((s) => s.setRibbonTab);
   const ribbonCollapsed = useViewerStore((s) => s.ribbonCollapsed);
   const setRibbonCollapsed = useViewerStore((s) => s.setRibbonCollapsed);
+  // Touch sizing and the stripped-down strip; owned by ViewerLayout's
+  // resize listener, so rotating a phone re-sizes the ribbon with it.
+  const isMobile = useViewerStore((s) => s.isMobile);
 
   useRibbonContextualTab();
+
+  // Keep the active tab reachable: the contextual driver (and the command
+  // palette) can open a tab that sits outside the scrolled strip on a
+  // phone. `nearest` so it never scrolls anything but the strip itself.
+  const activeTabRef = React.useRef<HTMLButtonElement>(null);
+  React.useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeTab]);
 
   // Shared command surface — registers the global load listeners and the
   // hidden file inputs exactly once for this toolbar style.
@@ -79,8 +99,16 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
   const handleTabClick = (id: RibbonTabId) => {
     if (id === activeTab && !ribbonCollapsed) return;
     setActiveTab(id);
-    // Clicking any tab while collapsed re-opens the band (Office pins on click).
-    if (ribbonCollapsed) setRibbonCollapsed(false);
+    if (ribbonCollapsed) {
+      // Clicking any tab while collapsed re-opens the band (Office pins on
+      // click) — but on a phone that pin is transient, written to the store
+      // and not to storage. One tap to reach a command must not cost 88px
+      // of every future session; the chevron is how a small screen says
+      // "keep it open", the same split Office draws between showing the
+      // band and pinning it.
+      if (isMobile) useViewerStore.setState({ ribbonCollapsed: false });
+      else setRibbonCollapsed(false);
+    }
   };
 
   return (
@@ -88,11 +116,19 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
       {fileCommands.fileInputs}
 
       {/* ── Tab strip ── */}
-      <div className="flex h-10 items-center gap-0.5 border-b border-zinc-200/70 px-2 dark:border-zinc-800/70">
+      <div
+        className={cn(
+          'flex items-center gap-0.5 border-b border-zinc-200/70 px-2 dark:border-zinc-800/70',
+          isMobile ? 'h-11' : 'h-10',
+        )}
+      >
+        {/* The strip is the one element allowed to shrink (`min-w-0`) and
+            scroll: everything to its right is a command that must stay
+            on-screen at every width. */}
         <div
           role="tablist"
           aria-label="Ribbon tabs"
-          className="flex h-full items-end gap-0.5"
+          className="flex h-full min-w-0 flex-1 items-end gap-0.5 overflow-x-auto overscroll-x-contain scrollbar-none"
           {...tourAnchor(TOUR_ANCHORS.ribbonTabs)}
         >
           {RIBBON_TABS.map((tab) => {
@@ -100,6 +136,7 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
             return (
               <button
                 key={tab.id}
+                ref={isActive ? activeTabRef : undefined}
                 type="button"
                 role="tab"
                 aria-selected={isActive}
@@ -108,8 +145,9 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
                   if (isActive) setRibbonCollapsed(!ribbonCollapsed);
                 }}
                 className={cn(
-                  'relative flex h-8 select-none items-center rounded-t-md px-3 text-xs font-medium tracking-wide transition-colors',
+                  'relative flex shrink-0 select-none items-center rounded-t-md px-3 text-xs font-medium tracking-wide transition-colors',
                   'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+                  isMobile ? 'h-9' : 'h-8',
                   isActive
                     ? 'text-foreground'
                     : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
@@ -126,23 +164,27 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
           })}
         </div>
 
-        <div className="flex-1" />
-
-        {/* Loading progress — lives in the strip so it survives collapse. */}
+        {/* Loading progress — lives in the strip so it survives collapse.
+            On a phone only the bar survives: the phase text alone is wider
+            than the tabs it would push out of reach. */}
         {loading && activeProgress && (
-          <div className="mr-2 flex items-center gap-2">
-            <span className="max-w-56 truncate text-xs text-muted-foreground">
-              {activeProgress.phase}
-              {geometryProgress && metadataProgress ? ` | ${metadataProgress.phase}` : ''}
-            </span>
+          <div className="mr-2 flex shrink-0 items-center gap-2">
+            {!isMobile && (
+              <span className="max-w-56 truncate text-xs text-muted-foreground">
+                {activeProgress.phase}
+                {geometryProgress && metadataProgress ? ` | ${metadataProgress.phase}` : ''}
+              </span>
+            )}
             {activeProgress.indeterminate ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
             ) : (
               <>
-                <Progress value={activeProgress.percent ?? 0} className="h-2 w-28" />
-                <span className="text-xs tabular-nums text-muted-foreground">
-                  {Math.round(activeProgress.percent ?? 0)}%
-                </span>
+                <Progress value={activeProgress.percent ?? 0} className={cn('h-2', isMobile ? 'w-14' : 'w-28')} />
+                {!isMobile && (
+                  <span className="text-xs tabular-nums text-muted-foreground">
+                    {Math.round(activeProgress.percent ?? 0)}%
+                  </span>
+                )}
               </>
             )}
           </div>
@@ -150,22 +192,28 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
 
         {/* Error Display */}
         {error && (
-          <span className="mr-2 max-w-72 truncate text-xs text-destructive">{error}</span>
+          <span className={cn('mr-2 shrink-0 truncate text-xs text-destructive', isMobile ? 'max-w-24' : 'max-w-72')}>
+            {error}
+          </span>
         )}
 
         {/* Extension toolbar contributions (right-aligned, same slot as
             the classic toolbar). */}
-        <ExtensionToolbarSlot slot="toolbar.right" />
+        <div className="flex shrink-0 items-center">
+          <ExtensionToolbarSlot slot="toolbar.right" />
+        </div>
 
         {/* Export Changes — pending-mutation affordance must stay visible
             regardless of the active tab or collapse state. */}
-        <ExportChangesButton />
+        <div className="flex shrink-0 items-center">
+          <ExportChangesButton />
+        </div>
 
-        <div className="ml-1 flex items-center gap-1 border-l border-zinc-200 pl-2 dark:border-zinc-700/60">
+        <div className="ml-1 flex shrink-0 items-center gap-1 border-l border-zinc-200 pl-2 dark:border-zinc-700/60">
           <Tooltip>
             <TooltipTrigger asChild>
               <div>
-                <ThemeSwitch />
+                <ThemeSwitch size={isMobile ? 48 : 80} />
               </div>
             </TooltipTrigger>
             <TooltipContent>Toggle theme (Shift+click for secret mode)</TooltipContent>
@@ -175,7 +223,7 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
-                size="icon-sm"
+                size={isMobile ? 'icon' : 'icon-sm'}
                 aria-label="Info and keyboard shortcuts"
                 onClick={() => onShowShortcuts?.()}
               >
@@ -189,7 +237,7 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
-                size="icon-sm"
+                size={isMobile ? 'icon' : 'icon-sm'}
                 aria-label={ribbonCollapsed ? 'Expand the ribbon' : 'Collapse the ribbon'}
                 aria-expanded={!ribbonCollapsed}
                 onClick={() => setRibbonCollapsed(!ribbonCollapsed)}
@@ -208,7 +256,15 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
         <div
           role="tabpanel"
           aria-label={`${activeTab} commands`}
-          className="flex h-[88px] items-stretch overflow-x-auto overflow-y-hidden px-1"
+          className={cn(
+            'flex h-[88px] items-stretch overflow-x-auto overflow-y-hidden overscroll-x-contain px-1',
+            // 88px is the height a large button needs (32px icon + two label
+            // lines); shrinking it on a phone would clip the labels, so the
+            // band keeps its size and the ribbon saves space by opening
+            // collapsed instead. Hide the scrollbar there — it would eat a
+            // sixth of the button and touch scrolling needs no track.
+            isMobile && 'scrollbar-none',
+          )}
         >
           {activeTab === 'file' && <FileTab fileCommands={fileCommands} />}
           {activeTab === 'home' && <HomeTab />}

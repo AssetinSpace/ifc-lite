@@ -157,6 +157,19 @@ describe('UISlice — toolbar style (issue #1686)', () => {
     assert.strictEqual(resolveInitialToolbarStyle(), 'ribbon');
   });
 
+  it('opens collapsed on a small screen only until the user says otherwise', async () => {
+    const { resolveInitialRibbonCollapsed } = await import('../constants.js');
+    // Fresh browser: the phone gets the tab strip alone (44px), the desk the band.
+    assert.strictEqual(resolveInitialRibbonCollapsed(null, true), true);
+    assert.strictEqual(resolveInitialRibbonCollapsed(null, false), false);
+    // A stored choice always wins — including "expanded" on a phone, which is
+    // what tapping a tab writes, so the band survives the next reload there.
+    assert.strictEqual(resolveInitialRibbonCollapsed('false', true), false);
+    assert.strictEqual(resolveInitialRibbonCollapsed('true', false), true);
+    // Anything else stored (stale / corrupt) reads as expanded, as before.
+    assert.strictEqual(resolveInitialRibbonCollapsed('nonsense', true), false);
+  });
+
   it('setRibbonTab opens a tab without touching storage', async () => {
     const slice = await buildSlice();
     (slice.state.setRibbonTab as (v: string) => void)('elements');

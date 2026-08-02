@@ -17,8 +17,12 @@ import { useViewerStore } from '@/store';
  *  - Hold Shift while clicking → toggles the hidden "colorful" theme
  *  - The sun/moon widget can't represent a third state, so it shows "sun" (day vibes)
  *    while the colorful gradient takes over the world.
+ *
+ * `size` is the widget's own pixel width (its height follows). The default
+ * suits a desktop toolbar; the ribbon passes a smaller one on phones, where
+ * 80px of sun would outweigh the tab strip it sits next to.
  */
-export function ThemeSwitch() {
+export function ThemeSwitch({ size = 80 }: { size?: number } = {}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const toggleRef = useRef<ThemeToggle | null>(null);
   // Track whether Shift was held during the click so we can intercept in onChange
@@ -36,7 +40,7 @@ export function ThemeSwitch() {
 
     const toggle = new ThemeToggle({
       element: containerRef.current,
-      size: 80,
+      size,
       // Colorful → show sun (it's a bright/day-ish theme)
       initialState: currentTheme === 'dark' ? 'dark' : 'light',
       onChange: (widgetState) => {
@@ -89,7 +93,9 @@ export function ThemeSwitch() {
       toggle.destroy();
       toggleRef.current = null;
     };
-  }, []);
+    // Rebuilt when `size` changes: the widget bakes its size in at
+    // construction, so a phone rotating into a wider layout needs a new one.
+  }, [size]);
 
   const theme = useViewerStore((s) => s.theme);
   const isColorful = theme === 'colorful';

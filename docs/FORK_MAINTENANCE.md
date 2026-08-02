@@ -19,7 +19,7 @@ with it as little as possible:
 |---|---|---|
 | **Isolated layer** (new files, upstream has none) | everything under `apps/viewer/src/aim/` | none |
 | **Wiring** (small edits into upstream files) | see table below | low, but real |
-| **Generic bug-fixes** we keep local | drag-across-iframe fix in `FloatingPanel.tsx`, `SidebarDock.tsx`, `SidebarPanelHost.tsx`, `useDraggablePanel.ts`, `ViewerLayout.tsx` | occasional |
+| **Generic bug-fixes** we keep local | drag-across-iframe fix in `FloatingPanel.tsx`, `SidebarDock.tsx`, `SidebarPanelHost.tsx`, `useDraggablePanel.ts`, `ViewerLayout.tsx`; the ribbon's small-screen sizing in `ribbon/RibbonToolbar.tsx` + `lib/viewport.ts` + `ThemeSwitch.tsx` `size` prop (**upstream-PR candidate** — it fixes the ribbon at any narrow width, not just ours) | occasional |
 
 ### Wiring touchpoints (where merge conflicts can appear)
 
@@ -43,7 +43,7 @@ git grep -n ">>> AIM-FORK" -- apps/ packages/
 | `apps/viewer/index.html` | 4 | branded title, assetin favicons, Inter font, brand colours (D-070) |
 | `apps/viewer/src/main.tsx` | 1 | assetin design-kit import order — tokens first (D-070) |
 | `apps/viewer/src/App.tsx` | 2 | `import { AimBridge }` + `<AimBridge />` mount |
-| `apps/viewer/src/components/viewer/ViewerLayout.tsx` | 1 | `?models=` federated autoload (extends upstream's `?model=`) |
+| `apps/viewer/src/components/viewer/ViewerLayout.tsx` | 2 | `?models=` federated autoload (extends upstream's `?model=`); the ribbon is the phone toolbar too (D-075 addendum) |
 | `apps/viewer/src/components/viewer/PropertiesPanel.tsx` | 4 | AIM \| IFC inspector tabs + `<AimCard />`, native content wrapped (D-077) |
 | `apps/viewer/src/components/viewer/HierarchyPanel.tsx` | 2 | AIM tree decorations — row → IFC GlobalId → badge counts (D-077) |
 | `apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx` | 5 | AIM badge icons + per-GUID counts (D-077) |

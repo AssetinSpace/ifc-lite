@@ -20,6 +20,7 @@ import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useActionLogger } from '@/hooks/useActionLogger';
 import { usePrivacyDisclosure } from '@/hooks/usePrivacyDisclosure';
 import { isSafeMode } from '@/lib/safe-mode';
+import { readIsMobileViewport } from '@/lib/viewport';
 import { ShieldAlert, Grip } from 'lucide-react';
 import { usePanelDetachDrag } from '@/hooks/usePanelDetachDrag';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
@@ -426,12 +427,11 @@ export function ViewerLayout() {
   const { models, geometryResult } = useIfc();
   const hasModelsLoaded = models.size > 0 || ((geometryResult?.meshes?.length ?? 0) > 0);
 
-  // Detect mobile viewport — use both width check AND touch capability
+  // Detect mobile viewport — width AND touch capability, from the shared
+  // predicate the store seed uses too (`lib/viewport.ts`).
   useEffect(() => {
     const checkMobile = () => {
-      const narrowScreen = window.innerWidth < 768;
-      const hasTouchScreen = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-      const mobile = narrowScreen || (hasTouchScreen && window.innerWidth < 1024);
+      const mobile = readIsMobileViewport();
       setIsMobile(mobile);
       // Auto-collapse panels on mobile
       if (mobile) {
@@ -477,13 +477,24 @@ export function ViewerLayout() {
         <SearchModal />
         <TourHost />
 
-        {/* Main Toolbar — compact MobileToolbar on mobile; on desktop the
-            user picks classic strip vs tabbed ribbon (issue #1686). */}
-        {isMobile
-          ? <MobileToolbar />
-          : toolbarStyle === 'ribbon'
-            ? <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />
+        {/* Main Toolbar — the chosen style owns every screen size (issue
+            #1686 + D-075 addendum). */}
+        {/* >>> AIM-FORK: the ribbon is the phone toolbar too. Upstream sends
+            every small screen to MobileToolbar, which left our AIM commands
+            (Documents, Underlays, 3D|2D|Split — the fork's ribbon tab) a
+            second-class citizen there, buried in its overflow menu, and made
+            the toolbar the one part of the viewer that differed between a
+            phone and a desk. The ribbon is now sized for a thumb instead
+            (see RibbonToolbar) and opens collapsed, so it costs 44px — less
+            than MobileToolbar's own strip. The classic style keeps
+            MobileToolbar as its small-screen form, so "Keep the classic bar"
+            in RibbonSwitchNotice is still the whole way back. */}
+        {toolbarStyle === 'ribbon'
+          ? <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />
+          : isMobile
+            ? <MobileToolbar />
             : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
+        {/* <<< AIM-FORK */}
 
         {/* Main Content Area - Desktop Layout */}
         {!isMobile && (
