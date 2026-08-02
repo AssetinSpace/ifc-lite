@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { deriveViewMode } from './viewModeCore.js';
+import { deriveViewMode, viewModeDisabledReason } from './viewModeCore.js';
 
 describe('deriveViewMode (D-075) — flag combinations → user-facing mode', () => {
   it('maps the canonical states', () => {
@@ -42,6 +42,27 @@ describe('deriveViewMode (D-075) — flag combinations → user-facing mode', ()
     assert.strictEqual(
       deriveViewMode({ splitView: true, planFull: false, viewLocked: true }),
       'split',
+    );
+  });
+});
+
+describe('viewModeDisabledReason (D-075) — one gate for every switcher surface', () => {
+  it('is usable only with storeys and no calibration in flight', () => {
+    assert.strictEqual(viewModeDisabledReason({ calibrating: false, storeyCount: 3 }), null);
+    assert.strictEqual(
+      viewModeDisabledReason({ calibrating: false, storeyCount: 0 }),
+      'Load a model with storeys first',
+    );
+  });
+
+  it('an in-flight calibration outranks the storey count (the flow owns the view)', () => {
+    assert.strictEqual(
+      viewModeDisabledReason({ calibrating: true, storeyCount: 3 }),
+      'Finish or cancel the calibration first',
+    );
+    assert.strictEqual(
+      viewModeDisabledReason({ calibrating: true, storeyCount: 0 }),
+      'Finish or cancel the calibration first',
     );
   });
 });

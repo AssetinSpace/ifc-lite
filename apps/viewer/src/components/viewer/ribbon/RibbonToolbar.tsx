@@ -38,6 +38,9 @@ import { AnalyzeTab } from './tabs/AnalyzeTab';
 import { AuthorTab } from './tabs/AuthorTab';
 import { RibbonSwitchNotice } from './RibbonSwitchNotice';
 import { useRibbonContextualTab } from './useRibbonContextualTab';
+// >>> AIM-FORK: fork-only Documents tab body (see src/aim/DocumentsRibbonTab.tsx)
+import { DocumentsRibbonTab } from '@/aim/DocumentsRibbonTab';
+// <<< AIM-FORK
 
 const RIBBON_TABS: { id: RibbonTabId; label: string }[] = [
   { id: 'file', label: 'File' },
@@ -46,6 +49,9 @@ const RIBBON_TABS: { id: RibbonTabId; label: string }[] = [
   { id: 'elements', label: 'Elements' },
   { id: 'analyze', label: 'Analyze' },
   { id: 'author', label: 'Author' },
+  // >>> AIM-FORK: fork-only tab, kept last so upstream keeps appending above us.
+  { id: 'documents', label: 'Documents' },
+  // <<< AIM-FORK
 ];
 
 interface RibbonToolbarProps {
@@ -210,6 +216,9 @@ export function RibbonToolbar({ onShowShortcuts }: RibbonToolbarProps = {} as Ri
           {activeTab === 'elements' && <ElementsTab />}
           {activeTab === 'analyze' && <AnalyzeTab />}
           {activeTab === 'author' && <AuthorTab />}
+          {/* >>> AIM-FORK: fork-only Documents tab (D-072 / D-075) */}
+          {activeTab === 'documents' && <DocumentsRibbonTab />}
+          {/* <<< AIM-FORK */}
         </div>
       )}
 

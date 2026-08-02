@@ -354,7 +354,10 @@ export function resolveInitialToolbarStyle(): ToolbarStyle {
 }
 
 /** Ribbon tab strip contexts, in strip order. */
-export type RibbonTabId = 'file' | 'home' | 'view' | 'elements' | 'analyze' | 'author';
+// >>> AIM-FORK: fork-only 'documents' tab (documents D-075, underlays D-072,
+// view mode D-075) — appended last so upstream keeps adding tabs above ours.
+export type RibbonTabId = 'file' | 'home' | 'view' | 'elements' | 'analyze' | 'author' | 'documents';
+// <<< AIM-FORK
 
 /** Home first: it holds the everyday tool and camera loop. */
 export const RIBBON_DEFAULT_TAB: RibbonTabId = 'home';

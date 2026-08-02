@@ -11,6 +11,10 @@
  * calibrated drawing it falls back to the locked ortho top-down model view.
  * Split shows the resizable 2D plan | free 3D pair. The control is disabled
  * while a calibration is in flight — the flow owns the view then.
+ *
+ * `VIEW_MODES` and `StoreyPicker` are exported because the ribbon's Documents
+ * tab (`src/aim/DocumentsRibbonTab.tsx`) offers the same switch in ribbon
+ * shape: same modes, same labels, same picker, one definition.
  */
 
 import { useMemo } from 'react';
@@ -18,23 +22,51 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 import { useViewerStore } from '@/store';
 import { useViewMode, type ViewMode } from '@/hooks/useViewMode';
+import { viewModeDisabledReason } from '@/hooks/viewModeCore';
 
-const MODES: ReadonlyArray<{ id: ViewMode; label: string; title: string }> = [
+export const VIEW_MODES: ReadonlyArray<{ id: ViewMode; label: string; title: string }> = [
   { id: '3d', label: '3D', title: 'Free 3D workspace' },
   { id: '2d', label: '2D', title: 'Storey plan (calibrated drawing, or top-down model)' },
   { id: 'split', label: 'Split', title: '2D plan beside a free 3D view' },
 ];
 
+/**
+ * Storey selector for an active 2D/Split view — renders nothing in 3D, where
+ * there is no plan to retarget. `className` styles the select so a host can
+ * match its own control rhythm (toolbar strip vs ribbon band).
+ */
+export function StoreyPicker({ className }: { className?: string } = {}) {
+  const { mode, setStorey, storeys, activeStorey } = useViewMode();
+  if (mode === '3d') return null;
+  return (
+    <select
+      aria-label="Storey"
+      className={cn('h-6 max-w-36 rounded border bg-background px-1 text-[11px]', className)}
+      value={activeStorey?.key ?? ''}
+      onChange={(e) => {
+        const storey = storeys.find((s) => s.key === e.target.value);
+        if (storey) setStorey(storey);
+      }}
+    >
+      {!activeStorey && <option value="" />}
+      {storeys.map((s) => (
+        <option key={s.key} value={s.key}>
+          {s.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 export function ViewModeSwitcher() {
-  const { mode, setMode, setStorey, storeys, activeStorey } = useViewMode();
+  const { mode, setMode, storeys } = useViewMode();
   const calibrating = useViewerStore((s) => s.underlayCalibration !== null);
   const disabled = storeys.length === 0 || calibrating;
 
-  const disabledReason = useMemo(() => {
-    if (calibrating) return 'Finish or cancel the calibration first';
-    if (storeys.length === 0) return 'Load a model with storeys first';
-    return null;
-  }, [calibrating, storeys.length]);
+  const disabledReason = useMemo(
+    () => viewModeDisabledReason({ calibrating, storeyCount: storeys.length }),
+    [calibrating, storeys.length],
+  );
 
   return (
     <div className="flex items-center gap-1">
@@ -48,7 +80,7 @@ export function ViewModeSwitcher() {
               disabled && 'opacity-50',
             )}
           >
-            {MODES.map((m) => (
+            {VIEW_MODES.map((m) => (
               <button
                 key={m.id}
                 type="button"
@@ -72,24 +104,7 @@ export function ViewModeSwitcher() {
         </TooltipTrigger>
         <TooltipContent>{disabledReason ?? 'View mode (3D / 2D / Split)'}</TooltipContent>
       </Tooltip>
-      {mode !== '3d' && (
-        <select
-          aria-label="Storey"
-          className="h-6 max-w-36 rounded border bg-background px-1 text-[11px]"
-          value={activeStorey?.key ?? ''}
-          onChange={(e) => {
-            const storey = storeys.find((s) => s.key === e.target.value);
-            if (storey) setStorey(storey);
-          }}
-        >
-          {!activeStorey && <option value="" />}
-          {storeys.map((s) => (
-            <option key={s.key} value={s.key}>
-              {s.name}
-            </option>
-          ))}
-        </select>
-      )}
+      <StoreyPicker />
     </div>
   );
 }
