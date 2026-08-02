@@ -229,9 +229,9 @@ from Actions) and drop the guard; for releases/docker, set up our own publish ta
 ## Depot runners → ubuntu-latest on the fork
 
 Upstream runs the heavy CI jobs on **Depot** managed runners (`depot-ubuntu-24.04-4`), which
-don't exist on the fork — so those jobs sit **queued forever** (`runner_id 0`). The affected
-jobs in `.github/workflows/test.yml` (`Build packages + WASM`, `Rust tests`) select their
-runner by repository:
+don't exist on the fork — so those jobs sit **queued forever** (`runner_id 0`) and the PR never
+goes green. The affected jobs in `.github/workflows/test.yml` (`Build packages + WASM`,
+`Rust tests`, `Geometry watertightness census`) select their runner by repository:
 
 ```
 runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
@@ -240,6 +240,18 @@ runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4'
 The from-source wasm compile additionally forces **thin LTO** on the fork
 (`CARGO_PROFILE_RELEASE_LTO`) so FAT-LTO doesn't OOM the smaller `ubuntu-latest` runner —
 same fix as `scripts/vercel-build.sh`. Upstream keeps Depot + FAT LTO unchanged.
+
+> **Check this on every sync that touches `test.yml`.** A *new* upstream job on a Depot runner
+> arrives unguarded and hangs the whole PR silently — no failure, just a check that never
+> finishes. `Geometry watertightness census` arrived exactly that way in the 2026-08-01 sync.
+> After a sync, grep for the unguarded form:
+>
+> ```bash
+> grep -rn "runs-on: depot" .github/workflows/
+> ```
+>
+> Every hit must either carry the repository-conditional `runs-on` above, or sit in a job whose
+> `if:` already restricts it to upstream (that is how `docker.yml` is handled).
 
 ## Conventions (don't drift)
 

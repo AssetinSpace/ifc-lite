@@ -502,7 +502,12 @@ jobs:
     name: Geometry watertightness census
     needs: changes
     if: needs.changes.outputs.geometry == 'true'
-    runs-on: depot-ubuntu-24.04-4
+    # >>> AIM-FORK: Depot runners are upstream-only — on the fork this job would
+    # sit queued forever with runner_id 0, and the PR would never go green.
+    # Same guard as `build` and `rust` above; see docs/FORK_MAINTENANCE.md →
+    # "Depot runners → ubuntu-latest on the fork".
+    runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
+    # <<< AIM-FORK
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
