@@ -21,3 +21,18 @@ export function deriveViewMode(flags: {
   if (flags.viewLocked) return '2d';
   return '3d';
 }
+
+/**
+ * Why the mode switcher is unavailable, or null when it is usable. Shared
+ * by every surface that offers the switch (classic toolbar, mobile toolbar,
+ * ribbon Documents tab) so they can never disagree about when 2D/Split is
+ * reachable — the string doubles as the tooltip.
+ */
+export function viewModeDisabledReason(gate: {
+  calibrating: boolean;
+  storeyCount: number;
+}): string | null {
+  if (gate.calibrating) return 'Finish or cancel the calibration first';
+  if (gate.storeyCount === 0) return 'Load a model with storeys first';
+  return null;
+}

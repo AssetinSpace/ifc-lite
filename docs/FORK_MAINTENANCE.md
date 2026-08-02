@@ -48,7 +48,13 @@ git grep -n ">>> AIM-FORK" -- apps/ packages/
 | `apps/viewer/src/components/viewer/HierarchyPanel.tsx` | 2 | AIM tree decorations — row → IFC GlobalId → badge counts (D-077) |
 | `apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx` | 5 | AIM badge icons + per-GUID counts (D-077) |
 | `apps/viewer/src/components/viewer/ViewportContainer.tsx` | 2 | Reality Capture pin billboard (D-073) |
+| `apps/viewer/src/components/viewer/MainToolbar.tsx` | 4 | Drawing Underlays panel toggle (D-072) + `<ViewModeSwitcher />` (D-075) |
+| `apps/viewer/src/components/viewer/ribbon/RibbonToolbar.tsx` | 3 | fork-only **Documents** ribbon tab — strip entry + band mount (D-072/D-075) |
+| `apps/viewer/src/store/constants.ts` | 1 | `'documents'` added to `RibbonTabId` |
+| `apps/viewer/src/store/index.ts` | 1 | fork-only store slices (underlays D-072, documents D-075, identifier links D-076) |
+| `apps/viewer/src/lib/panels/registry.ts` | 3 | fork-only workspace panels `drawing-underlay` + `documents`, appended last |
 | `packages/renderer/src/index.ts` | 5 | generic external-overlay hook + registry — **upstream-PR candidate** |
+| `packages/collab-server/src/bin.ts` | 3 | fail-closed startup guard (replaces upstream's warn-only block) |
 
 If you resolve a conflict here, grep for `AIM-FORK` to confirm you kept all our
 brackets, and note in the sync PR which extension point in upstream would have
