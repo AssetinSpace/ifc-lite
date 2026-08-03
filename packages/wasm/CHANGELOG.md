@@ -1,5 +1,50 @@
 # @ifc-lite/wasm
 
+## 4.2.2
+
+### Patch Changes
+
+- [#1969](https://github.com/LTplus-AG/ifc-lite/pull/1969) [`8793ffd`](https://github.com/LTplus-AG/ifc-lite/commit/8793ffd4948840fbd96bf745d8e9db71e139d350) Thanks [@louistrue](https://github.com/louistrue)! - Render geometry attached directly to `IfcBuilding` ([#1910](https://github.com/LTplus-AG/ifc-lite/issues/1910)). Terrain/DGM exports hang an `IfcShellBasedSurfaceModel` straight off the building rather than off a dedicated element. `is_non_geometric_spatial` blocked `IfcBuilding`, so `has_geometry_by_name` returned false, the building never became a geometry job, and the model loaded with correct metadata and hierarchy but rendered nothing at all.
+
+  The reported `(0,0,0)` RTC offset is a consequence, not the cause: with no job to sample, RTC detection had nothing to look at and fell through to the placement-bounds scan, which sees only the origin placements such files use. Once the building is sampled, the existing raw-vertex probe in `sample_element_translation` reads its first vertex and re-bases correctly — no change to RTC detection itself was needed.
+
+  `IfcBuilding` now joins `IfcSpace`, `IfcSite` and `IfcSpatialZone` in the exempt set, the same fix `IfcSpatialZone` got in [#1075](https://github.com/LTplus-AG/ifc-lite/issues/1075) once Revit Family/Dynamo exports were found emitting it with a body. The gate only _permits_ meshing — a building with no representation still produces nothing, which is the overwhelmingly common case — so the cost is one abandoned job per building. `IfcBuildingStorey` and the `IfcFacility`/`IfcFacilityPart` families stay blocked; no exporter has been observed giving them a body.
+
+  Perf verdict: mesh, vertex and triangle counts are byte-identical on every fixture in the perf suite (none of their buildings carries a representation), and the end-to-end suite total moved 2043 ms → 2034 ms (−0.4%, within noise) measured base-vs-branch with `scripts/perf/probe.sh --suite`, including the heavy-CSG Holter Tower model. The added work is one `is_subtype_of` inside `has_geometry_by_name`, which memoises per distinct type name, so it runs once per type per process.
+
+## 4.2.1
+
+### Patch Changes
+
+- [#1886](https://github.com/LTplus-AG/ifc-lite/pull/1886) [`8ba490e`](https://github.com/LTplus-AG/ifc-lite/commit/8ba490e6f64ce2ee9c564ff4c8b5be454d4f64b3) Thanks [@louistrue](https://github.com/louistrue)! - Stop the geometry kernel emitting NaN vertex normals.
+
+  `Triangle::normal()` normalized the edge cross product unconditionally. A zero-area
+  triangle — three collapsed or exactly collinear vertices — has a zero-length cross
+  product, so that was `0.0 / 0.0`: NaN in all three components. `add_triangle_to_mesh`,
+  its only production caller, wrote those NaNs straight into `Mesh::normals` for every
+  triangle `ClippingProcessor::clip_mesh` emits, which is the half-space clip and the
+  material-layer slicing path.
+
+  The mesh-hygiene pass did not clean them up, because it was never meant to:
+  `clean_degenerate` / `drop_thin_triangles` rewrites only `indices`. The degenerate
+  triangle disappears from the index buffer while its three vertices stay in
+  `positions` / `normals` as unreferenced orphans, still carrying NaN. On
+  `tests/models/ara3d/duplex.ifc` that shipped 81 NaN normal components across 6 of 622
+  meshes — all of them material-layer wall slices, all on vertices no triangle
+  references.
+
+  A degenerate triangle now gets `(0, 0, 1)`, the same undefined-normal convention
+  `csg::normals::calculate_normals` and the average-normals weld already use, stated in
+  the kernel's Z-up frame. Non-degenerate triangles are bit-identical: `try_normalize(0.0)`
+  computes exactly what `normalize()` did for every non-zero cross product. Measured over
+  duplex.ifc, the only meshes whose output moves are those same 6, and the triangle count
+  is unchanged (39,334 in both).
+
+  NaN normals were not merely cosmetic. They are unrepresentable in any consumer that
+  hashes or serializes the mesh — every NaN bit pattern collapses to a single quiet NaN,
+  so two different meshes could hash alike — and they defeat vertex welding, since
+  `NaN != NaN` keeps coincident vertices from merging.
+
 ## 4.2.0
 
 ### Minor Changes

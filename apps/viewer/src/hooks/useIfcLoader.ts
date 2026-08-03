@@ -25,9 +25,12 @@ import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
 import {
   GeometryProcessor,
   GeometryQuality,
+  geometryAabbAt,
+  geometryVolumeAt,
   getGeometryStreamWatchdogMs as getGeometryStreamWatchdogMsImpl,
   type MeshData,
   type CoordinateInfo,
+  type EntityWorldAabb,
   type GeometryResult,
   type TessellationQuality,
 } from '@ifc-lite/geometry';
@@ -58,6 +61,8 @@ import { detectPointCloudFormat, ingestPointCloud } from './ingest/pointCloudIng
 import { removePointCloudScanCache } from './ingest/pointCloudScanCache.js';
 import { getGlobalRenderer } from './useBCF.js';
 import { extractModelGeoref, alignGeometryToReference, findReferenceGeorefModel } from './ingest/federationAlign.js';
+import { capturePreAlignment } from './ingest/federationRealign.js';
+import type { PreAlignmentSnapshot } from '../store/index.js';
 import { computePointCloudAlignment, unregisterPointCloudAlignment, hasRegisteredPointCloudAlignment } from './ingest/pointCloudAlignment.js';
 import { toast } from '../components/ui/toast.js';
 import { posthog } from '../lib/analytics.js';
@@ -464,17 +469,17 @@ export function useIfcLoader() {
           const referenceGeoref = findReferenceGeorefModel()?.georef ?? null;
           const parsedGeorefMutations = useViewerStore.getState().georefMutations.get(modelId);
           const parsedGeoref = extractModelGeoref(dataStore, geometryResult.coordinateInfo, parsedGeorefMutations);
-          let preAlignmentPositions: Float32Array[] | undefined;
-          let preAlignmentNormals: (Float32Array | undefined)[] | undefined;
-          let preAlignmentCoordinateInfo: CoordinateInfo | undefined;
+          // The snapshot `realignFederation` later restores from. Captured by
+          // the same function that restores it (ingest/federationRealign.ts) so
+          // the two cannot cover different fields — #1891's world boxes are
+          // re-framed by the alignment exactly like the positions and normals,
+          // and a snapshot that misses one lets a later re-align transform it a
+          // second time.
+          let preAlignment: PreAlignmentSnapshot | undefined;
           let federationAlignmentStatus: FederatedModel['federationAlignmentStatus'] = 'none';
           if (referenceGeoref && parsedGeoref) {
             setProgress({ phase: 'Aligning georeferenced model', percent: 90 });
-            preAlignmentPositions = geometryResult.meshes.map((mesh) => new Float32Array(mesh.positions));
-            preAlignmentNormals = geometryResult.meshes.map((mesh) =>
-              mesh.normals && mesh.normals.length > 0 ? new Float32Array(mesh.normals) : undefined,
-            );
-            preAlignmentCoordinateInfo = geometryResult.coordinateInfo;
+            preAlignment = capturePreAlignment(geometryResult);
             const status = await alignGeometryToReference(geometryResult, parsedGeoref, referenceGeoref);
             federationAlignmentStatus = status;
             if (status === 'reprojected') {
@@ -531,9 +536,7 @@ export function useIfcLoader() {
             idOffset,
             maxExpressId,
             pointCloudHandleId: patch?.pointCloudHandleId,
-            preAlignmentPositions,
-            preAlignmentNormals,
-            preAlignmentCoordinateInfo,
+            preAlignment,
             federationAlignmentStatus,
           };
           useViewerStore.getState().addModel(federatedModel);
@@ -1243,6 +1246,16 @@ export function useIfcLoader() {
       // (their meshes never enter `allMeshes`). Folded onto the GeometryResult so
       // buildEntityFingerprints can still diff repeated opaque geometry.
       const allInstancedGeometryHashes = new Map<number, bigint>();
+      // #1891: and their world boxes, so the diff's positional tiers reach the
+      // repeated components instancing exists for. A separate map because an
+      // entity can be hashed with no box (NaN span on the wire).
+      const allInstancedGeometryAabbs = new Map<number, EntityWorldAabb>();
+      // #1993: and their proved enclosed volumes, so the split/merge detector
+      // can weigh one element against several without an IFC quantity set. A
+      // third map for the same reason the boxes are a second one: an entity can
+      // be hashed and boxed with no proved volume, and absence must stay
+      // distinguishable from "no fingerprint at all".
+      const allInstancedGeometryVolumes = new Map<number, number>();
       let finalCoordinateInfo: CoordinateInfo | null = null;
       // Capture RTC offset from WASM for proper multi-model alignment
       let capturedRtcOffset: { x: number; y: number; z: number } | null = null;
@@ -1451,9 +1464,19 @@ export function useIfcLoader() {
               if (event.instancedGeometryHashIds && event.instancedGeometryHashValues) {
                 const hashIds = event.instancedGeometryHashIds;
                 const hashVals = event.instancedGeometryHashValues;
+                // #1891: six values per id, NaN span = no box for that entity.
+                // Absent array (older wasm / no box in the batch) leaves the
+                // aabb map empty and compare falls back to a bare `moved`.
+                const aabbVals = event.instancedGeometryAabbValues;
+                // One value per id, NaN = volume not proved for that entity.
+                const volumeVals = event.instancedGeometryVolumeValues;
                 const hashN = Math.min(hashIds.length, hashVals.length);
                 for (let i = 0; i < hashN; i++) {
                   allInstancedGeometryHashes.set(hashIds[i], hashVals[i]);
+                  const aabb = geometryAabbAt(aabbVals, i);
+                  if (aabb) allInstancedGeometryAabbs.set(hashIds[i], aabb);
+                  const volume = geometryVolumeAt(volumeVals, i);
+                  if (volume !== undefined) allInstancedGeometryVolumes.set(hashIds[i], volume);
                 }
               }
               finalCoordinateInfo = event.coordinateInfo ?? null;
@@ -1562,7 +1585,16 @@ export function useIfcLoader() {
                 if (allInstancedGeometryHashes.size > 0) {
                   const gr = useViewerStore.getState().geometryResult;
                   if (gr) {
-                    setGeometryResult({ ...gr, instancedGeometryHashes: allInstancedGeometryHashes });
+                    setGeometryResult({
+                      ...gr,
+                      instancedGeometryHashes: allInstancedGeometryHashes,
+                      ...(allInstancedGeometryAabbs.size > 0
+                        ? { instancedGeometryAabbs: allInstancedGeometryAabbs }
+                        : {}),
+                      ...(allInstancedGeometryVolumes.size > 0
+                        ? { instancedGeometryVolumes: allInstancedGeometryVolumes }
+                        : {}),
+                    });
                   }
                 }
               }
@@ -1604,6 +1636,12 @@ export function useIfcLoader() {
                     // shape consistency / future-proofing. (#924 compare parity)
                     ...(allInstancedGeometryHashes.size > 0
                       ? { instancedGeometryHashes: allInstancedGeometryHashes }
+                      : {}),
+                    ...(allInstancedGeometryAabbs.size > 0
+                      ? { instancedGeometryAabbs: allInstancedGeometryAabbs }
+                      : {}),
+                    ...(allInstancedGeometryVolumes.size > 0
+                      ? { instancedGeometryVolumes: allInstancedGeometryVolumes }
                       : {}),
                   };
                   await finalizeModel(dataStore, federatedGeometry, getSchemaVersion(dataStore), {

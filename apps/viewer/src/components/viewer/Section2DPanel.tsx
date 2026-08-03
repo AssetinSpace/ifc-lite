@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useViewerStore } from '@/store';
+import { toast } from '@/components/ui/toast';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
 import { useDraggablePanel } from '@/hooks/useDraggablePanel';
@@ -40,7 +41,7 @@ import { useAnnotation2D } from '@/hooks/useAnnotation2D';
 import { useViewControls } from '@/hooks/useViewControls';
 import { useDrawingExport } from '@/hooks/useDrawingExport';
 import { useSymbolicAnnotationsForDrawing } from '@/hooks/useSymbolicAnnotations';
-import { useDxfUnderlaysForDrawing, dxfWorldShift, dxfUnderlayDrawingBounds } from '@/hooks/useDxfUnderlay';
+import { useDxfUnderlaysForDrawing, useDxfMapToWorldTransform, dxfWorldShift, dxfUnderlayDrawingBounds } from '@/hooks/useDxfUnderlay';
 import { useScanSectionLayer } from '@/hooks/useScanSectionLayer';
 
 interface Section2DPanelProps {
@@ -416,20 +417,44 @@ export function Section2DPanel({
 
   // Centre an underlay on the generated drawing: offset = model-drawing
   // centre − underlay centre at zero offset (same world→drawing mapping
-  // the render hook applies, including the current rotation/scale).
+  // the render hook applies, including the current rotation/scale and,
+  // for a georeferenced underlay, the inverse IfcMapConversion — issue
+  // #1929, same transform `dxfUnderlayData` above resolves).
+  const { transform: dxfMapToWorld, available: dxfGeoreferenceAvailable } = useDxfMapToWorldTransform();
   const handleCenterDxfUnderlay = useCallback((id: string) => {
     const entry = dxfUnderlays.find((u) => u.id === id);
     if (!entry || !drawing) return;
     const shift = dxfWorldShift(geometryResult?.coordinateInfo);
     const mirrorX = sectionPlane.flipped && sectionPlane.custom === undefined;
-    const underlayBounds = dxfUnderlayDrawingBounds(entry, shift, mirrorX);
-    if (!underlayBounds) return;
+    const underlayBounds = dxfUnderlayDrawingBounds(entry, shift, mirrorX, dxfMapToWorld, dxfGeoreferenceAvailable);
+    if (!underlayBounds) {
+      // PR #1965 review: this guard fires when the underlay has no usable
+      // bounds AT ALL (missing extents) OR the georeference produced a
+      // non-finite corner (`dxfUnderlayDrawingBounds` collapses both into
+      // `null` — see its docstring). Either way the button used to do
+      // nothing with no explanation; tell the user so a malformed
+      // `IfcMapConversion` doesn't read as an unresponsive button.
+      toast.error("Couldn't centre this underlay: its bounds are missing or the georeference produced non-finite coordinates.");
+      return;
+    }
     const modelCx = (drawing.bounds.min.x + drawing.bounds.max.x) / 2;
     const modelCy = (drawing.bounds.min.y + drawing.bounds.max.y) / 2;
     const underlayCx = (underlayBounds.min.x + underlayBounds.max.x) / 2;
     const underlayCy = (underlayBounds.min.y + underlayBounds.max.y) / 2;
-    updateDxfUnderlayPlacement(id, { offsetX: modelCx - underlayCx, offsetY: modelCy - underlayCy });
-  }, [dxfUnderlays, drawing, geometryResult, sectionPlane.flipped, sectionPlane.custom, updateDxfUnderlayPlacement]);
+    const offsetX = modelCx - underlayCx;
+    const offsetY = modelCy - underlayCy;
+    // Defense-in-depth (PR #1965 review): `dxfUnderlayDrawingBounds`
+    // already returns null on a non-finite bound (so `underlayBounds`
+    // above would have short-circuited), but guard the DERIVED offset too
+    // — `drawing.bounds` comes from the generated drawing, not the
+    // underlay, and a NaN here would otherwise still get written into the
+    // stored placement, which survives toggling georeferencing back off.
+    if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY)) {
+      toast.error("Couldn't centre this underlay: the drawing bounds are not finite.");
+      return;
+    }
+    updateDxfUnderlayPlacement(id, { offsetX, offsetY });
+  }, [dxfUnderlays, drawing, geometryResult, sectionPlane.flipped, sectionPlane.custom, updateDxfUnderlayPlacement, dxfMapToWorld, dxfGeoreferenceAvailable]);
 
   // Point-cloud scan overlay (issue #1805): a thin band of the loaded
   // scan(s) around the active section plane, projected into the SAME
@@ -1249,6 +1274,7 @@ export function Section2DPanel({
             onClose={() => setDxfPanelOpen(false)}
             onCenterOnModel={handleCenterDxfUnderlay}
             planViewActive={sectionPlane.axis === 'down' && sectionPlane.custom === undefined}
+            georeferenceAvailable={dxfGeoreferenceAvailable}
           />
         </div>
       )}

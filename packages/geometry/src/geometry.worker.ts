@@ -8,6 +8,12 @@ import { largeFilePrepassError } from './huge-file-error.js';
 import type { MeshData, TessellationQuality } from './types.js';
 import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostics.js';
 import {
+  extractGeometryFingerprints,
+  writeGeometryAabbAt,
+  type EntityGeometryFingerprint,
+  type GeometryFingerprintSource,
+} from './geometry-fingerprints.js';
+import {
   DEFAULT_BATCH_SIZING,
   resolveBatchSizing,
   nextAdaptiveBatchJobs,
@@ -348,6 +354,13 @@ export interface GeometryWorkerBatchMessage {
      *  geometry hashing was enabled via `set-compute-geometry-hashes`.
      *  A `bigint` survives the structured-clone `postMessage`. */
     geometryHash?: bigint;
+    /** Absolute world box for the whole entity (#1891), from the same pass as
+     *  `geometryHash`. A plain object of numbers, so structured clone carries
+     *  it — no transfer entry. */
+    geometryAabb?: MeshData['geometryAabb'];
+    /** Proved enclosed volume in m³ (#1993), from the same pass. A plain
+     *  number; absent means the pass proved none. */
+    geometryVolume?: MeshData['geometryVolume'];
   }[];
   /** GPU-instancing: per-batch IFNS shards (transferable ArrayBuffers). The
    *  renderer decodes + GPU-instances them. Opaque repeated occurrences render
@@ -362,6 +375,18 @@ export interface GeometryWorkerBatchMessage {
    *  to the instanced shard. Transferable. */
   instancedGeometryHashIds?: Uint32Array;
   instancedGeometryHashValues?: BigUint64Array;
+  /** World boxes (#1891) for those same instanced-only entities, SIX values per
+   *  `instancedGeometryHashIds` entry (`minXYZ` then `maxXYZ`) — the same
+   *  index-parallel layout as `MeshCollection.geometryAabbValues`, NaN span for
+   *  an entity with no box. Omitted entirely when no entity in the batch had
+   *  one (including on a wasm build predating the getter). Transferable. */
+  instancedGeometryAabbValues?: Float64Array;
+  /** Proved enclosed volumes in m³ (#1993) for those same instanced-only
+   *  entities, ONE value per `instancedGeometryHashIds` entry — the same
+   *  index-parallel layout as `MeshCollection.geometryVolumeValues`, `NaN` for
+   *  an entity whose volume the kernel could not prove. Omitted entirely when
+   *  no entity in the batch had one. Transferable. */
+  instancedGeometryVolumeValues?: Float64Array;
 }
 
 export interface GeometryWorkerProgressMessage {
@@ -719,12 +744,14 @@ interface ProcessingSession {
   /** Occurrence count accumulated in pendingInstancedShards since the last flush. */
   pendingInstancedOccurrences: number;
   /**
-   * Geometry-diff hashes (#924) for elements whose meshes ALL went to the
-   * instanced shard, so no flat MeshData carries the hash. Without this the
-   * compare feature would silently regress for repeated opaque geometry (it
-   * worked when those elements rendered flat). Keyed by express id → hash.
+   * Geometry fingerprints (#924 hash + #1891 world box + #1993 volume) for
+   * elements whose
+   * meshes ALL went to the instanced shard, so no flat MeshData carries them.
+   * Without this the compare feature would silently regress for repeated opaque
+   * geometry (it worked when those elements rendered flat) — which is exactly
+   * the population positional matching exists for. Keyed by express id.
    */
-  pendingInstancedGeometryHashes: Map<number, bigint>;
+  pendingInstancedGeometry: Map<number, EntityGeometryFingerprint>;
   totalMeshesEmitted: number;
   cumulativeMeshBytes: number;
   /** CSG / opening diagnostics merged across every batch this load (the
@@ -787,7 +814,7 @@ function startSession(input: {
     pendingTransfers: [],
     pendingInstancedShards: [],
     pendingInstancedOccurrences: 0,
-    pendingInstancedGeometryHashes: new Map(),
+    pendingInstancedGeometry: new Map(),
     totalMeshesEmitted: 0,
     cumulativeMeshBytes: 0,
     diagnostics: null,
@@ -799,14 +826,15 @@ function flushPending(session: ProcessingSession): void {
   session.pendingInstancedShards = [];
   const instancedOccurrences = session.pendingInstancedOccurrences;
   session.pendingInstancedOccurrences = 0;
-  // Drain the instanced-only geometry-hash side-channel into transferable arrays
-  // (#924 compare parity). Cleared every flush so it can't leak across batches.
-  const hashEntries = session.pendingInstancedGeometryHashes;
-  session.pendingInstancedGeometryHashes = new Map();
+  // Drain the instanced-only geometry-fingerprint side-channel into transferable
+  // arrays (#924 / #1891 compare parity). Cleared every flush so it can't leak
+  // across batches.
+  const fingerprintEntries = session.pendingInstancedGeometry;
+  session.pendingInstancedGeometry = new Map();
   if (
     session.pendingMeshes.length === 0 &&
     instancedShards.length === 0 &&
-    hashEntries.size === 0
+    fingerprintEntries.size === 0
   ) {
     return;
   }
@@ -816,13 +844,36 @@ function flushPending(session: ProcessingSession): void {
   session.pendingTransfers = [];
   let instancedGeometryHashIds: Uint32Array | undefined;
   let instancedGeometryHashValues: BigUint64Array | undefined;
-  if (hashEntries.size > 0) {
-    instancedGeometryHashIds = new Uint32Array(hashEntries.size);
-    instancedGeometryHashValues = new BigUint64Array(hashEntries.size);
+  let instancedGeometryAabbValues: Float64Array | undefined;
+  let instancedGeometryVolumeValues: Float64Array | undefined;
+  if (fingerprintEntries.size > 0) {
+    instancedGeometryHashIds = new Uint32Array(fingerprintEntries.size);
+    instancedGeometryHashValues = new BigUint64Array(fingerprintEntries.size);
+    // Six values per id, mirroring `MeshCollection.geometryAabbValues`: an entry
+    // with no box reserves its span as NaN rather than shortening the array,
+    // because the receiver reads purely by index and a gap would mis-attribute
+    // every later box. Allocated only once a box is actually seen — an older
+    // wasm build (or an all-boxless batch) ships nothing at all.
     let k = 0;
-    for (const [id, hash] of hashEntries) {
+    for (const [id, fingerprint] of fingerprintEntries) {
       instancedGeometryHashIds[k] = id;
-      instancedGeometryHashValues[k] = hash;
+      instancedGeometryHashValues[k] = fingerprint.hash;
+      if (fingerprint.aabb) {
+        if (!instancedGeometryAabbValues) {
+          instancedGeometryAabbValues = new Float64Array(fingerprintEntries.size * 6).fill(NaN);
+        }
+        writeGeometryAabbAt(instancedGeometryAabbValues, k, fingerprint.aabb);
+      }
+      // One value per id, mirroring `MeshCollection.geometryVolumeValues`, with
+      // `NaN` reserving the slot of an entity whose volume was not proved — the
+      // index-parallel invariant is the same one the boxes have, and so is the
+      // allocate-on-first-sighting rule.
+      if (fingerprint.volume !== undefined) {
+        if (!instancedGeometryVolumeValues) {
+          instancedGeometryVolumeValues = new Float64Array(fingerprintEntries.size).fill(NaN);
+        }
+        instancedGeometryVolumeValues[k] = fingerprint.volume;
+      }
       k += 1;
     }
     // Freshly allocated above, so `.buffer` is a real ArrayBuffer (TS widens it
@@ -831,6 +882,12 @@ function flushPending(session: ProcessingSession): void {
       instancedGeometryHashIds.buffer as ArrayBuffer,
       instancedGeometryHashValues.buffer as ArrayBuffer,
     );
+    if (instancedGeometryAabbValues) {
+      transfers.push(instancedGeometryAabbValues.buffer as ArrayBuffer);
+    }
+    if (instancedGeometryVolumeValues) {
+      transfers.push(instancedGeometryVolumeValues.buffer as ArrayBuffer);
+    }
   }
   // Total counts both routes: flat meshes + instanced occurrences (the latter
   // left the flat array but are still rendered geometry).
@@ -843,6 +900,8 @@ function flushPending(session: ProcessingSession): void {
       ...(instancedOccurrences > 0 ? { instancedOccurrences } : {}),
       ...(instancedGeometryHashIds ? { instancedGeometryHashIds } : {}),
       ...(instancedGeometryHashValues ? { instancedGeometryHashValues } : {}),
+      ...(instancedGeometryAabbValues ? { instancedGeometryAabbValues } : {}),
+      ...(instancedGeometryVolumeValues ? { instancedGeometryVolumeValues } : {}),
     } as GeometryWorkerBatchMessage,
     [...transfers, ...instancedShards],
   );
@@ -853,10 +912,14 @@ function collectMeshes(
   collection: ReturnType<IfcAPI['processGeometryBatch']>,
 ): void {
   try {
-    // Per-entity geometry fingerprints (issue #924) — empty unless hashing was
-    // enabled via `set-compute-geometry-hashes`. Read inside the try so
+    // Per-entity geometry fingerprints — hash (#924) plus the absolute world
+    // box (#1891) and the proved enclosed volume (#1993) — empty unless
+    // hashing was enabled via
+    // `set-compute-geometry-hashes`. Read inside the try so
     // `collection.free()` in finally still runs if extraction throws.
-    const geometryHashes = extractGeometryHashesFromCollection(collection);
+    const geometryFingerprints = extractGeometryFingerprints(
+      collection as unknown as GeometryFingerprintSource,
+    );
     // Track which entities got a flat mesh; any hashed entity NOT seen here had
     // all its meshes routed to the instanced shard, so its geometry-diff hash
     // would otherwise be dropped (it rides on flat MeshData). Captured below
@@ -883,7 +946,7 @@ function collectMeshes(
           shadingArray && shadingArray.length === 4
             ? [shadingArray[0], shadingArray[1], shadingArray[2], shadingArray[3]]
             : undefined;
-        const geometryHash = geometryHashes.get(mesh.expressId);
+        const fingerprint = geometryFingerprints.get(mesh.expressId);
         // Per-element local-frame origin (world = origin + position). Older wasm
         // bundles lack the getter; [0,0,0] means absolute. Metadata only — the
         // 3-tuple rides structured-clone, NOT pendingTransfers.
@@ -951,9 +1014,15 @@ function collectMeshes(
           session.pendingTransfers.push(uvs.buffer);
           session.cumulativeMeshBytes += uvs.byteLength;
         }
-        // #924: attach the per-entity geometry fingerprint (empty Map → no-op
-        // unless geometry hashing was enabled).
-        if (geometryHash !== undefined) meshData.geometryHash = geometryHash;
+        // #924 / #1891: attach the per-entity geometry fingerprint — hash and,
+        // when the pass produced them, the absolute world box and the proved
+        // enclosed volume. All three are plain values, so they ride structured
+        // clone, NOT pendingTransfers.
+        if (fingerprint) {
+          meshData.geometryHash = fingerprint.hash;
+          if (fingerprint.aabb) meshData.geometryAabb = fingerprint.aabb;
+          if (fingerprint.volume !== undefined) meshData.geometryVolume = fingerprint.volume;
+        }
         flatMeshedIds.add(mesh.expressId);
         session.pendingMeshes.push(meshData);
       } finally {
@@ -963,8 +1032,8 @@ function collectMeshes(
     // Instanced-only entities: hashes present in the collection but with no flat
     // mesh emitted this batch. Carry them so the compare fingerprint builder can
     // still detect geometry changes on repeated opaque elements. (#1238 / #924)
-    for (const [id, hash] of geometryHashes) {
-      if (!flatMeshedIds.has(id)) session.pendingInstancedGeometryHashes.set(id, hash);
+    for (const [id, fingerprint] of geometryFingerprints) {
+      if (!flatMeshedIds.has(id)) session.pendingInstancedGeometry.set(id, fingerprint);
     }
     // CSG / opening diagnostics: merge into the per-load accumulator only AFTER
     // mesh extraction succeeds (both batch paths attach a GeometryDiagnostics to
@@ -980,31 +1049,6 @@ function collectMeshes(
   } finally {
     collection.free();
   }
-}
-
-/**
- * Read the per-entity geometry hashes off a MeshCollection's parallel
- * `geometryHashIds`/`geometryHashValues` arrays into a `Map`. Empty when
- * hashing is off or the WASM build predates the getters. Must run before
- * `collection.free()`.
- */
-function extractGeometryHashesFromCollection(
-  collection: ReturnType<IfcAPI['processGeometryBatch']>,
-): Map<number, bigint> {
-  const map = new Map<number, bigint>();
-  const c = collection as unknown as {
-    geometryHashCount?: number;
-    geometryHashIds?: Uint32Array;
-    geometryHashValues?: BigUint64Array;
-  };
-  const count = c.geometryHashCount ?? 0;
-  if (count === 0) return map;
-  const ids = c.geometryHashIds;
-  const values = c.geometryHashValues;
-  if (!ids || !values) return map;
-  const n = Math.min(ids.length, values.length);
-  for (let i = 0; i < n; i++) map.set(ids[i], values[i]);
-  return map;
 }
 
 /** Shape of a PartitionedBatch result (legacy or `*FromSource`). */

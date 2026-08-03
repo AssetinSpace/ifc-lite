@@ -34,6 +34,13 @@ export { mergeGeometryDiagnostics } from './diagnostics.js';
 // Typed export-failure contract (fail-closed empty exports, mirrors Rust ExportError).
 export { NO_RENDER_GEOMETRY, isNoRenderGeometryError } from './export-errors.js';
 
+// The index-parallel layouts the geometry-hash pass emits — six values per id
+// for the world box (#1891), one for the proved volume (#1993) — shared with
+// consumers that read the instanced-only side-channel off the streaming `batch`
+// event rather than off a `MeshData`. Both resolve the absent `NaN` sentinel to
+// `undefined`, which is the only place that conversion is allowed to happen.
+export { geometryAabbAt, geometryVolumeAt } from './geometry-fingerprints.js';
+
 // Support components
 export { BufferBuilder } from './buffer-builder.js';
 export { CoordinateHandler } from './coordinate-handler.js';
@@ -204,6 +211,16 @@ export type StreamingGeometryEvent =
        *  repeated opaque elements. Present only when geometry hashing is on. */
       instancedGeometryHashIds?: Uint32Array;
       instancedGeometryHashValues?: BigUint64Array;
+      /** World boxes (#1891) for those same instanced-only entities: SIX values
+       *  per `instancedGeometryHashIds` entry, `minXYZ` then `maxXYZ`, absolute
+       *  world in the renderer's Y-up frame. A NaN span means that entity
+       *  produced no box; the whole array is omitted when none did. */
+      instancedGeometryAabbValues?: Float64Array;
+      /** Proved enclosed volumes in m³ (#1993) for those same instanced-only
+       *  entities: ONE value per `instancedGeometryHashIds` entry, `NaN` where
+       *  the kernel could not prove one. The whole array is omitted when no
+       *  entity in the batch had a volume. */
+      instancedGeometryVolumeValues?: Float64Array;
     }
   | { type: 'colorUpdate'; updates: Map<number, [number, number, number, number]> }
   | { type: 'rtcOffset'; rtcOffset: { x: number; y: number; z: number }; hasRtc: boolean }
@@ -976,6 +993,14 @@ export class GeometryProcessor {
    * `MeshCollection.geometryHashValues`, which `convertMeshCollectionToBatch`
    * attaches to each `MeshData.geometryHash`. RTC-invariant + tolerance-
    * quantized; default tolerance is {@link DEFAULT_GEOM_HASH_TOLERANCE} (1 mm).
+   *
+   * The same switch also populates `MeshCollection.geometryAabbValues`, which
+   * lands on `MeshData.geometryAabb` (#1891) — the absolute world box that lets
+   * a consumer tell a move from a reshape instead of reading one changed-hash
+   * bit — and `MeshCollection.geometryVolumeValues`, which lands on
+   * `MeshData.geometryVolume` (#1993), the proved enclosed volume the diff
+   * engine's split/merge detector weighs one element against several. Nothing
+   * is computed while this is off.
    *
    * Safe to call before `init()` — the bridge caches the value and replays
    * it on the freshly-built IfcAPI. No-op on the native/desktop path (the
