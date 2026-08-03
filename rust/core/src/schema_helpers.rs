@@ -17,12 +17,13 @@
 //!
 //! Co-authored with Geronimo <gerald.stampfel+geronimo@gmail.com> (PR #585).
 //!
-//! Both helpers are on the hot path during scene construction, where the
-//! same ~50–100 distinct type names are queried thousands of times per file.
-//! We memoise per-name behind a `RwLock<FxHashMap<String, bool>>`: the first
-//! call for a name pays the full `IfcType::from_str` (a ~1300-arm match) +
-//! `is_subtype_of` traversal cost; subsequent calls take a read-lock and a
-//! single hash lookup.
+//! `has_geometry_by_name`, `is_representationless_spatial_container_by_name`
+//! and `is_simple_geometry_type` are all on the hot path during scene
+//! construction, where the same ~50–100 distinct type names are queried
+//! thousands of times per file. We memoise per-name behind a
+//! `RwLock<FxHashMap<String, bool>>`: the first call for a name pays the
+//! full `IfcType::from_str` (a ~1300-arm match) + `is_subtype_of` traversal
+//! cost; subsequent calls take a read-lock and a single hash lookup.
 
 use std::sync::{OnceLock, RwLock};
 
@@ -136,6 +137,121 @@ fn is_non_geometric_spatial(t: IfcType) -> bool {
         return false;
     }
     t.is_subtype_of(IfcType::IfcSpatialElement)
+}
+
+/// Whether `type_name` is one of the spatial-container types that
+/// [`has_geometry_by_name`] still blocks by name (`IfcBuildingStorey`,
+/// `IfcFacility`, `IfcFacilityPart`, `IfcSpatialElement`,
+/// `IfcSpatialStructureElement`, and their subtypes) — i.e. `IfcProduct`
+/// subtypes that `is_non_geometric_spatial` treats as never carrying
+/// geometry directly. `IfcBuilding` (along with `IfcSpace`, `IfcSite` and
+/// `IfcSpatialZone`) is handled class-wide by `has_geometry_by_name` instead
+/// — see [`is_non_geometric_spatial`] — so it is no longer part of this
+/// instance-level exception.
+///
+/// In the overwhelming majority of real files that assumption holds for the
+/// still-blocked types: these entities are pure hierarchy nodes with a null
+/// `Representation`. Issue #1910 was discovered against a DGM/terrain export
+/// that attached an `IfcShellBasedSurfaceModel` directly to `IfcBuilding`
+/// with no `IfcBuildingElement` children at all; that concrete case is now
+/// covered by `IfcBuilding`'s class-wide exemption above, but the same
+/// exporter shape could in principle target `IfcBuildingStorey` or another
+/// still-blocked container. `has_geometry_by_name` alone can't distinguish
+/// "this type never has a body" from "this specific instance happens not
+/// to", so callers that need to catch that exceptional case combine this
+/// predicate with an instance-level check of whether the entity's
+/// `Representation` attribute (index 6 on any `IfcProduct`) is actually
+/// non-null before scheduling it for meshing. See
+/// `rust/processing/src/processor/mod.rs` and
+/// `rust/wasm-bindings/src/api/gpu_meshes/prepass.rs`.
+pub fn is_representationless_spatial_container_by_name(type_name: &str) -> bool {
+    static CACHE: OnceLock<RwLock<FxHashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
+
+    let upper = normalise_uppercase(type_name);
+    cached(cache, upper.as_ref(), || {
+        compute_is_representationless_spatial_container(upper.as_ref())
+    })
+}
+
+fn compute_is_representationless_spatial_container(upper: &str) -> bool {
+    if get_legacy_entity_info(upper).is_some() {
+        // Legacy/removed entities resolve their own `has_geometry` flag and
+        // are never part of this modern-schema-only exception path.
+        return false;
+    }
+    let t = IfcType::from_str(upper);
+    if matches!(t, IfcType::Unknown(_)) || !t.is_subtype_of(IfcType::IfcProduct) {
+        return false;
+    }
+    is_non_geometric_spatial(t)
+}
+
+/// Cheap textual check for whether a STEP entity's attribute at `index`
+/// (0-based, top-level — respects nested parens and quoted strings) is
+/// present and non-null (`$`), without fully decoding the entity via
+/// `EntityDecoder`. Companion to
+/// [`is_representationless_spatial_container_by_name`]: callers use it to
+/// check attribute 6 (`Representation`, stable across every `IfcProduct`
+/// subtype) before deciding an otherwise-excluded spatial container
+/// exceptionally carries geometry (#1910).
+pub fn nth_attribute_is_present(entity_bytes: &[u8], index: usize) -> bool {
+    let Some(open_idx) = entity_bytes.iter().position(|byte| *byte == b'(') else {
+        return false;
+    };
+    let Some(close_idx) = entity_bytes.iter().rposition(|byte| *byte == b')') else {
+        return false;
+    };
+    if close_idx <= open_idx {
+        return false;
+    }
+    let args = &entity_bytes[open_idx + 1..close_idx];
+
+    let mut in_string = false;
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut attr_idx = 0usize;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i] {
+            b'\'' => {
+                if in_string && i + 1 < args.len() && args[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_string = !in_string;
+                }
+            }
+            b'(' if !in_string => depth += 1,
+            b')' if !in_string => depth -= 1,
+            b',' if !in_string && depth == 0 => {
+                if attr_idx == index {
+                    let token = trim_ascii(&args[start..i]);
+                    return !token.is_empty() && token != b"$";
+                }
+                attr_idx += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if attr_idx == index {
+        let token = trim_ascii(&args[start..]);
+        return !token.is_empty() && token != b"$";
+    }
+    false
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let mut s = 0usize;
+    let mut e = bytes.len();
+    while s < e && bytes[s].is_ascii_whitespace() {
+        s += 1;
+    }
+    while e > s && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    &bytes[s..e]
 }
 
 /// Check if an IFC entity class is "simple" geometry (processed first for
