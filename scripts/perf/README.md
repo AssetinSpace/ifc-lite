@@ -242,6 +242,58 @@ SHIPPED (landed with a PR), or RE-REFUTED / NOT SHIPPABLE. Do not read the secti
   engine every week and turns red when this changes. See
   `docs/architecture/wasm-wide-arithmetic.md` (delivery status verified 2026-07-31).
 
+- **Content-dedup signature walk on large single BREPs** (~2.00x traversal, SHIPPED #1909):
+  `item_dedup_key` walked every face/bound/loop/point of an `IfcFacetedBrep` to build a
+  dedup key — a second full traversal mirroring the mesher's own. On a model that is one
+  large BREP with no repeats, that key can never pay off. Gated on
+  `FACETED_BREP_DEDUP_FACE_LIMIT` (20,000 faces), measured with a **deterministic counter**
+  (`EntityDecoder::point_cache_stats()`), not wall-clock: 5,880,000 accesses with dedup on
+  vs 2,940,000 with it off on a synthetic 980k-face BREP — exactly 2.00x — and 1.00x after.
+  Post-mesh `get_or_cache_by_hash` and `direct_rep_identity` still run, so genuinely repeated
+  large geometry still dedups and still instances (asserted by test).
+  **Lesson, and the reason this entry exists:** an end-to-end suite verdict **cannot be
+  produced for this lever on the current corpus.** The largest BREP across all 163 fixtures
+  is 8,848 faces, so nothing in the suite crosses a 20,000-face gate; a base-vs-branch A/B
+  swung -10%/+9%/-7% with the sign tracking run order, i.e. pure noise. Do not spend another
+  afternoon on `probe.sh --suite` for a threshold this corpus cannot reach — either add a
+  fixture above the gate, or measure with a deterministic counter as above. The 20,000 figure
+  is a judgement call (an order of magnitude clear of realistic repeated parts, which run to
+  low hundreds of faces), not a measured optimum.
+
+### Measured feature costs (not levers — recorded so nobody re-measures)
+- **Geometry fingerprint pass: world AABB + volume + closure verdict**
+  (#1891/#1988, PR #1993, measured 2026-08-02, base = merge-base `8f139a8e`).
+  The pass gained a per-triangle tetra determinant and a six-way bounds update.
+  Verdict: **hashing OFF is unaffected, hashing ON costs a fraction of a
+  percent.** Output byte-identical throughout — mesh/vertex/triangle counts
+  unchanged on every fixture, and an FNV-1a over every `geometryHashValues`
+  entry is equal base-vs-branch on all three (so the new arrays did not perturb
+  the fingerprint they ride with).
+  - Native `probe.sh --iters 5`, interleaved rounds, hashing off (the only mode
+    the native pipeline has — see the harness gap below): AC20-FZK-Haus
+    10 -> 10 ms total; ISSUE_129 median-of-6-rounds +1.4% inside a ±10%
+    round-to-round band (per-round minima 683..984 ms on base alone);
+    Holter/ISSUE_053 977 -> 967 ms (-1.0%). No signal either way.
+  - WASM boundary (`buildPrePassOnce` + `processGeometryBatch` in node, 3
+    interleaved rounds), min ms base -> branch: AC20 off 49.0 -> 49.1 (+0.2%),
+    on 50.1 -> 50.5 (+0.8%); ISSUE_129 off 1983.9 -> 1987.9 (+0.2%), on
+    1989.0 -> 1999.4 (+0.5%); Holter off 3555.7 -> 3600.1 (+1.2%), on
+    3790.6 -> 3849.8 (+1.6%).
+  - Turning the SWITCH on is the real cost, and it is the same on both sides:
+    off -> on is +2.9%/+0.6%/+6.9% on branch versus +2.2%/+0.3%/+6.6% on base,
+    i.e. this PR adds ~0.3-0.7 pp to a surcharge that only the diff feature pays.
+  - Honest outlier: hashing-off on Holter reads +1.2% at the wasm boundary while
+    the native probe on the same fixture reads -1.0%. Nothing in the
+    hashing-off path changed — the hasher is `None`, so every new accumulator is
+    dead code — and the delta sits inside the base's own 3528..3584 ms spread,
+    so read it as the 3.7 KB binary-size / code-layout shift, not added work.
+  - **Harness gap, worth fixing before the next hashing change:** `perf_probe`
+    CANNOT reach the hashing path. `process_geometry` -> `processor/jobs.rs`
+    hardcodes `MeshProductionOptions::default()`, so `geometry_hash` is always
+    `None` natively and the fingerprint pass only exists behind
+    `IfcAPI::setComputeGeometryHashes`. The hashing-on numbers above therefore
+    come from driving the real wasm entry point, not from `probe.sh`.
+
 ### Standing constraints
 - Geometry is **client-side only** (no server meshing).
 - One mesh home: `produce_element_meshes` - a fix in one pipeline diverges the other.

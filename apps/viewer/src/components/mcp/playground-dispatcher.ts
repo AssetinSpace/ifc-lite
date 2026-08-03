@@ -333,23 +333,35 @@ async function meshForClash(m: LoadedPlaygroundModel): Promise<MeshData[]> {
   const cached = getCachedMeshes(key);
   if (cached) return cached;
 
+  // Construction can't throw synchronously here (no wasm work happens until
+  // init()), so once we're past this line `processor` is a real object the
+  // finally below must dispose — on every exit, including the throw for
+  // empty meshes below.
   const processor = new GeometryProcessor({ preferNative: false });
-  await processor.init();
-  // Use our owning byte snapshot — store.source can be a detached sub-view.
-  const result = await processor.process(
-    m.bytes,
-    m.store.entityIndex.byId as unknown as Map<number, unknown>,
-  );
-  const meshes = result.meshes ?? [];
-  if (meshes.length === 0) {
-    throw new ToolExecutionError({
-      code: ToolErrorCode.UNSUPPORTED_OPERATION,
-      message: 'No mesh geometry could be produced for this model; clash detection needs tessellated solids.',
-      hint: 'Confirm the model carries explicit geometry (not schema/quantity-only data).',
-    });
+  try {
+    await processor.init();
+    // Use our owning byte snapshot — store.source can be a detached sub-view.
+    const result = await processor.process(
+      m.bytes,
+      m.store.entityIndex.byId as unknown as Map<number, unknown>,
+    );
+    const meshes = result.meshes ?? [];
+    if (meshes.length === 0) {
+      throw new ToolExecutionError({
+        code: ToolErrorCode.UNSUPPORTED_OPERATION,
+        message: 'No mesh geometry could be produced for this model; clash detection needs tessellated solids.',
+        hint: 'Confirm the model carries explicit geometry (not schema/quantity-only data).',
+      });
+    }
+    setCachedMeshes(key, meshes);
+    return meshes;
+  } finally {
+    // `result.meshes` is already copied out into plain JS MeshData — nothing
+    // downstream (the mesh cache, the clash engine) holds onto the WASM
+    // handle, so freeing it here is safe on every path above, including the
+    // throw.
+    processor.dispose();
   }
-  setCachedMeshes(key, meshes);
-  return meshes;
 }
 
 /**
@@ -1170,6 +1182,17 @@ const IMPLS: Record<string, ToolImpl> = {
 
   // ── Diff (needs two loaded models — uses ctx.registry) ────────────────
   async model_diff(m, args, ctx) {
+    if (args.by_content === true) {
+      // The stdio/HTTP server runs the @ifc-lite/diff engine here (#1891). The
+      // playground's dispatcher is a separate browser reimplementation that
+      // does not, and silently ignoring the flag would hand the agent a
+      // GlobalId set intersection labelled as a content diff.
+      throw new ToolExecutionError({
+        code: ToolErrorCode.UNSUPPORTED_OPERATION,
+        message: 'by_content is not available in the browser playground; the type/GlobalId diff is.',
+        hint: 'Run the MCP server locally (npx @ifc-lite/mcp) for content-keyed matching.',
+      });
+    }
     const { left, right } = resolveDiffModels(m, args, ctx);
     const types1 = new Map<string, number>();
     const types2 = new Map<string, number>();

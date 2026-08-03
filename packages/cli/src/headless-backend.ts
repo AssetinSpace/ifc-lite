@@ -41,7 +41,6 @@ import type {
 } from '@ifc-lite/sdk';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
-import { GeometryProcessor } from '@ifc-lite/geometry';
 import {
   addBeamToStore,
   addColumnToStore,
@@ -74,12 +73,15 @@ import {
   extractAllEntityAttributes,
   extractClassificationsOnDemand,
   extractMaterialsOnDemand,
+  extractPropertiesOnDemand,
+  extractQuantitiesOnDemand,
   extractTypePropertiesOnDemand,
   extractDocumentsOnDemand,
   extractRelationshipsOnDemand,
   extractScheduleOnDemand,
 } from '@ifc-lite/parser';
 import { exportToStep, StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { exportHbjson } from './hbjson-export.js';
 
 const MODEL_ID = 'default';
 
@@ -439,6 +441,19 @@ export class HeadlessBackend implements BimBackend {
   private getOrCreateStoreEditor(): StoreEditor {
     if (this.storeEditor) return this.storeEditor;
     this.mutationView = new MutablePropertyView(this.dataStore.properties || null, MODEL_ID);
+    // Give the overlay a base to merge against. The columnar parser leaves
+    // `store.properties` empty and serves properties on demand, so without these
+    // the view's *only* source is the overlay itself and `getForEntity` answers
+    // with the one edited pset and nothing else. `StepExporter` re-emits
+    // `getForEntity(id)` for every entity with a property mutation and skips the
+    // original records, so editing one property would drop every sibling
+    // property in that pset on save. Same wiring, same reason, as
+    // `packages/mcp/src/headless-backend.ts` and
+    // `apps/viewer/src/utils/configureMutationView.ts` (#2000, #2004).
+    if (this.dataStore.source?.length > 0) {
+      this.mutationView.setOnDemandExtractor((entityId) => extractPropertiesOnDemand(this.dataStore, entityId));
+      this.mutationView.setQuantityExtractor((entityId) => extractQuantitiesOnDemand(this.dataStore, entityId));
+    }
     this.storeEditor = new StoreEditor(this.dataStore, this.mutationView);
     return this.storeEditor;
   }
@@ -635,24 +650,9 @@ export class HeadlessBackend implements BimBackend {
         }
         return exportToStep(store, exportOpts);
       },
-      hbjson: async (name?: string): Promise<string> => {
-        // HBJSON is rebuilt analytically from the source IFC bytes (rooms/openings/
-        // shades/constructions/adjacency) via the wasm geometry engine.
-        const bytes = store.source;
-        if (!bytes || bytes.length === 0) {
-          throw new Error('HBJSON export needs the source IFC bytes, which this store did not retain.');
-        }
-        const processor = new GeometryProcessor();
-        await processor.init();
-        const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');
-        const result = processor.exportHbjson(bytes, baseName);
-        if (result === null) {
-          throw new Error('Geometry engine unavailable for HBJSON export.');
-        }
-        // The lens contract carries a string; HBJSON payloads are far below the
-        // V8 string ceiling, so decoding here is safe.
-        return new TextDecoder().decode(result);
-      },
+      hbjson: (name?: string): Promise<string> =>
+        // See hbjson-export.ts for the mutation-view application (issue #1908).
+        exportHbjson(store, this.mutationView, name ?? modelName),
       download(_content: string, _filename: string, _mimeType: string): void {
         /* no-op — CLI writes to stdout/file directly */
       },

@@ -3,15 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'vitest';
-import { IfcParser, EntityExtractor, type IfcDataStore } from '@ifc-lite/parser';
-import type { MutablePropertyView, Mutation } from '@ifc-lite/mutations';
-import { PropertyValueType } from '@ifc-lite/data';
+import { IfcParser, EntityExtractor, extractPropertiesOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import { PropertyValueType, QuantityType } from '@ifc-lite/data';
 import { isValidIfcGuid } from '@ifc-lite/encoding';
 import { MutablePropertyView as LiveMutablePropertyView } from '@ifc-lite/mutations';
 import { StepExporter } from './step-exporter.js';
 
 /** Decode Uint8Array content to string for test assertions */
 const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+
+/**
+ * A real `MutablePropertyView` wired to `store`, never a hand-rolled partial.
+ * Partial fakes silently stop exercising the exporter the moment it reads a
+ * method they don't implement — which is how the overlay-vs-history attribute
+ * bug (#1957) could have shipped unnoticed here.
+ */
+function liveView(store: IfcDataStore): LiveMutablePropertyView {
+  const view = new LiveMutablePropertyView(null, 'test-model');
+  view.setOnDemandExtractor((id: number) => extractPropertiesOnDemand(store, id));
+  return view;
+}
 
 type MockEntityRef = { expressId: number; type: string; byteOffset: number; byteLength: number; lineNumber: number };
 
@@ -204,32 +215,8 @@ describe('StepExporter', () => {
   it('updates type-owned HasPropertySets instead of creating a duplicate relationship', async () => {
     const parser = new IfcParser();
     const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
-    const mutations: Mutation[] = [{
-      id: 'mut_1',
-      type: 'UPDATE_PROPERTY',
-      timestamp: Date.now(),
-      modelId: 'test-model',
-      entityId: 67,
-      psetName: 'Pset_WallCommon',
-      propName: 'AcousticRating',
-      oldValue: 'This is Pset of the WallType',
-      newValue: 'Edited type value',
-      valueType: PropertyValueType.Label,
-    }];
-
-    const mutationView = {
-      getMutations: () => mutations,
-      getForEntity: (entityId: number) => entityId === 67 ? [{
-        name: 'Pset_WallCommon',
-        globalId: '3wkd_mjInDCfOthy7w_A6V',
-        properties: [{
-          name: 'AcousticRating',
-          type: PropertyValueType.Label,
-          value: 'Edited type value',
-        }],
-      }] : [],
-      getQuantitiesForEntity: () => [],
-    } as unknown as MutablePropertyView;
+    const mutationView = liveView(store);
+    mutationView.setProperty(67, 'Pset_WallCommon', 'AcousticRating', 'Edited type value', PropertyValueType.Label);
 
     const exporter = new StepExporter(store, mutationView);
     const result = exporter.export({ schema: 'IFC4', applyMutations: true });
@@ -319,32 +306,8 @@ describe('StepExporter', () => {
   it('reuses the project length unit when exporting property units', async () => {
     const parser = new IfcParser();
     const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
-    const mutations: Mutation[] = [{
-      id: 'mut_unit_1',
-      type: 'CREATE_PROPERTY',
-      timestamp: Date.now(),
-      modelId: 'test-model',
-      entityId: 74,
-      psetName: 'Pset_Custom',
-      propName: 'OffsetDistance',
-      newValue: 12.5,
-      valueType: PropertyValueType.Real,
-    }];
-
-    const mutationView = {
-      getMutations: () => mutations,
-      getForEntity: (entityId: number) => entityId === 74 ? [{
-        name: 'Pset_Custom',
-        globalId: 'test-pset',
-        properties: [{
-          name: 'OffsetDistance',
-          type: PropertyValueType.Real,
-          value: 12.5,
-          unit: 'METRE',
-        }],
-      }] : [],
-      getQuantitiesForEntity: () => [],
-    } as unknown as MutablePropertyView;
+    const mutationView = liveView(store);
+    mutationView.setProperty(74, 'Pset_Custom', 'OffsetDistance', 12.5, PropertyValueType.Real, 'METRE');
 
     const exporter = new StepExporter(store, mutationView);
     const result = exporter.export({ schema: 'IFC4', applyMutations: true });
@@ -357,31 +320,8 @@ describe('StepExporter', () => {
   it('generates valid IFC GlobalIds for new STEP entities', async () => {
     const parser = new IfcParser();
     const store = await parser.parseColumnar(new TextEncoder().encode(SIMPLE_TYPE_INHERITANCE_IFC).buffer);
-    const mutations: Mutation[] = [{
-      id: 'mut_guid_1',
-      type: 'CREATE_PROPERTY',
-      timestamp: Date.now(),
-      modelId: 'test-model',
-      entityId: 74,
-      psetName: 'Pset_GUID_Check',
-      propName: 'Marker',
-      newValue: 'ok',
-      valueType: PropertyValueType.Label,
-    }];
-
-    const mutationView = {
-      getMutations: () => mutations,
-      getForEntity: (entityId: number) => entityId === 74 ? [{
-        name: 'Pset_GUID_Check',
-        globalId: '',
-        properties: [{
-          name: 'Marker',
-          type: PropertyValueType.Label,
-          value: 'ok',
-        }],
-      }] : [],
-      getQuantitiesForEntity: () => [],
-    } as unknown as MutablePropertyView;
+    const mutationView = liveView(store);
+    mutationView.setProperty(74, 'Pset_GUID_Check', 'Marker', 'ok', PropertyValueType.Label);
 
     const exporter = new StepExporter(store, mutationView);
     const result = exporter.export({ schema: 'IFC4', applyMutations: true });
@@ -435,6 +375,118 @@ describe('StepExporter', () => {
 
     expect(content).toContain('#1=IFCCARTESIANPOINT((0.,0.,0.));');
     expect(content).not.toContain('#2=IFCCARTESIANPOINT');
+  });
+
+  // #1978: editing a pset/qset on an entity and then deleting that entity
+  // must not leave an IFCRELDEFINESBYPROPERTIES pointing at a #N with no
+  // defining line. The entity-emission loop (step-exporter.ts:~589) already
+  // skips the deleted entity itself; the pset/qset generation loops read
+  // from the same unfiltered mutation history and did not.
+  it('does not emit a dangling IFCRELDEFINESBYPROPERTIES for a deleted entity with a pset edit', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCWALL', "#1=IFCWALL('1ys5Xwuxz8gPJk6N$NGhAG',$,'Wall',$,$,$,$,$);"],
+    ]);
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setProperty(1, 'Pset_WallCommon', 'IsExternal', true, PropertyValueType.Boolean);
+    view.deleteEntity(1);
+
+    const result = new StepExporter(dataStore, view).export({
+      schema: 'IFC4',
+      applyMutations: true,
+    });
+    const content = decode(result.content);
+
+    expect(content).not.toContain('#1=IFCWALL');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  it('does not emit a dangling IFCRELDEFINESBYPROPERTIES for a deleted entity with a quantity edit', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCWALL', "#1=IFCWALL('1ys5Xwuxz8gPJk6N$NGhAG',$,'Wall',$,$,$,$,$);"],
+    ]);
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setQuantity(1, 'Qto_WallBaseQuantities', 'Length', 3, QuantityType.Length);
+    view.deleteEntity(1);
+
+    const result = new StepExporter(dataStore, view).export({
+      schema: 'IFC4',
+      applyMutations: true,
+    });
+    const content = decode(result.content);
+
+    expect(content).not.toContain('#1=IFCWALL');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // Adjacent hole flagged on #1996 by louistrue: `deleteEntity` FORGETS an
+  // overlay-created entity (removes it from `newEntities`) rather than
+  // tombstoning it, so `isDeleted()` returns false for it and the #1978
+  // guards above never fire. A created-then-deleted entity's pset/qset
+  // mutations are still in history and must not be emitted either.
+  it('does not emit a dangling IFCRELDEFINESBYPROPERTIES for a created-then-deleted entity with a pset edit', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCWALL', "#1=IFCWALL('1ys5Xwuxz8gPJk6N$NGhAG',$,'Wall',$,$,$,$,$);"],
+    ]);
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setExpressIdWatermark(1);
+    const created = view.createEntity('IFCWALL', []);
+    view.setProperty(created.expressId, 'Pset_WallCommon', 'IsExternal', true, PropertyValueType.Boolean);
+    view.deleteEntity(created.expressId);
+
+    const result = new StepExporter(dataStore, view).export({
+      schema: 'IFC4',
+      applyMutations: true,
+    });
+    const content = decode(result.content);
+
+    expect(content).not.toContain(`#${created.expressId}=IFCWALL`);
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  it('does not emit a dangling IFCRELDEFINESBYPROPERTIES for a created-then-deleted entity with a quantity edit', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCWALL', "#1=IFCWALL('1ys5Xwuxz8gPJk6N$NGhAG',$,'Wall',$,$,$,$,$);"],
+    ]);
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setExpressIdWatermark(1);
+    const created = view.createEntity('IFCWALL', []);
+    view.setQuantity(created.expressId, 'Qto_WallBaseQuantities', 'Length', 3, QuantityType.Length);
+    view.deleteEntity(created.expressId);
+
+    const result = new StepExporter(dataStore, view).export({
+      schema: 'IFC4',
+      applyMutations: true,
+    });
+    const content = decode(result.content);
+
+    expect(content).not.toContain(`#${created.expressId}=IFCWALL`);
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // The third route by which an entity's own line is dropped, after the
+  // tombstone and the forgotten create: `visibleOnly` filtering. The entity
+  // loop skips anything outside `allowedEntityIds`, so a pset edited on an
+  // entity that is then hidden used to emit an IFCRELDEFINESBYPROPERTIES
+  // pointing at a line the visibility filter had already removed.
+  it('does not emit a dangling IFCRELDEFINESBYPROPERTIES for a hidden entity under visibleOnly', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,$,$);"],
+      [2, 'IFCWALL', "#2=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA2',$,'Wall',$,$,$,$,$);"],
+      [3, 'IFCDOOR', "#3=IFCDOOR('1ys5Xwuxz8gPJk6N$NGhA3',$,'Door',$,$,$,$,$);"],
+    ]);
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setProperty(3, 'Pset_DoorCommon', 'IsExternal', true, PropertyValueType.Boolean);
+
+    const result = new StepExporter(dataStore, view).export({
+      schema: 'IFC4',
+      applyMutations: true,
+      visibleOnly: true,
+      hiddenEntityIds: new Set([3]),
+    });
+    const content = decode(result.content);
+
+    expect(content).not.toContain('#3=IFCDOOR');
+    expect(findDanglingRefs(content)).toEqual([]);
   });
 
   it('applies positional attribute mutations to non-IfcRoot entities', () => {

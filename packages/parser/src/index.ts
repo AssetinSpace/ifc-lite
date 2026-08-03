@@ -34,7 +34,7 @@ export {
   type ResolvedUnit,
   type MeasureUnit,
 } from './project-units.js';
-export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, getRawNamedAttributes, extractRootAttributesFromEntity, extractClassificationsOnDemand, extractMaterialsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractMaterialPropertiesForMaterialId, resolveMaterialDefId, resolveAllMaterialDefIds, collectMaterialLeaves, buildMaterialUsageIndex, getMaterialDisplay, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractTypeQuantitiesOnDemand, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type MaterialPsetGroup, type MaterialLeaf, type MaterialUsage, type TypePropertyInfo, type TypeQuantityInfo, type DocumentInfo, type EntityRelationships, type GroupMember } from './columnar-parser.js';
+export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, getRawNamedAttributes, extractRootAttributesFromEntity, extractClassificationsOnDemand, extractMaterialsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractMaterialPropertiesForMaterialId, resolveMaterialDefId, resolveAllMaterialDefIds, collectMaterialLeaves, buildMaterialUsageIndex, getMaterialDisplay, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractTypeQuantitiesOnDemand, mergeInheritedPropertySets, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type MaterialPsetGroup, type MaterialLeaf, type MaterialUsage, type TypePropertyInfo, type TypeQuantityInfo, type DocumentInfo, type EntityRelationships, type GroupMember } from './columnar-parser.js';
 export type { IfcStoreBase, IfcSourceHeader, SpatialHierarchy, EntityTable } from '@ifc-lite/data';
 export { parseSourceHeader } from './source-header.js';
 export { attachDataStoreAccessors, type IfcStoreData } from './data-store-accessors.js';
@@ -124,7 +124,24 @@ export {
 } from './generated/serializers.js';
 
 export * from './types.js';
-export { getAttributeNames, getAttributeNamesAcrossSchemas, getAttributeNameAt, isKnownType, normalizeIfcTypeName } from './ifc-schema.js';
+// `getInheritanceChainAcrossSchemas` is the counterpart of
+// `getAttributeNamesAcrossSchemas`: it answers for every bundled schema
+// (IFC2X3 + IFC4 + IFC4X3), where the generated `getInheritanceChainForEntity`
+// above only knows the codegen pin (IFC4_ADD2_TC1) and returns an empty chain
+// for a class the pin does not carry — `IfcMove`, `IfcSpaceProgram`, `IfcRoad`.
+// Anything that decides *what kind of thing* an entity is must use this one.
+// `isKnownType` and `normalizeIfcTypeName` are cross-schema too, despite the
+// unqualified names — they were pin-only until #2003.
+//
+// NAMING FOOTGUN, recorded rather than fixed here: the pinned helper has the
+// shorter, more obvious name (`getInheritanceChainForEntity`) and the correct
+// one carries the qualifier, so reaching for the wrong one is the path of least
+// resistance — five call sites have now been fixed after the fact (#2001, #2003,
+// #2014, this one). The qualifier belongs on the *pinned* function
+// (`…ForEntityInIfc4Pin`), leaving the union walker the plain name, so the easy
+// choice is the safe one. That is a rename across every consumer and does not
+// belong in a fix PR; it needs its own.
+export { getAttributeNames, getAttributeNamesAcrossSchemas, getAttributeNameAt, isKnownType, normalizeIfcTypeName, resolveEntityNameAlias, getInheritanceChain as getInheritanceChainAcrossSchemas } from './ifc-schema.js';
 
 import type { IfcEntity, ParseResult } from './types.js';
 import { EntityIndexBuilder } from './entity-index.js';

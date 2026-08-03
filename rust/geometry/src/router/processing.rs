@@ -370,20 +370,8 @@ impl GeometryRouter {
                 Error::geometry("Failed to resolve MappedRepresentation".to_string())
             })?;
 
-            // Get MappingTarget transformation
-            let mapping_transform = if let Some(target_attr) = item.get(1) {
-                if !target_attr.is_null() {
-                    if let Some(target_entity) = decoder.resolve_ref(target_attr)? {
-                        Some(self.parse_cartesian_transformation_operator(&target_entity, decoder)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // MappingTarget · MappingOrigin (#1985: the origin used to be dropped).
+            let mapping_transform = self.mapped_item_transform(item, &source_entity, decoder)?;
 
             // #1623 Phase 2/3 "don't-bake": if this top-level mapped item's source is
             // a REPEATED (count >= 2) single-solid `IfcRepresentationMap` the armed
@@ -754,6 +742,30 @@ impl GeometryRouter {
         if !(base || extra) {
             return None;
         }
+        // Skip the hash walk entirely for a faceted BREP too large for dedup to
+        // ever pay off (#1909): `try_faceted_brep_signature` mirrors the
+        // mesher's own face/bound/loop/point traversal, so on a huge one-off
+        // BREP (a single ~2.5M-triangle import, no sibling item to match) the
+        // hash is a full second traversal with zero possible payback — it
+        // measured ~30s where the equivalent web-ifc load took ~2.85s, almost
+        // entirely this walk. The face-count probe is a cheap O(faces) prefix
+        // of the same walk (shell ref + face list, no per-point decode), so
+        // bailing here costs nothing extra. Below the threshold (Tekla-style
+        // small repeated parts, the case this cache exists for) behavior is
+        // unchanged. Skipping this pre-mesh cache does NOT disable dedup for a
+        // genuinely repeated large BREP: the post-mesh `get_or_cache_by_hash`
+        // (sampled, O(1) regardless of mesh size) and the instancing
+        // `rep_identity` (`direct_rep_identity`, computed unconditionally after
+        // meshing) both still run, so repeated large geometry still collapses
+        // to one GPU-instanced template — it just re-meshes each occurrence
+        // instead of skipping the mesh on a cache hit.
+        if item.ifc_type == IfcType::IfcFacetedBrep {
+            if let Some(face_count) = super::content_hash::faceted_brep_face_count(decoder, item.id) {
+                if face_count > super::content_hash::FACETED_BREP_DEDUP_FACE_LIMIT {
+                    return None;
+                }
+            }
+        }
         let structural = {
             let mut memo = self.content_sig_memo.borrow_mut();
             super::content_hash::item_signature(decoder, item.id, &mut memo)
@@ -875,20 +887,9 @@ impl GeometryRouter {
 
         let source_id = source_entity.id;
 
-        // Get MappingTarget transformation (attribute 1: CartesianTransformationOperator)
-        let mapping_transform = if let Some(target_attr) = item.get(1) {
-            if !target_attr.is_null() {
-                if let Some(target_entity) = decoder.resolve_ref(target_attr)? {
-                    Some(self.parse_cartesian_transformation_operator(&target_entity, decoder)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // MappingTarget (attr 1) composed over the map's MappingOrigin (attr 0),
+        // which applies innermost. #1985
+        let mapping_transform = self.mapped_item_transform(item, &source_entity, decoder)?;
 
         // Check cache first. The model-wide shared cache (#1623) takes precedence
         // over the per-router RefCell fallback so a source shared across owning
