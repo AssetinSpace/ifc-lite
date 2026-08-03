@@ -3511,6 +3511,7 @@
     "resolveEntityNameAlias: function",
     "resolveMaterialDefId: function",
     "scanIfcEntities: function",
+    "secondsToIso8601Duration: function",
     "serializeScheduleToStep: function",
     "serializeValue: function",
     "toStepLine: function",
