@@ -296,6 +296,9 @@ impl MeshDataJs {
     /// `positions` and need no coordinate flip (they are 2D); the winding
     /// reversal in `new` swaps indices, not vertices, so per-vertex UVs stay
     /// aligned. Call after `new`.
+    // Each arg is a distinct JS call parameter; a Rust struct would not reduce
+    // arity for JS callers. Matches the 21 other sites in this crate.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_texture(
         &mut self,
         uvs: Vec<f32>,
