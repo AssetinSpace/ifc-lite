@@ -278,6 +278,22 @@ export class StepExporter {
     const skipPropertySetIds = new Set<number>();
     const skipRelationshipIds = new Set<number>();
 
+    // `getMutations()` / `getAttributeMutationsByEntity()` return unfiltered
+    // history and do not consult tombstones (#1978): an entity edited and then
+    // deleted still has pset/qset mutations grouped above into
+    // `newPropertySets` / `newQuantitySets` / `typeOwnedPsetNamesByEntity`.
+    // The entity-emission loop below skips the deleted entity's own line, so
+    // without this guard the pset/qset generators would still write an
+    // `IFCRELDEFINESBYPROPERTIES` referencing a `#N` with no defining line —
+    // a dangling ref and an invalid file.
+    const overlayActive = !!this.mutationView && (options.applyMutations !== false);
+    // `isDeleted` is optional on the overlay, so probe it per call rather than
+    // assuming it exists (the entity loop below has always done the same).
+    const isTombstoned = (entityId: number): boolean =>
+      overlayActive
+      && typeof this.mutationView!.isDeleted === 'function'
+      && this.mutationView!.isDeleted(entityId);
+
     // Process mutations if we have a mutation view
     if (this.mutationView && (options.applyMutations !== false)) {
       const mutations = this.mutationView.getMutations();
@@ -585,6 +601,42 @@ export class StepExporter {
     // references to them, producing dangling #-refs in the output.
     const completeIndex = getCompleteEntityIndex(this.dataStore);
 
+    // Adjacent hole to #1978, flagged on the PR by louistrue: `deleteEntity`
+    // FORGETS an overlay-created entity (drops it from `newEntities`) rather
+    // than tombstoning it — see mutable-property-view.ts `deleteEntity` — so
+    // `isTombstoned` above returns false for a created-then-deleted entity
+    // and the four guards below never fire for it. Its pset/qset mutations
+    // are still grouped into `newPropertySets` / `newQuantitySets` /
+    // `typeOwnedPsetNamesByEntity` from unfiltered history and would still
+    // reference a #N with no defining line.
+    //
+    // `willBeEmitted` answers what those guards actually need: will this id
+    // have a defining STEP line in the output at all? A source-buffer id
+    // resolves through `completeIndex` (a real, non-overlay-placeholder
+    // entry — mirrors the skip condition at the entity loop below — that
+    // isn't tombstoned); an overlay id has no `completeIndex` entry ever
+    // (created entities are never written into `entityIndex.byId`), so it
+    // resolves through `getNewEntity`, which returns null once `deleteEntity`
+    // forgets it. This does not change behaviour for real entities under
+    // `deltaOnly`/`exportPropertiesOnly` — they still resolve via
+    // `completeIndex` regardless of whether their own line gets copied.
+    const willBeEmitted = (entityId: number): boolean => {
+      if (isTombstoned(entityId)) return false;
+      // Visibility filtering is a third way an entity's own line is dropped,
+      // alongside a tombstone and a forgotten create. Both emission loops
+      // below skip a hidden entity (`allowedEntityIds` is consulted in the
+      // source-entity loop and again in the new-entities pass), so emitting
+      // its psets would reference a `#N` that never gets written. Read at
+      // call time: this closure runs long after the closure below assigns it.
+      if (allowedEntityIds !== null && !allowedEntityIds.has(entityId)) return false;
+      const ref = completeIndex.get(entityId);
+      if (ref && ref.byteLength > 0 && ref.byteOffset >= 0) return true;
+      if (overlayActive && typeof this.mutationView!.getNewEntity === 'function') {
+        return this.mutationView!.getNewEntity(entityId) !== null;
+      }
+      return false;
+    };
+
     // Build visible-only closure if requested
     let allowedEntityIds: Set<number> | null = null;
     if (options.visibleOnly && this.dataStore.source) {
@@ -621,10 +673,9 @@ export class StepExporter {
       const source = this.dataStore.source;
 
       // Extract existing entities from source
-      const overlayActive = !!this.mutationView && (options.applyMutations !== false);
       for (const [expressId, entityRef] of completeIndex) {
         // Skip entities deleted via the overlay (only when mutations are applied)
-        if (overlayActive && typeof this.mutationView!.isDeleted === 'function' && this.mutationView!.isDeleted(expressId)) {
+        if (isTombstoned(expressId)) {
           continue;
         }
 
@@ -726,6 +777,10 @@ export class StepExporter {
 
     // Generate new property entities for mutations (these REPLACE the skipped ones)
     for (const { entityId, psets } of newPropertySets) {
+      // Skip mutations against an entity that will not appear in the output —
+      // tombstoned (#1978) or overlay-created-then-forgotten (adjacent hole
+      // above) — see the `willBeEmitted` comment above.
+      if (!willBeEmitted(entityId)) continue;
       const newEntities = this.generatePropertySetEntities(
         entityId,
         psets,
@@ -753,6 +808,11 @@ export class StepExporter {
     // Handle type-owned pset deletions with no replacement pset content
     for (const [entityId, typeOwnedPsetNames] of typeOwnedPsetNamesByEntity) {
       if (rewrittenEntityLines.has(entityId)) continue;
+      // Skip mutations against an entity that will not appear in the output —
+      // see the `willBeEmitted` comment above. `entityId` here may be a TYPE
+      // entity (HasPropertySets owner), not an element; `willBeEmitted`
+      // resolves either the same way.
+      if (!willBeEmitted(entityId)) continue;
       const rewritten = this.rewriteTypeEntityHasPropertySets(
         entityId,
         typeOwnedPsetIdsByEntity.get(entityId) ?? [],
@@ -766,6 +826,9 @@ export class StepExporter {
 
     // Generate new quantity entities for mutations
     for (const { entityId, qsets } of newQuantitySets) {
+      // Skip mutations against an entity that will not appear in the output —
+      // see the `willBeEmitted` comment above.
+      if (!willBeEmitted(entityId)) continue;
       const newEntities = this.generateQuantitySetEntities(entityId, qsets, allowedEntityIds, options.guidRandom);
       entities.push(...newEntities.lines);
       newEntityCount += newEntities.count;
