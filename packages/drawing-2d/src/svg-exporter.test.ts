@@ -77,17 +77,25 @@ describe('SVGExporter underlays', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// computeTransform() characterisation (drift risk flagged on PR #2119: this
+// is one of four "world metres -> paper millimetres at scale N" transforms
+// in the codebase, see also sheet-types.test.ts and pdf-scale.test.ts).
+//
+// This transform centers the drawing on a FIXED, caller-chosen paper size
+// (no re-fit/clamp — always the exact requested scale) and flips Y.
+//
 // `padding` option (SVGExportOptions.padding, "Padding around drawing in mm")
 //
 // `computeTransform` derived `availableWidth`/`availableHeight` from padding
 // but never read them anywhere — `padding` was a documented no-op since the
-// exporter's original commit. Fix: treat padding as a minimum-margin
-// guarantee. It never re-scales a drawing that already fits inside the
-// padded area (the requested `scale` is otherwise exact, un-refit), but if
-// the drawing at the requested scale would leave less than `padding` mm of
-// margin — or overflow the paper — the effective scale is shrunk just
-// enough to respect the margin. Centring is unaffected (padding is uniform
-// on all sides, so the padded area shares the paper's center).
+// exporter's original commit (see git history for the now-removed
+// characterisation test that pinned that no-op). Fix: treat padding as a
+// minimum-margin guarantee. It never re-scales a drawing that already fits
+// inside the padded area (the requested `scale` is otherwise exact,
+// un-refit), but if the drawing at the requested scale would leave less than
+// `padding` mm of margin — or overflow the paper — the effective scale is
+// shrunk just enough to respect the margin. Centring is unaffected (padding
+// is uniform on all sides, so the padded area shares the paper's center).
 // ═══════════════════════════════════════════════════════════════════════════
 
 const cutLine = (start: { x: number; y: number }, end: { x: number; y: number }): DrawingLine => ({
@@ -125,6 +133,10 @@ const scaleByFactor = (factor: number) => COMMON_SCALES.find((s) => s.factor ===
 
 /** Pull `x1/y1/x2/y2` off the single `<line .../>` element the fixture emits. */
 const extractLineCoords = (svg: string): { x1: number; y1: number; x2: number; y2: number } => {
+  // Grab each individual self-closed `<line .../>` element (stopping at its
+  // OWN `/>`, so this can't span into a later element), then pick the one
+  // element carrying `data-entity-id` — the real drawing line, as opposed to
+  // the `<line>` elements inside the hatch-pattern `<defs>`, which have none.
   const elements = svg.match(/<line [^]*?\/>/g) ?? [];
   const entityLine = elements.find((el) => el.includes('data-entity-id'));
   if (!entityLine) throw new Error(`No entity <line> element found in SVG:\n${svg}`);
@@ -132,6 +144,47 @@ const extractLineCoords = (svg: string): { x1: number; y1: number; x2: number; y
   if (!match) throw new Error(`Entity <line> element missing coordinates:\n${entityLine}`);
   return { x1: Number(match[1]), y1: Number(match[2]), x2: Number(match[3]), y2: Number(match[4]) };
 };
+
+describe('SVGExporter.computeTransform (characterisation, via exportToSVG)', () => {
+  it('centers the drawing on the paper at exact scale 1:100, flipping Y (A3 landscape, 420x297mm)', () => {
+    // bounds: 4m x 6m box, center (2, 3). worldToMm = 1000/100 = 10.
+    // offsetX = 420/2 - 2*10 = 190; offsetY = 297/2 + 3*10 = 178.5.
+    const drawing = drawingWithLine(
+      { min: { x: 0, y: 0 }, max: { x: 4, y: 6 } },
+      { x: 0, y: 0 },
+      { x: 2, y: 3 }
+    );
+    const svg = exportToSVG(drawing, {
+      paperSize: PAPER_SIZES.A3_LANDSCAPE,
+      scale: scaleByFactor(100),
+      padding: 20,
+    });
+    const { x1, y1, x2, y2 } = extractLineCoords(svg);
+    expect(x1).toBeCloseTo(190, 3);
+    expect(y1).toBeCloseTo(178.5, 3);
+    expect(x2).toBeCloseTo(210, 3); // 2*10 + 190
+    expect(y2).toBeCloseTo(148.5, 3); // -3*10 + 178.5 (Y flipped)
+  });
+
+  it('scales linearly with the chosen scale factor (1:50 doubles mm-per-metre vs 1:100)', () => {
+    const drawing = drawingWithLine(
+      { min: { x: 0, y: 0 }, max: { x: 4, y: 6 } },
+      { x: 0, y: 0 },
+      { x: 2, y: 3 }
+    );
+    const svg = exportToSVG(drawing, {
+      paperSize: PAPER_SIZES.A3_LANDSCAPE,
+      scale: scaleByFactor(50),
+      padding: 20,
+    });
+    const { x1, y1, x2, y2 } = extractLineCoords(svg);
+    // worldToMm = 1000/50 = 20. offsetX = 210 - 2*20 = 170; offsetY = 148.5 + 3*20 = 208.5.
+    expect(x1).toBeCloseTo(170, 3);
+    expect(y1).toBeCloseTo(208.5, 3);
+    expect(x2).toBeCloseTo(210, 3); // 2*20 + 170
+    expect(y2).toBeCloseTo(148.5, 3); // -3*20 + 208.5
+  });
+});
 
 describe('SVGExporter padding option', () => {
   it('padding: 0 and omitted padding produce byte-identical SVG (compatibility guarantee)', () => {

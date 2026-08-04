@@ -26,7 +26,7 @@ import { toast } from '@/components/ui/toast';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
 import { useDraggablePanel } from '@/hooks/useDraggablePanel';
-import { GraphicOverrideEngine } from '@ifc-lite/drawing-2d';
+import { GraphicOverrideEngine, COMMON_SCALES } from '@ifc-lite/drawing-2d';
 import { type GeometryResult } from '@ifc-lite/geometry';
 import { DrawingSettingsPanel } from './DrawingSettingsPanel';
 import { DxfUnderlayPanel } from './DxfUnderlayPanel';
@@ -473,7 +473,7 @@ export function Section2DPanel({
     legacyPointClouds: geometryResult?.pointClouds,
   });
 
-  const { formatDistance, handleExportSVG, handleExportDXF, handlePrint } = useDrawingExport({
+  const { formatDistance, handleExportSVG, handleExportDXF, handleExportPDF, handlePrint } = useDrawingExport({
     drawing, displayOptions, sectionPlane, activePresetId,
     entityColorMap, overridesEnabled, overrideEngine,
     measure2DResults, polygonArea2DResults, textAnnotations2D, cloudAnnotations2D,
@@ -481,6 +481,34 @@ export function Section2DPanel({
     ifcDataStore, coordinateInfo: geometryResult?.coordinateInfo,
     scanSection: scanSectionLayer,
   });
+
+  // Scale prompt for the scaled PDF export (issue #2042). A proper
+  // scale-selector dropdown (presets + custom input, matching the issue's
+  // exact wording) is a follow-up; this is the "smallest useful version"
+  // — it still gives every requested scale (defaults to "as displayed",
+  // accepts any of the common presets or a fully custom denominator) and
+  // never guesses silently. `window.prompt` matches this hook's existing
+  // `alert`-based error surface (no toast wiring here); see useDrawingExport.
+  const handleExportPdfPrompt = useCallback(() => {
+    const presetHint = COMMON_SCALES.map((s) => s.name).join(', ');
+    const asDisplayed = displayOptions.scale || 100;
+    const input = window.prompt(
+      `Export PDF at scale 1:N — enter N, or leave blank for "as displayed" (currently 1:${asDisplayed}).\nCommon scales: ${presetHint}`,
+      String(asDisplayed)
+    );
+    if (input === null) return; // cancelled
+    const trimmed = input.trim();
+    if (trimmed === '') {
+      handleExportPDF();
+      return;
+    }
+    const n = Number(trimmed.replace(/^1:/, ''));
+    if (!Number.isFinite(n) || n <= 0) {
+      window.alert(`Invalid scale "${input}". Enter a positive number, e.g. 100 for 1:100.`);
+      return;
+    }
+    handleExportPDF(n);
+  }, [displayOptions.scale, handleExportPDF]);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // CALLBACKS
@@ -908,6 +936,15 @@ export function Section2DPanel({
               <Button
                 variant="ghost"
                 size="icon-sm"
+                onClick={handleExportPdfPrompt}
+                disabled={!drawing}
+                title="Download PDF (to scale)"
+              >
+                <FileText className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
                 onClick={handlePrint}
                 disabled={!drawing}
                 title="Print"
@@ -1033,6 +1070,10 @@ export function Section2DPanel({
                   <DropdownMenuItem onClick={handleExportDXF} disabled={!drawing}>
                     <FileDown className="h-4 w-4 mr-2" />
                     Download DXF
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={handleExportPdfPrompt} disabled={!drawing}>
+                    <FileText className="h-4 w-4 mr-2" />
+                    Download PDF (to scale)
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={handlePrint} disabled={!drawing}>
                     <Printer className="h-4 w-4 mr-2" />

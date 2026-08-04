@@ -11,11 +11,14 @@ import {
   renderTitleBlock,
   calculateDrawingTransform,
   exportToDXF,
+  formatScaleFactorLabel,
   type Drawing2D,
   type DrawingSheet,
   type ElementData,
   type TitleBlockExtras,
+  type PdfScaleLayout,
 } from '@ifc-lite/drawing-2d';
+import { computePdfSectionLayout, makeSectionMapPoint } from '@/hooks/pdfSectionLayout';
 import { getFillColorForType } from '@/components/viewer/Drawing2DCanvas';
 import { formatDistance } from '@/components/viewer/tools/formatDistance';
 import { formatArea, computePolygonCentroid } from '@/components/viewer/tools/computePolygonArea';
@@ -171,6 +174,12 @@ interface UseDrawingExportResult {
   formatDistance: (distance: number) => string;
   handleExportSVG: () => void;
   handleExportDXF: () => void;
+  /**
+   * Export the section as a true-vector PDF at an exact scale (issue #2042).
+   * `scaleFactor` is the "N" in "1:N" (e.g. 100 for 1:100); omit to use the
+   * drawing's current on-screen scale ("as displayed").
+   */
+  handleExportPDF: (scaleFactor?: number) => void;
   handlePrint: () => void;
 }
 
@@ -870,6 +879,144 @@ function useDrawingExport({
     storeModels, anchorModelIdOverride, georefMutations, mutationVersion,
   ]);
 
+  // Export scaled PDF (issue #2042): a true-vector PDF sized so the
+  // requested scale ("1:N") is EXACT — the page itself is sized to the
+  // drawing extent + margin (via computePdfScaleLayout) rather than fit
+  // into a fixed named paper size, so the scale can never be silently
+  // shrunk to make the drawing fit (see pdf-scale.ts for why that matters).
+  //
+  // v1 scope, deliberately smaller than the SVG export: cut-polygon
+  // OUTLINES and drawing LINES only (matching what an engineer actually
+  // measures off a printed section). Not yet included: area fills /
+  // hatching, DXF underlays, the drawing-sheet title block/frame/scale
+  // bar, text/cloud annotations, and the point-cloud scan overlay. Those
+  // are straightforward follow-ups once this scale plumbing is reviewed;
+  // see the PR description.
+  const handleExportPDF = useCallback((scaleFactor?: number) => {
+    if (!drawing) return;
+    const effectiveScale = scaleFactor ?? displayOptions.scale ?? 100;
+
+    // Axis-specific flipping, matching the SVG "as displayed" export above.
+    // The layout (page size + offsets) MUST be derived from the bounds as
+    // they are actually drawn (i.e. flipped), not the raw drawing bounds —
+    // see pdfSectionLayout.ts module doc: deriving it from un-flipped bounds
+    // only lands the drawing on the page when bounds happen to be symmetric
+    // about zero, which is not the case for a model at ordinary world
+    // coordinates (showstopper found on PR #2119).
+    const currentAxis = sectionPlane.axis;
+    let layout: PdfScaleLayout;
+    try {
+      layout = computePdfSectionLayout(drawing.bounds, currentAxis, effectiveScale, 10);
+    } catch (err) {
+      // eslint-disable-next-line no-alert -- matches handlePrint's popup-blocked alert below; this hook has no toast wiring.
+      alert(err instanceof Error ? err.message : 'Could not export PDF: invalid scale.');
+      return;
+    }
+    const mapPoint = makeSectionMapPoint(currentAxis, layout);
+
+    void (async () => {
+      try {
+        const { jsPDF } = await import('jspdf');
+        const { widthMm, heightMm } = layout.page;
+        const doc = new jsPDF({
+          unit: 'mm',
+          format: [widthMm, heightMm],
+          orientation: widthMm >= heightMm ? 'landscape' : 'portrait',
+        });
+
+        doc.setDrawColor(0, 0, 0);
+        doc.setLineCap('round');
+
+        // Cut polygon outlines (outer ring + holes), stroke only.
+        doc.setLineWidth(0.5);
+        for (const polygon of drawing.cutPolygons) {
+          const rings = [polygon.polygon.outer, ...polygon.polygon.holes];
+          for (const ring of rings) {
+            if (ring.length < 2) continue;
+            const points = ring.map((p) => mapPoint(p.x, p.y));
+            const deltas = points.slice(1).map((p, i) => [p.x - points[i].x, p.y - points[i].y]);
+            doc.lines(deltas, points[0].x, points[0].y, [1, 1], 'S', true);
+          }
+        }
+
+        // Entities actually covered by a cut-polygon outline above. Loop
+        // reconstruction (`PolygonBuilder.buildLoops`) can fail for short,
+        // degenerate, or ambiguous cross-sections and drop an entity's
+        // `cutPolygons` entirely while `drawing.lines` still carries valid
+        // `category: 'cut'` edges for that same entity (same source
+        // `cutSegments`, but polygon-building is a separate, fallible
+        // reconstruction, not a lockstep derivation — see #2119 review). Skip
+        // cut-category lines ONLY for entities that a polygon outline
+        // already covers; otherwise they are the sole remaining record of
+        // that cut and must still be drawn, or the geometry silently
+        // vanishes from the PDF.
+        const entitiesWithCutPolygon = new Set(
+          drawing.cutPolygons.map((p) => `${p.modelIndex}:${p.entityId}`)
+        );
+
+        // Drawing lines (projection/hidden/silhouette/crease/boundary).
+        for (const line of drawing.lines) {
+          if (
+            line.category === 'cut' &&
+            entitiesWithCutPolygon.has(`${line.modelIndex}:${line.entityId}`)
+          ) {
+            continue;
+          }
+          if (!displayOptions.showHiddenLines && line.visibility === 'hidden') continue;
+
+          const { start, end } = line.line;
+          if (!isFinite(start.x) || !isFinite(start.y) || !isFinite(end.x) || !isFinite(end.y)) continue;
+
+          let lineWidth = 0.25;
+          let dash: number[] = [];
+          switch (line.category) {
+            case 'cut': lineWidth = 0.5; break; // matches the polygon-outline stroke width above (fallback path only)
+            case 'hidden': lineWidth = 0.18; dash = [1, 0.6]; break;
+            case 'silhouette': lineWidth = 0.35; break;
+            case 'crease': lineWidth = 0.18; break;
+            case 'boundary': lineWidth = 0.25; break;
+            case 'annotation': lineWidth = 0.13; break;
+            default: lineWidth = 0.25;
+          }
+          if (line.visibility === 'hidden') {
+            dash = [1, 0.6];
+            lineWidth *= 0.7;
+          }
+
+          const p0 = mapPoint(start.x, start.y);
+          const p1 = mapPoint(end.x, end.y);
+          doc.setLineWidth(lineWidth);
+          doc.setLineDashPattern(dash, 0);
+          doc.line(p0.x, p0.y, p1.x, p1.y);
+        }
+        doc.setLineDashPattern([], 0);
+
+        // v1 has no title block, so this filename is the SOLE record of the
+        // sheet's scale — round-tripping through Math.round() here would
+        // file a 1:99.5 export as "…-1-100", silently misreporting it (same
+        // defect class as PR #2131's title-block scale label). Reuse that
+        // formatting (round to 2dp, strip trailing zeros) instead of
+        // re-deriving it.
+        const stem = `section-${sectionPlane.axis}-${sectionPlane.position}-1-${formatScaleFactorLabel(effectiveScale)}`;
+        downloadFile(doc.output('blob'), `${stem}.pdf`, 'application/pdf');
+        posthog.capture('drawing_exported', {
+          format: 'pdf',
+          axis: sectionPlane.axis,
+          scale_factor: effectiveScale,
+        });
+      } catch (err) {
+        // The dynamic `jspdf` import, PDF construction and download all run
+        // in this async IIFE, outside the synchronous try/catch above (which
+        // only guards the scale/layout arithmetic). A failed chunk load —
+        // the most likely failure here — used to surface as an unhandled
+        // promise rejection with no user feedback at all. Match the
+        // synchronous path's alert() rather than fail silently.
+        // eslint-disable-next-line no-alert -- matches the synchronous scale-validation alert above.
+        alert(err instanceof Error ? `Could not export PDF: ${err.message}` : 'Could not export PDF.');
+      }
+    })();
+  }, [drawing, displayOptions.scale, displayOptions.showHiddenLines, sectionPlane]);
+
   // Print handler
   const handlePrint = useCallback(() => {
     // Use sheet export if enabled, otherwise raw drawing export
@@ -942,6 +1089,7 @@ function useDrawingExport({
     formatDistance,
     handleExportSVG,
     handleExportDXF,
+    handleExportPDF,
     handlePrint,
   };
 }
