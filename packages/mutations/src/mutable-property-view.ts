@@ -1738,8 +1738,49 @@ export class MutablePropertyView {
     // entity that never made it into this view — that stale tombstone
     // would later suppress a freshly-allocated overlay entity reusing
     // the same expressId.
+    // Pass 1: collect every CREATE_ENTITY id up front, over the whole
+    // array, before applying anything. CREATE_ENTITY is unconditionally
+    // skipped below (every id it's called for lands here) — but a caller
+    // supplying an arbitrary (e.g. imported/merged) Mutation[] may not have
+    // its CREATE_ENTITY appear before the mutations that depend on it. A
+    // single incremental forward pass would only "see" a create once the
+    // loop reaches it, so a dependent mutation earlier in the array would
+    // replay before its own entity's creation was known to be skipped —
+    // reproducing the orphaned-pset bug via ordering instead of via the
+    // original bug shape. Doing the full collection first makes the result
+    // order-independent.
     const skippedCreateIds = new Set<number>();
     for (const mutation of mutations) {
+      if (mutation.type === 'CREATE_ENTITY') {
+        skippedCreateIds.add(mutation.entityId);
+      }
+    }
+
+    // Pass 2: apply mutations against the now-complete skip set.
+    for (const mutation of mutations) {
+      // Any mutation recorded against an entity whose own CREATE_ENTITY was
+      // skipped above would otherwise replay into an orphan — a pset (or
+      // attribute/quantity/type edit) keyed to an expressId that exists in
+      // neither the source buffer nor `newEntities`. Refuse those too, so
+      // the round trip is lossy (entity + its edits both dropped) rather
+      // than corrupting (edits surviving without their entity). This keys
+      // off `skippedCreateIds`, not "id absent from newEntities", so a
+      // mutation against a normal, pre-existing source-buffer entity is
+      // never affected — only ids that had their own CREATE_ENTITY skipped
+      // in this same batch land here.
+      // The `newEntities` check makes the condition "the create was skipped
+      // AND nothing else supplied the entity". A caller following the
+      // documented recovery flow calls `restoreNewEntity()` first and
+      // *then* replays the history; the id is live by the time we get here,
+      // so there is no orphan to guard against and dropping its edits would
+      // silently lose data on the exact path the console.warn recommends.
+      if (
+        mutation.type !== 'CREATE_ENTITY' &&
+        skippedCreateIds.has(mutation.entityId) &&
+        !this.newEntities.has(mutation.entityId)
+      ) {
+        continue;
+      }
       switch (mutation.type) {
         case 'CREATE_PROPERTY':
         case 'UPDATE_PROPERTY':
@@ -1836,17 +1877,22 @@ export class MutablePropertyView {
           // doesn't carry the type+attributes payload — applying a bare
           // CREATE_ENTITY would lose the entity. We log and skip rather
           // than silently dropping it, so callers see they need to
-          // restore the payload through the dedicated path.
-          skippedCreateIds.add(mutation.entityId);
+          // restore the payload through the dedicated path. Unless the
+          // caller already restored it, every other mutation recorded
+          // against this id in this batch is dropped too (see the guard
+          // above this switch) — otherwise the entity is gone but its edits
+          // survive as an orphan. (skippedCreateIds was already fully
+          // populated in pass 1, above.)
           // eslint-disable-next-line no-console
           console.warn(
-            `applyMutations: CREATE_ENTITY for #${mutation.entityId} requires a NewEntity payload — restore via restoreNewEntity()`,
+            `applyMutations: CREATE_ENTITY for #${mutation.entityId} requires a NewEntity payload — ` +
+              `restore via restoreNewEntity(). Skipping the record; dependent mutations recorded against ` +
+              `#${mutation.entityId} are dropped too unless the entity was restored before this call.`,
           );
           break;
         }
 
         case 'DELETE_ENTITY':
-          if (skippedCreateIds.has(mutation.entityId)) break;
           this.deleteEntity(mutation.entityId);
           break;
 

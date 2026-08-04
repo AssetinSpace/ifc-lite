@@ -12,6 +12,7 @@ import {
   type MutationEntityRef,
   type MutationStoreShape,
 } from '../src/index.js';
+import { PropertyValueType } from '@ifc-lite/data';
 
 function makeStore(maxId: number, type = 'IFCBUILDINGELEMENTPROXY'): MutationStoreShape {
   const byId = new Map<number, MutationEntityRef>();
@@ -163,6 +164,106 @@ describe('MutablePropertyView.setEntityType', () => {
     expect(mut).not.toBeNull();
     expect(mut!.newType).toBe('IfcMember');
     expect(mut!.predefinedType).toBe('MULLION');
+  });
+});
+
+describe('MutablePropertyView.importMutations — skipped CREATE_ENTITY (#2044)', () => {
+  it('does not orphan a property set under a created-but-unrestored entity id', () => {
+    const a = new MutablePropertyView(null, 'm1');
+    a.setExpressIdWatermark(1000);
+    const created = a.createEntity('IfcWall', ['$', '$', '$']);
+    a.setProperty(created.expressId, 'Pset_WallCommon', 'FireRating', 'F90', PropertyValueType.String);
+
+    const json = a.exportMutations();
+
+    const b = new MutablePropertyView(null, 'm1');
+    b.setExpressIdWatermark(1000);
+    b.importMutations(json);
+
+    // The entity itself was never restored (CREATE_ENTITY is intentionally
+    // skipped by applyMutations — restoring it is a separate, out-of-scope
+    // decision, see #2044). The bug is that the dependent CREATE_PROPERTY
+    // mutation was replayed anyway, leaving a pset keyed to an expressId
+    // that exists in neither the source buffer nor `newEntities`.
+    expect(b.getNewEntity(created.expressId)).toBeNull();
+    expect(b.getForEntity(created.expressId)).toEqual([]);
+    expect(b.hasChanges(created.expressId)).toBe(false);
+  });
+
+  it('still replays mutations that target a pre-existing source-buffer entity', () => {
+    const a = new MutablePropertyView(null, 'm1');
+    a.setProperty(4, 'Pset_WallCommon', 'FireRating', 'F90', PropertyValueType.String);
+    a.setAttribute(4, 'Name', 'New Name', 'Old Name');
+
+    const json = a.exportMutations();
+
+    const b = new MutablePropertyView(null, 'm1');
+    b.importMutations(json);
+
+    expect(b.getForEntity(4)).toMatchObject([
+      { name: 'Pset_WallCommon', properties: [{ name: 'FireRating', value: 'F90' }] },
+    ]);
+    // Assert the attribute separately — the property replay alone already
+    // makes hasChanges(4) true, so an UPDATE_ATTRIBUTE that failed to replay
+    // would otherwise go unnoticed.
+    expect(b.getAttributeMutationsForEntity(4)).toEqual([{ name: 'Name', value: 'New Name' }]);
+    expect(b.hasChanges(4)).toBe(true);
+  });
+
+  it('skips a dependent mutation whose CREATE_ENTITY appears LATER in the array (#2044 follow-up)', () => {
+    const a = new MutablePropertyView(null, 'm1');
+    a.setExpressIdWatermark(1000);
+    const created = a.createEntity('IfcWall', ['$', '$', '$']);
+    a.setProperty(created.expressId, 'Pset_WallCommon', 'FireRating', 'F90', PropertyValueType.String);
+
+    const json = a.exportMutations();
+    const forward = JSON.parse(json) as { mutations: Array<{ type: string; entityId: number }> };
+    // Sanity-check the fixture actually has the CREATE_ENTITY before its
+    // dependent CREATE_PROPERTY, then reverse it so the dependent mutation
+    // is processed BEFORE the CREATE_ENTITY that owns it — this is the
+    // ordering the single-forward-pass implementation gets wrong.
+    expect(forward.mutations[0].type).toBe('CREATE_ENTITY');
+    const reversed = { ...forward, mutations: [...forward.mutations].reverse() };
+
+    const b = new MutablePropertyView(null, 'm1');
+    b.setExpressIdWatermark(1000);
+    b.importMutations(JSON.stringify(reversed));
+
+    // Same expectation as forward order: the entity was never restored, so
+    // its dependent CREATE_PROPERTY must be dropped too, regardless of
+    // where in the array the CREATE_ENTITY happens to sit.
+    expect(b.getNewEntity(created.expressId)).toBeNull();
+    expect(b.getForEntity(created.expressId)).toEqual([]);
+    expect(b.hasChanges(created.expressId)).toBe(false);
+  });
+
+  it('keeps dependent mutations when restoreNewEntity() ran BEFORE the import', () => {
+    const a = new MutablePropertyView(null, 'm1');
+    a.setExpressIdWatermark(1000);
+    const created = a.createEntity('IfcWall', ['$', '$', '$']);
+    a.setProperty(created.expressId, 'Pset_WallCommon', 'FireRating', 'F90', PropertyValueType.String);
+    a.setAttribute(created.expressId, 'Name', 'Restored Wall');
+
+    const json = a.exportMutations();
+
+    // The documented recovery flow: the caller supplies the CREATE_ENTITY
+    // payload itself (the history record can't carry it), then replays the
+    // history. The entity is no longer missing by the time applyMutations
+    // walks the batch, so its dependent mutations must NOT be dropped —
+    // the skip set means "create skipped AND nothing else supplied it".
+    const b = new MutablePropertyView(null, 'm1');
+    b.setExpressIdWatermark(1000);
+    b.restoreNewEntity(a.getNewEntity(created.expressId)!);
+    b.importMutations(json);
+
+    expect(b.getNewEntity(created.expressId)!.type).toBe('IfcWall');
+    expect(b.getForEntity(created.expressId)).toMatchObject([
+      { name: 'Pset_WallCommon', properties: [{ name: 'FireRating', value: 'F90' }] },
+    ]);
+    expect(b.getAttributeMutationsForEntity(created.expressId)).toEqual([
+      { name: 'Name', value: 'Restored Wall' },
+    ]);
+    expect(b.hasChanges(created.expressId)).toBe(true);
   });
 });
 
