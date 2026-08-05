@@ -233,6 +233,9 @@ mod extract_file_tests;
 mod ifczip_tests;
 
 #[cfg(test)]
+mod fetch_tests;
+
+#[cfg(test)]
 mod resolved_tessellation_quality_tests {
     use super::*;
     use crate::error::ApiError;
