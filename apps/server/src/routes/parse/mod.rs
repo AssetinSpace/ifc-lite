@@ -233,6 +233,12 @@ mod extract_file_tests;
 mod ifczip_tests;
 
 #[cfg(test)]
+mod parquet_tests;
+
+#[cfg(test)]
+mod json_tests;
+
+#[cfg(test)]
 mod fetch_tests;
 
 #[cfg(test)]
