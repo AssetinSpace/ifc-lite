@@ -8,29 +8,67 @@
 //! metres, occurrence-keyed) directly to Python — no Node, no wasm, no
 //! subprocess. This is the path compas_ifc and other Python consumers use.
 //!
-//! Two entry points share one pipeline:
+//! Two entry points share one geometry pipeline:
 //! - [`geometry_data_buffers`] (fast): vertices/faces as raw little-endian byte
 //!   buffers for zero-parse `numpy.frombuffer` on the Python side.
 //! - [`geometry_data_json`]: the human-readable `ifc-lite-geometry-data` JSON
 //!   document (debugging / language-agnostic interchange).
+//!
+//! Both accept a `quality` label selecting the tessellation detail level, the
+//! same knob the wasm path exposes as `setTessellationQuality` and the server as
+//! `?tessellation_quality=`.
+//!
+//! A third entry point, [`entity_data`], reads the non-geometric half of the
+//! file (attributes, property sets, quantity sets) over `ifc-lite-export`'s
+//! attribute model, the same one behind the wasm `exportCsv` / `exportJson`.
 
-use ifc_lite_processing::{build_geometry_data_export, process_geometry, GeometryDataExport};
+use ifc_lite_export::{build_export_model_with_options, ExportModel, ModelOptions};
+use ifc_lite_processing::{
+    build_geometry_data_export, process_geometry_filtered_with_quality, GeometryDataExport,
+    OpeningFilterMode, TessellationQuality,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Stack size for the geometry worker (256 MiB). IFC CSG recurses deeply
 /// (BSP-tree booleans, nested clips); the default thread stack overflows.
 /// Mirrors `rust/ffi`.
 const GEOMETRY_STACK_BYTES: usize = 256 * 1024 * 1024;
 
+/// Map a consumer-facing quality label onto [`TessellationQuality`].
+///
+/// `None` keeps the engine default (`medium`), which is byte-for-byte the
+/// output this module produced before the knob existed. An unknown label is a
+/// hard error rather than a silent fallback: each level is a factor of two in
+/// density, so a caller that asked for `"lowest"` and quietly got `medium`
+/// would pay several times the triangle budget it asked for, with no signal.
+fn parse_quality(label: Option<&str>) -> PyResult<TessellationQuality> {
+    match label {
+        None => Ok(TessellationQuality::default()),
+        Some(s) => TessellationQuality::parse_label(s).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown tessellation quality {s:?}; expected one of \
+                 'lowest', 'low', 'medium', 'high', 'highest'"
+            ))
+        }),
+    }
+}
+
 /// Run the native (rayon) pipeline off the calling thread with a large stack.
-fn run_export(ifc_bytes: Vec<u8>) -> Result<GeometryDataExport, String> {
+fn run_export(
+    ifc_bytes: Vec<u8>,
+    quality: TessellationQuality,
+) -> Result<GeometryDataExport, String> {
     std::thread::Builder::new()
         .stack_size(GEOMETRY_STACK_BYTES)
         .name("ifclite-geometry".into())
         .spawn(move || {
-            let result = process_geometry(&ifc_bytes);
+            let result = process_geometry_filtered_with_quality(
+                &ifc_bytes,
+                OpeningFilterMode::Default,
+                quality,
+            );
             let rtc = result.metadata.coordinate_info.origin_shift;
             // Reapply the IfcSite rotation only in the site-local axis frame;
             // model_rtc / raw_ifc keep true IFC world axes (R = identity).
@@ -56,11 +94,19 @@ fn run_export(ifc_bytes: Vec<u8>) -> Result<GeometryDataExport, String> {
 ///    metres, keyed by IFC STEP id (occurrences only).
 ///
 /// `ifc_bytes` is the raw IFC file content (e.g. `open(path, "rb").read()`).
+/// `quality` selects the tessellation detail level (`"lowest"`, `"low"`,
+/// `"medium"` (default), `"high"`, `"highest"`), scaling the segment count on
+/// every curved primitive (swept-disk tubes, cylinders, revolutions, arcs).
 #[pyfunction]
-#[pyo3(signature = (ifc_bytes))]
-fn geometry_data_buffers(py: Python<'_>, ifc_bytes: Vec<u8>) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (ifc_bytes, quality = None))]
+fn geometry_data_buffers(
+    py: Python<'_>,
+    ifc_bytes: Vec<u8>,
+    quality: Option<&str>,
+) -> PyResult<Py<PyAny>> {
+    let quality = parse_quality(quality)?;
     let export = py
-        .detach(|| run_export(ifc_bytes))
+        .detach(|| run_export(ifc_bytes, quality))
         .map_err(PyRuntimeError::new_err)?;
 
     let out = PyDict::new(py);
@@ -106,21 +152,165 @@ fn geometry_data_buffers(py: Python<'_>, ifc_bytes: Vec<u8>) -> PyResult<Py<PyAn
 /// `name` when present.
 ///
 /// `ifc_bytes` is the raw IFC file content (e.g. `open(path, "rb").read()`).
+/// `quality` is as documented on [`geometry_data_buffers`].
 #[pyfunction]
-#[pyo3(signature = (ifc_bytes))]
-fn geometry_data_json(py: Python<'_>, ifc_bytes: Vec<u8>) -> PyResult<String> {
+#[pyo3(signature = (ifc_bytes, quality = None))]
+fn geometry_data_json(
+    py: Python<'_>,
+    ifc_bytes: Vec<u8>,
+    quality: Option<&str>,
+) -> PyResult<String> {
+    let quality = parse_quality(quality)?;
     let export = py
-        .detach(|| run_export(ifc_bytes))
+        .detach(|| run_export(ifc_bytes, quality))
         .map_err(PyRuntimeError::new_err)?;
     export
         .to_json()
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Run the attribute/property extraction off the calling thread.
+///
+/// Shares the geometry worker's large stack: the placement resolver walks an
+/// `IfcLocalPlacement` chain recursively, and the decode path is the same one
+/// the geometry pipeline needs the headroom for.
+fn run_entity_export(ifc_bytes: Vec<u8>, placements: bool) -> Result<ExportModel, String> {
+    let opts = ModelOptions::default().with_placements(placements);
+    std::thread::Builder::new()
+        .stack_size(GEOMETRY_STACK_BYTES)
+        .name("ifclite-entities".into())
+        .spawn(move || build_export_model_with_options(&ifc_bytes, &opts))
+        .map_err(|e| format!("spawn failed: {e}"))?
+        .join()
+        .map_err(|_| "entity worker panicked".to_string())
+}
+
+/// Read attributes, property sets and quantity sets. No tessellation.
+///
+/// Returns a dict:
+/// `{ length_unit_scale, plane_angle_to_radians, project_id, entity_count,
+///    entities: { express_id: { ifc_type, global_id, name, description,
+///    object_type, has_geometry, placement, property_sets, quantity_sets } } }`
+///
+/// `entities` is keyed by IFC STEP id in file order, so it joins directly
+/// against `geometry_data_buffers()["elements"]`. The join is one-way total:
+/// every meshed element has a row here, but not every row has an element.
+/// Besides products with no geometry, an orphan `IfcTypeProduct` gets a row
+/// with `has_geometry = True` and yet never appears in `elements`, because the
+/// geometry functions emit occurrences only. Drive the join from `elements`,
+/// or use `.get()`.
+///
+/// **Property values are strings, in the file's OWN units.** A millimetre model
+/// reports `Qto_WallBaseQuantities.Length` as `3000`, while geometry from this
+/// module is always metres. Quantity values are floats and carry the same
+/// caveat.
+///
+/// Converting is per dimension, not one blanket factor: multiply a `Length` by
+/// `length_unit_scale`, an `Area` by its SQUARE and a `Volume` by its CUBE, and
+/// use `plane_angle_to_radians` for angles. `Count` is dimensionless. Only the
+/// length and plane-angle scales are resolved, so a model declaring an area or
+/// volume unit inconsistent with its length unit cannot be reconciled from what
+/// is returned here.
+///
+/// `placement` is `None` unless `placements=True`, and is then a list of 16
+/// floats: a COLUMN-major 4x4, translation in metres at indices 12/13/14.
+///
+/// It is in the same absolute IFC world frame as `geometry_data_buffers`
+/// vertices, so the two line up directly: do NOT fold `rtc_offset` into either.
+/// The geometry export already adds the offset back into every vertex, and this
+/// placement is never RTC-rebased, so both are unshifted, Z-up and in metres.
+///
+/// Known limits, inherited from the shared export model:
+///
+/// * Only `IfcPropertySingleValue` properties are decoded. Enumerated, list,
+///   bounded, table and reference properties are skipped silently. The pset
+///   still appears, with those entries missing.
+/// * **Type-level properties surface only for types that carry orphan
+///   geometry.** A type attaches its sets via `IfcTypeObject.HasPropertySets`,
+///   and this export emits a row for a type only when that type also has
+///   `RepresentationMaps` no occurrence instantiates; such a row does carry
+///   its psets, but has no matching entry in `elements` (see the join note).
+///   A plain `IfcWallType` holding `Pset_WallCommon` has no representation, so
+///   it yields no row at all, and its properties are not merged down into the
+///   occurrences that inherit them through `IfcRelDefinesByType` either. That
+///   is the common case, and authoring tools put a lot on types, so treat a
+///   missing property as "not asked for yet" rather than "absent from the
+///   file".
+#[pyfunction]
+#[pyo3(signature = (ifc_bytes, placements = false))]
+fn entity_data(py: Python<'_>, ifc_bytes: Vec<u8>, placements: bool) -> PyResult<Py<PyAny>> {
+    let model = py
+        .detach(|| run_entity_export(ifc_bytes, placements))
+        .map_err(PyRuntimeError::new_err)?;
+
+    let out = PyDict::new(py);
+    out.set_item("length_unit_scale", model.units.length_unit_scale)?;
+    out.set_item("plane_angle_to_radians", model.units.plane_angle_to_radians)?;
+    out.set_item("project_id", model.units.project_id)?;
+
+    let entities = PyDict::new(py);
+    for row in &model.entities {
+        let d = PyDict::new(py);
+        d.set_item("ifc_type", &row.ifc_type)?;
+        d.set_item("global_id", row.global_id.clone())?;
+        d.set_item("name", row.name.clone())?;
+        d.set_item("description", row.description.clone())?;
+        d.set_item("object_type", row.object_type.clone())?;
+        d.set_item("has_geometry", row.has_geometry)?;
+        d.set_item("placement", row.placement.map(|p| p.matrix.to_vec()))?;
+
+        let psets = PyList::empty(py);
+        for ps in &row.property_sets {
+            let props = PyList::empty(py);
+            for p in &ps.properties {
+                let pd = PyDict::new(py);
+                pd.set_item("name", &p.name)?;
+                pd.set_item("value", &p.value)?;
+                pd.set_item("value_type", &p.value_type)?;
+                props.append(pd)?;
+            }
+            let sd = PyDict::new(py);
+            sd.set_item("name", &ps.name)?;
+            sd.set_item("properties", props)?;
+            psets.append(sd)?;
+        }
+        d.set_item("property_sets", psets)?;
+
+        let qsets = PyList::empty(py);
+        for qs in &row.quantity_sets {
+            let quants = PyList::empty(py);
+            for q in &qs.quantities {
+                let qd = PyDict::new(py);
+                qd.set_item("name", &q.name)?;
+                qd.set_item("value", q.value)?;
+                qd.set_item("kind", q.kind)?;
+                quants.append(qd)?;
+            }
+            let sd = PyDict::new(py);
+            sd.set_item("name", &qs.name)?;
+            sd.set_item("quantities", quants)?;
+            qsets.append(sd)?;
+        }
+        d.set_item("quantity_sets", qsets)?;
+
+        entities.set_item(row.express_id, d)?;
+    }
+    // Count the DICT, not the row list. A malformed file can repeat a STEP id,
+    // and keying by `express_id` collapses those to one entry (last wins), so
+    // `model.entities.len()` would promise more entries than are readable.
+    out.set_item("entity_count", entities.len())?;
+    out.set_item("entities", entities)?;
+    Ok(out.into_any().unbind())
+}
+
 #[pymodule]
 fn ifclite_geom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(geometry_data_buffers, m)?)?;
     m.add_function(wrap_pyfunction!(geometry_data_json, m)?)?;
-    m.add("__doc__", "Native ifc-lite geometry-data export for Python.")?;
+    m.add_function(wrap_pyfunction!(entity_data, m)?)?;
+    m.add(
+        "__doc__",
+        "Native ifc-lite geometry and attribute export for Python.",
+    )?;
     Ok(())
 }
