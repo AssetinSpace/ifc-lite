@@ -58,7 +58,14 @@ export type IfcSourceTransfer =
       storedMask: Uint8Array;
       blockSize: number;
       totalLength: number;
-      contentKey: string | null;
+      /**
+       * Required, unlike the contiguous arm's nullable key. A contiguous
+       * receiver can recompute a missing key with one linear pass over bytes it
+       * already holds; a blocked one would have to inflate every block to do
+       * it. Making it non-nullable here forces the compression swap to compute
+       * and carry the key eagerly, while the source is still contiguous.
+       */
+      contentKey: string;
     };
 
 export interface IfcSourceBytes {
@@ -135,9 +142,15 @@ function clampRange(start: number, end: number, len: number): [number, number] {
 class ContiguousSourceBytes implements IfcSourceBytes {
   readonly isResident = true;
   #view: Uint8Array;
-  #contentKey: string | null | undefined;
+  /**
+   * `undefined` = not computed yet, `string` = computed. Never `null` for a
+   * non-empty source: the constructor no longer accepts one, so the state
+   * "permanently keyed on nothing" -- which reads downstream as an overlay
+   * silently not rendering -- is unrepresentable rather than merely unused.
+   */
+  #contentKey: string | undefined;
 
-  constructor(view: Uint8Array, contentKey?: string | null) {
+  constructor(view: Uint8Array, contentKey?: string) {
     this.#view = view;
     this.#contentKey = contentKey;
   }
@@ -145,12 +158,14 @@ class ContiguousSourceBytes implements IfcSourceBytes {
   get byteLength(): number { return this.#view.byteLength; }
   get length(): number { return this.#view.byteLength; }
 
-  get contentKey(): string | null {
-    if (this.#contentKey === undefined) {
-      // Lazy: only the callers that key a cache on identity pay for it, and
-      // they pay once. Nothing on the load path needs it.
-      this.#contentKey = this.#view.byteLength === 0 ? null : fnv1a(this.#view);
-    }
+  get contentKey(): string {
+    // Lazy: only the callers that key a cache on identity pay for it, and they
+    // pay once. Nothing on the load path needs it.
+    //
+    // Always a string, never null: `contiguousSourceBytes` collapses a
+    // zero-length view to EMPTY_SOURCE_BYTES, so a ContiguousSourceBytes is
+    // non-empty by construction and the "no source" key has nowhere to appear.
+    this.#contentKey ??= fnv1a(this.#view);
     return this.#contentKey;
   }
 
@@ -176,7 +191,14 @@ class ContiguousSourceBytes implements IfcSourceBytes {
   }
 
   toTransferable(): IfcSourceTransfer {
-    return { kind: 'contiguous', bytes: this.#view, contentKey: this.contentKey };
+    // Deliberately reads the memo FIELD, not the getter. This method exists to
+    // hand a source to a worker without paying whole-file costs on the sending
+    // thread, and `contentKey` is a full-file FNV-1a walk -- forcing it here
+    // would make the documented "without materialising" path allocate and walk
+    // the whole 342 MB source on the main thread, which is what #2183 is about.
+    // Pass the key on only when something has already computed it; a receiver
+    // that needs one computes it lazily, on its own thread, to the same value.
+    return { kind: 'contiguous', bytes: this.#view, contentKey: this.#contentKey ?? null };
   }
 }
 
@@ -215,16 +237,37 @@ export const EMPTY_SOURCE_BYTES: IfcSourceBytes = Object.freeze(new EmptySourceB
  */
 export function contiguousSourceBytes(
   view: Uint8Array | null | undefined,
-  contentKey?: string | null,
+  contentKey?: string,
 ): IfcSourceBytes {
   if (!view || view.byteLength === 0) return EMPTY_SOURCE_BYTES;
   return new ContiguousSourceBytes(view, contentKey);
 }
 
-/** Rebuild a source from {@link IfcSourceBytes.toTransferable} output. */
+/**
+ * Rebuild a source from {@link IfcSourceBytes.toTransferable} output.
+ *
+ * `contentKey: null` on the wire means "the sender had not computed one", NOT
+ * "the key is null" -- `toTransferable` deliberately does not force the
+ * full-file hash. So it maps to `undefined` here, which is the constructor's
+ * "not computed yet" state, and the receiver hashes lazily on its own thread if
+ * anything asks. Passing the `null` straight through would pin the key at null
+ * forever and every downstream cache would key on nothing.
+ *
+ * A non-empty source cannot legitimately have a null key: `fnv1a` always
+ * returns a string, and a zero-length view collapses to
+ * {@link EMPTY_SOURCE_BYTES} before it can reach a constructor.
+ *
+ * CONSTRAINT FOR THE BLOCKED IMPLEMENTATION. A contiguous receiver can shrug
+ * off a missing key because recomputing it is one linear pass over bytes it
+ * already holds. A blocked one cannot -- it would have to inflate every block
+ * to hash them. So the compression swap must compute and carry `contentKey`
+ * EAGERLY, at swap time, while the bytes are still contiguous. Inheriting the
+ * lazy contiguous behaviour there would turn the first cache lookup into a
+ * full decompression of the model.
+ */
 export function sourceBytesFromTransferable(transfer: IfcSourceTransfer): IfcSourceBytes {
   if (transfer.kind === 'contiguous') {
-    return contiguousSourceBytes(transfer.bytes, transfer.contentKey);
+    return contiguousSourceBytes(transfer.bytes, transfer.contentKey ?? undefined);
   }
   throw new Error(
     'sourceBytesFromTransferable: blocked sources are not implemented yet (#2183)',
