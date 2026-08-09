@@ -140,17 +140,64 @@ export function quantityTypeToIfcType(type: QuantityType): string {
 
 /**
  * Serialize a property value to STEP format (e.g. IFCLABEL, IFCREAL, etc.).
+ *
+ * The token this writes is the property's DECLARED TYPE in the exported file, so
+ * every member below has to name the IFC primitive the value was authored as —
+ * not merely one that can hold the characters. Two did not (#2472):
+ *
+ *   - `Text` was written as `IFCLABEL`. `IfcLabel` is a bounded, name-like
+ *     string; `IfcText` is unbounded prose. A consumer read a different type
+ *     than the property was created with, and a long value exceeded what
+ *     `IfcLabel` is specified to carry.
+ *   - `Logical` was written as `IFCBOOLEAN` for its two definite states.
+ *     `IfcBoolean` has two values; `IfcLogical` has three, and `.U.` is the
+ *     reason a property is Logical rather than Boolean in the first place.
+ *
+ * Neither could be caught by a value-level round-trip: the extractor collapses
+ * every string-valued token (`IFCLABEL`, `IFCTEXT`, `IFCIDENTIFIER`) to
+ * `PropertyValueType.String` and keeps the token name only in `dataType`, so
+ * the VALUE survives export/re-import through the wrong wrapper unchanged. Only
+ * an assertion on the emitted token sees the difference — which is what
+ * `property-value-serialization.test.ts` makes.
+ *
+ * `@ifc-lite/collab`'s `PROPERTY_TYPE_NAMES` is the same table for a different
+ * transport, and it already named `Text` and `Logical` correctly — so on THOSE
+ * TWO MEMBERS the two agree now. Not on the table as a whole, and this pass does
+ * not make them agree:
+ *
+ *   - `String`: collab says `IfcText`, this says `IFCLABEL`. Both are guesses
+ *     about a token the extractor did not keep, and they guess in opposite
+ *     directions (unbounded prose vs the conservative bounded name). Changing
+ *     either is a behaviour change to the OTHER transport's payload, out of
+ *     #2472's scope, and it needs the argument about which guess is right made
+ *     first — not a silent alignment.
+ *   - `List`: collab says `IfcText`; this writes a STEP aggregate `(...)` of
+ *     `IFCLABEL` items, which is not a NominalValue token at all.
+ *   - `Enum`: collab says `IfcLabel`; this writes a bare `.TOKEN.` (#2488).
+ *
+ * `Label`, `Identifier`, `Real`, `Integer`, `Boolean`, `Text`, `Logical` and
+ * `Reference` agree.
  */
 export function serializePropertyValue(value: unknown, type: PropertyValueType): string {
   if (value === null || value === undefined) {
+    // `Logical` is the one member with a value FOR "no value": the extractor
+    // reads `.U.` / `.X.` back as a null-valued Logical, so `$` here would
+    // turn an explicit unknown into an omitted attribute on re-export.
+    if (type === PropertyValueType.Logical) return `IFCLOGICAL(.U.)`;
     return '$';
   }
 
   switch (type) {
+    // `String` is the extractor's catch-all for any string-valued token whose
+    // declared type it did not keep, so it stays the bounded `IfcLabel`: the
+    // conservative direction for an unknown short string, and what
+    // `PROPERTY_TYPE_NAMES` calls `Enum` and `Reference` too.
     case PropertyValueType.String:
     case PropertyValueType.Label:
-    case PropertyValueType.Text:
       return `IFCLABEL('${escapeStepString(String(value))}')`;
+
+    case PropertyValueType.Text:
+      return `IFCTEXT('${escapeStepString(String(value))}')`;
 
     case PropertyValueType.Identifier:
       return `IFCIDENTIFIER('${escapeStepString(String(value))}')`;
@@ -165,9 +212,17 @@ export function serializePropertyValue(value: unknown, type: PropertyValueType):
       return `IFCINTEGER(${Math.round(Number(value))})`;
 
     case PropertyValueType.Boolean:
-    case PropertyValueType.Logical:
       if (value === true) return `IFCBOOLEAN(.T.)`;
       if (value === false) return `IFCBOOLEAN(.F.)`;
+      // A Boolean whose value is neither: no `IfcBoolean` literal says that, and
+      // `.U.` is not in its domain, so the three-state primitive is the only
+      // thing that can carry it. Unchanged from before #2472 — the Logical case
+      // below is what stopped borrowing IfcBoolean's name for it.
+      return `IFCLOGICAL(.U.)`;
+
+    case PropertyValueType.Logical:
+      if (value === true) return `IFCLOGICAL(.T.)`;
+      if (value === false) return `IFCLOGICAL(.F.)`;
       return `IFCLOGICAL(.U.)`;
 
     case PropertyValueType.Enum:
@@ -180,6 +235,10 @@ export function serializePropertyValue(value: unknown, type: PropertyValueType):
       }
       return '$';
 
+    // Includes `Reference`, which no extraction path produces (an
+    // `IfcPropertyReferenceValue` comes back as a String holding `#id`) and
+    // which this function could not express anyway: an entity reference is a
+    // different property CLASS, not a different `NominalValue` token.
     default:
       return `IFCLABEL('${escapeStepString(String(value))}')`;
   }
@@ -376,6 +435,13 @@ export function splitTopLevelArgs(text: string): string[] {
  * Returns null when the text is not a parseable single STEP record or the slot
  * is past the end of the argument list; a null must not be treated as "no
  * change", since the intended replacement did not happen.
+ *
+ * The regex only pins the two ENDS of the record — `#N=CLASS(` and `);`. Text
+ * malformed BETWEEN them is caught by {@link splitTopLevelStepArguments}, which
+ * rejects an argument list it could not scan cleanly rather than handing back
+ * whatever it accumulated: those parts are not the record's slots, so writing
+ * one lands on the wrong argument and reports a success that did not happen
+ * (#2470). Silently corrupted output instead of a dropped entity, same class.
  */
 export function replaceStepArgument(
   entityText: string,
@@ -387,6 +453,14 @@ export function replaceStepArgument(
 
   const [, prefix, attrsText, suffix] = match;
   const attrs = splitTopLevelStepArguments(attrsText);
+  // Load-bearing, and covered: the bounds check below READS `attrs.length`, so a
+  // null reaches it as a TypeError rather than falling through to a rejection.
+  // Deleting this line fails exactly the three malformed-input cases in
+  // `step-serialization.test.ts` — unterminated string, unbalanced list, stray
+  // closing paren — which throw instead of returning null. Kept as its own line,
+  // not folded into that check, because "could not scan it" and "that slot is
+  // past the end" are different facts about the input.
+  if (attrs === null) return null;
   // A negative or fractional slot must not reach the assignment below: it would
   // set a NAMED PROPERTY on the array rather than an element, `join` would skip
   // it, and this would hand back the line unchanged — but non-null, which the
@@ -401,11 +475,50 @@ export function replaceStepArgument(
 }
 
 /**
- * Split a STEP argument list on top-level commas while preserving nested syntax.
+ * Split a STEP argument list on top-level commas while preserving nested syntax,
+ * or null when the text is not a well-formed argument list.
+ *
  * Similar to `splitTopLevelArgs` but uses a slightly different accumulation style
  * suited for the {@link replaceStepArgument} call-site.
+ *
+ * ## Why it validates
+ *
+ * The scan already tracks quote state and paren depth to know where a top-level
+ * comma is. It used to ignore the final state, so text that never left a string
+ * or never closed a list still produced parts — parts whose boundaries are
+ * wherever the scanner happened to be, not the record's slots. Both callers then
+ * acted on them: `replaceStepArgument` wrote a slot by index and reported
+ * success, and the unit rescale multiplied numbers in whatever argument the
+ * mis-split had put them in. Neither could tell, because a broken split looks
+ * exactly like a good one.
+ *
+ * Rejected, because after either of these the parts are no longer the record's
+ * arguments — commas were swallowed and everything past them shifted:
+ *   - a quote left open at the end (unterminated string);
+ *   - a paren depth that does not return to zero, or that ever goes below it
+ *     (unbalanced or stray-closing nested list). Both ends matter: a depth that
+ *     dips negative and climbs back looks balanced at the end while every comma
+ *     in between was read as nested.
+ *
+ * An EMPTY top-level slot (`a,,b`, or a trailing comma) is deliberately NOT
+ * rejected, though it is invalid STEP. It costs no alignment: an empty argument
+ * is ONE part, exactly as the entity parser counts it, so every index still
+ * names the attribute it is meant to and the replacement lands where it should.
+ * Rejecting it made things strictly worse, and measurably: the parser resolves
+ * `HasPropertySets` on such a line, so a session deleting that type object's
+ * property set has already had the pset's lines WITHHELD by the time the repoint
+ * runs — refuse the repoint and the record keeps a `#id` pointing at a property
+ * set the export just dropped. A dangling reference is worse than a
+ * still-invalid-but-unchanged empty slot.
+ *
+ * An empty INPUT is not an empty slot: `#1=IFCFOO();` is a record with no
+ * arguments, so it splits to `[]` and any slot request then fails the bounds
+ * check in {@link replaceStepArgument} — which is the right answer for a record
+ * that has no slots.
  */
-export function splitTopLevelStepArguments(input: string): string[] {
+export function splitTopLevelStepArguments(input: string): string[] | null {
+  if (input.trim() === '') return [];
+
   const parts: string[] = [];
   let current = '';
   let depth = 0;
@@ -427,8 +540,12 @@ export function splitTopLevelStepArguments(input: string): string[] {
 
     if (!inString) {
       if (char === '(') depth++;
-      else if (char === ')') depth--;
-      else if (char === ',' && depth === 0) {
+      else if (char === ')') {
+        depth--;
+        // Already past the record's own closing paren: every comma from here
+        // would be read as nested and the split is meaningless.
+        if (depth < 0) return null;
+      } else if (char === ',' && depth === 0) {
         parts.push(current);
         current = '';
         continue;
@@ -438,6 +555,7 @@ export function splitTopLevelStepArguments(input: string): string[] {
     current += char;
   }
 
+  if (inString || depth !== 0) return null;
   parts.push(current);
   return parts;
 }
