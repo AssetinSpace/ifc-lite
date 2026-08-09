@@ -16,6 +16,12 @@
  *      (position, target, up) triple straight through
  *      (`apps/viewer/src/components/viewer/Viewport.tsx` `applyViewpoint`,
  *      `apps/viewer/src/hooks/useBCF.ts` `applyCameraState`).
+ *
+ * Scope: the matrix derivation only — `MathUtils.lookAt` and the `orthoSize` /
+ * `fov` / `aspect` inputs that feed the projection alongside the pose. The
+ * other half of #2441, where a navigation gesture in `camera-controls.ts`
+ * spreads a malformed pose instead of rejecting it, lives in
+ * `camera-malformed-pose-navigation.test.ts`.
  */
 
 import { describe, it } from 'node:test';
@@ -400,13 +406,6 @@ describe('degenerate camera entry points (#2441)', () => {
 });
 
 /**
- * The pose is only half of the projection matrix. `orthoSize`, `fov` and
- * `aspect` feed it too, and each of their clamps was written with
- * `Math.max`/`Math.min`, which are NaN-transparent: `Math.max(0.01, NaN)` is
- * `NaN`, not the floor. A malformed value therefore passed straight through
- * the clamp that looked like it was rejecting it.
- */
-/**
  * Drive a camera animation on a fake clock. Same shape as the helper in
  * `camera-preset-orbit.test.ts`: the animator's completion promise is chained
  * off `requestAnimationFrame`, which does not exist under `node:test`.
@@ -432,6 +431,13 @@ function withStubbedFrameClock(run: (advance: (ms: number) => void) => void): vo
   }
 }
 
+/**
+ * The pose is only half of the projection matrix. `orthoSize`, `fov` and
+ * `aspect` feed it too, and each of their clamps was written with
+ * `Math.max`/`Math.min`, which are NaN-transparent: `Math.max(0.01, NaN)` is
+ * `NaN`, not the floor. A malformed value therefore passed straight through
+ * the clamp that looked like it was rejecting it.
+ */
 describe('degenerate projection inputs (#2441)', () => {
   it('setOrthoSize keeps the last usable half-height instead of storing a NaN', () => {
     const camera = new Camera();
