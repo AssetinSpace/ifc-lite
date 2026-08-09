@@ -28,12 +28,18 @@ import { collectReferencedEntityIds, getVisibleEntityIds, collectStyleEntities }
 import { convertStepLine, needsConversion, type IfcSchemaVersion } from './schema-converter.js';
 import { retypeStepLine, retypeArgTokens } from './retype.js';
 import { getCompleteEntityIndex, getMaxExpressId } from './entity-iteration.js';
+import {
+  createModificationLedger,
+  recordSourceLineDelivery,
+  type SourceLineDelivery,
+} from './delta-modification-ledger.js';
 import { authoredEntityRefs, getEffectiveEntityIndex, type EffectiveEntityIndex } from './effective-index.js';
 import {
   HAS_PROPERTY_SETS_SLOT,
-  hasPropertySetsToken,
   isTypeClass,
   resolveTypeOwnedPsetIds,
+  rewriteTypeOwnedPsetLine,
+  typeOwnedPsetRewriteWarning,
 } from './type-owned-psets.js';
 import {
   escapeStepString,
@@ -44,7 +50,6 @@ import {
   serializeStepValue,
   tokenIsRealLiteral,
   splitTopLevelArgs,
-  splitTopLevelStepArguments,
   assembleStepBytes,
 } from './step-serialization.js';
 import { getRealTypedSlots, serializeEntityArgs, serializeAttributeSlot, isTypedMarker } from './attribute-real-slots.js';
@@ -205,6 +210,15 @@ const MAP_CONVERSION_WITHOUT_CRS_WARNING =
   'Cannot create IfcMapConversion: no IfcProjectedCRS was requested and none exists in the file to reference as TargetCRS. Nothing was written.';
 
 /**
+ * What {@link StepExporter.applySourceLineMutations} produced: the rewritten
+ * line, plus which edit kinds that rewrite actually delivered. The delivery
+ * half is {@link SourceLineDelivery} rather than three loose booleans so that
+ * the pipeline and the ledger cannot disagree about what a source line carries
+ * — an added kind has one place to be added.
+ */
+type SourceLineMutations = SourceLineDelivery & { text: string };
+
+/**
  * IFC STEP file exporter
  */
 export class StepExporter {
@@ -235,7 +249,6 @@ export class StepExporter {
   export(options: StepExportOptions): StepExportResult {
     const entities: string[] = [];
     let newEntityCount = 0;
-    let modifiedEntityCount = 0;
     // Both owner-history caches are per-EXPORT, not per-exporter: they now
     // depend on `willBeEmitted`, which depends on this call's options. Reusing
     // one exporter for a `visibleOnly` export and then a full one would
@@ -396,9 +409,15 @@ export class StepExporter {
       return true;
     };
 
+    // Under `deltaOnly` a nomination only becomes a count once some pass has
+    // actually written content that delivers THAT KIND of edit for the host —
+    // see `delta-modification-ledger.ts` for why the two are not the same event
+    // in that mode, and why the pair is (entity, kind) rather than the entity
+    // (#2462).
+    const modifications = createModificationLedger(options.deltaOnly === true);
+
     // Collect entities that need to be modified or created
     const modifiedEntities = new Set<number>();
-    const modifiedPsets = new Map<number, Set<string>>(); // entityId -> psetNames being modified
     const modifiedAttributes = new Map<number, Map<string, string>>();
     const newPropertySets: Array<{ entityId: number; psets: PropertySet[] }> = [];
     const newQuantitySets: Array<{ entityId: number; qsets: QuantitySet[] }> = [];
@@ -498,13 +517,14 @@ export class StepExporter {
         // sweep above, which handles a plain delete too — no pset edit needed.
         if (effective.isDeleted(entityId)) continue;
         modifiedEntities.add(entityId);
-        modifiedPsets.set(entityId, psetNames);
         // Same rule as the attribute loop below: an overlay-CREATED entity is
         // emitted once, by the new-entities pass, and already counted in
         // `newEntityCount` — as are the pset entities this loop goes on to
         // generate. Only the COUNT is guarded; the entity still records its
         // pset edits and still emits them.
-        if (!isOverlayCreated(entityId) && hasEmittableHostBytes(entityId)) modifiedEntityCount++;
+        if (!isOverlayCreated(entityId) && hasEmittableHostBytes(entityId)) {
+          modifications.nominate(entityId, 'property-set');
+        }
 
         // Get the FULL mutated property sets for this entity (merged base + mutations)
         const allPsets = this.mutationView.getForEntity(entityId);
@@ -573,8 +593,14 @@ export class StepExporter {
         if (effective.isDeleted(entityId)) continue;
         modifiedEntities.add(entityId);
         // See the property loop above — an overlay-created entity is counted as
-        // new, not modified.
-        if (!isOverlayCreated(entityId) && !modifiedPsets.has(entityId) && hasEmittableHostBytes(entityId)) modifiedEntityCount++;
+        // new, not modified. The pset loop's own nomination no longer has to be
+        // excluded to avoid a double count: the ledger settles per ENTITY, so a
+        // host with both a pset and a qset edit counts once whatever is
+        // nominated. Nominating both buys the opposite — an accurate warning
+        // when the qset half is the half a delta cannot carry.
+        if (!isOverlayCreated(entityId) && hasEmittableHostBytes(entityId)) {
+          modifications.nominate(entityId, 'quantity-set');
+        }
 
         const allQsets = this.mutationView.getQuantitiesForEntity(entityId);
         const relevantQsets = allQsets.filter((qset: QuantitySet) => qsetNames.has(qset.name));
@@ -611,9 +637,19 @@ export class StepExporter {
         // source-iteration pass skips it), so an attribute edit against it
         // must not inflate the count either.
         if (!hasEmittableHostBytes(entityId)) continue;
-        if (!entityPropMutations.has(entityId) && !entityQuantMutations.has(entityId)) {
-          modifiedEntityCount++;
-        }
+        // Under `deltaOnly` this only NOMINATES the host's ATTRIBUTE edits:
+        // nothing writes an in-place attribute edit into a delta except the
+        // type-object line rewrite, so the ledger drops it at settle time
+        // unless that pass reports having carried it (#2462). A full export
+        // counts it here, as before.
+        //
+        // Nominated unconditionally. It used to be skipped for a host that also
+        // had a pset or qset edit, because the count was per entity and the
+        // other loop had already nominated it — which is exactly what let a
+        // pset emission mark the rename delivered and suppress its warning. The
+        // ledger de-duplicates the COUNT per entity now, so the two edits can
+        // and must be nominated separately.
+        modifications.nominate(entityId, 'attribute');
       }
     }
 
@@ -653,9 +689,15 @@ export class StepExporter {
           attrMap.set('MapUnit', `#${mapUnitRef}`);
           changed = true;
         }
-        if (changed && !modifiedEntities.has(entityId)) {
+        if (changed) {
           modifiedEntities.add(entityId);
-          if (hasEmittableHostBytes(entityId)) modifiedEntityCount++;
+          // Queued as attribute edits, which only the source-iteration pass
+          // writes — so under `deltaOnly` this nominates and settle decides.
+          // Nominated even when the host is already in `modifiedEntities`: that
+          // guard existed to stop a second COUNT, which the ledger now handles
+          // per entity, and suppressing the nomination would hide a dropped
+          // georeferencing edit behind an unrelated edit to the same record.
+          if (hasEmittableHostBytes(entityId)) modifications.nominate(entityId, 'georeferencing');
         }
       }
 
@@ -674,9 +716,10 @@ export class StepExporter {
         if (mc.xAxisAbscissa !== undefined) { attrMap.set('XAxisAbscissa', String(mc.xAxisAbscissa)); changed = true; }
         if (mc.xAxisOrdinate !== undefined) { attrMap.set('XAxisOrdinate', String(mc.xAxisOrdinate)); changed = true; }
         if (mc.scale !== undefined) { attrMap.set('Scale', String(mc.scale)); changed = true; }
-        if (changed && !modifiedEntities.has(entityId)) {
+        if (changed) {
           modifiedEntities.add(entityId);
-          if (hasEmittableHostBytes(entityId)) modifiedEntityCount++;
+          // Same as the IfcProjectedCRS branch above.
+          if (hasEmittableHostBytes(entityId)) modifications.nominate(entityId, 'georeferencing');
         }
       }
 
@@ -877,51 +920,30 @@ export class StepExporter {
           entityRef.byteOffset,
           entityRef.byteOffset + entityRef.byteLength
         );
-        let nextEntityText = entityText;
+        // Retype, named attribute edits and positional edits, in that order.
+        // Shared verbatim with the type-object `HasPropertySets` rewrite below,
+        // which writes the line this pass would otherwise have written.
+        const mutated = this.applySourceLineMutations(
+          expressId,
+          entityText,
+          entityRef.type,
+          modifiedAttributes.get(expressId),
+          sourceSchema,
+          overlayActive,
+        );
+        const nextEntityText = mutated.text;
 
-        // Entity retype (reassign class) runs FIRST so attribute mutations
-        // below resolve against the TARGET class's attribute names. The
-        // expressId is unchanged, so geometry / placement / representation and
-        // every IfcRel* reference (keyed by #id) carry over untouched.
-        //
-        // This materializes inside the source-iteration loop, which `deltaOnly`
-        // skips — so, like in-place attribute/positional edits to existing
-        // entities, an existing-entity retype is only emitted by a full export
-        // (the common `applyMutations` path). Retyped OVERLAY-created entities
-        // are emitted under `deltaOnly` via the new-entities pass below.
-        const typeMutation = overlayActive && typeof this.mutationView!.getEntityTypeMutation === 'function'
-          ? this.mutationView!.getEntityTypeMutation(expressId)
-          : null;
-        let workingType = entityType;
-        if (typeMutation) {
-          nextEntityText = retypeStepLine(
-            nextEntityText,
-            entityRef.type,
-            typeMutation.newType,
-            typeMutation.predefinedType ?? null,
-            sourceSchema,
-          );
-          workingType = typeMutation.newType.toUpperCase();
-          if (!modifiedEntities.has(expressId)) {
-            modifiedEntities.add(expressId);
-            modifiedEntityCount++;
-          }
-        }
-
-        if (modifiedAttributes.has(expressId)) {
-          nextEntityText = this.applyAttributeMutations(nextEntityText, workingType, modifiedAttributes.get(expressId)!);
-        }
-
-        const positional = overlayActive && typeof this.mutationView!.getPositionalMutationsForEntity === 'function'
-          ? this.mutationView!.getPositionalMutationsForEntity(expressId)
-          : null;
-        if (positional && positional.size > 0) {
-          nextEntityText = this.applyPositionalMutations(nextEntityText, positional, workingType, sourceSchema);
-          if (!modifiedEntities.has(expressId)) {
-            modifiedEntities.add(expressId);
-            modifiedEntityCount++;
-          }
-        }
+        // A retype or a positional edit that CHANGED the line is what makes
+        // this entity count; a named attribute edit was already nominated by
+        // the collection pass. Both flags report effect, so retyping an entity
+        // to the class it already is — or writing a slot the token it already
+        // holds — no longer claims a modification over a line the export left
+        // byte-identical. This pass is full-export-only (`deltaOnly` skips it
+        // wholesale), so nomination IS emission here and the kinds only have to
+        // be right for the entity count — which is per entity, hence unchanged.
+        if (mutated.retyped || mutated.positional) modifiedEntities.add(expressId);
+        if (mutated.retyped) modifications.nominate(expressId, 'retype');
+        if (mutated.positional) modifications.nominate(expressId, 'positional');
 
         // Apply schema conversion if exporting to a different schema version
         if (converting) {
@@ -952,6 +974,9 @@ export class StepExporter {
       );
       entities.push(...newEntities.lines);
       newEntityCount += newEntities.count;
+      // Replacement content for this host actually landed, so a delta really
+      // does carry its PROPERTY-SET modification — and only that one (#2462).
+      if (newEntities.lines.length > 0) modifications.recordEmitted(entityId, 'property-set');
       generatedTypeOwnedPsetIds.set(entityId, newEntities.generatedTypeOwnedPsetIds);
     }
 
@@ -978,14 +1003,108 @@ export class StepExporter {
         );
         continue;
       }
-      const rewritten = this.replaceEntityAttribute(
-        entityId,
-        HAS_PROPERTY_SETS_SLOT,
-        hasPropertySetsToken(resolved),
-      );
-      if (rewritten) {
-        rewrittenEntityLines.set(entityId, rewritten);
+      // This line REPLACES the one the source-iteration pass would have
+      // written — `rewrittenEntityIds` makes that pass skip the entity — so it
+      // has to carry the entity's other edits too, and it has to apply them
+      // the way that pass does. It used to replace slot 5 and nothing else,
+      // which dropped the rename in `setAttribute(id,'Name',…)` +
+      // `addPropertySet(id,…)`, and then, once renames were special-cased
+      // here, still dropped retypes and positional edits — same line, same
+      // silence. So run the ONE pipeline both passes share and replace
+      // `HasPropertySets` on its output. Order matters: see
+      // {@link applySourceLineMutations}.
+      const record = effective.get(entityId);
+      let sourceLine: string | null = null;
+      let mutated: SourceLineMutations | null = null;
+      // One narrowed block for both calls: `record` is in scope for the decode
+      // AND for the record type below, with no non-null assertion to keep true
+      // by hand. `byteOffset >= 0` is the same "are there real source bytes"
+      // test the source-iteration pass makes — an overlay-authored record
+      // carries `-1` there, and decoding from it would read another entity's
+      // bytes rather than fall through to the no-source-bytes branch.
+      if (record && this.dataStore.source && record.byteOffset >= 0 && record.byteLength > 0) {
+        sourceLine = decodeRange(
+          this.dataStore.source,
+          record.byteOffset,
+          record.byteOffset + record.byteLength,
+        );
+        // The RECORD's class is the from-type: the bytes are still the source
+        // class, whatever `typeOf` now says the entity effectively is.
+        mutated = this.applySourceLineMutations(
+          entityId,
+          sourceLine,
+          record.type,
+          modifiedAttributes.get(entityId),
+          sourceSchema,
+          overlayActive,
+        );
       }
+      if (mutated === null) {
+        // `willBeEmitted` already required real source bytes for a non-overlay
+        // record, so this is only reachable with no source buffer at all —
+        // in which case the source-iteration pass never ran either and there is
+        // nothing to lose. Say it anyway; the pset edit is still going nowhere.
+        warnings.push(typeOwnedPsetRewriteWarning(entityId, 'no-source-bytes'));
+        // The line above IS the report, so the ledger must not add a second,
+        // vaguer one blaming the delta format for a drop the format did not
+        // cause.
+        modifications.acknowledgeUndelivered(entityId, 'property-set');
+        continue;
+      }
+      const { line, repointed } = rewriteTypeOwnedPsetLine(mutated.text, resolved);
+      if (repointed) {
+        // A repoint that resolves to the list the line ALREADY names changes
+        // nothing, and it is reachable: deleting a pset name the type object
+        // does not own leaves every original id in place (it is "affected" but
+        // matches none of them) and generates no replacement, so slot 5 comes
+        // back byte-identical. Same rule as the fallback branch below — an
+        // unchanged line has no place in a delta, and claiming it delivered the
+        // edit would put a modification in the header over a line that carries
+        // none. A FULL export still emits it: `rewrittenEntityIds` made the
+        // source-iteration pass skip this entity, so withholding the line there
+        // would delete the record from the file (#2469).
+        const changed = line !== sourceLine;
+        if (options.deltaOnly !== true || changed) {
+          rewrittenEntityLines.set(entityId, line);
+        }
+        // A rewritten source line IS in the delta — the one in-place change a
+        // delta does carry today (#2462). The repoint itself delivers the
+        // property-set edit that put this host in the loop; the rest of the
+        // line delivers whichever in-place edits the pipeline applied to it.
+        if (changed) {
+          modifications.recordEmitted(entityId, 'property-set');
+          recordSourceLineDelivery(modifications, entityId, mutated);
+        }
+        continue;
+      }
+      // A malformed source line — too few arguments to have a slot 5, or not
+      // parseable as a STEP record at all. The entity must still come out:
+      // `rewrittenEntityIds` made the source-iteration pass skip it, so
+      // dropping the line here deletes the whole record from the file (#2469).
+      warnings.push(typeOwnedPsetRewriteWarning(entityId, 'unparseable-line'));
+      // Same as the `no-source-bytes` branch: the property-set edit is
+      // genuinely undelivered — the repoint is what would have delivered it and
+      // it did not happen — but this warning already says so, precisely, so the
+      // ledger stays quiet about that pair rather than duplicating it. (When
+      // the affected psets produced replacement content, the property-set pass
+      // above has already recorded the emission, and an emission outranks an
+      // acknowledgement.)
+      modifications.acknowledgeUndelivered(entityId, 'property-set');
+      // `line` is byte-for-byte what the source-iteration pass would have
+      // written, so emit it wherever that pass would have run. Under
+      // `deltaOnly` it does not run, and a line the mutation pipeline left
+      // identical to its source is not a change — it has no place in a delta.
+      const changed = line !== sourceLine;
+      if (options.deltaOnly !== true || changed) {
+        rewrittenEntityLines.set(entityId, line);
+      }
+      // The ledger stays honest about WHICH modification landed: the
+      // property-set edit that nominated this host is the thing that just
+      // failed, so only the entity's OTHER edits are in this line. Under the
+      // per-kind keying that comes out as `attribute/retype/positional:
+      // delivered, property-set: undelivered` — the host still counts once,
+      // because a real change of its did land.
+      if (changed) recordSourceLineDelivery(modifications, entityId, mutated);
     }
 
     // Generate new quantity entities for mutations
@@ -994,6 +1113,7 @@ export class StepExporter {
       const newEntities = this.generateQuantitySetEntities(entityId, qsets, willBeEmitted, options.guidRandom);
       entities.push(...newEntities.lines);
       newEntityCount += newEntities.count;
+      if (newEntities.lines.length > 0) modifications.recordEmitted(entityId, 'quantity-set');
     }
 
     for (const rewrittenLine of rewrittenEntityLines.values()) {
@@ -1106,6 +1226,14 @@ export class StepExporter {
         }
       }
     }
+
+    // Settle the count against what the passes above actually wrote, and say
+    // out loud every KIND of edit a delta could not carry, per host. Silence
+    // was the other half of #2462: `deltaOnly` skips the source-iteration pass,
+    // so an in-place edit to a source entity is not in the file and never was —
+    // the header merely used to claim otherwise.
+    const { modifiedEntityCount, warnings: deltaWarnings } = modifications.settle();
+    warnings.push(...deltaWarnings);
 
     // Assemble final file as Uint8Array chunks to avoid V8 string length limit.
     // The header is built last so its provenance item reflects the real count.
@@ -1369,6 +1497,104 @@ export class StepExporter {
     }
 
     return { lines, count };
+  }
+
+  /**
+   * THE mutation pipeline for a line read out of the source buffer: retype,
+   * then named attribute edits, then positional edits.
+   *
+   * **One implementation, two call sites**, and that is the whole point. Two
+   * passes can write the defining line of a source entity — the
+   * source-iteration pass, and the type-object `HasPropertySets` rewrite that
+   * REPLACES it (`rewrittenEntityIds` makes the source pass skip those ids).
+   * The rewrite used to do its own thing (replace slot 5, nothing else), so
+   * every other edit to a type object with a type-owned pset edit was dropped
+   * in silence: first the renames (#2462 follow-up), and after those were
+   * special-cased here, still the retypes and the positional edits. Whatever
+   * the source pass applies, the rewrite has to apply too, or the next edit
+   * kind added to one site goes missing at the other.
+   *
+   * The order is load-bearing:
+   *
+   *   - the retype runs FIRST so named attribute edits resolve against the
+   *     TARGET class's attribute names, and so positional slots are indexed
+   *     into the retyped argument list;
+   *   - the `HasPropertySets` replacement (rewrite path only) runs LAST, on
+   *     the text this returns. Run it first and a positional edit to slot 5 —
+   *     or a retype's argument-list rebuild — overwrites the resolved pset
+   *     list with the stale one, which is the same silent drop one slot over.
+   *
+   * The expressId is unchanged by all of this, so geometry / placement /
+   * representation and every IfcRel* reference (keyed by #id) carry over.
+   *
+   * All three flags report EFFECT, not intent — each is the answer to "did this
+   * operation change the line", measured across that operation alone. The count
+   * and the ledger are claims about the FILE, so an edit that resolves to the
+   * text already there has delivered nothing and must not be reported: retyping
+   * an entity to the class it already is, or writing a positional slot the token
+   * it already holds, used to count as a modification and reach the ledger as a
+   * landed edit, over a byte-identical line. Discarded edits read the same way:
+   * `applyAttributeMutations` drops a name its class has no slot for and
+   * `retypeStepLine` returns an unparseable line untouched, and neither is a
+   * modification of anything.
+   *
+   * `retyped` / `positional` matter most in a FULL export, which is where the
+   * two are nominated (their edits have no earlier nomination site); named
+   * attribute edits are nominated by the collection pass and `attributed` only
+   * settles their delivery.
+   */
+  private applySourceLineMutations(
+    expressId: number,
+    entityText: string,
+    recordType: string,
+    attributeMutations: Map<string, string> | undefined,
+    sourceSchema: IfcSchemaVersion,
+    overlayActive: boolean,
+  ): SourceLineMutations {
+    let text = entityText;
+    let workingType = recordType.toUpperCase();
+
+    const typeMutation = overlayActive && typeof this.mutationView!.getEntityTypeMutation === 'function'
+      ? this.mutationView!.getEntityTypeMutation(expressId)
+      : null;
+    let retyped = false;
+    if (typeMutation) {
+      const beforeRetype = text;
+      text = retypeStepLine(
+        text,
+        recordType,
+        typeMutation.newType,
+        typeMutation.predefinedType ?? null,
+        sourceSchema,
+      );
+      retyped = text !== beforeRetype;
+      // Set even for a no-op retype: the entity IS the target class from here
+      // on, so the named and positional edits below must resolve against it.
+      workingType = typeMutation.newType.toUpperCase();
+    }
+
+    // `applyAttributeMutations` returns its input UNCHANGED when it wrote
+    // nothing — no slot resolved for any of the names, or the line does not
+    // parse — so comparing is what tells the ledger whether a named attribute
+    // edit was really carried, rather than merely attempted.
+    let attributed = false;
+    if (attributeMutations && attributeMutations.size > 0) {
+      const beforeAttributes = text;
+      text = this.applyAttributeMutations(text, workingType, attributeMutations);
+      attributed = text !== beforeAttributes;
+    }
+
+    const positionals = overlayActive && typeof this.mutationView!.getPositionalMutationsForEntity === 'function'
+      ? this.mutationView!.getPositionalMutationsForEntity(expressId)
+      : null;
+    let positional = false;
+    if (positionals && positionals.size > 0) {
+      const beforePositionals = text;
+      text = this.applyPositionalMutations(text, positionals, workingType, sourceSchema);
+      positional = text !== beforePositionals;
+    }
+
+    return { text, attributed, retyped, positional };
   }
 
   /**
@@ -1990,31 +2216,6 @@ export class StepExporter {
 
     return hasPropertySets.filter((value): value is number => typeof value === 'number');
   }
-
-  /**
-   * Replace a single top-level STEP attribute in an entity line.
-   */
-  private replaceEntityAttribute(entityId: number, attrIndex: number, replacement: string): string | null {
-    const entityRef = this.dataStore.entityIndex.byId.get(entityId);
-    if (!entityRef || !this.dataStore.source) return null;
-
-    const entityText = decodeRange(
-      this.dataStore.source,
-      entityRef.byteOffset,
-      entityRef.byteOffset + entityRef.byteLength
-    );
-
-    const match = entityText.match(/^(#\d+\s*=\s*\w+\()([\s\S]*)(\)\s*;)\s*$/);
-    if (!match) return null;
-
-    const [, prefix, attrsText, suffix] = match;
-    const attrs = splitTopLevelStepArguments(attrsText);
-    if (attrIndex >= attrs.length) return null;
-
-    attrs[attrIndex] = replacement;
-    return `${prefix}${attrs.join(',')}${suffix}`;
-  }
-
 }
 
 /**
