@@ -26,7 +26,7 @@ export const CLASSIC_EXPORT_ICONS: ExportIconSet = {
   glb: Download,
   kmz: Globe2,
   usd: Download,
-  hbjson: Download,
+  energy: Download,
   csv: FileSpreadsheet,
   json: FileJson,
   screenshot: Camera,

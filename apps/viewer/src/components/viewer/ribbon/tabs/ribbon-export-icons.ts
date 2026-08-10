@@ -20,7 +20,7 @@ export const RIBBON_EXPORT_ICONS: ExportIconSet = {
   glb: FileGlb,
   kmz: FileKmz,
   usd: FileUsd,
-  hbjson: FileHbjson,
+  energy: FileHbjson,
   csv: FileCsv,
   json: FileJson,
   screenshot: Screenshot,

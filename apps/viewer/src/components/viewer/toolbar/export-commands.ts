@@ -27,7 +27,7 @@ import type React from 'react';
 import { ExportDialog } from '../ExportDialog';
 import { GLBExportDialog } from '../GLBExportDialog';
 import { KmzExportDialog } from '../KmzExportDialog';
-import { HbjsonExportDialog } from '../HbjsonExportDialog';
+import { EnergyModelExportDialog } from '../EnergyModelExportDialog';
 import { UsdExportDialog } from '../UsdExportDialog';
 
 /** The CSV tables the exporter can emit. */
@@ -142,12 +142,12 @@ export const EXPORT_COMMANDS = [
     emphasis: 'small',
   },
   {
-    id: 'hbjson',
+    id: 'energy',
     kind: 'dialog',
-    Dialog: HbjsonExportDialog,
-    label: 'HBJSON',
-    menuLabel: 'Export HBJSON (Energy Model)',
-    tooltip: 'Export HBJSON (energy model)',
+    Dialog: EnergyModelExportDialog,
+    label: 'Energy',
+    menuLabel: 'Energy Model (HBJSON / DFJSON)',
+    tooltip: 'Export energy model (HBJSON / DFJSON)',
     requires: 'model',
     group: 2,
     emphasis: 'small',
