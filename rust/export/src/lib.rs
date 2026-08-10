@@ -11,6 +11,7 @@ mod adjacency;
 mod collada;
 mod constructions;
 mod csv;
+mod dfjson;
 mod error;
 mod frame;
 mod geom;
@@ -23,6 +24,7 @@ mod kmz;
 mod merged;
 mod model;
 mod obj;
+mod relationships;
 mod openings;
 #[cfg(feature = "parquet-bos")]
 mod parquet_bos;
@@ -30,17 +32,20 @@ mod rooms;
 mod schema_convert;
 mod shades;
 mod step;
+mod step_text;
+mod usd;
 
 pub use collada::export_collada_from_meshes;
 pub use csv::{export_csv, CsvMode, CsvOptions};
+pub use dfjson::DfjsonStats;
 pub use error::ExportError;
 pub use gltf::{
     export_glb, export_glb_from_meshes, export_glb_streaming_bounded,
     export_glb_streaming_bounded_with_index, export_glb_with_stats,
     export_glb_with_stats_with_index, export_gltf_streaming, export_gltf_streaming_with_index,
-    project_glb_size, project_glb_size_with_index, try_export_glb, try_export_glb_streaming_bounded,
-    try_export_glb_streaming_bounded_with_index, try_export_glb_with_stats, GlbSizeProjection,
-    GltfBuffer, GltfOptions, GltfStats,
+    project_glb_size, project_glb_size_with_index, try_export_glb, try_export_glb_from_meshes,
+    try_export_glb_streaming_bounded, try_export_glb_streaming_bounded_with_index,
+    try_export_glb_with_stats, GlbSizeProjection, GltfBuffer, GltfOptions, GltfStats,
 };
 pub use hbjson::Model;
 // Re-exported so a caller can `build_entity_index` once and share it across the
@@ -52,7 +57,17 @@ pub use hbjson::Model;
 // count WITHOUT forcing the full index (`build_entity_index(..).len()` would
 // allocate ~20 B/entity — undoing the bounded-memory work).
 pub use ifc_lite_core::{build_entity_index, entity_count, EntityIndex};
+// The attribute model, re-exported so a consumer of the row callback can name
+// the types it is handed, and `IfcType` so it can tell what it was handed.
+pub use ifc_lite_core::{AttributeValue, DecodedEntity, IfcType};
+// Re-exported alongside the model so a consumer of `EntityRow` attribute values
+// can interpret them: those values are in the file's own units, unlike the
+// geometry exporters' output, which is normalised to metres.
+pub use ifc_lite_processing::prepass::UnitScales;
 pub use ifc5::{export_ifc5, Ifc5Options};
+// Spatial and type relationships, which `EntityRow` cannot carry because IFC
+// models them as separate entities that are not products.
+pub use relationships::{relationships, Relationships};
 pub use json::{export_json, JsonOptions};
 pub use jsonld::{export_jsonld, JsonLdOptions};
 pub use kmz::{
@@ -60,8 +75,9 @@ pub use kmz::{
 };
 pub use merged::{export_merged, export_merged_with_stats, MergedOptions, MergedStats};
 pub use model::{
-    build_export_model, stream_export_model, stream_export_model_with_index, EntityRow,
-    ExportModel, PropValue, PropertySet, QuantitySet, QuantityValue,
+    build_export_model, build_export_model_with_options, stream_export_model,
+    stream_export_model_with_index, stream_export_model_with_options, EntityRow, ExportModel,
+    ModelOptions, Placement, PropValue, PropertySet, QuantitySet, QuantityValue,
 };
 pub use obj::{export_obj, export_obj_with_stats, ObjOptions, ObjStats};
 #[cfg(feature = "parquet-bos")]
@@ -70,6 +86,7 @@ pub use step::{
     export_step, export_step_json, export_step_with_stats, AttrMutation, PropMutation, StepOptions,
     StepStats,
 };
+pub use usd::{export_usd, UsdOptions};
 
 use ifc_lite_geometry::extract_profiles;
 
@@ -164,6 +181,41 @@ pub fn export_hbjson_with_stats(content: &[u8], opts: &HbjsonOptions) -> (String
     (json, stats)
 }
 
+/// Options for DFJSON (Dragonfly) export.
+pub struct DfjsonOptions {
+    /// Model identifier / display name.
+    pub name: String,
+    /// Geometry tolerance in metres (Ladybug Tools default 0.01).
+    pub tolerance: f64,
+}
+
+impl Default for DfjsonOptions {
+    fn default() -> Self {
+        Self { name: "ifc_lite_model".to_string(), tolerance: 0.01 }
+    }
+}
+
+/// Export the `IfcSpace` volumes in `content` (raw IFC/STEP bytes) as a Dragonfly DFJSON
+/// string. Each space becomes an extruded `Room2D` (floor polygon + heights) grouped into
+/// stories — the simpler Ladybug target for mostly-vertical-wall models.
+pub fn export_dfjson(content: &[u8], opts: &DfjsonOptions) -> String {
+    export_dfjson_with_stats(content, opts).0
+}
+
+/// Like [`export_dfjson`] but also returns coverage stats.
+pub fn export_dfjson_with_stats(content: &[u8], opts: &DfjsonOptions) -> (String, DfjsonStats) {
+    let profiles = extract_profiles(content, 0);
+    // Read the file's own IfcBuilding / IfcBuildingStorey containment so stories are the
+    // model's storeys rather than an elevation guess at them (#1911). An empty index
+    // (no spatial structure declared) falls back to the elevation heuristic inside
+    // `build_model`.
+    let spatial = dfjson::spatial_index(content);
+    let (model, stats) =
+        dfjson::build_model(&sanitize_identifier(&opts.name), &profiles, opts.tolerance, Some(&spatial));
+    let json = serde_json::to_string(&model).expect("DFJSON model serializes");
+    (json, stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +307,45 @@ mod tests {
             assert_eq!(roof, 1, "room {} roofs", room["identifier"]);
             assert!(wall >= 3, "room {} walls={}", room["identifier"], wall);
         }
+    }
+
+    /// Mutation killed: swapping `constructions::build_constructions`'s returned
+    /// `Constructions { wall, floor, roof }` (e.g. `wall: slab_id.clone(), floor:
+    /// wall_id.clone(), roof: wall_id`) survived the full suite — every existing
+    /// assertion only checks `stats.constructions > 0` / that the energy library is
+    /// non-empty, never which construction id lands on which `face_type`. This test
+    /// pins wall faces to the wall build-up and floor/roof faces to the slab build-up.
+    #[test]
+    fn duplex_faces_get_construction_by_face_type_not_swapped() {
+        let Some(bytes) = fixture("ara3d/duplex.ifc") else {
+            return;
+        };
+        let (json, stats) = export_hbjson_with_stats(&bytes, &HbjsonOptions::default());
+        assert!(stats.constructions > 0, "expected constructions, got {}", stats.constructions);
+        let v: Value = serde_json::from_str(&json).expect("valid JSON");
+
+        let mut saw_wall_construction = false;
+        let mut saw_slab_construction = false;
+        for r in v["rooms"].as_array().unwrap() {
+            for f in r["faces"].as_array().unwrap() {
+                let Some(cons) = f["properties"]["energy"]["construction"].as_str() else {
+                    continue;
+                };
+                match f["face_type"].as_str().unwrap() {
+                    "Wall" => {
+                        assert_eq!(cons, "ifclite_wall", "wall face got {cons}");
+                        saw_wall_construction = true;
+                    }
+                    "Floor" | "RoofCeiling" => {
+                        assert_eq!(cons, "ifclite_slab", "{} face got {cons}", f["face_type"]);
+                        saw_slab_construction = true;
+                    }
+                    other => panic!("unexpected face_type {other}"),
+                }
+            }
+        }
+        assert!(saw_wall_construction, "expected at least one Wall face with a construction");
+        assert!(saw_slab_construction, "expected at least one Floor/RoofCeiling face with a construction");
     }
 
     #[test]

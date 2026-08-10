@@ -15,9 +15,13 @@
 import { ViewerLayout } from './components/viewer/ViewerLayout';
 import { BimProvider } from './sdk/BimProvider';
 import { ExtensionHostProvider } from './sdk/ExtensionHostProvider';
+<<<<<<< HEAD
 // >>> AIM-FORK: mount the AIM iframe-bridge layer (see apps/viewer/src/aim/, docs/FORK_MAINTENANCE.md)
 import { AimBridge } from './aim/AimBridge';
 // <<< AIM-FORK
+=======
+import { SourceHostProvider } from './services/sources/SourceHostProvider';
+>>>>>>> upstream/main
 import { Toaster } from './components/ui/toast';
 import { ChunkErrorBoundary } from './components/ChunkErrorBoundary';
 import { Suspense, lazy, useEffect, useState } from 'react';
@@ -101,12 +105,20 @@ export function App() {
   return (
     <BimProvider>
       <ExtensionHostProvider>
+<<<<<<< HEAD
         {/* >>> AIM-FORK: postMessage bridge for iframe embedding (no-op outside an AIM host) */}
         <AimBridge />
         {/* <<< AIM-FORK */}
         <ViewerLayout />
         <Toaster />
         <Analytics />
+=======
+        <SourceHostProvider>
+          <ViewerLayout />
+          <Toaster />
+          <Analytics />
+        </SourceHostProvider>
+>>>>>>> upstream/main
       </ExtensionHostProvider>
     </BimProvider>
   );
