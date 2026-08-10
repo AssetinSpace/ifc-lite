@@ -68,7 +68,7 @@ import { goHomeFromStore, resetVisibilityForHomeFromStore } from '@/store/homeVi
 import { executeBasketIsolate } from '@/store/basket/basketCommands';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
-import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, DraftingCompass } from 'lucide-react';
+import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, DraftingCompass, Box } from 'lucide-react';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
 import { DataConnector } from './DataConnector';
 import { ExportChangesButton } from './ExportChangesButton';
@@ -624,6 +624,15 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           >
             <Layers className="h-4 w-4 mr-2" />
             Layer Stack
+          </DropdownMenuCheckboxItem>
+          {/* Location zones (#1810), reachable from a toolbar for the first
+              time (#2508): the ActivityBar rail was its only entry point. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('zones')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('zones')}
+          >
+            <Box className="h-4 w-4 mr-2" />
+            Location Zones
           </DropdownMenuCheckboxItem>
           {collabEnabled && (
             <DropdownMenuCheckboxItem

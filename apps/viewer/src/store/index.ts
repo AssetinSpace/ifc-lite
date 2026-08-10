@@ -331,6 +331,14 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       // above; `useZoneAssignmentSync` recomputes against the new scene.
       zoneAssignments: new Map(),
       zoneAssignmentTiming: null,
+      // ... and the apportioned cubic metres computed off those assignments
+      // (#2508). `validEntry` only checks the ZONE revision, which a model swap
+      // does not move, so an entry that survives here is served against the
+      // incoming file — and the single-model fallback (globalId === expressId)
+      // means the new model's ids collide with the old one's. Same stale-model
+      // reference as `zoneAssignments` directly above; the two are one fact and
+      // must be dropped together.
+      zoneApportionment: new Map(),
       // ... and drop any in-flight zone-edit session: leaving `editingZone`
       // set would hand the incoming model live gizmo handles + picking for
       // a zone the user was editing against the outgoing model.
@@ -590,6 +598,21 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       layersPanelVisible: panel === 'layers',
       rightPanelCollapsed: false,
     });
+    // A side panel with NO visibility flag of its own (Location zones, #1869)
+    // cannot be adopted by `registerSidebarExclusivity` below, which promotes
+    // the panel whose flag just went off->on. Nothing went on, so the docked
+    // slot stayed where it was and the panel could not be opened from ANY entry
+    // point -- the activity bar included. Set it here, where the intent to open
+    // is unambiguous; a flagged panel still goes through the subscription so
+    // there remains one writer per mechanism.
+    // ...but only for a SIDE panel. `showWorkspacePanel` returns early for the
+    // bottom strip (Script / Schedule / Lists); this entry point has no such
+    // early return, so without the `isBottomPanel` clause a re-dock of a
+    // popped-out Lists window would promote it into the single-tenant side slot
+    // it does not belong to.
+    if (!isBottomPanel(panel) && !SIDEBAR_PANEL_FLAGS.some(([, id]) => id === panel)) {
+      get().setSidebarActivePanel(panel);
+    }
     if (get().sidebarMode !== 'expanded') get().setSidebarMode('expanded');
   },
 

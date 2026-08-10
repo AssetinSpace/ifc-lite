@@ -36,10 +36,13 @@ import { useIfc } from '@/hooks/useIfc';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { IfcQuery } from '@ifc-lite/query';
 import { MutablePropertyView } from '@ifc-lite/mutations';
-import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
+import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeQuantitiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
 import type { NewEntity } from '@ifc-lite/mutations';
 import { EntityFlags, RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
 import type { EntityRef, FederatedModel } from '@/store/types';
+import { ZoneVolumeBreakdown } from './ZoneVolumeBreakdown';
+import type { ZoneSet } from '@/lib/zones';
+import { withInheritedTypeQuantities } from '@/lib/zones/inherited-quantities';
 
 import { CoordVal, CoordRow } from './properties/CoordinateDisplay';
 import { renderToWorldViewer, viewerToIfcAxes } from './tools/measure-modes/coordinates';
@@ -615,6 +618,30 @@ export function PropertiesPanel() {
     return entityNode.quantities();
   }, [entityNode, selectedEntity, mutationViews, mutationVersion]);
 
+  /**
+   * The occurrence's quantity sets followed by those it INHERITS from its
+   * `IfcTypeObject` (#1745/#1755), for the zone volume breakdown (#2508).
+   *
+   * Appended rather than merged in place, because `declaredVolumeBases` keeps
+   * the FIRST value it sees per basis: the occurrence therefore still wins for
+   * any basis it declares, and the type only fills a basis the occurrence is
+   * silent on. Without this, a door whose `NetVolume` lives only on its type —
+   * the common case for catalogue-driven exports — showed a mesh basis alone
+   * and looked like a file that declares nothing.
+   *
+   * Both parse paths are served: the on-demand extractor walks STEP source and
+   * returns `null` when there is none, which is every server-parsed store, so
+   * that path reads the prebuilt table keyed by the TYPE's express id — the
+   * same split `lib/lists/adapter.ts` makes.
+   */
+  const quantitiesWithInheritedType = useMemo(() => withInheritedTypeQuantities(
+    quantities,
+    (model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null,
+    selectedEntity?.expressId,
+    RelationshipType.DefinesByType,
+    (store, id) => extractTypeQuantitiesOnDemand(store as IfcDataStore, id)?.quantities as QuantitySet[] | undefined,
+  ), [quantities, selectedEntity, model, ifcDataStore]);
+
   // Build attributes array for display - must be before early return to maintain hook order
   // Uses schema-aware extraction to show ALL string/enum attributes for the entity type.
   // Merges mutated attributes (from bSDD) into the base attribute list.
@@ -966,7 +993,7 @@ export function PropertiesPanel() {
     // display NAME, which is "unique-by-convention but not enforced" (see
     // `ZoneSet.name`), so two same-named sets would collide as React keys
     // (CodeRabbit review of PR #1869).
-    const rows: Array<{ setId: string; label: string; value: string }> = [];
+    const rows: Array<{ setId: string; label: string; value: string; straddles: boolean; zoneSet: ZoneSet }> = [];
     for (const zs of zoneSets) {
       const assignment = record?.[zs.id];
       if (!assignment) continue;
@@ -974,9 +1001,12 @@ export function PropertiesPanel() {
         const touched = assignment.touchedZoneIds
           .map((zoneId) => zs.zones.find((z) => z.id === zoneId)?.name)
           .filter((n): n is string => !!n);
-        rows.push({ setId: zs.id, label: zs.name, value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles' });
+        rows.push({
+          setId: zs.id, label: zs.name, straddles: true, zoneSet: zs,
+          value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles',
+        });
       } else if (assignment.zoneName) {
-        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName });
+        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName, straddles: false, zoneSet: zs });
       }
     }
     return rows.length > 0 ? rows : null;
@@ -1094,6 +1124,7 @@ export function PropertiesPanel() {
   const renderedInheritedTypeProperties = inheritedTypeProperties;
   const renderedMergedProperties = mergedProperties;
   const renderedQuantities = quantities;
+  const renderedQuantitiesWithInheritedType = quantitiesWithInheritedType;
   const renderedAttributes = attributes;
   const renderedClassifications = classifications;
   const renderedMaterialInfos = materialInfos;
@@ -1516,9 +1547,23 @@ export function PropertiesPanel() {
           <CollapsibleContent>
             <div className="divide-y border-t">
               {zoneMembership.map((item) => (
-                <div key={item.setId} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
-                  <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
-                  <span className="font-medium font-mono truncate" title={item.value}>{item.value}</span>
+                <div key={item.setId}>
+                  <div className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
+                    <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
+                    <span className="font-medium font-mono truncate" title={item.value}>{item.value}</span>
+                  </div>
+                  {/* Only a straddler has anything to apportion (#2508): an
+                      element wholly inside one zone contributes its whole
+                      volume to that zone and needs no clip to say so. */}
+                  {item.straddles && selectedEntityId !== null && (
+                    <ZoneVolumeBreakdown
+                      zoneSet={item.zoneSet}
+                      globalId={selectedEntityId}
+                      quantitySets={renderedQuantitiesWithInheritedType}
+                      projectUnits={renderedProjectUnits}
+                      unitDisplayOverrides={unitDisplayOverrides}
+                    />
+                  )}
                 </div>
               ))}
             </div>
