@@ -258,8 +258,9 @@ impl IfcAPI {
     /// Create and initialize the IFC API
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        #[cfg(feature = "console_error_panic_hook")]
-        console_error_panic_hook::set_once();
+        // MUST be `set_panic_hook()`, never `console_error_panic_hook::set_once()`
+        // directly — that would replace init()'s panic-location stash. Idempotent.
+        crate::utils::set_panic_hook();
 
         Self {
             initialized: true,
