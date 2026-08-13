@@ -32,7 +32,9 @@ import {
   orthometricTargetForTerrain,
 } from '@/lib/geo/cesium-placement';
 import { egm96Undulation } from '@/lib/geo/egm96-undulation';
-import { buildCesiumModelGLB, cesiumModelGLBKey } from '@/lib/geo/cesium-model-glb';
+import { buildCesiumModelGLB, cesiumModelGLBKey, type CesiumModelGLBInput } from '@/lib/geo/cesium-model-glb';
+import { effectiveIsolatedIds } from '@/lib/effective-isolation';
+import { VisibilityEpochTracker } from '@ifc-lite/renderer';
 import { applySolarScene, SunPathDome } from '@/lib/geo/cesium-sun';
 import { sunPosition, sunTimes } from '@ifc-lite/solar';
 
@@ -109,6 +111,10 @@ export interface CesiumOverlayProps {
    *  Used to clamp the model's ground-floor storey to terrain instead of
    *  the lowest geometry vertex (which can be a basement or foundation). */
   storeyElevations?: Map<number, number>;
+  /** Storey isolation, class filter and manual isolation already intersected,
+   *  exactly as the viewport receives it. The world view must hide what the
+   *  viewport hides (#2578). */
+  computedIsolatedIds?: ReadonlySet<number> | null;
 }
 
 export function CesiumOverlay({
@@ -119,6 +125,7 @@ export function CesiumOverlay({
   geometryResult,
   lengthUnitScale = 1,
   storeyElevations,
+  computedIsolatedIds,
 }: CesiumOverlayProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<InstanceType<typeof import('cesium').Viewer> | null>(null);
@@ -144,6 +151,25 @@ export function CesiumOverlay({
   // In-place mesh mutations (a gizmo move rewrites positions in the SAME
   // arrays) change no mesh count, so the world-view GLB cache keys on this too.
   const geometryContentVersion = useViewerStore((s) => s.geometryContentVersion);
+  // Hide/isolate, resolved the way Viewport resolves what it hands the
+  // renderer, so the map draws the elements the viewport draws (#2578).
+  const hiddenEntities = useViewerStore((s) => s.hiddenEntities);
+  const storeIsolatedEntities = useViewerStore((s) => s.isolatedEntities);
+  const isolatedEntities = effectiveIsolatedIds(computedIsolatedIds, storeIsolatedEntities);
+  // The GLB effect keys on this version, NOT on the Set references. The store
+  // hands out a fresh Set on every visibility action, and the effect's cleanup
+  // pulls the model off the globe — so keying on identity blanks the map for a
+  // second and rebuilds a multi-megabyte GLB even when the content is
+  // unchanged. `VisibilityEpochTracker` compares content, so an equal set is a
+  // no-op while an in-place mutation of the same Set still registers.
+  //
+  // Safe to run during render: `update()` only bumps when the content actually
+  // changed, so a double-invoked render (StrictMode) returns the same version.
+  const visibilityEpochsRef = useRef(new VisibilityEpochTracker());
+  const visibilityVersion = visibilityEpochsRef.current.update(hiddenEntities, isolatedEntities);
+  // Read inside the deferred build, which runs long after the effect fired.
+  const visibilityRef = useRef({ hiddenIds: hiddenEntities, isolatedIds: isolatedEntities });
+  visibilityRef.current = { hiddenIds: hiddenEntities, isolatedIds: isolatedEntities };
 
   // Solar study state — drives the sun-path dome + shadow study.
   const solarEnabled = useViewerStore((s) => s.solarEnabled);
@@ -563,7 +589,14 @@ export function CesiumOverlay({
         // Reuse the cached GLB when it was built from the same mesh set. The key
         // spans flat AND instanced geometry (see cesiumModelGLBKey), so an
         // all-instanced batch still invalidates it.
-        const key = cesiumModelGLBKey(geometryResult, geometryContentVersion);
+        const glbInput: CesiumModelGLBInput = {
+          geometryResult,
+          geometryContentVersion,
+          hiddenIds: visibilityRef.current.hiddenIds,
+          isolatedIds: visibilityRef.current.isolatedIds,
+          visibilityVersion,
+        };
+        const key = cesiumModelGLBKey(glbInput);
         const cached = glbCacheRef.current;
         if (cesiumModelRef.current && cached?.key === key) {
           // Model already loaded with same geometry — just update matrix
@@ -582,7 +615,7 @@ export function CesiumOverlay({
         } else {
           await new Promise(r => setTimeout(r, 50));
           if (cancelled) return;
-          const built = buildCesiumModelGLB(geometryResult, geometryContentVersion);
+          const built = buildCesiumModelGLB(glbInput);
           glbBytes = built.glb;
           glbCacheRef.current = { key: built.key, glb: built.glb };
         }
@@ -654,7 +687,7 @@ export function CesiumOverlay({
       }
       setCesiumGlbLoaded(false);
     };
-  }, [status, bridgeVersion, geometryResult, geometryContentVersion]);
+  }, [status, bridgeVersion, geometryResult, geometryContentVersion, visibilityVersion]);
 
   // ─── Effect 2d: Update model matrix (instant, no reload) ────────────────
   // When terrain placement or georef changes, just update the
