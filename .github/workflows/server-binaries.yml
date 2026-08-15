@@ -22,6 +22,17 @@ on:
     types:
       - published
   workflow_dispatch:
+    inputs:
+      upload-to-tag:
+        # Backfill lever: a plain dispatch only produces 1-day artifacts, so
+        # before this input existed a release missing an archive (issue
+        # #2619, v1.16.6 shipped without the win32-x64 zip) could not be
+        # repaired self-service. Supplying an existing v* tag uploads the
+        # rebuilt archives to that release and re-verifies its assets.
+        description: 'Existing release tag (e.g. v1.16.6) to upload the built archives to; leave empty for artifacts only'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -153,6 +164,18 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The build ref and the workflow ref deliberately differ on a
+          # manual backfill. A dispatch runs the workflow DEFINITION from the
+          # dispatch ref (normally the default branch, which is the only ref
+          # that has the `upload-to-tag` input), but the SOURCE being built
+          # must be the tag under repair: the install-time resolver in
+          # packages/server-bin picks its release by the installed package
+          # version, so an archive built from any other revision would ship
+          # different code under that old version number. Do not "simplify"
+          # this to the default checkout. On a `release` event
+          # `inputs.upload-to-tag` is empty, so this falls back to
+          # `github.ref` (the release tag), identical to the default.
+          ref: ${{ inputs.upload-to-tag || github.ref }}
           lfs: false
           persist-credentials: false
 
@@ -232,15 +255,92 @@ jobs:
           retention-days: 1
 
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
-        # Force bash so the backslash line-continuation parses on Windows
-        # runners too (default shell there is PowerShell, which reads the
-        # bare `--clobber` continuation as the unary decrement operator →
-        # win32-x64 release upload failed with a ParserError).
+        # Also runs on a manual dispatch that names an existing tag, so a
+        # release with a missing archive can be backfilled (issue #2619).
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload-to-tag != '')
+        # Force bash so multi-line scripts parse on Windows runners too
+        # (default shell there is PowerShell, which once read a bare
+        # `--clobber` line-continuation as the unary decrement operator and
+        # failed the win32-x64 release upload with a ParserError).
         shell: bash
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            ifc-lite-server-${{ matrix.target }}.${{ matrix.archive }} \
-            --clobber
+          asset="ifc-lite-server-${{ matrix.target }}.${{ matrix.archive }}"
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            # Fresh release: assets are being created for the first time, so
+            # --clobber is the correct idempotent choice for job re-runs.
+            gh release upload "$RELEASE_TAG" "$asset" --clobber
+          else
+            # Manual backfill of an existing release: every matrix leg runs,
+            # including platforms whose assets are already healthy, and
+            # `gh release upload --clobber` DELETES the existing asset before
+            # uploading ("If the upload fails, the original assets will be
+            # lost"). A transient failure would then destroy a working
+            # archive for a platform that was never broken. So only upload
+            # what is actually missing, and never clobber.
+            existing="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+            if printf '%s\n' "$existing" | grep -qxF "$asset"; then
+              echo "$asset already exists on $RELEASE_TAG; leaving the healthy asset untouched"
+            else
+              gh release upload "$RELEASE_TAG" "$asset"
+            fi
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The tag must reach bash as DATA, never as source: `${{ }}` expands
+          # before bash parses the script, so inlining it would let a tag name
+          # or `upload-to-tag` input containing shell metacharacters (git
+          # refnames allow $, (, ), ; and friends) execute in a job holding a
+          # contents:write token. The matrix.* values inlined above are
+          # literals defined in this file, so they are not injectable.
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.upload-to-tag }}
+
+  # Verify the release actually carries one archive per supported platform.
+  # The upload matrix above can partially fail, and a missing archive makes
+  # every install on that platform 404 at postinstall (issue #2619).
+  verify-release-assets:
+    name: Verify release assets
+    needs: release-server-binaries
+    # `always()` is the load-bearing part. A failed `needs:` skips the
+    # dependent whatever the condition says, so without it the job that
+    # exists to name a missing archive could not run on the case it exists
+    # for: a matrix leg that failed or was cancelled. That is exactly how
+    # v1.16.6 shipped without the win32-x64 zip and nothing said so.
+    #
+    # Runs on version-tagged releases, and on a manual dispatch that names
+    # a tag to backfill - the same two paths that upload assets.
+    if: |
+      always()
+      && (
+        (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+        || (github.event_name == 'workflow_dispatch' && inputs.upload-to-tag != '')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          persist-credentials: false
+
+      - name: Verify release carries every supported platform archive
+        # The script reads the expected archive set from the TAG'S OWN
+        # platform.ts (git show), not from this checkout: on a manual
+        # backfill the checkout is the workflow ref (main), whose
+        # SUPPORTED_TARGETS may have drifted since the tag - main's set
+        # would demand archives the old release never claimed to ship, a
+        # false red on exactly the repair path this job exists for. The
+        # checker code itself still runs from the workflow ref. A `release`
+        # event checkout already carries the tag ref, a backfill checkout
+        # does not, so fetch it explicitly (anonymous fetch works: the repo
+        # is public and persist-credentials is off); if the ref is absent
+        # the script fails closed rather than falling back to today's set.
+        run: |
+          git fetch --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          node scripts/check-server-bin-targets.mjs --release "$RELEASE_TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same hardening as the upload step: the tag reaches bash as data
+          # through env, never spliced into the script source via ${{ }}.
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.upload-to-tag }}
