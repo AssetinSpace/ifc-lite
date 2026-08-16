@@ -34,6 +34,7 @@ import {
   shouldStartDragMeasurement,
 } from './measureHandlers.js';
 import { handleSelectionClick, handleContextMenu as handleContextMenuSelection, handleAddElementHover, handleSplitHover, finishPolylineFromDoubleClick } from './selectionHandlers.js';
+import { applyWheelZoom, createFineZoomModifierTracker } from './wheelZoom.js';
 
 export interface MouseState {
   isDragging: boolean;
@@ -818,8 +819,22 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // Debounce: clear isInteracting 150ms after the last wheel event
     let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // Ctrl/Cmd held = finer zoom step (#2683). Tracked from keyboard events
+    // rather than read off the wheel event, because a trackpad pinch arrives
+    // as a wheel event with `ctrlKey: true` and no key ever pressed - see
+    // wheelZoom.ts.
+    const fineZoomModifier = createFineZoomModifierTracker();
+
     const handleWheel = (e: WheelEvent) => {
-      e.preventDefault();
+      // Cancels the browser's own Ctrl+wheel page zoom as well as scrolling;
+      // works only because the listener below is registered `passive: false`.
+      applyWheelZoom(e, {
+        camera,
+        canvas,
+        fastZoom: e.shiftKey || params.fastZoomRef.current,
+        fineModifierHeld: fineZoomModifier.isHeld(),
+      });
+
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
       wheelIdleTimer = setTimeout(() => {
         isInteractingRef.current = false;
@@ -827,11 +842,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         // One signal per zoom gesture, on the trailing edge of the debounce.
         emitCameraInteracted('zoom');
       }, 150);
-      const rect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-      const fastZoom = e.shiftKey || params.fastZoomRef.current;
-      camera.zoom(e.deltaY, false, mouseX, mouseY, canvas.width, canvas.height, fastZoom);
 
       isInteractingRef.current = true;
       renderer.requestRender();
@@ -894,6 +904,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       canvas.removeEventListener('wheel', handleWheel);
       canvas.removeEventListener('click', handleClick);
       canvas.removeEventListener('dblclick', handleDoubleClick);
+      fineZoomModifier.dispose();
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
 
       // Cancel pending raycast requests
