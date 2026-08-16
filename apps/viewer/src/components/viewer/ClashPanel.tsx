@@ -104,7 +104,19 @@ function describeClash(c: Clash): string {
   if (isTouching(c)) {
     return 'Touching contact (≈0 m) — surfaces meet but barely overlap';
   }
-  return `Hard clash — ${penetrationDepth(c).toFixed(3)} m interpenetration`;
+  // An ABSENT `distanceKind` (results recorded before the field existed) is
+  // not the same statement as an explicit `'estimate'`: the estimate wording
+  // asserts the depth IS the AABB overlap, which an old record never said —
+  // for those, say only that the provenance is unknown (review: #2536).
+  if (c.distanceKind === undefined) {
+    return `Hard clash — ~${penetrationDepth(c).toFixed(3)} m interpenetration (depth provenance unavailable)`;
+  }
+  // 'estimate' means the depth is a box dimension read off the AABBs, not a
+  // mesh measurement (see Clash.distanceKind) — mark it so this does not
+  // read as a precise interpenetration measurement.
+  return c.distanceKind === 'estimate'
+    ? `Hard clash — ~${penetrationDepth(c).toFixed(3)} m interpenetration (AABB estimate)`
+    : `Hard clash — ${penetrationDepth(c).toFixed(3)} m interpenetration`;
 }
 
 /**
