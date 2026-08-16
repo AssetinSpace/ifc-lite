@@ -3651,6 +3651,7 @@
     "decodeIfcxPointAttribute: function",
     "decodeLasPoints: function",
     "decodePcd: function",
+    "decodePly: function",
     "decodePointsArray: function",
     "decodePointsBase64: function",
     "decompressLZF: function",
