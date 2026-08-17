@@ -31,8 +31,10 @@ import {
   handleMeasureHover,
   handleMeasureUp,
   updateMeasureScreenCoords,
+  shouldStartDragMeasurement,
 } from './measureHandlers.js';
-import { handleSelectionClick, handleContextMenu as handleContextMenuSelection, handleAddElementHover, handleSplitHover } from './selectionHandlers.js';
+import { handleSelectionClick, handleContextMenu as handleContextMenuSelection, handleAddElementHover, handleSplitHover, finishPolylineFromDoubleClick } from './selectionHandlers.js';
+import { applyWheelZoom, createFineZoomModifierTracker } from './wheelZoom.js';
 
 export interface MouseState {
   isDragging: boolean;
@@ -390,7 +392,12 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       // co-planar triangle pairs; the slice would warn and refuse a
       // commit anyway, so don't waste a preview on it.
       const nLen = hit ? Math.hypot(hit.intersection.normal.x, hit.intersection.normal.y, hit.intersection.normal.z) : 0;
-      if (!hit || nLen < 1e-6) {
+      // `nLen < 1e-6` alone is a magnitude test where finiteness is also at
+      // stake: it is false for BOTH `Infinity` and `NaN`, so a non-finite
+      // raycast normal passed the floor and then `Infinity / Infinity` made
+      // the snapshot below all-NaN (#2495). The store repeats this screen —
+      // this copy just avoids arming a 200ms dwell timer for a dead pick.
+      if (!hit || !Number.isFinite(nLen) || nLen < 1e-6) {
         if (sectionDwellTimerRef.current) {
           clearTimeout(sectionDwellTimerRef.current);
           sectionDwellTimerRef.current = null;
@@ -577,16 +584,22 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         mouseState.isPanning = e.shiftKey;
         canvas.style.cursor = e.shiftKey ? 'move' : 'grabbing';
       } else if (tool === 'measure') {
-        // Measure tool - shift+drag = orbit, normal drag = measure
-        if (e.shiftKey) {
-          // Shift pressed: allow orbit (not pan) when no measurement is active
+        // Measure tool - shift+drag = orbit, normal drag = measure (drag
+        // mode) or nothing (polyline mode — see shouldStartDragMeasurement).
+        if (shouldStartDragMeasurement(useViewerStore.getState().measureMode, e.shiftKey)) {
+          // Normal drag: delegate to measurement handler
+          if (handleMeasureDown(ctx, e)) return;
+        } else {
+          // Shift held, OR polyline mode (#2199): never start a drag
+          // measurement. Polyline mode places points on 'click' only (see
+          // handlePolylineClick in selectionHandlers.ts) — falling through
+          // to plain orbit/pan here means a click that doesn't move the
+          // mouse is a no-op for the camera and `activeMeasurement` is
+          // never touched, so the two modes can't corrupt each other.
           mouseState.isDragging = true;
           mouseState.isPanning = false;
           canvas.style.cursor = 'grabbing';
           // Fall through to allow orbit handling in mousemove
-        } else {
-          // Normal drag: delegate to measurement handler
-          if (handleMeasureDown(ctx, e)) return;
         }
       } else {
         // Default behavior
@@ -810,6 +823,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // Debounce: clear isInteracting 150ms after the last wheel event
     let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
+<<<<<<< HEAD
     // Physical Ctrl-key state for the cut-move gesture (D-072). Browsers
     // synthesize wheel events with ctrlKey=true for TRACKPAD PINCH, so
     // gating on e.ctrlKey would hijack pinch-zoom into cut movement.
@@ -854,6 +868,23 @@ export function useMouseControls(params: UseMouseControlsParams): void {
           }
         }
       }
+=======
+    // Ctrl/Cmd held = finer zoom step (#2683). Tracked from keyboard events
+    // rather than read off the wheel event, because a trackpad pinch arrives
+    // as a wheel event with `ctrlKey: true` and no key ever pressed - see
+    // wheelZoom.ts.
+    const fineZoomModifier = createFineZoomModifierTracker();
+
+    const handleWheel = (e: WheelEvent) => {
+      // Cancels the browser's own Ctrl+wheel page zoom as well as scrolling;
+      // works only because the listener below is registered `passive: false`.
+      applyWheelZoom(e, {
+        camera,
+        canvas,
+        fastZoom: e.shiftKey || params.fastZoomRef.current,
+        fineModifierHeld: fineZoomModifier.isHeld(),
+      });
+>>>>>>> upstream/main
 
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
       wheelIdleTimer = setTimeout(() => {
@@ -862,11 +893,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         // One signal per zoom gesture, on the trailing edge of the debounce.
         emitCameraInteracted('zoom');
       }, 150);
-      const rect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-      const fastZoom = e.shiftKey || params.fastZoomRef.current;
-      camera.zoom(e.deltaY, false, mouseX, mouseY, canvas.width, canvas.height, fastZoom);
 
       isInteractingRef.current = true;
       renderer.requestRender();
@@ -884,6 +910,33 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       await handleSelectionClick(ctx, e);
     };
 
+    // Double-click finishes an in-progress polyline sequence as OPEN (#2199)
+    // — the same "reads the length so far, does not close the loop" outcome
+    // as pressing Enter (see useKeyboardShortcuts.ts). Closing the loop is a
+    // different gesture entirely (clicking back near the first point — see
+    // handlePolylineClick), so double-click never closes anything.
+    const handleDoubleClick = (e: MouseEvent) => {
+      if (activeToolRef.current !== 'measure') return;
+      // The store side lives in selectionHandlers.ts (beside
+      // handlePolylineClick) so it is reachable from a test without a canvas
+      // — it is the one finish path allowed to drop the browser's duplicate
+      // second click, and that has to be verifiable.
+      const recorded = finishPolylineFromDoubleClick();
+      if (recorded === null) return; // not this gesture — leave the event alone
+      e.preventDefault();
+      // The duplicate near-final point is dropped before the minimum is
+      // checked (see measurementSlice.ts), so double-clicking right after
+      // the very first placed point can still collapse below the 2-point
+      // minimum — same "did nothing register" gap as Enter on a 1-point
+      // sequence (useKeyboardShortcuts.ts), same fix: surface it instead of
+      // leaving it silent.
+      if (!recorded) {
+        import('@/components/ui/toast').then(({ toast }) => {
+          toast.error('Polyline needs at least 2 points');
+        });
+      }
+    };
+
     canvas.addEventListener('pointerdown', handleMouseDown);
     canvas.addEventListener('pointermove', handleMouseMove);
     canvas.addEventListener('pointerup', handleMouseUp);
@@ -891,9 +944,13 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     canvas.addEventListener('contextmenu', handleContextMenu);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     canvas.addEventListener('click', handleClick);
+<<<<<<< HEAD
     window.addEventListener('keydown', handleModifierDown);
     window.addEventListener('keyup', handleModifierUp);
     window.addEventListener('blur', handleWindowBlur);
+=======
+    canvas.addEventListener('dblclick', handleDoubleClick);
+>>>>>>> upstream/main
 
     return () => {
       canvas.removeEventListener('pointerdown', handleMouseDown);
@@ -903,9 +960,14 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       canvas.removeEventListener('contextmenu', handleContextMenu);
       canvas.removeEventListener('wheel', handleWheel);
       canvas.removeEventListener('click', handleClick);
+<<<<<<< HEAD
       window.removeEventListener('keydown', handleModifierDown);
       window.removeEventListener('keyup', handleModifierUp);
       window.removeEventListener('blur', handleWindowBlur);
+=======
+      canvas.removeEventListener('dblclick', handleDoubleClick);
+      fineZoomModifier.dispose();
+>>>>>>> upstream/main
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
 
       // Cancel pending raycast requests

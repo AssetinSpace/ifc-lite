@@ -32,6 +32,38 @@ export interface ActiveMeasurement {
   distance: number;
 }
 
+// ============================================================================
+// Polyline Measurement Types (multi-click accumulate mode, issue #2199)
+// ============================================================================
+
+/**
+ * Which gesture the Measure tool is currently listening for. `'drag'` is the
+ * original mousedown→mouseup distance measurement (unchanged by this mode).
+ * `'polyline'` accumulates points via successive clicks instead; the two are
+ * mutually exclusive so a sequence started in one can never leak state into
+ * the other (see `setMeasureMode` in measurementSlice.ts).
+ */
+export type MeasureMode = 'drag' | 'polyline';
+
+/** A multi-click sequence in progress, not yet finished or cancelled. */
+export interface ActivePolyline {
+  points: MeasurePoint[];
+}
+
+/**
+ * A finished multi-click measurement. `closed` is the basis for `length` and
+ * must always be read alongside it (never assumed): for an open polyline,
+ * `length` is the sum of the placed segments; for a closed loop it is the
+ * perimeter, i.e. the same sum PLUS the closing segment back to the first
+ * point. The tool never blends the two under one unlabelled number.
+ */
+export interface PolylineMeasurement {
+  id: string;
+  points: MeasurePoint[];
+  closed: boolean;
+  length: number;
+}
+
 /** Orthogonal constraint axis type */
 export type OrthogonalAxis = 'axis1' | 'axis2' | 'axis3';
 
@@ -255,6 +287,7 @@ export interface CameraCallbacks {
   rotateRight?: () => void;
   frameSelection?: () => void;
   /**
+<<<<<<< HEAD
    * Frame the camera to the union of the given entities' world AABBs, keeping
    * the current view direction (same fit as `frameSelection`, but for an
    * explicit id list instead of the current selection). Drives the SDK
@@ -264,6 +297,41 @@ export interface CameraCallbacks {
    * selection channels (which would race the ref sync and echo back to hosts).
    */
   frameEntities?: (globalIds: number[]) => void;
+=======
+   * Resolve ids to what the 3D renderer can actually highlight, expanding a
+   * geometry-less `IfcRelAggregates` assembly (own id has no mesh) to its
+   * geometry-bearing parts — the same resolution `frameSelection` applies to
+   * decide what to frame. For a selection entry point that assigns
+   * `selectedEntityId`/`selectedEntityIds` directly (search modal, programmatic
+   * select) rather than a 3D pick, calling this before setting the selection
+   * keeps "camera moved here" and "this is highlighted" in agreement. Returns
+   * `[]` for an id with neither geometry nor renderable parts.
+   */
+  resolveHighlightIds?: (ids: number[]) => number[];
+  /**
+   * Frame the camera on the bounds of an explicit id set, keeping the current
+   * view direction. Ids are federated GLOBAL ids — the id space the scene
+   * meshes carry (single model: global === express). Used by the Space Sketch
+   * tool to zoom to the existing IfcSpace extent on open.
+   */
+  frameEntities?: (ids: number[]) => void;
+  /**
+   * Frame the camera on the building shell - the bounds of all rendered
+   * geometry EXCLUDING IfcSite/terrain and IfcSpace. Used by the Space Sketch
+   * tool when a model has no spaces yet, so it frames the building rather than
+   * the much larger georeferenced site extent.
+   */
+  frameBuildingExtent?: () => void;
+  /**
+   * Replace the Space Sketch draft "ghost" overlay meshes in the 3D scene. These
+   * go straight to the renderer scene (NOT through geometryResult), so frequent
+   * per-edit updates can't trip the streaming reclassifier (which would reset the
+   * camera / un-pick newly created spaces). Pass [] (or use clear) to remove all.
+   */
+  setSpaceOverlayMeshes?: (meshes: MeshData[]) => void;
+  /** Remove all Space Sketch overlay ghost meshes from the scene. */
+  clearSpaceOverlayMeshes?: () => void;
+>>>>>>> upstream/main
   /**
    * Frame an explicit world-space box (min/max corners) from the canonical
    * isometric view, animating there. Used to frame a focused clash's contact
@@ -294,7 +362,7 @@ export interface CameraCallbacks {
 // ============================================================================
 
 import type { IfcDataStore } from '@ifc-lite/parser';
-import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
+import type { CoordinateInfo, EntityWorldAabb, GeometryResult, MeshData } from '@ifc-lite/geometry';
 
 /**
  * Compound identifier for entities across multiple models.
@@ -336,6 +404,56 @@ export type MetadataLoadState =
 export type ModelSourceFile = File;
 
 /** Complete model container for federation */
+/**
+ * A federated model's geometry as it stood before alignment re-baked it.
+ *
+ * The whole set of channels `federationAlign.ts` overwrites — anything it
+ * writes has to be in here or the restore is incomplete. Captured and restored
+ * by the one pair of functions in `hooks/ingest/federationRealign.ts`.
+ */
+export interface PreAlignmentSnapshot {
+  /** One Float32Array per mesh, in `geometryResult.meshes` order. */
+  positions: Float32Array[];
+  /** Per mesh, sparse: `undefined` where the mesh carried no normals. Restored
+   *  because alignment rotates normals in place, so repeated re-bakes would
+   *  compound the rotation and drift the shading. */
+  normals: (Float32Array | undefined)[];
+  /**
+   * Per mesh, sparse: the local-frame origin (`world = origin + position`),
+   * `undefined` where the mesh carried none.
+   *
+   * Alignment folds each origin into the vertices and then ZEROES it — it does
+   * not remove it — so there is no safe "leave the origin alone" reading of a
+   * restore: leaving the zero misplaces the mesh by exactly the offset that was
+   * folded in, which is the same damage as deleting it. Only putting the true
+   * value back is correct. Measured at up to 54 m of displacement on the second
+   * re-align of `Infra-Bridge.ifc`, and every model off the wasm local-frame
+   * path carries origins.
+   */
+  origins: ([number, number, number] | undefined)[];
+  /** The RTC/shift frame the positions are relative to, recovered before the
+   *  new alignment is applied. */
+  coordinateInfo: CoordinateInfo;
+  /**
+   * Per mesh, sparse: the per-entity world box (#1891), `undefined` where the
+   * mesh carried none. Alignment REPLACES each box with one in the anchor's
+   * frame, so a re-align run against already-aligned boxes would transform them
+   * twice while the vertices started over from the snapshot — the box and its
+   * mesh would part company again, silently.
+   *
+   * References, not copies: alignment never mutates a box in place, so the
+   * snapshotted objects stay valid pre-alignment values.
+   */
+  geometryAabbs: (EntityWorldAabb | undefined)[];
+  /**
+   * `geometryResult.instancedGeometryAabbs`, where `undefined` is a VALUE — the
+   * model had no instanced-only channel — and not a missing snapshot. Restoring
+   * it unconditionally is what keeps capture and restore asking the same
+   * question (#2005).
+   */
+  instancedGeometryAabbs: Map<number, EntityWorldAabb> | undefined;
+}
+
 export interface FederatedModel {
   /** Unique identifier (UUID generated on load) */
   id: string;
@@ -397,29 +515,20 @@ export interface FederatedModel {
    */
   pointCloudHandleId?: number;
   /**
-   * Snapshot of mesh positions before federation alignment ran (one Float32Array
-   * per mesh, indexed in `geometryResult.meshes` order). Populated when this
-   * model joined an existing federation and its geometry was re-baked into the
-   * anchor's viewer frame. Used by `realignFederation()` to re-apply alignment
-   * against a different anchor without re-parsing the source file.
+   * This model's geometry as it stood before federation alignment re-baked it
+   * into the anchor's viewer frame, or `undefined` when no alignment is applied
+   * — a single-model load, the federation anchor itself, or a model that was
+   * restored back into its own frame.
    *
-   * Stays `undefined` for single-model loads and the federation anchor itself
-   * (which has no alignment applied).
+   * ONE object rather than a field per channel, on purpose. Every channel here
+   * is something the alignment overwrites, and a restore that puts back some of
+   * them and not others is the defect this whole path keeps producing (#2005
+   * lost the world boxes, #2007 the anchor, and the local-frame origins were
+   * never captured at all). Grouping them makes "positions but no origins"
+   * unrepresentable instead of merely unreachable: capture and restore cannot
+   * drift apart, because there is one value to write and one to read.
    */
-  preAlignmentPositions?: Float32Array[];
-  /**
-   * Snapshot of mesh normals before federation alignment ran (one Float32Array
-   * per mesh, sparse — empty slot when a mesh had no normals). Restored
-   * alongside `preAlignmentPositions` on re-alignment so repeated re-bakes
-   * don't accumulate rotation drift on the normals (lighting/shading bug).
-   */
-  preAlignmentNormals?: (Float32Array | undefined)[];
-  /**
-   * CoordinateInfo at the time `preAlignmentPositions` was taken. Restored
-   * together with the positions on re-alignment so the source's RTC/shift
-   * frame is recovered before applying the new alignment.
-   */
-  preAlignmentCoordinateInfo?: CoordinateInfo;
+  preAlignment?: PreAlignmentSnapshot;
   /**
    * How this model was placed in the current federation:
    *   - `'anchor'`       — this model drives the world frame, no alignment
@@ -429,12 +538,23 @@ export interface FederatedModel {
    *   - `'failed'`       — alignment could not be computed; model rendered in
    *                        its own local frame and likely at the wrong real
    *                        world position
-   *   - `'none'`         — single-model load or first georeferenced model
+   *   - `'none'`         — single-model load, first georeferenced model, or a
+   *                        model that could not take part in the last
+   *                        federation re-align (no geometry, or no georeference)
    */
   federationAlignmentStatus?: 'anchor' | 'same-crs' | 'reprojected' | 'identity' | 'failed' | 'none';
 }
 
-/** Convert EntityRef to string for use as Map/Set key */
+/**
+ * Convert EntityRef to string for use as Map/Set key.
+ *
+ * NOTE: `packages/sdk/src/types.ts` carries a second implementation of this
+ * pair with a THROWING contract and a LAST-colon split. Deliberate, not
+ * drift: this side decodes untrusted DOM/state strings on hot paths and
+ * must not throw (a sentinel `{ modelId: '', expressId: -1 }` instead), and
+ * a published API is free to fail loudly at the corruption site. Keep the
+ * two in step on *bugs*, not on contract.
+ */
 export function entityRefToString(ref: EntityRef): string {
   return `${ref.modelId}:${ref.expressId}`;
 }

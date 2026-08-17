@@ -28,11 +28,15 @@ import { useIfc } from '@/hooks/useIfc';
 import { useEntityListMultiSelect, type MultiSelectItem } from '@/hooks/useEntityListMultiSelect';
 import { Rule, type FilterRule } from '@/lib/search/filter-rules';
 import { toast } from '@/components/ui/toast';
+import { useSourceHost } from '@/services/sources/SourceHostProvider';
+import { syncSourceModel } from '@/lib/sources/syncSourceModel';
 
 import type { TreeNode } from './hierarchy/types';
 import { isSpatialContainer } from './hierarchy/types';
 import { useHierarchyTree } from './hierarchy/useHierarchyTree';
-import { HierarchyNode, SectionHeader } from './hierarchy/HierarchyNode';
+import { computeTypeIsolationLabel } from './hierarchy/typeIsolationLabel';
+import { HierarchyNode } from './hierarchy/HierarchyNode';
+import { SectionHeader } from './hierarchy/SectionHeader';
 import { StoreyDisplayControls } from './hierarchy/StoreyDisplayControls';
 import { HierarchySortControl } from './hierarchy/HierarchySortControl';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
@@ -42,12 +46,12 @@ export function HierarchyPanel() {
     ifcDataStore,
     geometryResult,
     models,
-    activeModelId,
     setActiveModel,
     setModelVisibility,
-    setModelCollapsed,
     removeModel,
+    addModel,
   } = useIfc();
+  const sourceHost = useSourceHost();
   const selectedEntityId = useViewerStore((s) => s.selectedEntityId);
   const selectedEntityIds = useViewerStore((s) => s.selectedEntityIds);
   const setSelectedEntityId = useViewerStore((s) => s.setSelectedEntityId);
@@ -74,6 +78,7 @@ export function HierarchyPanel() {
   const clearClassFilter = useViewerStore((s) => s.clearClassFilter);
   const clearAllFilters = useViewerStore((s) => s.clearAllFilters);
   const setHierarchyBasketSelection = useViewerStore((s) => s.setHierarchyBasketSelection);
+  const sourceTags = useViewerStore((s) => s.sourceTags);
 
   // Group-isolation needs the camera + the hidden-by-default class toggles
   // (spaces / spatial zones), mirroring the properties panel's Groups & Zones
@@ -88,30 +93,29 @@ export function HierarchyPanel() {
   const toggleEntityVisibility = useViewerStore((s) => s.toggleEntityVisibility);
   const clearSelection = useViewerStore((s) => s.clearSelection);
 
-  // Derive label for type isolation (from Type tab) by checking mesh ifcType
-  const typeIsolationLabel = useMemo(() => {
-    if (!isolatedEntities || isolatedEntities.size === 0) return null;
-    const sampleId = isolatedEntities.values().next().value!;
-    for (const [, model] of models) {
-      const gr = model.geometryResult;
-      if (!gr?.meshes) continue;
-      const mesh = gr.meshes.find((m: { expressId: number }) =>
-        toGlobalIdFromModels(models, model.id, m.expressId) === sampleId,
-      );
-      if (mesh?.ifcType) return mesh.ifcType;
-    }
-    if (geometryResult?.meshes) {
-      const mesh = geometryResult.meshes.find((m: { expressId: number }) => m.expressId === sampleId);
-      if (mesh?.ifcType) return mesh.ifcType;
-    }
-    return `${isolatedEntities.size} elements`;
-  }, [isolatedEntities, models, geometryResult]);
+  // Derive label for type isolation (from the Type tab, or any other
+  // isolation source — e.g. the Filter tab's "Isolate in 3D", #2532) by
+  // resolving each isolated id's IFC type through the data-store index
+  // (O(1) per id via entities.getTypeName) rather than scanning
+  // geometryResult.meshes per id. Only label with a single type name when
+  // EVERY isolated id shares it — a heterogeneous isolation must not claim
+  // a class the user never isolated (#2532 review: the chip mislabelled a
+  // mixed-class Filter result by sampling only the first id). Extracted to
+  // `hierarchy/typeIsolationLabel.ts` (pure, unit-tested) — it also skips ids
+  // that don't resolve to any federated model rather than querying the
+  // fallback store with a raw, un-offset id (#2532 review: could hit an
+  // unrelated entity in a multi-model scene and mislabel the chip).
+  const typeIsolationLabel = useMemo(
+    () => computeTypeIsolationLabel(isolatedEntities, models, ifcDataStore),
+    [isolatedEntities, models, ifcDataStore],
+  );
 
   const hasActiveFilters = selectedStoreys.size > 0 || isolatedEntities !== null || classFilter !== null;
 
   // Resizable panel split (percentage for storeys section, 0.5 = 50%)
   const [splitRatio, setSplitRatio] = useState(0.5);
   const [isDragging, setIsDragging] = useState(false);
+  const [syncingSourceModelIds, setSyncingSourceModelIds] = useState<Set<string>>(new Set());
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Check if we have multiple models loaded
@@ -288,6 +292,41 @@ export function HierarchyPanel() {
     removeModel(modelId);
   }, [removeModel]);
 
+  const handleSyncSourceModel = useCallback(async (modelId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    const model = models.get(modelId);
+    const tag = sourceTags.get(modelId);
+    if (!model || !tag) return;
+
+    setSyncingSourceModelIds((previous) => new Set(previous).add(modelId));
+    try {
+      const { latestFile } = await syncSourceModel({
+        modelId,
+        tag,
+        sourceHost,
+        addModel,
+        removeModel,
+      });
+      const providerTitle = sourceHost.get(tag.provider)?.manifest.title ?? tag.provider;
+      toast.success(`Synced ${latestFile.name} from ${providerTitle}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to sync source model');
+    } finally {
+      setSyncingSourceModelIds((previous) => {
+        const next = new Set(previous);
+        next.delete(modelId);
+        return next;
+      });
+    }
+  }, [
+    addModel,
+    models,
+    removeModel,
+    sourceHost,
+    sourceTags,
+  ]);
+
   // Handle model header click (select model + toggle expand)
   const handleModelHeaderClick = useCallback((modelId: string, nodeId: string, hasChildren: boolean) => {
     setSelectedModelId(modelId);
@@ -346,7 +385,12 @@ export function HierarchyPanel() {
       if (elements.length > 0) {
         // Clear multi-selection highlight
         setSelectedEntityIds([]);
-        setSelectedEntity(resolveEntityRef(elements[0]));
+        // Open the Properties panel on the class's own first MEMBER, not an
+        // arbitrary aggregated part of a decomposed one — `elements[0]` can be
+        // a part (e.g. an IfcColumn) when the first entity in the class is a
+        // geometry-less IfcElementAssembly, which would open the wrong
+        // properties for a row the user clicked expecting the assembly.
+        setSelectedEntity(resolveEntityRef(node.memberGlobalIds?.[0] ?? elements[0]));
         if (groupingMode === 'type') {
           const className = node.ifcType || node.name;
           // Class tab → class filter (combinable with storey + type isolation)
@@ -800,6 +844,9 @@ export function HierarchyPanel() {
   // Helper to render a node via the extracted HierarchyNode component
   const renderNode = (node: TreeNode, virtualRow: { index: number; size: number; start: number }) => {
     const { isSelected, nodeHidden, modelVisible } = computeNodeState(node);
+    const modelId = node.type === 'model-header' && node.id.startsWith('model-')
+      ? node.modelIds[0]
+      : undefined;
 
     return (
       <HierarchyNode
@@ -816,8 +863,14 @@ export function HierarchyPanel() {
         onVisibilityToggle={handleVisibilityToggle}
         onModelVisibilityToggle={handleModelVisibilityToggle}
         onRemoveModel={handleRemoveModel}
+        onSyncSourceModel={handleSyncSourceModel}
         onModelHeaderClick={handleModelHeaderClick}
+<<<<<<< HEAD
         aimDecoration={aimDecorationFor(node)}
+=======
+        sourceBacked={modelId ? sourceTags.has(modelId) : false}
+        sourceSyncing={modelId ? syncingSourceModelIds.has(modelId) : false}
+>>>>>>> upstream/main
       />
     );
   };

@@ -6,7 +6,8 @@ import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { Renderer } from './index.js';
 import { Picker } from './picker.js';
-import type { MeshData, RenderOptions, BatchedMesh } from './types.js';
+import type { MeshData } from '@ifc-lite/geometry';
+import type { RenderOptions, BatchedMesh } from './types.js';
 
 /**
  * Drives the REAL render() loop against a stub GPU so the frame-lifecycle
@@ -27,6 +28,10 @@ import type { MeshData, RenderOptions, BatchedMesh } from './types.js';
 };
 (globalThis as Record<string, unknown>).GPUTextureUsage = {
     COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16,
+};
+// Used by the SkyPass bind-group layout (GPUShaderStage.FRAGMENT).
+(globalThis as Record<string, unknown>).GPUShaderStage = {
+    VERTEX: 1, FRAGMENT: 2, COMPUTE: 4,
 };
 
 /**
@@ -56,6 +61,14 @@ interface Harness {
         createdBuffers: FakeBuffer[];
         /** how many times a readback buffer was actually mapped */
         mapAsync: number;
+        /** every `queue.writeBuffer` payload, copied at call time */
+        writes: { buffer: unknown; floats: Float32Array }[];
+        /**
+         * Ordered log of `setPipeline` / `setBindGroup` / `drawIndexed` calls on
+         * the render pass, so a test can assert command ORDER (e.g. that the
+         * lighting environment is rebound at group(1) after the sky pass).
+         */
+        commands: { op: string; index?: number }[];
     };
     knobs: {
         /** 'texture' = getCurrentTexture succeeds; 'null' = returns null */
@@ -88,7 +101,7 @@ interface Harness {
 }
 
 function makeHarness(): Harness {
-    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0 };
+    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [], commands: [] };
     const knobs: Harness['knobs'] = {
         textureMode: 'texture', encodeThrows: false, popRejects: false, gpuDead: false,
         deferMaps: false,
@@ -126,8 +139,24 @@ function makeHarness(): Harness {
             if (prop === 'setVertexBuffer') {
                 return (slot: number, buf: unknown) => { if (slot === 0) boundVertexBuffer = buf; };
             }
+            if (prop === 'setPipeline') {
+                return () => { stats.commands.push({ op: 'setPipeline' }); };
+            }
+            if (prop === 'setBindGroup') {
+                return (index: number) => { stats.commands.push({ op: 'setBindGroup', index }); };
+            }
             if (prop === 'drawIndexed') {
-                return () => { stats.draws.push(boundVertexBuffer); };
+                return () => {
+                    stats.commands.push({ op: 'drawIndexed' });
+                    stats.draws.push(boundVertexBuffer);
+                };
+            }
+            // The sky pass issues a NON-indexed draw (pass.draw(3)); record it
+            // so a test can pin the env rebind to AFTER the sky draw, not merely
+            // after the sky pipeline was set (the boundary Greptile/CodeRabbit
+            // flagged on #2669).
+            if (prop === 'draw') {
+                return () => { stats.commands.push({ op: 'draw' }); };
             }
             return () => undefined;
         },
@@ -147,7 +176,17 @@ function makeHarness(): Harness {
     });
 
     const queue = {
-        writeBuffer() { /* no-op */ },
+        // Copied eagerly: the renderer reuses one scratch array for every
+        // per-mesh uniform, so holding the reference would read back only the
+        // LAST value written in the frame.
+        writeBuffer(buffer: unknown, _offset: number, data: ArrayBufferView | ArrayBuffer) {
+            const floats = ArrayBuffer.isView(data)
+                ? new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
+                : new Float32Array(data.slice(0));
+            stats.writes.push({ buffer, floats });
+        },
+        writeTexture() { /* no-op */ },
+        copyExternalImageToTexture() { /* no-op */ },
         submit() { /* no-op */ },
         onSubmittedWorkDone() { return Promise.resolve(); },
     };
@@ -368,6 +407,54 @@ describe('destroy() lifecycle', () => {
         h.renderer.destroy();
         assert.strictEqual((grey.vertexBuffer as unknown as FakeBuffer).destroyed, 1);
         assert.strictEqual((red.vertexBuffer as unknown as FakeBuffer).destroyed, 1);
+    });
+});
+
+describe('lighting environment bind ordering', () => {
+    // Regression: switching the WebGPU "Environment" preset away from Default
+    // enables the procedural sky, whose pipeline has an incompatible layout
+    // (its own group(0), no group(1)). Drawing the sky invalidates the
+    // per-frame lighting group(1) binding on conformant WebGPU
+    // implementations; the flat batch loop re-sets only group(0) per batch, so
+    // when the env was bound BEFORE the sky pass every non-Default preset drew
+    // no geometry ("the model disappears when I change the environment") on
+    // strict drivers. The env must be (re)bound at group(1) AFTER the sky pass
+    // and BEFORE the first geometry draw.
+    it('rebinds the environment at group(1) after the sky draw, before geometry', () => {
+        const h = makeHarness();
+        seedBatches(h);
+        h.stats.commands.length = 0;
+        h.render({ environment: { skyEnabled: true, sunDirection: [0.45, 0.83, 0.33] } });
+
+        const cmds = h.stats.commands;
+        const firstPipeline = cmds.findIndex((c) => c.op === 'setPipeline');
+        // The sky pass's own non-indexed draw — the real boundary the env
+        // rebind must clear. Anchoring on this (not just on a setPipeline)
+        // is what rejects a rebind issued before the sky actually drew.
+        const skyDraw = cmds.findIndex((c) => c.op === 'draw');
+        const firstGeometryDraw = cmds.findIndex((c) => c.op === 'drawIndexed');
+        assert.ok(firstPipeline >= 0, 'the sky pass must set a pipeline');
+        assert.ok(skyDraw > firstPipeline, 'the sky must draw after its pipeline is set');
+        assert.ok(firstGeometryDraw > skyDraw, 'geometry must draw after the sky');
+        const envBind = cmds.findIndex(
+            (c, i) => c.op === 'setBindGroup' && c.index === 1 && i > skyDraw && i < firstGeometryDraw,
+        );
+        assert.ok(envBind >= 0, 'group(1) must be re-bound after the sky draw and before geometry');
+    });
+
+    it('binds the environment at group(1) before geometry with the sky off (Default preset)', () => {
+        const h = makeHarness();
+        seedBatches(h);
+        h.stats.commands.length = 0;
+        h.render();
+
+        const cmds = h.stats.commands;
+        const firstDraw = cmds.findIndex((c) => c.op === 'drawIndexed');
+        assert.ok(firstDraw >= 0, 'geometry must draw');
+        const envBind = cmds.findIndex(
+            (c, i) => c.op === 'setBindGroup' && c.index === 1 && i < firstDraw,
+        );
+        assert.ok(envBind >= 0, 'group(1) must be bound before the first geometry draw');
     });
 });
 
@@ -739,5 +826,88 @@ describe('pick path survives the device dying mid-readback (#1901)', () => {
         for (const buf of readbacks) {
             assert.ok(buf.destroyed > 0, 'a readback buffer survived the rethrow — leaked');
         }
+    });
+});
+
+/**
+ * #1973 — the textured sub-pass must carry each mesh's per-element `origin` as
+ * its model translation. It used to hoist `tpl[28..30] = 0` out of the loop,
+ * which was right only for the orphan type-geometry path (absolute positions,
+ * `origin == 0`) and drew every textured occurrence offset by `-origin`.
+ *
+ * The scene-side bookkeeping is covered in `scene-textured-origin.test.ts`;
+ * this asserts the value that actually reaches the GPU.
+ */
+function texturedTriangle(expressId: number, origin?: [number, number, number]): MeshData {
+    return {
+        expressId,
+        positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+        normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+        indices: new Uint32Array([0, 1, 2]),
+        color: [1, 1, 1, 1],
+        uvs: new Float32Array([0, 0, 1, 0, 0, 1]),
+        texture: { width: 1, height: 1, data: new Uint8Array([255, 255, 255, 255]) },
+        ...(origin ? { origin } : {}),
+    } as unknown as MeshData;
+}
+
+/** The model-matrix translation column of the uniform written for `tm`. */
+function translationFor(h: Harness, uniformBuffer: unknown): number[] | null {
+    for (let i = h.stats.writes.length - 1; i >= 0; i--) {
+        const w = h.stats.writes[i];
+        if (w.buffer === uniformBuffer && w.floats.length > 30) {
+            return [w.floats[28], w.floats[29], w.floats[30]];
+        }
+    }
+    return null;
+}
+
+describe('textured sub-pass carries the per-element origin (#1973)', () => {
+    const ORIGIN: [number, number, number] = [12.5, 10.5, -3.25];
+
+    function seedTextured(h: Harness, meshes: MeshData[]) {
+        const scene = h.renderer.getScene();
+        const device = h.renderer['device'].getDevice();
+        const pipeline = h.renderer['pipeline'] as never;
+        scene.appendToBatches(meshes, device, pipeline, false);
+        return scene.getTexturedMeshes();
+    }
+
+    it('writes the mesh origin into the model translation', () => {
+        const h = makeHarness();
+        const textured = seedTextured(h, [texturedTriangle(1, ORIGIN)]);
+        assert.strictEqual(textured.length, 1);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), ORIGIN);
+    });
+
+    it('writes zero for a mesh whose positions are already absolute', () => {
+        // The #961 orphan type-geometry path: `transform_mesh_local` leaves
+        // positions in world space and sets no origin.
+        const h = makeHarness();
+        const textured = seedTextured(h, [texturedTriangle(1)]);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), [0, 0, 0]);
+    });
+
+    it('gives each textured mesh its OWN origin, not the last one written', () => {
+        // The bug class this replaces was a single hoisted write shared by every
+        // mesh in the pass, so per-mesh divergence is the property that matters.
+        const h = makeHarness();
+        const other: [number, number, number] = [-4, 0.5, 88];
+        const textured = seedTextured(h, [texturedTriangle(1, ORIGIN), texturedTriangle(2, other)]);
+        assert.strictEqual(textured.length, 2);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), ORIGIN);
+        assert.deepStrictEqual(translationFor(h, textured[1].uniformBuffer), other);
     });
 });

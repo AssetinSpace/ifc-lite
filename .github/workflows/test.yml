@@ -7,10 +7,28 @@ name: Test
 on:
   pull_request:
     branches: [main]
+  # Post-merge guard. Two PRs can each be green against their own base and be
+  # broken as a pair on main: #2551 removed a helper from
+  # measure-parity.test.tsx at 01:41 on 2026-08-12, #2538 added a caller of it
+  # at 06:35, and main was red from then on. Nothing ran on main, so it
+  # surfaced hours later on an unrelated first-time contributor's PR, and every
+  # open PR's Node lane was red until it was fixed.
+  push:
+    branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # PR runs share a group per ref, so a new commit supersedes the old run — the
+  # newer commit is the only one whose verdict matters.
+  #
+  # Push runs get a group PER COMMIT. Not merely `cancel-in-progress: false`:
+  # GitHub keeps only one running plus one PENDING run per group, and a newer
+  # queued run EVICTS the pending one even when cancellation is off. With three
+  # merges in quick succession, a docs-only third merge would evict the queued
+  # run for a frontend-breaking second merge, and its path filters would then
+  # skip the Node lane — leaving exactly the broken state this guard exists to
+  # catch unchecked. A per-commit group means no merge can displace another.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -50,7 +68,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+          # A push event filters against the previous commit, which a depth-1
+          # clone does not contain. PRs filter against the base ref and are
+          # unaffected, so only the push path pays the extra object.
+          fetch-depth: ${{ github.event_name == 'push' && 2 || 1 }}
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -64,11 +86,31 @@ jobs:
               - 'tests/models/manifest.json'
               - '.github/workflows/test.yml'
             frontend:
+              # A changeset naming a package that does not exist fails the
+              # RELEASE workflow, which only runs on main - so the Lint job has
+              # to see changeset-only PRs, or the check it runs cannot fire on
+              # the PR that introduces the mistake.
+              - '.changeset/**'
+              # oxlint lints all of `apps/` except `apps/landing`, but this
+              # filter names the two apps individually rather than `apps/**` —
+              # broadening it would drag every landing-page edit through the
+              # full frontend lane. The cost of that choice: a NEW app under
+              # `apps/` gets linted without being able to trigger the Lint job,
+              # so the PR adding it skips the gate and drops its violations on
+              # whoever touches the frontend next. Add it here when you add it.
               - 'apps/viewer/**'
               - 'apps/viewer-embed/**'
               - 'packages/**'
               - 'tests/e2e/**'
               - 'playwright.config.ts'
+              # The lint CONFIG, so a PR that only edits it cannot skip the
+              # Lint job that reads it. Absent CI reads as green here, and a
+              # guard cannot fire in a job that never runs.
+              - '.oxlintrc.json'
+              # The server-bin platform-parity check reads this workflow's
+              # release matrix, so a PR that only edits the matrix cannot
+              # skip the job that checks it (issue #2619).
+              - '.github/workflows/server-binaries.yml'
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'
@@ -145,7 +187,7 @@ jobs:
         # v6 reads the version from the `packageManager` field in
         # package.json (`pnpm@10.8.1`); specifying `with.version` here
         # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -273,7 +315,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -290,7 +332,12 @@ jobs:
     name: Lint
     needs: [changes, build]
     if: needs.changes.outputs.frontend == 'true'
-    # Free runner — eslint runs against source, no compile.
+    # Two gates, both free-runner: oxlint over the source (no compile), and the
+    # unused-locals ratchet (scripts/check-unused-locals.mjs), which needs the
+    # built dist below because it type-checks each package. Before #2603 this
+    # lane ran NOTHING: the root script was `pnpm -r lint` and no package
+    # defined one, so it passed in 20s having checked nothing, and dead imports
+    # shipped through it.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -298,13 +345,22 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # lint runs against source; doesn't need built dist.
+      # The unused-locals ratchet runs `tsc` per package, and a package resolves
+      # its workspace siblings through their built `dist` types — without the
+      # artifact every dependent package fails to compile, reads as
+      # unmeasurable, and the ratchet fails closed. (It was written assuming
+      # "lint needs no dist", which is true of eslint and false of this.)
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-output
+          path: packages
       - run: pnpm lint
 
   node-tests:
@@ -322,7 +378,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -344,6 +400,34 @@ jobs:
         run: pnpm fixtures
       - name: Check test wiring
         run: node scripts/check-test-wiring.mjs
+      # typecheck-tests.mjs writes the `extends` of every generated test
+      # program. A bare (non-`./`-prefixed) value is resolved by tsc as a NODE
+      # MODULE, so the base config is not found and the `noEmit` it carries
+      # silently stops applying -- a repo-root run then scattered 9,609
+      # untracked .js/.d.ts/.map files through the source tree (#2664 review).
+      # Nothing about that is visible in normal use, so it is pinned here.
+      - name: Check typecheck-tests extends resolution
+        run: node --test scripts/typecheck-tests.test.mjs
+      # A test that reads its subject's SOURCE and asserts on the text passes
+      # while the behaviour is broken -- SearchModal.filter's stayed 5/5 green
+      # with the row handler unwired (#2396 verbatim). The harness that made
+      # the behavioural version look impossible now exists in
+      # apps/viewer/src/test/, so this ratchets the remaining list down (#2434).
+      - name: Check for new source-text assertions
+        run: node scripts/check-source-text-assertions.mjs
+      # A hidden tab never delivers an animation frame, so an unbounded
+      # `await new Promise(r => requestAnimationFrame(r))` in the load pipeline
+      # parks finalize / WASM release / setLoading(false) until the user comes
+      # back (#2385). Absence over five files is a lint, not a unit test --
+      # it used to be the one non-executable case in frameWait.test.ts (#2434).
+      - name: Check for unbounded animation-frame waits
+        run: node scripts/check-unbounded-frame-wait.mjs
+      # Every `new GeometryProcessor(...)` must free its WASM handle on all
+      # paths. AGENTS.md required this already, but self-policing decayed one
+      # call site at a time until 12 sites leaked (#1959) -- including the
+      # viewer's canonical load path, which fires on every IFC load.
+      - name: Check WASM handle disposal
+        run: node scripts/check-wasm-disposal.mjs
       # Guard the published API surface: the exported names of every
       # non-private packages/* package (read from the dist d.ts in the
       # build artifact downloaded above) must match the committed
@@ -351,6 +435,53 @@ jobs:
       # can't ship silently.
       - name: Check API surface
         run: node scripts/check-api-surface.mjs
+      # A server-bin release must ship one archive per platform the package
+      # claims to support. Three lists encode that set (SUPPORTED_TARGETS in
+      # platform.ts, package.json os/cpu, the release matrix in
+      # server-binaries.yml) and agreed only by hand until v1.16.6 shipped
+      # without the win32-x64 zip and nothing noticed (issue #2619).
+      - name: Check server-bin platform parity
+        run: node scripts/check-server-bin-targets.mjs
+      # Executable proof that the parity gate itself cannot pass vacuously:
+      # an adversarial review of PR #2642 produced four false greens
+      # (commented-out matrix entries and targets still counted; a stale
+      # literal in a comment satisfied the upload check) that hand-testing
+      # had missed. Each hostile mutation now runs against the real inputs
+      # in a temp tree and must turn the gate red with an accurate message.
+      # The second file unit-tests stripYamlComments, the primitive the gate's
+      # comment-awareness rests on (a lone apostrophe once blinded it).
+      - name: Check server-bin parity gate regressions
+        run: node --test scripts/check-server-bin-targets.test.mjs scripts/lib/server-bin-targets-parse.test.mjs
+      # Unit tests for the branching check-unused-locals.mjs uses to decide
+      # "real violation" vs "does not compile" vs "cannot parse this output".
+      # A #2634 review found the fail-loud branch only engaged when the whole
+      # run was unparseable — a run with one recognised diagnostic and one
+      # unrecognised one silently dropped the unrecognised one instead of
+      # failing. Pinned here so that gap can't reopen unnoticed. The #2663
+      # review found the twin gap one level up: the exit status itself was
+      # never inspected, so an ENOBUFS-truncated or OOM-killed run handed the
+      # classifier a prefix that parsed cleanly into a confident undercount.
+      # untrustworthyExitReason is pinned in the same file.
+      - name: Check unused-locals output classification
+        run: node --test scripts/lib/unused-locals-classify.test.mjs
+      # check-lint-ran.mjs buffered oxlint's whole output, wrote it, then
+      # process.exit()'d. On a PIPE — every CI log — stdout is asynchronous, so
+      # the exit discarded most of the write: a 120k-line failing run reached
+      # the log as ~1k lines, cut mid-diagnostic, with no summary and no error
+      # line. A genuine eslint(no-control-regex) failure was diagnosed off such
+      # a log as "pre-existing warnings, not ours". A TTY or a file kept
+      # everything, so hand-testing never showed it — this drives the gate
+      # through a pipe and asserts the bytes that arrive.
+      - name: Check lint gate survives a piped stdout
+        run: node --test scripts/check-lint-ran.test.mjs
+      # The Release workflow runs ONLY on main, and only on an actual publish,
+      # so nothing on a PR ever read release-crates.mjs's publish ORDER. #2574
+      # added a versioned dev-dependency (ifc-lite-clash) to rust/geometry and
+      # it sat latent until the next release, where cargo refused to publish
+      # geometry ahead of clash — AFTER npm had already gone out, leaving
+      # crates.io behind npm. This makes that order a PR-visible gate.
+      - name: Check the crates publish order matches the dependency graph
+        run: node --test scripts/release-crates-order.test.mjs
       # The server-parse root-attribute table (attr_indices.rs) is generated
       # from @ifc-lite/parser's SCHEMA_REGISTRY — the SAME table the in-browser
       # parse resolves names against. Guard that the committed file is in sync
@@ -359,6 +490,32 @@ jobs:
       # toolchain needed (issue #1780).
       - name: Check server attr-indices freshness
         run: node scripts/generate-server-attr-indices.mjs --check
+      # The sandbox `bim` ambient type surface (apps/viewer/.../bim-globals.d.ts)
+      # is generated from @ifc-lite/sandbox's NAMESPACE_SCHEMAS — the SAME schema
+      # the script editor's completions and the LLM system prompt read live.
+      # Nothing verified it, and the generator itself had stopped running, so the
+      # file was hand-edited instead: it never carried `bim.clash` at all, and
+      # lost two `create` parameters along the way (issue #2418). Uses the sandbox
+      # dist from the build artifact above; the `frontend` path filter covers both
+      # sides of the contract (packages/**, apps/viewer/**).
+      - name: Check sandbox bim-globals freshness
+        run: node scripts/generate-bim-globals.mjs --check
+      # Typecheck the built-in template scripts AGAINST that generated surface.
+      # This is the only thing that actually compiles bim-globals.d.ts, and it
+      # was run by no workflow: it sat at 193 errors (every one of them
+      # `Cannot find name 'console'`, because the sandbox `console` was never
+      # declared), which is why the drift in #2418 went unnoticed for months.
+      # Now that the declaration is generated, this also verifies every type the
+      # schema NAMES resolves — a `tsReturn` of `BimClash.Nope` fails here
+      # (#2422). No build needed: the .d.ts is self-contained and the templates
+      # import nothing.
+      # Scoped name + `--fail-if-no-match`: an unmatched pnpm filter prints
+      # "No projects matched the filters" and exits 0, so a filter that stops
+      # resolving would turn this gate green without running it. That is the
+      # same "cannot fail" shape as the `skipLibCheck` default this step was
+      # already fixed for, so it is closed here rather than left to luck.
+      - name: Check sandbox script templates typecheck
+        run: pnpm --filter=@ifc-lite/viewer --fail-if-no-match check:templates
       # Docs upkeep guards (cheap, no build/fixtures needed — the doc-sample
       # typecheck resolves @ifc-lite/* to each package's src via tsconfig
       # paths). Keep the docs in lockstep with the code they describe.
@@ -376,6 +533,14 @@ jobs:
         run: pnpm test:integration
       - name: WASM contract tests (real processGeometryBatch boundary)
         run: pnpm test:wasm-contract
+      # The snap cache reconstructs model edges from the mesher's per-triangle
+      # segments, so its correctness depends on geometry the unit fixtures can
+      # only imitate. This drives the real wasm pipeline over the committed
+      # samples and asserts the invariants (one edge per straight run, the
+      # reported length is the whole run, the cache does not move when triangle
+      # emission order does -- the #2388 failure class). Issue #2199.
+      - name: Snap edge reconstruction (real wasm pipeline)
+        run: pnpm test:snap-edges
 
   # Functional smoke of the real viewer: real WASM pipeline + WebGPU
   # renderer (swiftshader) + pick pass + section plane, asserted through
@@ -385,7 +550,9 @@ jobs:
   viewer-e2e:
     name: Viewer E2E smoke
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true'
+    # PR-only: see the `push:` trigger comment. The post-merge run repeats the
+    # cheap unit lanes that catch cross-PR collisions, not the whole matrix.
+    if: (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true') && github.event_name == 'pull_request'
     # Free runner — vite build + a ~2.4MB model; not compute-bound.
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -394,7 +561,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -417,7 +584,12 @@ jobs:
       # Package dists come from the build artifact; the wasm build
       # soft-skips (no wasm-pack on this runner) and reuses the artifact
       # runtime, so this is just the vite build of the app.
-      - name: Build viewer app
+      # The viewer's own `build` script runs scripts/check-tla-chunk-await.mjs
+      # over the emitted dist/assets, so this step enforces the __tla guard
+      # too. It lives in the build script rather than here because the #2243
+      # white screen reached users through Vercel, and a CI-only gate does not
+      # run there: vercel-build.sh -> turbo build --filter -> this same script.
+      - name: Build viewer app (also runs the __tla chunk-await guard)
         run: pnpm turbo build --filter=@ifc-lite/viewer
       # No browser download: the CI project uses channel:'chrome' (the
       # runner's preinstalled Chrome) because Playwright's headless
@@ -456,7 +628,7 @@ jobs:
       - name: Setup Rust (pinned by rust-toolchain.toml)
         run: rustup show
       - name: Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: ci-rust
       - name: Cache test fixtures
@@ -478,12 +650,15 @@ jobs:
       # notices if that ever stops being true.
       - name: Cargo.lock is in sync with the manifests
         run: cargo metadata --locked --format-version 1 > /dev/null
-      # Workspace exclusions:
-      #   - ifc-lite-wasm: dev-deps on wasm-bindgen-test; tests target wasm32.
+      # ifc-lite-wasm is included: its only wasm32-only test file,
+      # tests/mesh_determinism.rs, self-gates with `#![cfg(target_arch =
+      # "wasm32")]` and compiles to an empty test binary on the native host
+      # (`running 0 tests ... ok`), so no workspace-wide exclusion is needed.
+      # That wasm32 leg runs on its own schedule in determinism.yml.
       - name: Clippy (lint gate)
-        run: cargo clippy --workspace --exclude ifc-lite-wasm --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Rust tests
-        run: cargo test --workspace --exclude ifc-lite-wasm
+        run: cargo test --workspace
 
   # Geometry watertightness / triangulation-invariance census.
   #
@@ -501,6 +676,7 @@ jobs:
   geometry-census:
     name: Geometry watertightness census
     needs: changes
+<<<<<<< HEAD
     if: needs.changes.outputs.geometry == 'true'
     # >>> AIM-FORK: Depot runners are upstream-only — on the fork this job would
     # sit queued forever with runner_id 0, and the PR would never go green.
@@ -508,6 +684,11 @@ jobs:
     # "Depot runners → ubuntu-latest on the fork".
     runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
     # <<< AIM-FORK
+=======
+    # PR-only — see viewer-e2e.
+    if: needs.changes.outputs.geometry == 'true' && github.event_name == 'pull_request'
+    runs-on: depot-ubuntu-24.04-4
+>>>>>>> upstream/main
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -517,7 +698,7 @@ jobs:
       - name: Setup Rust (pinned by rust-toolchain.toml)
         run: rustup show
       - name: Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: ci-rust-census
       - name: Cache test fixtures
@@ -531,6 +712,18 @@ jobs:
         run: node scripts/fixtures/fetch-fixtures.mjs
       - name: Census
         run: cargo test -p ifc-lite-geometry --features triangulation-alt --test triangulation_invariance -- --nocapture
+      # The per-host rows this run measured, uploaded pass or fail. The census
+      # gates against a checked-in golden, and its log prints its per-element
+      # lists truncated, so without this a run that disagrees with the golden
+      # could only be diagnosed by reproducing a ~20-minute sweep over a 1.4 GB
+      # fixture corpus locally. Re-blessing is now: download, replace the golden.
+      - name: Upload the census rows
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: watertightness-census-rows
+          path: target/watertightness_census.run.tsv
+          if-no-files-found: warn
 
   # Plato clash-math single-source freshness gate. The clash narrow-phase math
   # is written once in Plato and transpiled to Rust + TypeScript; the committed
@@ -542,7 +735,8 @@ jobs:
   plato-check:
     name: Plato clash-math freshness
     needs: changes
-    if: needs.changes.outputs.plato == 'true'
+    # PR-only — see viewer-e2e.
+    if: needs.changes.outputs.plato == 'true' && github.event_name == 'pull_request'
     # Free runner - the generator clones + builds Plato.CLI with dotnet; no
     # Depot cores needed.
     runs-on: ubuntu-latest
@@ -552,7 +746,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -598,7 +792,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
