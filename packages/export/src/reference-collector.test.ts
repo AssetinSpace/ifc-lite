@@ -4,7 +4,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { collectReferencedEntityIds, getVisibleEntityIds } from './reference-collector.js';
-import type { IfcDataStore } from '@ifc-lite/parser';
+import { EMPTY_SOURCE_BYTES, type IfcDataStore } from '@ifc-lite/parser';
+import type { EffectiveEntityIndex } from './effective-index.js';
 
 /**
  * Helper: encode a set of STEP entity lines into a source buffer + entity index.
@@ -248,6 +249,44 @@ describe('collectReferencedEntityIds', () => {
     expect(closure.has(11)).toBe(true);  // point (reached via placement)
     expect(closure.has(2)).toBe(false);  // hidden wall (excluded)
   });
+
+  // CodeRabbit finding on #2637: `relationshipRefGroupsFromSourceLine` (via
+  // `extractRelationshipRefGroupsIndexed`) only walks ONE level of
+  // parenthesised nesting. A DOUBLY-nested list of entity refs — a real IFC
+  // shape, e.g. `IfcBSplineSurfaceWithKnots.ControlPointsList: LIST OF LIST
+  // OF IfcCartesianPoint` — has each inner `(#N,#N)` group fail the bare
+  // `#(\d+)` match, so the whole attribute is discarded as "contains a
+  // non-ref item" and every ref inside it is lost. This only bites a
+  // source-backed entity with a queued mutation elsewhere on the SAME record
+  // (`hasSourceMutation` gates the parse-instead-of-byte-scan path) — an
+  // unmutated entity still takes the plain `extractRefsFromBytes` scan below,
+  // which has no such blind spot.
+  it('does not drop refs inside a doubly-nested list attribute on a mutated entity', () => {
+    const { source, entityIndex: base } = buildTestData([
+      [1, 'IFCBSPLINESURFACEWITHKNOTS', '#1=IFCBSPLINESURFACEWITHKNOTS(3,3,((#10,#11),(#12,#13)),.UNSPECIFIED.,$,$,$);'],
+      [10, 'IFCCARTESIANPOINT', '#10=IFCCARTESIANPOINT((0.,0.,0.));'],
+      [11, 'IFCCARTESIANPOINT', '#11=IFCCARTESIANPOINT((1.,0.,0.));'],
+      [12, 'IFCCARTESIANPOINT', '#12=IFCCARTESIANPOINT((0.,1.,0.));'],
+      [13, 'IFCCARTESIANPOINT', '#13=IFCCARTESIANPOINT((1.,1.,0.));'],
+    ]);
+    // Mark #1 as carrying a queued mutation on SOME other attribute (the
+    // gate cares only that a mutation is queued for the id, not which
+    // attribute) so the closure takes the parse-based path instead of the
+    // plain byte scan.
+    const entityIndex = {
+      get: (id: number) => base.get(id),
+      has: (id: number) => base.has(id),
+      hasSourceMutation: (id: number) => id === 1,
+    };
+
+    const closure = collectReferencedEntityIds(new Set([1]), source, entityIndex);
+
+    expect(closure.has(1)).toBe(true);
+    expect(closure.has(10)).toBe(true);
+    expect(closure.has(11)).toBe(true);
+    expect(closure.has(12)).toBe(true);
+    expect(closure.has(13)).toBe(true);
+  });
 });
 
 describe('getVisibleEntityIds', () => {
@@ -407,5 +446,117 @@ describe('getVisibleEntityIds', () => {
     expect(roots.has(17)).toBe(false);
     expect(roots.has(18)).toBe(false);
     expect(roots.has(19)).toBe(false);
+  });
+});
+
+/**
+ * A source-less store (server-parsed, synthetic, GLB, point cloud) can still
+ * carry overlay-authored `IfcRelVoidsElement` records, and those serve their
+ * ends from the creation payload rather than from bytes.
+ *
+ * The guard in front of the byte scan used to be `if (!source) return`, which
+ * never fired -- even a zero-length `Uint8Array` is truthy. Rewriting it as an
+ * early `byteLength === 0` return during the accessor migration (#2339) would
+ * have silently skipped the authored branch too, dropping opening-exclusion
+ * propagation for exactly those stores. Pin the behaviour so it cannot narrow
+ * again.
+ */
+describe('propagateOpeningExclusions without a source (#2339)', () => {
+  const WALL = 10;
+  const OPENING = 20;
+  const REL = 30;
+
+  function sourcelessStore(): IfcDataStore {
+    return {
+      source: EMPTY_SOURCE_BYTES,
+      entityIndex: {
+        byId: new Map([
+          [WALL, { type: 'IFCWALL', byteOffset: 0, byteLength: 0 }],
+          [OPENING, { type: 'IFCOPENINGELEMENT', byteOffset: 0, byteLength: 0 }],
+          [REL, { type: 'IFCRELVOIDSELEMENT', byteOffset: 0, byteLength: 0 }],
+        ]),
+        byType: new Map([
+          ['IFCWALL', [WALL]],
+          ['IFCOPENINGELEMENT', [OPENING]],
+          ['IFCRELVOIDSELEMENT', [REL]],
+        ]),
+      },
+    } as unknown as IfcDataStore;
+  }
+
+  /** Minimal overlay index that authors the relation's two ends. */
+  function overlayIndex(store: IfcDataStore): EffectiveEntityIndex {
+    const byId = store.entityIndex.byId;
+    return {
+      byType: store.entityIndex.byType,
+      get: (id: number) => byId.get(id),
+      effectiveType: (_id: number, type: string) => type.toUpperCase(),
+      refsOf: (id: number) => (id === REL ? [WALL, OPENING] : undefined),
+      [Symbol.iterator]: () => byId[Symbol.iterator](),
+    } as unknown as EffectiveEntityIndex;
+  }
+
+  it('still excludes an opening whose wall is hidden', () => {
+    const store = sourcelessStore();
+    const { hiddenProductIds } = getVisibleEntityIds(
+      store,
+      new Set([WALL]),
+      null,
+      overlayIndex(store),
+    );
+    expect(hiddenProductIds.has(WALL)).toBe(true);
+    // The propagation under test: it can only come from the authored refs,
+    // because there are no bytes to scan.
+    expect(hiddenProductIds.has(OPENING)).toBe(true);
+  });
+
+  it('skips a bytes-only relation without abandoning a later authored one', () => {
+    // `continue`, not `break`. OverlayIndex.byType shallow-copies the source
+    // buckets and APPENDS created ids, so a byte-scan relation is iterated
+    // before an authored one. With `break` the authored relation is never
+    // reached and its opening silently stays in the export. Without a second
+    // relation in this order the two spellings are indistinguishable.
+    const WALL2 = 11;
+    const OPENING2 = 21;
+    const REL_BYTES = 31;   // no authored refs -> takes the byte branch
+    const REL_AUTHORED = 32;
+
+    const byId = new Map([
+      [WALL2, { type: 'IFCWALL', byteOffset: 0, byteLength: 0 }],
+      [OPENING2, { type: 'IFCOPENINGELEMENT', byteOffset: 0, byteLength: 0 }],
+      [REL_BYTES, { type: 'IFCRELVOIDSELEMENT', byteOffset: 0, byteLength: 0 }],
+      [REL_AUTHORED, { type: 'IFCRELVOIDSELEMENT', byteOffset: -1, byteLength: 0 }],
+    ]);
+    const store = {
+      source: EMPTY_SOURCE_BYTES,
+      entityIndex: {
+        byId,
+        byType: new Map([
+          ['IFCWALL', [WALL2]],
+          ['IFCOPENINGELEMENT', [OPENING2]],
+          // Byte-scan relation FIRST, mirroring the real append order.
+          ['IFCRELVOIDSELEMENT', [REL_BYTES, REL_AUTHORED]],
+        ]),
+      },
+    } as unknown as IfcDataStore;
+
+    const index = {
+      byType: store.entityIndex.byType,
+      get: (id: number) => byId.get(id),
+      effectiveType: (_id: number, type: string) => type.toUpperCase(),
+      refsOf: (id: number) => (id === REL_AUTHORED ? [WALL2, OPENING2] : undefined),
+      [Symbol.iterator]: () => byId[Symbol.iterator](),
+    } as unknown as EffectiveEntityIndex;
+
+    const { hiddenProductIds } = getVisibleEntityIds(store, new Set([WALL2]), null, index);
+    expect(hiddenProductIds.has(OPENING2)).toBe(true);
+  });
+
+  it('leaves the opening visible when its wall is visible', () => {
+    // Control: proves the assertion above is driven by the wall's hidden state
+    // and not by the opening being unconditionally excluded.
+    const store = sourcelessStore();
+    const { hiddenProductIds } = getVisibleEntityIds(store, new Set(), null, overlayIndex(store));
+    expect(hiddenProductIds.has(OPENING)).toBe(false);
   });
 });

@@ -4,10 +4,23 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { MergedExporter, type MergeModelInput } from './merged-exporter.js';
-import type { IfcDataStore } from '@ifc-lite/parser';
+import { asSourceBytes, type IfcDataStore, type IfcSourceBytes } from '@ifc-lite/parser';
 import { MutablePropertyView as LiveMutablePropertyView } from '@ifc-lite/mutations';
 
 type MockEntityRef = { expressId: number; type: string; byteOffset: number; byteLength: number; lineNumber: number };
+
+/**
+ * `IfcDataStore.entityIndex.byId` is the read-only `EntityByIdIndex` surface
+ * (satisfied by both a plain `Map` and the memory-optimised
+ * `CompactEntityIndex`), so it has no `set`. These fixtures build a real
+ * `Map` and a few of them splice extra entities in after the store is
+ * assembled, so the concrete `Map` type is kept on the fixture. Every
+ * `MockDataStore` is still an `IfcDataStore`.
+ */
+type MockDataStore = Omit<IfcDataStore, 'entityIndex'> & {
+  entityIndex: { byId: Map<number, MockEntityRef>; byType: Map<string, number[]> };
+};
+type MockMergeModelInput = Omit<MergeModelInput, 'dataStore'> & { dataStore: MockDataStore };
 
 /**
  * Helper: build a minimal IfcDataStore from STEP entity lines.
@@ -21,7 +34,7 @@ type MockEntityRef = { expressId: number; type: string; byteOffset: number; byte
 function buildMockDataStore(
   entries: Array<[number, string, string]>,
   deferredIds?: Set<number>,
-): IfcDataStore {
+): MockDataStore {
   const encoder = new TextEncoder();
   const parts: Uint8Array[] = [];
   const byId = new Map<number, MockEntityRef>();
@@ -57,13 +70,13 @@ function buildMockDataStore(
     schemaVersion: 'IFC4',
     entityCount: entries.length,
     parseTime: 0,
-    source,
+    source: asSourceBytes(source),
     entityIndex: { byId, byType },
     ...(deferred.size > 0 ? { deferredEntityIndex: deferred } : {}),
-  } as unknown as IfcDataStore;
+  } as unknown as MockDataStore;
 }
 
-function buildModel(id: string, name: string, entries: Array<[number, string, string]>, deferredIds?: Set<number>): MergeModelInput {
+function buildModel(id: string, name: string, entries: Array<[number, string, string]>, deferredIds?: Set<number>): MockMergeModelInput {
   return { id, name, dataStore: buildMockDataStore(entries, deferredIds) };
 }
 
@@ -201,6 +214,45 @@ describe('MergedExporter', () => {
     expect(decode(result.content)).toContain("#1=IFCPROJECT"); // infrastructure always included
     expect(decode(result.content)).toContain("#2=IFCWALL");    // visible wall
     expect(decode(result.content)).not.toContain("#3=IFCDOOR"); // hidden door
+  });
+
+  // #2548: `MergedExporter`'s `visibleOnly` shares `getVisibleEntityIds` /
+  // `collectReferencedEntityIds` with `StepExporter` — the same closure-walk
+  // fix that stops a hidden PRODUCT's pset from riding along on the
+  // relationship that named it applies here too, with no merged-export-
+  // specific code required.
+  it('does not ship a hidden door’s property set in a merged export', () => {
+    const model1 = buildModel('m1', 'Arch', [
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('g1',$,'P',$,$,$,$,$,$);"],
+      [3, 'IFCDOOR', "#3=IFCDOOR('g3',$,'D1',$,$,$,$,$);"],
+      [10, 'IFCPROPERTYSET', "#10=IFCPROPERTYSET('g10',$,'Pset_Custom',$,(#11));"],
+      [11, 'IFCPROPERTYSINGLEVALUE', "#11=IFCPROPERTYSINGLEVALUE('Cost',$,IFCTEXT('CONFIDENTIAL'),$);"],
+      [22, 'IFCRELDEFINESBYPROPERTIES', "#22=IFCRELDEFINESBYPROPERTIES('g22',$,$,$,(#3),#10);"],
+    ]);
+
+    const exporter = new MergedExporter([model1]);
+    const result = exporter.export({
+      schema: 'IFC4',
+      projectStrategy: 'keep-first',
+      visibleOnly: true,
+      hiddenEntityIdsByModel: new Map([['m1', new Set([3])]]), // Hide door
+    });
+
+    const content = decode(result.content);
+    expect(content).not.toContain('IFCDOOR');
+    expect(content).not.toContain('CONFIDENTIAL');
+    expect(content).not.toContain('IFCPROPERTYSET');
+    // The pset being gone is necessary but not sufficient: `MergedExporter`
+    // must also narrow the RELATIONSHIP's own output line (`#22`'s
+    // RelatedObjects list named only the hidden door), or #22 survives
+    // verbatim, naming a `#3` that no longer has a defining line — the
+    // relationship's own `#N=` narrows away, but its `#N` OUTPUT still names
+    // the pset via `#10` if that half is left unfiltered. Measured before
+    // this assertion existed: dropping the pset from the closure alone (the
+    // #2548 fix, with no #2398-shaped filtering applied to `MergedExporter`'s
+    // own relationship line) trades a privacy leak for a dangling reference
+    // with no error — structurally invalid IFC, silently emitted.
+    expect(findDanglingRefs(content)).toEqual([]);
   });
 
   it('should unify single site and remap spatial chain', () => {
@@ -946,7 +998,7 @@ describe('MergedExporter', () => {
     // Secondary = millimetres. A column at x=3000 mm, a storey at 3000 mm, a
     // 2500 mm extrusion depth, a 300 mm circle radius, a length quantity in mm and
     // an AREA quantity already in m² (Revit) that must NOT be length-rescaled.
-    const mmModel = (): MergeModelInput => {
+    const mmModel = (): MockMergeModelInput => {
       const m = buildModel('mm', 'Secondary-mm', [
         [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('mmProj')}',$,'Secondary',$,$,$,$,(#3),#2);`],
         [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8,#9,#10));'],
@@ -1102,17 +1154,18 @@ describe('MergedExporter', () => {
       const map = "#18=IFCMAPCONVERSION(#3,#19,10.,20.,0.,$,$,$);";
       const crs = "#19=IFCPROJECTEDCRS('EPSG:2056',$,$,$,$,$,$);";
       const extra = new TextEncoder().encode(map + crs);
-      const merged = new Uint8Array(store.source!.length + extra.length);
-      merged.set(store.source!); merged.set(extra, store.source!.length);
-      let off = store.source!.length;
+      const original = store.source.slice(0, store.source.byteLength);
+      const merged = new Uint8Array(original.length + extra.length);
+      merged.set(original); merged.set(extra, original.length);
+      let off = original.length;
       for (const [id, type, text] of [[18, 'IFCMAPCONVERSION', map], [19, 'IFCPROJECTEDCRS', crs]] as Array<[number, string, string]>) {
         const len = new TextEncoder().encode(text).length;
-        store.entityIndex.byId.set(id, { expressId: id, type, byteOffset: off, byteLength: len, lineNumber: 0 } as never);
+        store.entityIndex.byId.set(id, { expressId: id, type, byteOffset: off, byteLength: len, lineNumber: 0 });
         if (!store.entityIndex.byType.has(type)) store.entityIndex.byType.set(type, []);
         store.entityIndex.byType.get(type)!.push(id);
         off += len;
       }
-      (store as { source: Uint8Array }).source = merged;
+      (store as { source: IfcSourceBytes }).source = asSourceBytes(merged);
 
       const result = new MergedExporter([metreModel(), mm])
         .export({ schema: 'IFC4', unitReconciliation: 'normalize' });
