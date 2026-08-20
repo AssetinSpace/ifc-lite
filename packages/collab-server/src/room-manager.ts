@@ -68,6 +68,15 @@ export interface VerifyDecision {
   ok: boolean;
   /** Audit-friendly reason string when ok=false. */
   reason?: string;
+  /**
+   * Optional replacement payload to dispatch instead of the raw wire
+   * message — e.g. the anti-replay protector unwraps its signed envelope
+   * (tag + clientId + clock + hmac + inner frame) down to the inner
+   * y-protocol frame here. Without this, the envelope bytes themselves
+   * would be handed to `dispatchMessage`, which doesn't recognise them as
+   * a sync/awareness frame and silently drops them in its `default` case.
+   */
+  payload?: Uint8Array;
 }
 
 export type VerifyMessageFn = (msg: Uint8Array, conn: PeerConnection) => VerifyDecision;
@@ -91,9 +100,13 @@ export interface RoomOptions {
    * so a non-writer / rate-limited / oversized frame is rejected before the
    * verifier parses it (avoids Y.Doc-parse amplification). Signed-envelope
    * frames (e.g. the anti-replay protector's `0xff`-tagged frames) aren't
-   * recognised as sync write-frames, so the verifier still runs first for
-   * them and sees every signed frame. Returning `{ ok: false }` audits as
-   * `reject` with `reason`.
+   * recognised as sync write-frames by that first peek, so the verifier
+   * runs first for them and sees every signed frame — but if the verifier
+   * unwraps the envelope and returns `payload`, `handleMessage` re-runs
+   * `preCheckWriteFrame` on THAT payload before dispatch. The unwrapped
+   * frame is a real write frame the outer peek never saw, so it must still
+   * clear role / rate-limit / size before it reaches the doc. Returning
+   * `{ ok: false }` audits as `reject` with `reason`.
    */
   verifyMessage?: VerifyMessageFn;
   /** Internal: metric counters injected by the manager. */
@@ -288,6 +301,7 @@ export class Room {
     // 'viewer' could force unbounded full-Y.Doc parses by flooding
     // write-tagged frames (asymmetric CPU/GC DoS). Cheap peeks only here.
     if (!this.preCheckWriteFrame(conn, msg)) return;
+    let dispatchable = msg;
     if (this.verifyMessage) {
       const decision = this.verifyMessage(msg, conn);
       if (!decision.ok) {
@@ -296,9 +310,26 @@ export class Room {
         this.counters.reject?.(reason);
         return;
       }
+      // A verifier that unwraps an outer envelope (e.g. the anti-replay
+      // protector's signed frame) hands back the inner y-protocol frame
+      // here; dispatch THAT, not the raw envelope bytes — the envelope
+      // isn't itself a valid sync/awareness frame.
+      if (decision.payload) {
+        dispatchable = decision.payload;
+        // The preCheckWriteFrame call above read the ENVELOPE (msg), whose
+        // outer varint is the verifier's own tag (e.g. SIGNED_TAG) and never
+        // MESSAGE_SYNC, so it returned true without consulting the role, the
+        // limiter, or the size cap (see preCheckWriteFrame's early return).
+        // decision.payload is a real, unwrapped write frame that peek never
+        // saw — re-run the same gate on the bytes we are actually about to
+        // dispatch, or a viewer holding a valid signing key can write to the
+        // doc, and an oversized/unrate-limited envelope bypasses the caps
+        // meant to bound Y.Doc-parse amplification.
+        if (!this.preCheckWriteFrame(conn, dispatchable)) return;
+      }
     }
     try {
-      this.dispatchMessage(conn, msg);
+      this.dispatchMessage(conn, dispatchable);
     } catch {
       // Malformed/truncated frame from a peer. lib0 decoding throws
       // (errorUnexpectedEndOfArray / RangeError) on short or oversized
