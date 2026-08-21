@@ -342,6 +342,23 @@ export interface RenderOptions {
    * detail. Absent or `screenPx <= 0` = always full detail.
    */
   lod?: { screenPx: number };
+  /**
+   * Sun cast shadows (issue #2670, Phase 2). When `enabled`, the renderer runs
+   * a depth pre-pass from the sun before the colour pass, rasterising every
+   * geometry path (flat / quantized / instanced / textured) into a shadow map,
+   * then samples it in the shading pass with a rotated 12-tap Poisson-disk PCF
+   * kernel to occlude the direct sun term. Absent or `enabled: false` (the
+   * default) skips the pass entirely, so the hot path pays only a boolean check.
+   *
+   * - `resolution`: square shadow-map side in texels (default 2048). A
+   *   device/Quality dial, clamped to a minimum of 256.
+   * - `sunAngleDeg`: the sun's apparent angular diameter in degrees (default
+   *   ~0.53, the real sun on a clear sky). It sets shadow-edge SOFTNESS, not the
+   *   sun position: larger widens the penumbra. The renderer maps it to the PCF
+   *   kernel radius (`pcfRadius ≈ clamp(sunAngleDeg × 3, 0.75, 8)` texels), so a
+   *   later PCSS swap can consume the same angle without a UI change.
+   */
+  sunShadows?: { enabled: boolean; resolution?: number; sunAngleDeg?: number };
 }
 
 /**
