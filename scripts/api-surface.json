@@ -1884,7 +1884,6 @@
     "GeometryProcessingResult: interface",
     "GeometryProcessor: class",
     "GeometryProcessorOptions: interface",
-    "GeometryQuality: enum",
     "GeometryResult: interface",
     "GridAxis: interface",
     "IPlatformBridge: interface",
