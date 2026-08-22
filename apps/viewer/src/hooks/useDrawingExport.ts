@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { useCallback } from 'react';
+import type React from 'react';
 import { posthog } from '@/lib/analytics';
 import { downloadFile, sanitizeFilename } from '@/lib/export/download';
 import { toast } from '@/components/ui/toast';
@@ -11,7 +12,6 @@ import {
   GraphicOverrideEngine,
   renderFrame,
   renderTitleBlock,
-  calculateDrawingTransform,
   exportToDXF,
   formatScaleFactorLabel,
   fitRasterPixels,
@@ -23,6 +23,8 @@ import {
   type PdfScaleLayout,
 } from '@ifc-lite/drawing-2d';
 import { computePdfSectionLayout, makeSectionMapPoint } from '@/hooks/pdfSectionLayout';
+import { resolveSheetTransform } from '@/lib/drawing/sheet-transform';
+import type { CachedSheetTransform } from '@/lib/drawing/sheet-geometry-key';
 import { getFillColorForType } from '@/components/viewer/Drawing2DCanvas';
 import { formatDistance } from '@/components/viewer/tools/formatDistance';
 import { formatArea, computePolygonCentroid } from '@/components/viewer/tools/computePolygonArea';
@@ -309,6 +311,14 @@ interface UseDrawingExportParams {
   coordinateInfo: GeometryResult['coordinateInfo'] | undefined;
   /** Point-cloud scan overlay, already in drawing space (issue #1805) */
   scanSection: { points: readonly ScanBandPoint[] };
+  /** Pin View state, shared with the preview canvas. While pinned the sheet
+   *  placement is HELD across a regenerate; print/export must honour the same
+   *  held placement or it silently prints a different layout from the one on
+   *  screen (see `resolveSheetTransform`). */
+  isPinned?: boolean;
+  /** The preview's pinned-transform cache. Read-only here — the preview owns
+   *  the write, so exporting never perturbs what is on screen. */
+  cachedSheetTransformRef?: React.MutableRefObject<CachedSheetTransform | null>;
 }
 
 interface UseDrawingExportResult {
@@ -342,6 +352,8 @@ function useDrawingExport({
   ifcDataStore,
   coordinateInfo,
   scanSection,
+  isPinned = false,
+  cachedSheetTransformRef,
 }: UseDrawingExportParams): UseDrawingExportResult {
   // Georef inputs for the DXF export (PR #1871 review, P1): placement edits
   // applied in CesiumPlacementEditor live in `georefMutations` (per model
@@ -709,22 +721,26 @@ function useDrawingExport({
     const paperHeight = activeSheet.paper.heightMm;
     const viewport = activeSheet.viewportBounds;
 
-    // Calculate transform to fit drawing into viewport
-    const drawingTransform = calculateDrawingTransform(
-      { minX: bounds.min.x, minY: bounds.min.y, maxX: bounds.max.x, maxY: bounds.max.y },
-      viewport,
-      activeSheet.scale
-    );
-
-    const { translateX, translateY, scaleFactor } = drawingTransform;
-
-    // Axis-specific flipping (matching canvas rendering)
-    // - 'down' (plan view): DON'T flip Y so north (Z+) is up
-    // - 'front' and 'side': flip Y so height (Y+) is up
-    // - 'side': also flip X to look from conventional direction
-    const currentAxis = sectionPlane.axis;
-    const flipY = currentAxis !== 'down';
-    const flipX = currentAxis === 'side';
+    // Flips, cache read and the axis-corrected transform all come from the
+    // ONE resolver the preview canvas (`Drawing2DCanvas.tsx`) also calls, so
+    // print/export cannot derive any of the three separately (#2940: print
+    // used the raw, always-Y-flip-assuming transform, which only matched the
+    // preview for axes that flip Y and left plan ('down') sections off-centre
+    // on paper; and print recomputed from current bounds while a PINNED
+    // preview held a cached placement).
+    //
+    // Read-only on the cache by construction: `resolveSheetTransform` never
+    // writes, and this path does not write either — printing must not move
+    // what is on screen.
+    const resolved = resolveSheetTransform({
+      sheet: activeSheet,
+      drawingBounds: { minX: bounds.min.x, minY: bounds.min.y, maxX: bounds.max.x, maxY: bounds.max.y },
+      axis: sectionPlane.axis,
+      isPinned,
+      cached: cachedSheetTransformRef?.current,
+    });
+    const { flipX, flipY } = resolved;
+    const { translateX, translateY, scaleFactor } = resolved.transform;
 
     // Helper: convert model coordinates to paper mm (matching canvas rendering exactly)
     const modelToPaper = (x: number, y: number): { x: number; y: number } => {
@@ -950,7 +966,13 @@ function useDrawingExport({
 
     svg += '</svg>';
     return svg;
-  }, [drawing, activeSheet, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine, dxfUnderlays, scanSection]);
+    // `sectionPlane.axis` and `isPinned` are read INSIDE this callback (via
+    // `resolveSheetTransform`) and so must be here. Both were previously
+    // held up only by invariants elsewhere — `drawing` happens to change
+    // identity when the axis changes, and the canvas rewrote the cache on
+    // every fresh draw — neither of which this callback controls.
+    // `cachedSheetTransformRef` is a ref: stable identity, read at call time.
+  }, [drawing, activeSheet, displayOptions, activePresetId, entityColorMap, overridesEnabled, overrideEngine, dxfUnderlays, scanSection, sectionPlane.axis, isPinned]);
 
   // Export SVG
   const handleExportSVG = useCallback(() => {
