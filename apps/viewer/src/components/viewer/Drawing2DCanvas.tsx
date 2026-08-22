@@ -987,7 +987,52 @@ export function Drawing2DCanvas({
       // 6. Draw scale bar at BOTTOM LEFT of title block
       // Uses actual drawingTransform.scaleFactor which accounts for dynamic scaling
       // ─────────────────────────────────────────────────────────────────────
-      if (scaleBar.visible && tbH > 10) {
+      // The scale bar is sized by two loops, and BOTH can fail to terminate:
+      //
+      //   while (sbLengthMm > maxBarWidth && targetLengthM > 0.5)   // halving
+      //     targetLengthM = targetLengthM / 2;
+      //   while (sbLengthMm < maxBarWidth * 0.3 && targetLengthM < 100)  // doubling
+      //     targetLengthM = targetLengthM * 2;
+      //
+      // They wedge on different inputs, which is why the guard needs three
+      // clauses and not one. Measured against the real component, each one a
+      // render that had to be killed by the test runner's timeout:
+      //
+      //     totalLengthM=0         doubling loop   0 * 2 is 0, forever
+      //     totalLengthM=-1        doubling loop   halves toward -Infinity,
+      //                                            which stays < 100
+      //     totalLengthM=Infinity  HALVING loop    Infinity / 2 is Infinity
+      //     scaleFactor=NaN        terminates
+      //     scaleFactor=0          terminates
+      //
+      // The Infinity case is the one I missed first time round, because I
+      // reasoned about the doubling loop the bug report named and never looked
+      // at the one above it. `Infinity > 0` passes a positivity check, so a
+      // guard without `Number.isFinite` reads as complete and is not.
+      //
+      // title-block-renderer.ts:410 already had this exactly right, and says so:
+      // "Checked BEFORE the clamp, and the ordering is load-bearing: testing
+      // the clamped result loses the infinite case". This is the canvas
+      // catching up with the exporter, which is also why `calculateOptimal-
+      // ScaleBarLength` is left alone: it returns 0 for "no usable bar" and the
+      // exporter already declines to draw that. The canvas was the half not
+      // holding up its end.
+      //
+      // The two scaleFactor clauses do a different job. Neither prevents a
+      // hang; they stop a bar being drawn with a `NaNm` label when
+      // `actualTotalLength` comes out 0/0.
+      //
+      // Guards only the scale bar: the north arrow is drawn after this block in
+      // the same function, so an early return would silently drop it. That was
+      // my first attempt.
+      if (
+        scaleBar.visible &&
+        tbH > 10 &&
+        scaleBar.totalLengthM > 0 &&
+        Number.isFinite(scaleBar.totalLengthM) &&
+        Number.isFinite(drawingTransform.scaleFactor) &&
+        drawingTransform.scaleFactor > 0
+      ) {
         // Position: bottom left with small margin
         const sbX = tbX + 3;
         const sbY = tbY + tbH - 8; // 8mm from bottom (leaves room for label)
