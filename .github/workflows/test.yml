@@ -749,6 +749,15 @@ jobs:
       # crates.io behind npm. This makes that order a PR-visible gate.
       - name: Check the crates publish order matches the dependency graph
         run: node --test scripts/release-crates-order.test.mjs
+      # verify-esm-entrypoints.mjs is the last gate before `pnpm release`
+      # publishes. If its package discovery ever returns nothing — packages/
+      # moved, or the publishable filter stops matching — the smoke loop has
+      # nothing to fail on, the summary reads "0 passed, 0 failed, 0 skipped"
+      # and the run exits 0: success reported for having imported nothing.
+      # Same absence-as-success shape as the unbuilt skip it already fails
+      # closed on. This also pins that a legitimate run still exits 0.
+      - name: Check the ESM smoke test fails on an empty discovery
+        run: node --test scripts/verify-esm-entrypoints.test.mjs
       # Executable proof for the test-glob-coverage gate, which runs in `lint`:
       # its fixtures drive the unmodified checker against synthetic packages via
       # `--root` and assert it goes red for a non-recursive shell glob, for an
