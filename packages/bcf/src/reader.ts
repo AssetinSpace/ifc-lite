@@ -9,16 +9,14 @@
  */
 
 import JSZip from 'jszip';
+import { parseComponents } from './reader-components.js';
+import { extractElement, unescapeXml } from './xml-text.js';
 import type {
   BCFProject,
   BCFTopic,
   BCFComment,
   BCFViewpoint,
   BCFVersion,
-  BCFComponents,
-  BCFComponent,
-  BCFVisibility,
-  BCFColoring,
   BCFPerspectiveCamera,
   BCFOrthogonalCamera,
   BCFLine,
@@ -31,6 +29,7 @@ import type {
   BCFBimSnippet,
   BCFHeaderFile,
 } from './types.js';
+import { parseFiniteFloat } from './numeric.js';
 
 /**
  * Resource caps guarding against a malicious (zip-bomb) .bcfzip: a tiny
@@ -265,11 +264,15 @@ async function readProjectFile(zip: JSZip, budget: ExpansionBudget): Promise<{
   const content = await readEntryCapped(projectFile, 'string', budget);
 
   const projectIdMatch = content.match(/ProjectId="([^"]+)"/);
-  const nameMatch = content.match(/<Name>([^<]+)<\/Name>/);
+  // extractElement, not a raw regex: writeProjectFile escapes the name with
+  // escapeXml, so a raw match hands back the literal entities (`A &amp; B`) and
+  // the next export escapes them again. Every other element in this reader goes
+  // through extractElement precisely so the escape has an inverse.
+  const name = extractElement(content, 'Name');
 
   return {
     projectId: projectIdMatch?.[1],
-    name: nameMatch?.[1],
+    name,
   };
 }
 
@@ -316,14 +319,21 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
 
   const markupContent = await readEntryCapped(markupFile, 'string', budget);
 
-  // Parse Topic element
-  const topicMatch = markupContent.match(/<Topic\s+Guid="([^"]+)"[^>]*>([\s\S]*?)<\/Topic>/);
+  // Parse Topic element. Attributes are captured generically (not anchored to
+  // Guid being first) and pulled out with extractAttr, so a spec-legal file
+  // that orders attributes differently from our own writer still parses.
+  const topicMatch = markupContent.match(/<Topic\b([^>]*)>([\s\S]*?)<\/Topic>/);
   if (!topicMatch) {
     console.warn(`Invalid markup.bcf in ${topicFolder}: missing Topic element`);
     return null;
   }
 
-  const guid = topicMatch[1];
+  const topicAttrs = topicMatch[1];
+  const guid = extractAttr(topicAttrs, 'Guid');
+  if (!guid) {
+    console.warn(`Invalid markup.bcf in ${topicFolder}: Topic element missing Guid`);
+    return null;
+  }
   const topicContent = topicMatch[2];
 
   // Header (source IFC files) sits before Topic in the markup, so parse it from
@@ -331,8 +341,8 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
   const header = parseHeaderFiles(markupContent);
 
   // Extract topic attributes
-  const topicTypeMatch = markupContent.match(/<Topic[^>]*TopicType="([^"]+)"/);
-  const topicStatusMatch = markupContent.match(/<Topic[^>]*TopicStatus="([^"]+)"/);
+  const topicType = extractAttr(topicAttrs, 'TopicType');
+  const topicStatus = extractAttr(topicAttrs, 'TopicStatus');
 
   // Extract topic elements
   const title = extractElement(topicContent, 'Title') || 'Untitled';
@@ -362,9 +372,10 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
 
   // Extract related topics
   const relatedTopics: string[] = [];
-  const relatedMatches = topicContent.matchAll(/<RelatedTopic\s+Guid="([^"]+)"/g);
+  const relatedMatches = topicContent.matchAll(/<RelatedTopic\b([^>]*)\/?>/g);
   for (const match of relatedMatches) {
-    relatedTopics.push(match[1]);
+    const relatedGuid = extractAttr(match[1], 'Guid');
+    if (relatedGuid) relatedTopics.push(relatedGuid);
   }
 
   // Parse comments
@@ -377,8 +388,8 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
     guid,
     title,
     description,
-    topicType: topicTypeMatch?.[1],
-    topicStatus: topicStatusMatch?.[1],
+    topicType,
+    topicStatus,
     priority,
     index: index ? parseInt(index, 10) : undefined,
     creationDate,
@@ -435,46 +446,48 @@ function parseHeaderFiles(markupContent: string): BCFHeaderFile[] {
 }
 
 /**
- * Extract a simple element value from XML
+ * Extract an attribute's value from a captured opening-tag attribute string.
  *
- * Values are unescaped so writer.ts's escapeXml() round-trips correctly
- * (see escapeXml/unescapeXml regression: & < > " ' in titles/descriptions/
- * comments must come back exactly as written, not as literal entities).
+ * XML attribute order is not semantically significant, so every caller that
+ * needs an attribute off an opening tag must first capture the tag's whole
+ * attribute list generically (e.g. `<Tag\b([^>]*)>`) and then pull individual
+ * attributes out of that captured string with this helper, rather than
+ * anchoring a single regex to one specific attribute position (e.g.
+ * `<Tag\s+Guid="..."`). The latter shape only matches when a foreign tool
+ * happens to write that attribute first, which our own writer.ts always does
+ * -- so a self round-trip can never catch the fragility (see reader.test.ts's
+ * "interop: attribute order independence" suite).
  */
-function extractElement(content: string, elementName: string): string | undefined {
-  const match = content.match(new RegExp(`<${elementName}>([^<]*)<\\/${elementName}>`));
-  return match?.[1] !== undefined ? unescapeXml(match[1]) : undefined;
-}
-
-/**
- * Unescape XML entities produced by writer.ts's escapeXml()
- *
- * &amp; must be decoded last so a literal "&lt;" written as "&amp;lt;"
- * doesn't get corrupted into "<" by an earlier pass.
- */
-function unescapeXml(str: string): string {
-  return str
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
+function extractAttr(attrsString: string, attrName: string): string | undefined {
+  return attrsString.match(new RegExp(`\\b${attrName}="([^"]*)"`))?.[1];
 }
 
 /**
  * Extract BIM snippet from topic content
  */
 function extractBimSnippet(content: string): BCFBimSnippet | undefined {
-  const match = content.match(/<BimSnippet\s+SnippetType="([^"]+)"[^>]*>([\s\S]*?)<\/BimSnippet>/);
+  // Attributes are captured generically and pulled out with extractAttr rather
+  // than anchoring SnippetType to first position: our own writer always emits
+  // it first, so an anchored regex round-trips our files and silently drops the
+  // entire snippet from a foreign tool's file that orders the two attributes
+  // the other way (see extractAttr's note on attribute order).
+  const match = content.match(/<BimSnippet\b([^>]*)>([\s\S]*?)<\/BimSnippet>/);
   if (!match) return undefined;
 
-  const isExternalMatch = match[0].match(/isExternal="([^"]+)"/);
+  const snippetType = extractAttr(match[1], 'SnippetType');
+  if (!snippetType) return undefined;
+
+  // BCF 2.1 spells this `isExternal`, 3.0 `IsExternal` (same rename as the
+  // Header `<File>` attribute in reader.ts's parseHeaderFiles); accept either
+  // casing so a spec-correct 3.0 file's flag isn't silently read as false, and
+  // the xs:boolean `1`/`0` forms alongside `true`/`false`.
+  const isExternalRaw = match[1].match(/\b[Ii]sExternal="([^"]*)"/)?.[1];
   const reference = extractElement(match[2], 'Reference');
   const referenceSchema = extractElement(match[2], 'ReferenceSchema');
 
   return {
-    snippetType: match[1],
-    isExternal: isExternalMatch?.[1] === 'true',
+    snippetType,
+    isExternal: isExternalRaw === 'true' || isExternalRaw === '1',
     reference: reference || '',
     referenceSchema,
   };
@@ -482,22 +495,37 @@ function extractBimSnippet(content: string): BCFBimSnippet | undefined {
 
 /**
  * Extract document references from topic content
+ *
+ * BCF 2.1's `<DocumentReference>` carries `<ReferencedDocument>` plus an
+ * `isExternal` flag; BCF 3.0 replaced that with `<DocumentGuid>` (internal,
+ * into project.bcfp's Documents) or `<Url>` (external), and dropped
+ * `isExternal` entirely (buildingSMART/BCF-XML markup.xsd). Parse whichever
+ * shape is present rather than assuming 2.1, so a 3.0 file's document
+ * references aren't silently dropped.
  */
 function extractDocumentReferences(content: string): BCFDocumentReference[] {
   const refs: BCFDocumentReference[] = [];
-  const matches = content.matchAll(/<DocumentReference[^>]*>([\s\S]*?)<\/DocumentReference>/g);
+  // `(?![A-Za-z])` keeps 3.0's <DocumentReferences> CONTAINER from matching as
+  // if it were an entry: without it the container's opening tag pairs with the
+  // first entry's closing tag, and the first reference is only parsed
+  // correctly by accident of that overlap.
+  const matches = content.matchAll(/<DocumentReference(?![A-Za-z])[^>]*>([\s\S]*?)<\/DocumentReference>/g);
 
   for (const match of matches) {
     const guidMatch = match[0].match(/Guid="([^"]+)"/);
-    const isExternalMatch = match[0].match(/isExternal="([^"]+)"/);
+    const isExternalMatch = match[0].match(/\bisExternal="([^"]+)"/);
     const referencedDoc = extractElement(match[1], 'ReferencedDocument');
+    const documentGuid = extractElement(match[1], 'DocumentGuid');
+    const url = extractElement(match[1], 'Url');
     const description = extractElement(match[1], 'Description');
 
-    if (referencedDoc) {
+    if (referencedDoc || documentGuid || url) {
       refs.push({
         guid: guidMatch?.[1],
-        isExternal: isExternalMatch?.[1] === 'true',
+        isExternal: isExternalMatch ? isExternalMatch[1] === 'true' : undefined,
         referencedDocument: referencedDoc,
+        documentGuid,
+        url,
         description,
       });
     }
@@ -525,10 +553,14 @@ function parseComments(markupContent: string): BCFComment[] {
   const comments: BCFComment[] = [];
 
   // Collect every top-level comment-wrapper opening tag and where its body starts.
-  const openRe = /<Comment\s+Guid="([^"]+)"[^>]*>/g;
+  // Attributes are captured generically and pulled out with extractAttr so a
+  // Guid that isn't the tag's first attribute still matches (see extractAttr).
+  const openRe = /<Comment\b([^>]*)>/g;
   const opens: { guid: string; tagStart: number; bodyStart: number }[] = [];
   for (let m = openRe.exec(markupContent); m; m = openRe.exec(markupContent)) {
-    opens.push({ guid: m[1], tagStart: m.index, bodyStart: m.index + m[0].length });
+    const guid = extractAttr(m[1], 'Guid');
+    if (!guid) continue;
+    opens.push({ guid, tagStart: m.index, bodyStart: m.index + m[0].length });
   }
 
   for (let i = 0; i < opens.length; i++) {
@@ -549,14 +581,15 @@ function parseComments(markupContent: string): BCFComment[] {
     const modifiedAuthor = extractElement(content, 'ModifiedAuthor');
 
     // Extract viewpoint reference
-    const viewpointMatch = content.match(/<Viewpoint\s+Guid="([^"]+)"/);
+    const viewpointMatch = content.match(/<Viewpoint\b([^>]*)\/?>/);
+    const viewpointGuid = viewpointMatch ? extractAttr(viewpointMatch[1], 'Guid') : undefined;
 
     comments.push({
       guid: opens[i].guid,
       date,
       author,
       comment,
-      viewpointGuid: viewpointMatch?.[1],
+      viewpointGuid,
       modifiedDate,
       modifiedAuthor,
     });
@@ -576,14 +609,55 @@ async function parseViewpoints(
 ): Promise<BCFViewpoint[]> {
   const viewpoints: BCFViewpoint[] = [];
 
-  // Parse viewpoint references from markup.bcf to get snapshot filenames
-  // Format: <Viewpoint Guid="xxx"><Viewpoint>filename.bcfv</Viewpoint><Snapshot>snapshot.png</Snapshot></Viewpoint>
+  // Parse viewpoint references from markup.bcf to get snapshot filenames.
+  // The markup element is plural -- <Viewpoints Guid="xxx"><Viewpoint>file.bcfv</Viewpoint>
+  // <Snapshot>file.png</Snapshot></Viewpoints> -- per the BCF 2.1/3.0 schema (see
+  // writer.ts writeMarkupFile) and buildingSMART's own reference fixtures. A prior
+  // version of this regex looked for singular <Viewpoint Guid="..."> instead, which is
+  // the tag Comment elements use to reference a viewpoint (see parseComments below) --
+  // it can never match the top-level markup element, so this map was always empty and
+  // every snapshot resolution silently fell through to the filename-guessing fallback.
+  // On a real-world file whose viewpoint/snapshot filenames don't follow the
+  // buildingSMART naming convention, that fallback fails to find the snapshot at all
+  // even though markup.bcf names it explicitly.
   const viewpointInfoMap = new Map<string, { viewpointFile?: string; snapshotFile?: string }>();
 
-  // Match full viewpoint elements with both viewpoint and snapshot references
-  const viewpointElementRegex = /<Viewpoint\s+Guid="([^"]+)"[^>]*>([\s\S]*?)<\/Viewpoint>/g;
+  // Match full viewpoint elements with both viewpoint and snapshot references.
+  // Attributes are captured generically and pulled out with extractAttr so a
+  // Guid that isn't the tag's first attribute still matches (see extractAttr).
+  const viewpointElementRegex = /<Viewpoints\b([^>]*)>([\s\S]*?)<\/Viewpoints>/g;
   for (const match of markupContent.matchAll(viewpointElementRegex)) {
-    const guid = match[1];
+    const guid = extractAttr(match[1], 'Guid');
+    if (!guid) continue;
+    const content = match[2];
+
+    const viewpointFileMatch = content.match(/<Viewpoint>([^<]+)<\/Viewpoint>/);
+    const snapshotFileMatch = content.match(/<Snapshot>([^<]+)<\/Snapshot>/);
+
+    viewpointInfoMap.set(guid, {
+      viewpointFile: viewpointFileMatch?.[1],
+      snapshotFile: snapshotFileMatch?.[1],
+    });
+  }
+
+  // BCF 3.0 nests viewpoint entries inside <Topic>, wrapped in a plural
+  // <Viewpoints> container that (unlike 2.1's) carries no Guid itself; each
+  // entry is a singular <ViewPoint Guid="..."> -- capital P, distinct from
+  // the lowercase-p <Viewpoint Guid="..."/> a Comment uses to reference a
+  // viewpoint -- per buildingSMART/BCF-XML markup.xsd (release_3_0, Topic's
+  // Viewpoints element wraps `ViewPoint` entries) and confirmed against the
+  // buildingSMART/BCF-XML Test Cases/v3.0/Visualization/Perspective camera
+  // fixture, whose markup.bcf reads
+  // `<Viewpoints><ViewPoint Guid="f99eb1ed-...">`. The plural-with-Guid regex
+  // above can never match this shape (the wrapper has no Guid attribute), so
+  // without this pass every 3.0 file's markup-declared snapshot filename was
+  // silently dropped and resolution fell through to guessing our own
+  // Snapshot_<guid> naming convention -- which a third-party 3.0 file has no
+  // reason to follow.
+  const viewPointElementRegex = /<ViewPoint\b([^>]*)>([\s\S]*?)<\/ViewPoint>/g;
+  for (const match of markupContent.matchAll(viewPointElementRegex)) {
+    const guid = extractAttr(match[1], 'Guid');
+    if (!guid || viewpointInfoMap.has(guid)) continue;
     const content = match[2];
 
     const viewpointFileMatch = content.match(/<Viewpoint>([^<]+)<\/Viewpoint>/);
@@ -596,10 +670,11 @@ async function parseViewpoints(
   }
 
   // Also match self-closing viewpoint references
-  const simpleViewpointRefs = markupContent.matchAll(/<Viewpoint\s+Guid="([^"]+)"[^>]*\/>/g);
+  const simpleViewpointRefs = markupContent.matchAll(/<Viewpoints\b([^>]*)\/>/g);
   for (const match of simpleViewpointRefs) {
-    if (!viewpointInfoMap.has(match[1])) {
-      viewpointInfoMap.set(match[1], {});
+    const guid = extractAttr(match[1], 'Guid');
+    if (guid && !viewpointInfoMap.has(guid)) {
+      viewpointInfoMap.set(guid, {});
     }
   }
 
@@ -760,12 +835,42 @@ function parsePerspectiveCamera(content: string): BCFPerspectiveCamera | undefin
     return undefined;
   }
 
+  // Same treatment as the coordinates: an unusable scalar is a missing one.
+  // `fieldOfView` is converted to radians and handed to the viewer camera,
+  // and the parser already drops the whole camera when the element is absent.
+  const fov = parseFiniteFloat(fieldOfView);
+  if (fov === undefined) return undefined;
+
   return {
     cameraViewPoint: viewPoint,
     cameraDirection: direction,
     cameraUpVector: upVector,
-    fieldOfView: parseFloat(fieldOfView),
+    fieldOfView: fov,
+    ...parseAspectRatio(cameraContent),
   };
+}
+
+/**
+ * Parse the optional `<AspectRatio>` of either camera type.
+ *
+ * BCF 3.0's visinfo.xsd makes `AspectRatio` (a `PositiveDouble`) a REQUIRED
+ * child of both camera types; BCF 2.1 has no such element. It is read here for
+ * both, since the element's presence — not the archive's declared version — is
+ * what says whether there is a value to keep.
+ *
+ * Reading it matters beyond fidelity: the writer refuses to emit a 3.0 camera
+ * without one, so a 3.0 archive from another tool could otherwise be read and
+ * then not written back. Returned as a spread-able partial so an absent or
+ * unusable value leaves the property off entirely rather than setting it to
+ * `undefined`, and a non-positive value is dropped rather than carried into
+ * output the schema would reject.
+ */
+function parseAspectRatio(cameraContent: string): { aspectRatio?: number } {
+  const raw = extractElement(cameraContent, 'AspectRatio');
+  if (!raw) return {};
+  const value = parseFiniteFloat(raw);
+  if (value === undefined || !(value > 0)) return {};
+  return { aspectRatio: value };
 }
 
 /**
@@ -786,11 +891,18 @@ function parseOrthogonalCamera(content: string): BCFOrthogonalCamera | undefined
     return undefined;
   }
 
+  // `viewToWorldScale` becomes the orthographic half-height, which is the
+  // value `getOrthoSize()` hands back into a saved viewpoint — so a
+  // non-finite one persists past the session if it is allowed in (#2461).
+  const scale = parseFiniteFloat(viewToWorldScale);
+  if (scale === undefined) return undefined;
+
   return {
     cameraViewPoint: viewPoint,
     cameraDirection: direction,
     cameraUpVector: upVector,
-    viewToWorldScale: parseFloat(viewToWorldScale),
+    viewToWorldScale: scale,
+    ...parseAspectRatio(cameraContent),
   };
 }
 
@@ -809,11 +921,24 @@ function parsePoint(content: string, elementName: string): BCFPoint | undefined 
     return undefined;
   }
 
-  return {
-    x: parseFloat(x),
-    y: parseFloat(y),
-    z: parseFloat(z),
-  };
+  // A coordinate that is not a real number is treated as a missing one.
+  // `parseFloat` has no out-of-band failure value — `"NaN"` parses to `NaN`
+  // and the well-formed literal `"1e999"` parses to `Infinity` — and from here
+  // the value reaches `Camera.setPosition`/`setTarget`, which store a pose
+  // verbatim by design. Once stored, a single non-finite coordinate spreads
+  // across the whole pose on the next gesture. Rejecting at the file boundary
+  // means it never gets there, and it costs no new branch: every caller
+  // already drops the thing it was parsing when a coordinate is missing
+  // (#2466).
+  const px = parseFiniteFloat(x);
+  const py = parseFiniteFloat(y);
+  const pz = parseFiniteFloat(z);
+
+  if (px === undefined || py === undefined || pz === undefined) {
+    return undefined;
+  }
+
+  return { x: px, y: py, z: pz };
 }
 
 /**
@@ -821,122 +946,6 @@ function parsePoint(content: string, elementName: string): BCFPoint | undefined 
  */
 function parseDirection(content: string, elementName: string): BCFDirection | undefined {
   return parsePoint(content, elementName) as BCFDirection | undefined;
-}
-
-/**
- * Parse components (selection/visibility/coloring)
- */
-function parseComponents(content: string): BCFComponents | undefined {
-  const componentsMatch = content.match(/<Components>([\s\S]*?)<\/Components>/);
-  if (!componentsMatch) return undefined;
-
-  const componentsContent = componentsMatch[1];
-
-  // Parse selection
-  const selection = parseComponentList(componentsContent, 'Selection');
-
-  // Parse visibility
-  const visibility = parseVisibility(componentsContent);
-
-  // Parse coloring
-  const coloring = parseColoring(componentsContent);
-
-  if (!selection && !visibility && !coloring) {
-    return undefined;
-  }
-
-  return {
-    selection: selection?.length ? selection : undefined,
-    visibility,
-    coloring: coloring?.length ? coloring : undefined,
-  };
-}
-
-/**
- * Parse a list of components
- */
-function parseComponentList(content: string, elementName: string): BCFComponent[] | undefined {
-  const match = content.match(new RegExp(`<${elementName}>([\\s\\S]*?)<\\/${elementName}>`));
-  if (!match) return undefined;
-
-  const components: BCFComponent[] = [];
-  const componentMatches = match[1].matchAll(/<Component[^>]*(?:\/>|>[\s\S]*?<\/Component>)/g);
-
-  for (const compMatch of componentMatches) {
-    const component = parseComponent(compMatch[0]);
-    if (component) {
-      components.push(component);
-    }
-  }
-
-  return components.length > 0 ? components : undefined;
-}
-
-/**
- * Parse a single component
- */
-function parseComponent(content: string): BCFComponent | undefined {
-  const ifcGuidMatch = content.match(/IfcGuid="([^"]+)"/);
-  const authoringToolIdMatch = content.match(/AuthoringToolId="([^"]+)"/);
-  const originatingSystemMatch = content.match(/OriginatingSystem="([^"]+)"/);
-
-  if (!ifcGuidMatch && !authoringToolIdMatch) {
-    return undefined;
-  }
-
-  return {
-    ifcGuid: ifcGuidMatch?.[1],
-    authoringToolId: authoringToolIdMatch?.[1],
-    originatingSystem: originatingSystemMatch?.[1],
-  };
-}
-
-/**
- * Parse visibility settings
- */
-function parseVisibility(content: string): BCFVisibility | undefined {
-  const visibilityMatch = content.match(/<Visibility[^>]*>([\s\S]*?)<\/Visibility>/);
-  if (!visibilityMatch) return undefined;
-
-  const defaultVisMatch = content.match(/DefaultVisibility="([^"]+)"/);
-  const defaultVisibility = defaultVisMatch?.[1] !== 'false';
-
-  const exceptions = parseComponentList(visibilityMatch[1], 'Exceptions');
-
-  return {
-    defaultVisibility,
-    exceptions,
-  };
-}
-
-/**
- * Parse coloring settings
- */
-function parseColoring(content: string): BCFColoring[] | undefined {
-  const coloringMatch = content.match(/<Coloring>([\s\S]*?)<\/Coloring>/);
-  if (!coloringMatch) return undefined;
-
-  const colorings: BCFColoring[] = [];
-  const colorMatches = coloringMatch[1].matchAll(/<Color\s+Color="([^"]+)"[^>]*>([\s\S]*?)<\/Color>/g);
-
-  for (const match of colorMatches) {
-    const color = match[1];
-    const components: BCFComponent[] = [];
-    const componentMatches = match[2].matchAll(/<Component[^>]*(?:\/>|>[\s\S]*?<\/Component>)/g);
-
-    for (const compMatch of componentMatches) {
-      const component = parseComponent(compMatch[0]);
-      if (component) {
-        components.push(component);
-      }
-    }
-
-    if (components.length > 0) {
-      colorings.push({ color, components });
-    }
-  }
-
-  return colorings.length > 0 ? colorings : undefined;
 }
 
 /**
@@ -981,20 +990,31 @@ function parseClippingPlanes(content: string): BCFClippingPlane[] {
 
 /**
  * Parse bitmaps
+ *
+ * The two BCF versions diverge in shape (see writer.ts's writeBitmap/
+ * writeViewpointFiles for the write side of this):
+ * - BCF 3.0: entries sit inside a `<Bitmaps>` wrapper, and the per-entry
+ *   format element is named `<Format>`. No tag inside an entry shares the
+ *   entry's own name, so a plain non-greedy `<Bitmap>...</Bitmap>` match
+ *   is unambiguous.
+ * - BCF 2.1: entries sit DIRECTLY under `<VisualizationInfo>` (no wrapper),
+ *   and the format element is confusingly also named `<Bitmap>`, nested one
+ *   level inside the entry (`<Bitmap><Bitmap>PNG</Bitmap><Reference>...`).
+ *   A naive non-greedy `<Bitmap>...</Bitmap>` match on that shape terminates
+ *   at the FIRST `</Bitmap>` it sees -- the inner format tag's closing tag,
+ *   not the entry's -- and silently drops the rest of the entry. It must be
+ *   matched with an explicit two-level pattern instead.
  */
 function parseBitmaps(content: string): BCFBitmap[] {
   const bitmaps: BCFBitmap[] = [];
   const bitmapsMatch = content.match(/<Bitmaps>([\s\S]*?)<\/Bitmaps>/);
-  if (!bitmapsMatch) return bitmaps;
 
-  const bitmapMatches = bitmapsMatch[1].matchAll(/<Bitmap>([\s\S]*?)<\/Bitmap>/g);
-  for (const match of bitmapMatches) {
-    const format = extractElement(match[1], 'Format') || extractElement(match[1], 'Bitmap');
-    const reference = extractElement(match[1], 'Reference');
-    const location = parsePoint(match[1], 'Location');
-    const normal = parseDirection(match[1], 'Normal');
-    const up = parseDirection(match[1], 'Up');
-    const height = extractElement(match[1], 'Height');
+  const pushBitmap = (format: string | undefined, body: string) => {
+    const reference = extractElement(body, 'Reference');
+    const location = parsePoint(body, 'Location');
+    const normal = parseDirection(body, 'Normal');
+    const up = parseDirection(body, 'Up');
+    const height = extractElement(body, 'Height');
 
     if (format && reference && location && normal && up && height) {
       bitmaps.push({
@@ -1005,6 +1025,21 @@ function parseBitmaps(content: string): BCFBitmap[] {
         up,
         height: parseFloat(height),
       });
+    }
+  };
+
+  if (bitmapsMatch) {
+    // BCF 3.0 shape: <Bitmaps><Bitmap><Format>...</Format>...</Bitmap>...</Bitmaps>
+    for (const match of bitmapsMatch[1].matchAll(/<Bitmap>([\s\S]*?)<\/Bitmap>/g)) {
+      pushBitmap(extractElement(match[1], 'Format'), match[1]);
+    }
+  } else {
+    // BCF 2.1 shape: <Bitmap><Bitmap>PNG</Bitmap>...</Bitmap>, unwrapped,
+    // directly under VisualizationInfo.
+    for (const match of content.matchAll(
+      /<Bitmap>\s*<Bitmap>([\s\S]*?)<\/Bitmap>([\s\S]*?)<\/Bitmap>/g,
+    )) {
+      pushBitmap(match[1], match[2]);
     }
   }
 

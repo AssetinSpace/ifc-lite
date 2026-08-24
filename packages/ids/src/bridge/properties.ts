@@ -9,6 +9,8 @@ import {
   extractTypePropertiesOnDemand,
   extractTypeEntityOwnProperties,
   extractAllEntityAttributes,
+  extractMaterialPropertiesForMaterialId,
+  mergeInheritedPropertySets,
 } from '@ifc-lite/parser';
 import { RelationshipType } from '@ifc-lite/data';
 
@@ -44,13 +46,19 @@ export function collectAllPropertySets(
   store: IfcDataStore,
   expressId: number
 ): PropertySetInfo[] {
-  const out: PropertySetInfo[] = [];
+  const own: PropertySetInfo[] = [];
   const scale = store.lengthUnitScale;
 
-  appendInstancePropertySets(store, expressId, scale, out);
-  appendQuantitySets(store, expressId, out);
-  appendPredefinedPropertySets(store, expressId, out);
-  appendInheritedPropertySets(store, expressId, scale, out);
+  appendInstancePropertySets(store, expressId, scale, own);
+  appendQuantitySets(store, expressId, own);
+  appendPredefinedPropertySets(store, expressId, own);
+  appendMaterialOwnPropertySets(store, expressId, scale, own);
+
+  // Merged per property, not per set — see `mergeInheritedPropertySets`.
+  const out = mergeInheritedPropertySets(
+    own,
+    inheritedPropertySets(store, expressId, scale),
+  );
 
   if (out.length === 0) {
     appendTypeEntityOwnProperties(store, expressId, out);
@@ -159,12 +167,60 @@ function appendPredefinedPropertySets(
   }
 }
 
-function appendInheritedPropertySets(
+/**
+ * `IfcMaterialProperties` (IFC4+) / `IfcExtendedMaterialProperties`
+ * (IFC2X3) attach property sets directly to an `IfcMaterial`, not
+ * through `IfcRelDefinesByProperties` like every other pset. When the
+ * IDS applicability targets `IfcMaterial` itself (rather than an
+ * element that merely uses one), those material-owned psets are the
+ * ONLY property source available — without this, a property facet on
+ * `IfcMaterial` always reports the pset missing regardless of content.
+ *
+ * Gated on the entity's own type so this never runs for the much more
+ * common "element that has a material" shape; that path goes through
+ * the material facet, not this one.
+ */
+function appendMaterialOwnPropertySets(
   store: IfcDataStore,
   expressId: number,
   scale: number | undefined,
   out: PropertySetInfo[]
 ): void {
+  if (resolveEntityTypeName(store, expressId)?.toUpperCase() !== 'IFCMATERIAL') return;
+
+  const groups = extractMaterialPropertiesForMaterialId(store, expressId);
+  for (const group of groups) {
+    for (const pset of group.psets) {
+      if (out.some((p) => p.name === pset.name)) continue;
+      out.push({
+        name: pset.name,
+        properties: pset.properties.map((p) => projectProperty(p as RawProp, scale)),
+      });
+    }
+  }
+}
+
+/**
+ * Raw IFC type name for an entity, falling back from the columnar
+ * entity table (which only summarises "interesting" types — resource
+ * -level entities like `IfcMaterial` resolve to `'Unknown'` there) to
+ * `entityIndex.byId`. Mirrors `createDataAccessor`'s `getEntityType`;
+ * duplicated rather than threaded through as a parameter because only
+ * this one caller needs a raw type check ahead of the accessor existing.
+ */
+function resolveEntityTypeName(store: IfcDataStore, expressId: number): string | undefined {
+  const fromTable = store.entities?.getTypeName?.(expressId);
+  if (fromTable && fromTable !== 'Unknown') return fromTable;
+  const entry = store.entityIndex?.byId?.get(expressId);
+  if (!entry) return undefined;
+  return typeof entry === 'object' && 'type' in entry ? String((entry as { type: unknown }).type) : undefined;
+}
+
+function inheritedPropertySets(
+  store: IfcDataStore,
+  expressId: number,
+  scale: number | undefined
+): PropertySetInfo[] {
   // Source-backed extraction (WASM/columnar parse) first; it bails on stores
   // with no `source` buffer — i.e. server-parsed stores — so fall back to the
   // prebuilt property table keyed by the element's IfcTypeProduct id (issue
@@ -172,18 +228,11 @@ function appendInheritedPropertySets(
   const inheritedPsets =
     extractTypePropertiesOnDemand(store, expressId)?.properties ??
     typePropertySetsFromTable(store, expressId);
-  if (inheritedPsets.length === 0) return;
 
-  const seen = new Set(out.map((p) => p.name));
-  for (const pset of inheritedPsets) {
-    if (seen.has(pset.name)) continue;
-    out.push({
-      name: pset.name,
-      properties: (pset.properties || []).map((p) =>
-        projectProperty(p as RawProp, scale)
-      ),
-    });
-  }
+  return inheritedPsets.map((pset) => ({
+    name: pset.name,
+    properties: (pset.properties || []).map((p) => projectProperty(p as RawProp, scale)),
+  }));
 }
 
 /** Type-inherited property sets for server-parsed stores: resolve the element's

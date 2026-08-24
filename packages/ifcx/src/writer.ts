@@ -11,6 +11,7 @@
 import type { IfcxFile, IfcxNode, IfcxHeader, ImportNode } from './types.js';
 import type { EntityTable, PropertyTable, PropertySet, SpatialHierarchy } from '@ifc-lite/data';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
+import { IFCX_VERSION } from '@ifc-lite/data';
 
 // ============================================================================
 // Standard IFCX schema imports
@@ -124,7 +125,7 @@ export class IfcxWriter {
   private createHeader(options: IfcxExportOptions): IfcxHeader {
     return {
       id: this.generateId(),
-      ifcxVersion: 'IFCX-1.0',
+      ifcxVersion: IFCX_VERSION,
       dataVersion: options.dataVersion || '1.0.0',
       author: options.author || 'ifc-lite',
       timestamp: new Date().toISOString(),
@@ -138,17 +139,43 @@ export class IfcxWriter {
     const nodes: IfcxNode[] = [];
     const { entities, spatialHierarchy, mutationView, idToPath } = this.data;
 
+    // Single source of truth for expressId -> path, built once up front so that
+    // an entity's own path and any *reference* to that entity as a child
+    // (see getChildrenForEntity) can never diverge. Previously the child-ref
+    // path was synthesized independently as `element:${childId}`, which does
+    // not match `ifc:${typeName}.${expressId}` produced by generatePath() and
+    // left every exported child reference dangling whenever idToPath was not
+    // supplied (i.e. every plain STEP-IFC -> IFCX export).
+    //
+    // Seed from idToPath first: on a round-trip it may know the authoritative
+    // path of an id that has no row in this file's entity table at all (e.g.
+    // a node referenced only as someone else's child). Those entries must
+    // survive even though the entity loop below never visits that id.
+    const resolvedPaths = new Map<number, string>(idToPath ?? []);
+    for (let i = 0; i < entities.count; i++) {
+      const expressId = entities.expressId[i];
+      const typeEnum = entities.typeEnum[i];
+      resolvedPaths.set(
+        expressId,
+        idToPath?.get(expressId)
+          ?? this.generatePath(expressId, typeEnum, this.getString(entities.globalId[i]))
+      );
+    }
+
     // Process entities from table
     for (let i = 0; i < entities.count; i++) {
       const expressId = entities.expressId[i];
       const typeEnum = entities.typeEnum[i];
 
       // Get or generate path
-      const path = idToPath?.get(expressId) || this.generatePath(expressId, typeEnum);
+      // The map above has a row for every entity, so the fallback is
+      // unreachable — but it must derive the path the same way regardless, or
+      // an entity's own path and every reference to it could disagree.
+      const path = resolvedPaths.get(expressId)
+        ?? this.generatePath(expressId, typeEnum, this.getString(entities.globalId[i]));
 
       // Get entity name
       const name = this.getString(entities.name[i]);
-      const globalId = this.getString(entities.globalId[i]);
 
       // Build attributes
       const attributes: Record<string, unknown> = {};
@@ -186,7 +213,7 @@ export class IfcxWriter {
       };
 
       // Add children based on spatial hierarchy
-      const children = this.getChildrenForEntity(expressId, spatialHierarchy, idToPath);
+      const children = this.getChildrenForEntity(expressId, spatialHierarchy, resolvedPaths);
       if (Object.keys(children).length > 0) {
         node.children = children;
       }
@@ -236,7 +263,7 @@ export class IfcxWriter {
   private getChildrenForEntity(
     entityId: number,
     spatialHierarchy: SpatialHierarchy | undefined,
-    idToPath: Map<number, string> | undefined
+    resolvedPaths: Map<number, string>
   ): Record<string, string | null> {
     const children: Record<string, string | null> = {};
 
@@ -250,7 +277,13 @@ export class IfcxWriter {
 
     if (containedElements) {
       for (const childId of containedElements) {
-        const childPath = idToPath?.get(childId) || `element:${childId}`;
+        // Resolve from the same expressId -> path map used to assign the
+        // child's own node path, so a child reference can never point at a
+        // path no node in this file actually has. If the child id has no
+        // corresponding entity row (e.g. a dangling relationship in the
+        // source data), skip it rather than emit an unresolvable reference.
+        const childPath = resolvedPaths.get(childId);
+        if (childPath === undefined) continue;
         // key = relationship/child name, value = child path
         // (IFCX children = Record<name, path>; null is reserved for removals)
         children[`element_${childId}`] = childPath;
@@ -306,9 +339,25 @@ export class IfcxWriter {
   }
 
   /**
-   * Generate path for an entity
+   * Generate path for an entity.
+   *
+   * A node's `path` IS the entity's identity in IFCX: the reader hands it
+   * straight back as the GlobalId (`entity-extractor.ts`: "Use path as
+   * GlobalId"), the sibling IFC5 exporter keys nodes by GlobalId for that
+   * reason, and the buildingSMART v5a schemas committed under
+   * `packages/export/src/__fixtures__/schemas/` define no attribute that could
+   * carry a GlobalId instead — there is no other slot for it.
+   *
+   * So synthesizing `ifc:<Type>.<expressId>` for an entity that HAS a
+   * GlobalId did not merely pick a different name: it discarded the real IFC
+   * identity on the way through and invented one in its place, and expressId
+   * is not stable across files, so nothing downstream could federate or
+   * re-match the node. The synthetic form remains the fallback for an entity
+   * with no GlobalId (and an explicit `idToPath` entry still wins over both,
+   * so a round-trip keeps the paths the source file authored).
    */
-  private generatePath(expressId: number, typeEnum: number): string {
+  private generatePath(expressId: number, typeEnum: number, globalId?: string): string {
+    if (globalId) return globalId;
     const typeName = this.getTypeName(typeEnum) || 'IfcElement';
     return `ifc:${typeName}.${expressId}`;
   }

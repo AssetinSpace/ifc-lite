@@ -1,5 +1,603 @@
 # @ifc-lite/clash
 
+## 1.9.0
+
+### Minor Changes
+
+- [#2805](https://github.com/LTplus-AG/ifc-lite/pull/2805) [`0a10389`](https://github.com/LTplus-AG/ifc-lite/commit/0a1038972a72b27bda99c8793055efe39d623f10) Thanks [@louistrue](https://github.com/louistrue)! - Expose an exact minimum-distance query between two meshes, with witness points.
+  
+  `triTriDistance` already computed the exact triangle-to-triangle minimum
+  distance, but it lived under `math/`, which has no export subpath, so any
+  consumer outside the package hit `ERR_PACKAGE_PATH_NOT_EXPORTED`. What did not
+  exist anywhere was a traversal that can find the CLOSEST pair: every BVH query
+  in the package is an overlap predicate, so two disjoint meshes yield an empty
+  candidate set and there is nothing left to measure.
+  
+  Adds `minDistanceBetweenMeshes` / `minDistanceBetweenBvhs` (branch-and-bound
+  over the two BVHs, pruning on the exact AABB lower bound) and re-exports
+  `buildMeshBvh` / `queryMeshCross` from `@ifc-lite/clash/contact` so a caller
+  measuring one element against several can build each tree once. Additive: no
+  existing export changes.
+
+### Patch Changes
+
+- [#2819](https://github.com/LTplus-AG/ifc-lite/pull/2819) [`432fdb8`](https://github.com/LTplus-AG/ifc-lite/commit/432fdb8dd12dd90af17d1ca3ce24a2fd5b7168b0) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two divergences between `@ifc-lite/clash`'s STEP and IFCX source adapters, found by comparing them side by side.
+  
+  `adapters/ifcx.ts` had no equivalent of `adapters/step.ts`'s [#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464) non-clashable-tag filter: an IFCX-sourced model reproduced the same phantom-clash bug class (openings, spaces, and spatial containers with tessellated geometry becoming ordinary clash candidates) that [#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464) fixed for STEP.
+  
+  `adapters/step.ts` had no equivalent of `adapters/ifcx.ts`'s per-entity mesh coalescing: an entity with more than one mesh representation (e.g. Body + Axis) produced one `ClashElement` per mesh instead of one per entity, and `buildStepExclusions`'s `byExpressId` map silently kept only the last mesh's geometry for that entity.
+  
+  Both the non-clashable-tag filter and the mesh-coalescing logic now live in one shared module (`adapters/shared.ts`) that both adapters call, instead of two copies that could (and did) drift apart. `elementsFromIfcx`'s `tag` is already the real IFC class code, spelled identically to STEP's `node.type`, so the filter applies verbatim; merged bounds are derived from the merged geometry, so the union is correct without a separate "combine bounds" step.
+  
+  No existing fixture's clash count changed: the affected code paths (IFCX openings/spaces/containers, STEP multi-mesh entities) had no prior test coverage to regress.
+
+- [#2704](https://github.com/LTplus-AG/ifc-lite/pull/2704) [`6a43522`](https://github.com/LTplus-AG/ifc-lite/commit/6a43522cdf3b0a9b0f7ce303b59f479dca2a2aca) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash element identity for federated models past the first.
+  
+  The viewer's loader shifts every `mesh.expressId` into the federated global id
+  space in place, while `IfcDataStore` keeps local express ids. `elementsFromStep`
+  used `mesh.expressId` to address the store anyway, so for any model with a
+  non-zero `idOffset` every lookup missed: `key` fell back to the synthetic
+  `expressid:N`, `tag` read `Unknown`, name and storey came back empty, and
+  `buildStepExclusions` found no relationships — so the void / host / assembly
+  exclusions silently stopped excluding, and a door in the opening it fills was
+  reported as a hard clash. `ref` was wrong in the other direction, with
+  `federation.toGlobalId` adding the offset a second time.
+  
+  `elementsFromStep` now takes `meshIdOffset`: the shift the host has already
+  applied to `mesh.expressId`. It subtracts that back out before touching the
+  store, so the store is addressed locally and the federation offset is applied
+  exactly once. Callers that pass local meshes (CLI, MCP, the playground) leave it
+  at its `0` default and are unaffected — it stays optional deliberately, since
+  `elementsFromStep` is published API and requiring it would break every external
+  caller. To keep a forgotten offset from being silent in any host, the adapter
+  now also warns once when every element in a model resolves to an empty GlobalId
+  *and the store does hold GlobalIds* — the signature of exactly this wiring
+  mistake. A model whose store has none (a GLB import, whose store carries
+  geometry and no IFC entities) is left alone: there, every element missing is the
+  normal state, not a defect.
+  
+  The synthetic key an element without a GlobalId falls back to is now scoped to
+  its model — `expressid:<encoded modelId>:<expressId>` rather than
+  `expressid:<expressId>`. Express ids are only unique within a model, and review
+  state and user element-pair exclusions are keyed on the element key alone
+  (deliberately, so they survive a reload), so in a federation the unqualified
+  form made two models' elements one identity: a review status or an exclusion set
+  on one model's element silently covered another model's element. Two federated
+  GLB models produced ONE review key where there should have been two.
+  
+  Migration: elements that have a GlobalId — nearly all of them, and every one
+  this fix restores — are unaffected; only the fallback changes shape. A review
+  status or an element-pair exclusion a previous session stored against the old
+  `expressid:N` string stops matching: the clash comes back as `open`, the
+  exclusion rule stays listed but suppresses nothing. Nothing is mis-applied, and
+  nothing else reads the string. In the viewer that fallback is per-load anyway
+  (the model id is a per-load uuid), which is the honest position for an element
+  that carries no durable identity of its own. Review status a pre-fix session
+  saved against a federated model past the first was likewise keyed on the old
+  fallback and no longer matches.
+
+- [#2878](https://github.com/LTplus-AG/ifc-lite/pull/2878) [`b699875`](https://github.com/LTplus-AG/ifc-lite/commit/b6998754039676def950735335147556afcb2977) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash detection silently skipping every GPU-instanced entity.
+  
+  `useClash` built its clash elements from `model.geometryResult.meshes` alone, which excludes every entity whose geometry was fully GPU-instanced — anything repeated 8 or more times (`INSTANCE_MIN_OCCURRENCES` in the wasm mesher). Doors, windows, columns, sprinklers, light fittings, and other repeated components vanished from clash detection with no error, no warning, and no count discrepancy: the report simply came back short.
+  
+  `gatherElements` now restores those entities with `withInstancedMeshes` — the same helper the glTF/IFC5 export path already uses ([#2558](https://github.com/LTplus-AG/ifc-lite/issues/2558)/[#2576](https://github.com/LTplus-AG/ifc-lite/issues/2576)) to reach instanced-only geometry through `Scene.getAllInstancedMeshData()`. This surfaces real triangles from the live renderer scene, not an AABB approximation, so a clash reported off an instanced entity is exactly as exact as one reported off a flat mesh.
+  
+  This also covers federated models. `withInstancedMeshes` used to gate on `isPrimary` and no-op for every non-primary model — correct when it was written, but GPU instancing stopped being primary-only once federated models got instanced shards too ([#2255](https://github.com/LTplus-AG/ifc-lite/issues/2255)), and the gate was never updated, so a federated model's own instanced entities were silently skipped for both clash and every glTF/IFC5/KMZ export call site. The helper now takes this model's `{ idOffset, maxExpressId }` id-range bracket instead of a boolean, scoping `getAllInstancedMeshData()`'s all-models output down to just this model's occurrences — restoring a federated model's own instanced entities without a federation of N models double-counting each other's.
+  
+  `elementsFromStep` (`@ifc-lite/clash`) now also keys an element's identity on `MeshData.occurrenceKey` when present, so distinct physical occurrences of one GPU-instanced expressId no longer collapse onto a single review/exclusion key, and a relationship-derived exclusion (void/host, assembly) fans out to every occurrence sharing that expressId instead of only the last one built.
+  
+  That per-occurrence `key` is one `ClashElement` per `MeshData`, so an entity with a mix of a flat submesh and an instanced occurrence (an ordinary shape once routing goes per-mesh, `rust/wasm-bindings/src/api/gpu_meshes/batch.rs:820-856`) now mints two elements with the SAME `ref` but DIFFERENT `key`s. The broad-phase self-clash guard only checked `key`, so that pair passed through as a false-positive self-clash — the entity clashing with itself. `candidatePairs`' guard (`@ifc-lite/clash`, `engine-ts/broad.ts`) now also treats a shared `ref` within the same model as the same entity.
+
+- [#2815](https://github.com/LTplus-AG/ifc-lite/pull/2815) [`b3a4d30`](https://github.com/LTplus-AG/ifc-lite/commit/b3a4d307c50c9b0a8b8bb0e29952c4a98e417c16) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `minDistanceBetweenMeshes`/`minDistanceBetweenBvhs` reporting a nonzero distance for a genuinely intersecting pair of triangles.
+  
+  `minDistanceBetweenBvhs` called `triTriDistance` unconditionally on every candidate leaf triangle pair, with no `triTriIntersect` gate. `triTriDistance`'s own contract says it is "only invoked for non-intersecting pairs" — intersecting triangles must be detected separately. For an axis-aligned box-overlap pair the missing gate happened not to matter (overlapping-box vertices/edges land exactly on the boundary features `triTriDistance` samples, so it returned 0 anyway), which is why the existing test suite did not catch it. A tilted, non-axis-aligned triangle pierced through another triangle's face interior has no such coincidence and returned a nonzero gap for two surfaces that actually overlap, contradicting `MeshDistance.distance`'s own documentation ("0 when they touch or overlap").
+  
+  The traversal now tests `triTriIntersect` before `triTriDistance` on each candidate leaf pair, the same order `engine-ts/narrow.ts` already uses for its per-pair test. Since 0 is the smallest distance this query can ever report, finding an intersecting pair now returns immediately rather than continuing to search the remaining frontier.
+
+- [#2818](https://github.com/LTplus-AG/ifc-lite/pull/2818) [`5334bd1`](https://github.com/LTplus-AG/ifc-lite/commit/5334bd1589acb1c4b81a1f255d1a9171530b1467) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two clash-detection bugs.
+  
+  `matchesSelector` mishandled a selector made of only negated alternatives
+  (e.g. `!IfcWall|!IfcSlab`): the top-level `!` handling stripped only the
+  first leading `!` and negated the recursive match on the remainder, so the
+  second exclusion's type still matched. `matchesSelector('IfcSlab',
+  '!IfcWall|!IfcSlab')` returned `true` instead of `false`. A pure negation
+  list is now treated as an implicit AND of exclusions -- "match everything
+  except A and except B" -- rather than the literal (and useless, tautological
+  for any single input) OR-of-negations reading. Mixed positive/negative
+  selectors (e.g. `IfcWall|!IfcSlab`) are unaffected.
+  
+  `clusterSharedFaces`'s `classify` step relabeled a small-area coplanar
+  contact (area between `pointAreaM2` and `surfaceAreaM2`) as `kind: "line"`,
+  but such a cluster comes from `buildSurfaceCluster`, which always sets
+  `length_m: 0` -- contradicting the field's own documented invariant
+  ("line only -- 0 otherwise") and the viewer's contact overlay, which renders
+  `"line"` clusters as a 2-point segment rather than the polygon boundary a
+  surface cluster actually has. This band is now classified `"surface"`.
+
+- [#2839](https://github.com/LTplus-AG/ifc-lite/pull/2839) [`b1ac6be`](https://github.com/LTplus-AG/ifc-lite/commit/b1ac6be425cd89ff90eaab02636211f0d928b3e6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add direct tests for `runClash`'s shared orchestration (severity resolution, exclusions, dedup, sort ordering, summary tallies) and document a blind spot in `differential.test.ts` ([#2830](https://github.com/LTplus-AG/ifc-lite/issues/2830)).
+  
+  `engine-wasm/index.ts` calls the same `runClash` (`engine-ts/orchestrator.ts`) as `engine-ts/index.ts`, so the differential suite comparing the two backends can never catch a bug in that shared orchestration — only in the geometry kernel. Verified: constant-folding `inferClashSeverity` to always return `'info'` left all 16 differential tests passing.
+  
+  The suite's header now says so explicitly. `engine-ts/orchestrator.test.ts` (new) drives `runClash` directly through a fake kernel to cover severity resolution, exclusion gating, identity/dedup, and sort ordering on their own terms; `analysis.test.ts` gained direct coverage of `summarizeClashes`'s tallies. No behavior changes — tests only.
+
+- [#2816](https://github.com/LTplus-AG/ifc-lite/pull/2816) [`c233d48`](https://github.com/LTplus-AG/ifc-lite/commit/c233d48a935a70851271b61a305f43dd9261dcca) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add frozen-output vectors that pin `uuidFromSeed`'s hard-coded expected UUIDs.
+  
+  Every existing test touching `uuidFromSeed` (in `bcf-bridge.test.ts`) either
+  compared two calls against each other within the same process, or checked
+  shape/regex/version-nibble — none asserted a fixed expected value. That is
+  the same shape as an encode/decode pair sharing a table: internally
+  consistent, free to drift. Confirmed by mutation: replacing all four salt
+  constants in `deterministic-uuid.ts` with different arbitrary values still
+  produced valid-shaped, self-consistent UUIDs, and the existing suite stayed
+  green.
+  
+  These are BCF topic guids: `bcf-bridge.ts` derives a topic's guid from
+  `uuidFromSeed(group.id)` so that re-running the same coordination produces
+  byte-identical topic guids and previously exported BCF topics keep
+  correlating with the clash they describe. A silent change to the salts, the
+  mixing/rotation order, or the version/variant nibble derivation would
+  silently detach every previously exported BCF topic from its clash.
+  
+  No behavior change — this is test-only. The new vectors are frozen output
+  captured from the current implementation, not values derived from any
+  specification (there is no external reference for this algorithm); the test
+  file documents this explicitly so a failing assertion is never "fixed" by
+  regenerating the expected value from the new code.
+
+- [#2820](https://github.com/LTplus-AG/ifc-lite/pull/2820) [`b28a629`](https://github.com/LTplus-AG/ifc-lite/commit/b28a629d49f279ce01537cb06ae4c28f32beb2bb) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin eight untested comparison-operator boundaries in the clash geometry kernel with exact-boundary fixtures found by mutation testing (flipping the operator killed zero tests): `contact/aabb.ts`'s `intersects()`, `contains()`, and `longestAxis()`; `contact/bvh.ts`'s and `contact/mesh-bvh.ts`'s inflated-bounds overlap checks; and `engine-ts/obb.ts`'s zero-thickness reject, noise-band skip, and through-penetration far-side check. No production logic changed — this is coverage-only.
+
+- [#2881](https://github.com/LTplus-AG/ifc-lite/pull/2881) [`1900a1a`](https://github.com/LTplus-AG/ifc-lite/commit/1900a1a9f8174ef874dddbd1541ccadd9a89415e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin the `depthClashResult` f32-precision-floor comparison (`<=` at `engine-ts/depth.ts:195`) with a fixture whose box-box MTD lands exactly on the computed floor value, found by mutation testing (flipping the operator killed zero tests — the nearest existing fixtures sit a decade below and well above the boundary). No production logic changed — this is coverage-only, ported 1:1 from the equivalent Rust pin in `rust/clash/src/kernel_tests.rs`.
+- Updated dependencies [[`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911), [`bc179f6`](https://github.com/LTplus-AG/ifc-lite/commit/bc179f6a1091c8c307a07b31d8c30fbba140e4a9), [`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542), [`c688a12`](https://github.com/LTplus-AG/ifc-lite/commit/c688a1272ec72d575e8ecf78072e0a0084b517ca), [`79322b6`](https://github.com/LTplus-AG/ifc-lite/commit/79322b6e76049be0df3b07149c711414bd80863e), [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65), [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`989ee2c`](https://github.com/LTplus-AG/ifc-lite/commit/989ee2c4e396575529488c17b73e1a884e4e8b9d), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f), [`5a9ecfb`](https://github.com/LTplus-AG/ifc-lite/commit/5a9ecfb6bcd3190eae4463bd8926cf38a2143496), [`a29b040`](https://github.com/LTplus-AG/ifc-lite/commit/a29b04069fec3c6b726f49fc58054e535c255034), [`cc19a8d`](https://github.com/LTplus-AG/ifc-lite/commit/cc19a8d4a79a5e8563a90ab663b28e1b93ef9c18), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`105eb31`](https://github.com/LTplus-AG/ifc-lite/commit/105eb31e7ccdd697f74db3bc9fac41396cdc6faa), [`5254699`](https://github.com/LTplus-AG/ifc-lite/commit/52546994268440a468de81ce6ac0b385e6ef73d7), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`b7d2a11`](https://github.com/LTplus-AG/ifc-lite/commit/b7d2a11345add8acdf0926ade5d4c1ca19ccecf7), [`ae5a5ca`](https://github.com/LTplus-AG/ifc-lite/commit/ae5a5caa3e20304085ba14c0708cd026c1d4bf16)]:
+  - @ifc-lite/bcf@1.18.2
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/query@1.14.17
+  - @ifc-lite/wasm@5.0.0
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/spatial@1.14.14
+
+## 1.8.0
+
+### Minor Changes
+
+- [#2535](https://github.com/LTplus-AG/ifc-lite/pull/2535) [`e5acbb2`](https://github.com/LTplus-AG/ifc-lite/commit/e5acbb2589628d7e9f8a9d640c4b82d11f510929) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Export `qualifiedKey` (the model-qualified element identity behind `pairKey`) and add `summarizeClashes`, which tallies a clash list into a `ClashSummary`. Both were already implemented internally: `qualifiedKey` lets a consumer build federation-safe pair identities without re-deriving the encoding, and `summarizeClashes` replaces the two private `buildSummary` copies in the TypeScript orchestrator and the duplicate scan, so a consumer that filters a `ClashResult` can rebuild its buckets the same way the engine does.
+
+  The viewer uses `summarizeClashes` for user-defined clash exclusions: a coordinator can now mark an overlap as by design in three ways: a whole IFC type pair, a ONE-SIDED type rule that excludes every clash involving one type regardless of what it meets, or one specific element pair, see how many clashes each rule is hiding, and remove or disable it. The rules persist in local storage and are applied to the last run without re-detecting. `qualifiedKey` is exported for external consumers but is not called from the viewer itself, which keys exclusion rules on the durable element key alone (see `apps/viewer/src/lib/clash/exclusions.ts`).
+
+### Patch Changes
+
+- [#2661](https://github.com/LTplus-AG/ifc-lite/pull/2661) [`90d5b35`](https://github.com/LTplus-AG/ifc-lite/commit/90d5b3563c7732c674dfd4890ab94d201b83db3d) Thanks [@louistrue](https://github.com/louistrue)! - Fix fabricated coplanar contacts far from the origin in the contact narrow phase. The scaled plane-distance tolerance took the max abs coordinate over all three axes of both world AABBs, so an axis orthogonal to the tested plane normal could inflate the tolerance past a genuine clearance (2 mm clearance read as coplanar at 10 km along an unrelated axis). Per-axis f32-ULP noise amplitudes are now projected onto each tested plane's own normal, preserving the 1e-6 floor.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop reporting a wall's full height as the penetration depth where two walls cross.
+
+  Two walls meeting at an X-junction — 200 mm thick, 3 m tall, one running along X and one along Y — reported `penetration 3.000 m` as a certified measurement. The shared volume is a 0.2 x 0.2 x 3 m column, so 0.2 m is the honest depth, and that is what the release before this one reported.
+
+  The box-to-box minimum translation distance for that pair really is 3.0: the cheapest way to slide the two walls apart is straight up, along their shared height. That is the reason the exact box depth is withheld from any pair where one member pierces the other clean through — the number is then dominated by the piercing member's own extent, not by the material it actually crossed. The guard that detects the shape required the piercing cross-section to sit _strictly_ inside the other's, with a real margin. At an X-junction each wall does pierce the other clean through in thickness, but the two walls are the same height, so that axis ties exactly and the margin rejected the pair. The depth was then certified as measured and reached the user with no "estimate" qualifier.
+
+  The containment test now admits a cross-section that touches the other's edges, so the tie no longer disqualifies the pair. What still disqualifies a pair is the separate test that the piercing member pokes out past the other on _both_ ends, which is untouched: stacked layers sharing a footprint, and a footing embedded into a slab from above, both keep their measured depth.
+
+  Walls of unequal heights were affected too (a 3 m wall crossing a 2.5 m one reported 2.5 m), and so were crossing members of any size whose overlap ties on one axis.
+
+  Also lands a brute-force oracle for the BVH-accelerated point-in-solid test, on a 2048-triangle sphere and a concave L-prism: 20,000 pseudo-random points each plus every triangle vertex probed either side of the surface, compared against an exhaustive scan over every triangle. Both kernels agree with the scan on every probe.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Replace the mesh-depth "measurement" with a real one, box-exact, for hard clashes.
+
+  PR [#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) was held on review with a measured refutation: `TriMesh.maxPenetrationInto` (the `'mesh'`-labelled depth introduced by `clash-mesh-penetration-depth.md` / `clash-distance-provenance.md` in this same release) measures the distance from the nearest crossing-triangle VERTEX to the other solid's surface — an O(edge length) sampling artifact. On two 2x2x2 boxes overlapping exactly 1.5 m, tessellated at 12/48/192 triangles per element, it reported **0.03 / 0.50 / 0.07**, all labelled `'mesh'` — a sampling artifact that converges to 0 under retessellation, the opposite of what a depth metric should do, while the AABB estimate (labelled `'estimate'`) was the correct 1.5 m the whole time. The labelling had it backwards.
+
+  This is fixed by removing `maxPenetrationInto` and replacing it with `obbPenetrationDepth` (`packages/clash/src/engine-ts/obb.ts`, `rust/clash/src/obb.rs`): when BOTH elements of a hard-clash pair are, within floating tolerance, rectangular boxes (`detectObb` — 3 mutually orthogonal face-normal families, 2 offset planes each, triangulation-independent), the reported depth is the minimum translation distance along a separating axis — the classical two-OBB penetration depth (Gottschalk), computed over the 15 canonical candidate axes (each box's 3 face normals plus the 9 pairwise cross products). This is provably exact for boxes, deterministic, and — because it is derived from the box's face-plane geometry rather than its triangulation — provably unchanged by retessellation; an analytic-oracle test suite (`obb.test.ts`, `tests.rs`) reproduces the maintainer's 0.03/0.50/0.07 numbers against the OLD metric, then asserts the NEW metric reports the true 1.5 m at all three tessellations, plus a 45°-rotated-box case with an independently-derived expected value and a barely-overlapping (5 mm) control.
+
+  **This narrows what the engine claims to measure.** When either element is not a box, there is no certified box-box depth, and the pair falls back to the AABB estimate — labelled `'estimate'`, honestly, not `'mesh'`. This is a real, known regression relative to the removed probe for a handful of non-box shapes (e.g. a concave L-shaped member contained in another element): the reported depth goes back to being a bounding-box dimension rather than the shape's true penetration, exactly as it was before [#1866](https://github.com/LTplus-AG/ifc-lite/issues/1866), and the test suite (`boundaries.test.ts`, `engine.test.ts`, `tests.rs`) now documents this residual explicitly rather than hiding it behind an artifact that only looked right. A non-box depth metric — the maintainer's other suggested option, an intersection-volume-derived depth — is future work; the divergence-theorem machinery already used for the shape-signature work in this package is a plausible starting point, but deriving a _distance_ (not a volume) from it for non-convex solids needs its own design and did not fit in this correction.
+
+  On a real model (AC20-FZK-Haus, 282 total distances across hard/clearance/touch), 9 pairs (3.2%) are now certified `'mesh'` (all box-box); the remaining 273 (96.8%) are `'estimate'`, numerically identical to the pre-[#1866](https://github.com/LTplus-AG/ifc-lite/issues/1866) baseline. This is a far smaller, more conservative change surface than the held PR's 71/282 relabelling, and none of the certified 9 can exhibit the sampling-artifact failure mode — the code path that produced it no longer exists.
+
+  Both kernels changed identically (`obb.ts` / `obb.rs`, bit-identical `OBB_EPS = 1e-6` and axis-projection arithmetic), and the differential suite asserts `distanceKind` parity on every fixture. `TriMesh.distanceToSurface` and `containsPoint` are kept — they are exact, independently tested primitives, just no longer on this hot path.
+
+  **Follow-up (review): a thin member piercing clean through another box was still mislabelled `'mesh'`, at up to 5.5x the true depth.** The box-box minimum translation distance is the wrong quantity for a through-penetration (a duct through a wall, a beam through a slab): it is dominated by the piercing member's own extent along the shared axis, not by the material actually crossed. A 0.4x0.4x2 m duct centred through a 5.0x0.2x3.0 m wall reported **1.1 m** (the duct's own half-length plus the wall's half-thickness) where the true wall thickness is **0.2 m** — and, unlike the pre-[#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) estimate, it carried the `'mesh'` label a coordinator would trust. `isThroughPenetration` (`obb.ts` / `obb.rs`) now detects this shape — one box's cross-section strictly inside the other's footprint along a shared axis, extending past it on both ends — and declines to certify it, falling back to the AABB estimate exactly as before [#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) existed. Only attempted when the two boxes share a common frame (every axis of one parallel to an axis of the other); at a generic relative rotation the box-box MTD is unchanged. Also closed: `detectObb` could certify a non-watertight mesh (e.g. a slab exported without its top face) as a zero-thickness box, because a face family whose triangles are all coplanar passed the 2-plane test with no positive extent — a positive-extent guard now rejects it.
+
+  **Follow-up (review): the cross-axis degeneracy guard is now scale-relative, not absolute.** `obbPenetrationDepth` rejected a near-degenerate cross-product candidate with an absolute `len > 1e-6` test and divided by any accepted `len` unconditionally. At large operand scale that absolute cutoff fails in both directions, verified against an exact-rational-arithmetic oracle over all 15 candidates: for two 2000 km near-parallel beams meeting edge-to-edge, the dropped common normal IS the minimum-translation axis, so the min over the remaining axes reported a certified 0.45 m depth for a 0.02 m edge contact (22x); and a disjoint pair of the same beams reported a 0.055 m penetration because the only separating axis of the 15 was the dropped one. Each candidate's verdict now carries a noise bound derived from the operands themselves (the summed half-extents of both boxes plus the center offset, times `8 * EPS / len` - the projection error the `1/len` normalisation can amplify); a verdict inside its own band is skipped, which in a separating-axis test is the conservative direction (skipping a candidate can only fail to find a separation, never invent one), and a verdict outside the band is kept whatever `len` is. Identical change in both kernels (`obb.ts` / `obb.rs`), pinned by mirrored beam fixtures that fail on the old guard with bit-identical wrong values in TS and Rust.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - **Corrected in this same release — see `clash-depth-box-exact-metric.md`.** The `'mesh'` label this changeset introduced was, for most hard clashes, applied to `TriMesh.maxPenetrationInto`'s output — a nearest-crossing-vertex sampling artifact, not a real measurement (see the superseding changeset for the analytic-oracle evidence). The `distanceKind` field and its meaning (`'mesh'` = certified measured, `'estimate'` = read off the AABBs) are unchanged; what changed is which pairs are ALLOWED to claim `'mesh'` — now only pairs where both elements are confirmed rectangular boxes, where the depth is provably exact. The description below is kept for history.
+
+  Say which clashes report a measured penetration depth and which report an AABB estimate.
+
+  `Clash.distance` carries two different quantities under one name. For a hard clash it is either a depth measured on the triangle meshes — the distance from the deepest crossing-triangle vertex inside the other solid to that solid's surface — or, when the narrow phase had no such vertex to measure from, the smallest overlapping bounding-box dimension of the two elements. Nothing in the output distinguished them, so a reader had no way to tell a real measurement from a number that is a property of the boxes and can equal an element's own thickness.
+
+  The estimate is not a rare corner. It is what gets reported whenever the two surfaces merely coincide (stacked layers sharing a footprint), when one solid is modelled wholly inside another, and when a member pierces clean through so every crossing vertex sticks out the far side. On a layered infrastructure model, roughly a third of hard clashes land there, and their depths come out as the round layer thicknesses.
+
+  `Clash` now carries `distanceKind: 'mesh' | 'estimate'` recording which one it is. `clearance` and `touch` distances are exact triangle-to-triangle measurements and are labelled `'mesh'`. The field is optional on the type only so a clash rehydrated from a run recorded before it existed stays assignable — absent means "unknown", never "measured".
+
+  The CLI's human-readable clash list prints an estimated penetration as `penetration ~0.250m (AABB estimate)` instead of a bare `penetration 0.250m`.
+
+  **This change adds only the label, no arithmetic.** It does not itself alter any `distance` value — it binds an existing internal boolean (whether the narrow phase found a mesh depth or fell back to the AABB reading) to the new field. Separately, `clash-mesh-penetration-depth.md` in this same release generalises which pairs take the mesh-depth path (previously only AABB-contained pairs; now every intersecting pair), which does change reported depths for some clashes — see that changeset. The estimates this label identifies are still bounding-box readings, not penetration depths; measuring a true depth for the coincident-surface case needs a translational penetration depth (Minkowski) over non-convex solids, which is a separate piece of work.
+
+  The Rust/WASM kernel records and reports the same label over the same code paths, and the differential suite now asserts the two kernels agree on it exactly.
+
+- [#2573](https://github.com/LTplus-AG/ifc-lite/pull/2573) [`33eb685`](https://github.com/LTplus-AG/ifc-lite/commit/33eb685de6c1578727587d87af5c3cd4a30a4122) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop treating spatial containers as clash bodies in the STEP adapter.
+
+  `NON_CLASHABLE_TAGS` dropped `IfcSpace` and `IfcSpatialZone` ([#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464)) but nothing else from the spatial structure, so any container that carries tessellated geometry became a clash body and collided with the elements assigned to it. That is not a coordination problem — a storey's geometry is its extent, and by construction it encloses its contents.
+
+  It bites hardest on IFC4.3 infrastructure models, where storeys and facility parts routinely carry real bodies. On one road/bridge certification model a default `ifc-lite clash` run reported 235 clashes, of which 89 (37.9%) were an `IfcBuildingStorey` against an element it contains.
+
+  The check is now derived from the schema instead of enumerated: an element is dropped when `getInheritanceChainAcrossSchemas` puts `IfcSpatialElement` or `IfcSpatialStructureElement` in its chain. That walks the bundled IFC2X3 + IFC4 + IFC4X3 union, so `IfcSite`, `IfcBuilding`, `IfcBuildingStorey`, `IfcExternalSpatialElement` and the IFC4.3 facility leaves (`IfcFacility`, `IfcFacilityPart`, `IfcBridge`, `IfcRoad`, `IfcRailway`, `IfcMarineFacility`, …) are all covered without a second hand-maintained list, and `IfcSpatialStructureElement` is checked alongside `IfcSpatialElement` because IFC2X3 has no `IfcSpatialElement`. The two hand-listed space entries are removed as redundant.
+
+  Elements _contained in_ a container are unaffected — they still clash with each other, and still carry the storey name as metadata. Measured on the road/bridge model: 235 → 146 clashes, 89 pairs removed and none added, every removed pair involving `IfcBuildingStorey`. Building-model controls: 274 → 274 and 469 → 469 with byte-identical pair sets; 282 → 279 on a third, the three removed pairs all being the site's own terrain body.
+
+  No API surface change.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - The f32 precision floor takes precedence over depth derivation: a pair below the noise floor is `touch` no matter which quantity would have been reported, and the estimate-vs-mesh selection only applies to pairs already above the floor.
+
+  Two halves, both closing routes by which this release's depth-provenance work could promote a sub-floor pair to `hard`:
+
+  1. **Every mesh-labelling branch routes through one floor gate.** `testPair` (`narrow.rs`'s `test_pair`) has three separate places that can build a `hard` result off a box-exact or AABB-estimate depth - the surface-crossing branch, the fully-enclosed-solid branch, and the coincide/shared-volume branch - and only the first checked the floor introduced by [#2594](https://github.com/LTplus-AG/ifc-lite/issues/2594). A pair that was fully enclosed (or coincident-footprint) AND below the floor for its coordinate magnitude still reported `hard`/`mesh` at the exact depth. Reproduced with two 40 mm-overlap box slabs translated 1,000,000 units from the origin (floor ~0.238 m there): both branches returned `hard`/`mesh`/-0.04 in both kernels. Fixed by extracting the floor decision into one function each branch must route its candidate depths through (`depthClashResult` in the new `engine-ts/depth.ts`, `depth_clash_result` in the new `rust/clash/src/depth.rs`), so a fourth mesh-labelling branch added later inherits the precedence by construction.
+
+  2. **The floor is tested against every candidate depth the pair has, not against whichever one the selection would report.** Three candidates exist: the AABB estimate (always), the box MTD (when both elements are certified boxes), and - for a CONTAINED pair - the crossing-vertex penetration. The pair is `hard` only when the smallest available candidate clears the floor; only then does the selection pick which above-floor number is reported and how it is labelled, so a `hard` distance clears the floor by construction. Without this, replacing a contained non-box pair's mesh-level depth with the AABB estimate flipped eight flush, designed-contact pairs on buildingSMART's `Infra-Bridge.ifc` (spandrel wall x arch segment, arch segment x filler; crossing-vertex penetrations 4.2e-8 to 1.9e-6 m, two-plus orders below their ~1e-5 floors) from `touch` back to `hard` at a fabricated 4.084 m - the contained element's own AABB extent - moving the CLI-default count pinned by [#2594](https://github.com/LTplus-AG/ifc-lite/issues/2594) from 50 to 58. It is 50 again, for the pinned reason that the floor wins.
+
+  The crossing-vertex probe this reintroduces (`crossingVertexPenetration` / `crossing_vertex_penetration`) is NOT the depth metric this same release removed coming back: it is never reported and cannot label anything `mesh`. It answers only the yes/no question the floor gate asks - is any mesh-level penetration measurably above f32 noise at all - for the one pair class (AABB-contained) whose estimate is fabricated. Its known failure mode, underestimating true depth under retessellation, can only keep a pair BELOW the floor, which is the conservative direction for a noise gate.
+
+- [#2665](https://github.com/LTplus-AG/ifc-lite/pull/2665) [`3dd3dd4`](https://github.com/LTplus-AG/ifc-lite/commit/3dd3dd41c50f027b705b3a3b04c72f3aea66c0df) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Duplicate detection abstains on bounds it cannot compare, and the position
+  tolerance is documented as the bound it actually is.
+
+  **Non-finite bounds no longer report a pair.** The distance gate was written as
+  two rejections (`if (!boxesTouch(...)) return; if (dist > tolerance) return;`).
+  Every comparison against `NaN` is false, so an element whose `bounds` carry `NaN`
+  fell through both rejections and was reported as coincident with elements 100 m
+  and 500 m away — and, not being evicted from the sweep either, with every element
+  visited after it. The gate is now `if (!(dist <= tolerance)) return;`: an
+  acceptance, so a distance that cannot be compared abstains instead of asserting a
+  match. The deprecated `iouThreshold` branch is left as it is and does **not**
+  match: on two solid `NaN` boxes it also reports nothing, but only because
+  `similarity` clamps them to 0, and against a degenerate (zero-volume) element it
+  takes the `aabbApproxEqual` fallback — whose per-axis comparisons are all false
+  against `NaN` — and asserts the pair even at the default 0.9. Both behaviours are
+  now pinned by tests so the difference is on record.
+
+  **And one non-finite element no longer loses duplicates elsewhere.** The broad
+  phase sorted element indices by `bounds.min[axis]` with a subtracting comparator,
+  which answers `NaN` for every comparison involving a non-finite minimum. That is
+  not a total order, so V8's TimSort returned an arbitrary permutation of the whole
+  array; the sweep then saw minima going backwards, evicted boxes that were still
+  live, and unrelated true duplicates were silently dropped — measured, 12
+  coincident pairs in a 25-element model became 11. The comparator now compares a
+  key instead of subtracting, with non-finite minima ordered last. Nothing changes
+  for a model whose bounds are all finite.
+
+  **And non-finite coordinates no longer become bounds.** `fromPositions`
+  (`math/aabb.ts`) excluded `NaN` only as a side effect of `<` and `>` both failing
+  against it; `±Infinity` propagated straight through into the bounds, and two
+  elements each carrying `-Infinity` on the same axis give a NaN `boxDistance` that
+  `boxesTouch` passes — a NaN distance without a NaN vertex. Whether the geometry
+  pipeline can emit an infinite vertex is not established, so treat that as a
+  mechanism rather than an observed path; the guard closes it at the source either
+  way. `fromPositions` now requires each coordinate to be finite _after_ the
+  transform is applied, per coordinate — the same rule `NaN` already got, so the
+  finite coordinates of a partly poisoned vertex still count. Coordinates a real
+  file can produce are finite, so no viewer or CLI result changes for them.
+
+  **`positionTolerance` is an upper bound, not a per-axis guarantee.** The 1.7.0
+  entry said the effective tolerance was "10 mm for every shape on every axis and
+  on the diagonal". `boxDistance` is isotropic, but the pass also requires the two
+  boxes to touch — enforced both by `boxesTouch` and, independently, by the broad
+  phase's eviction on the axis it sweeps — and two copies stop touching once the
+  offset exceeds the element's own extent on the offset axis. So the effective
+  tolerance is `min(positionTolerance, extent on that axis)`: measured, a
+  `[4, 0.2, 3]` m wall matches within 10.00 mm on all three axes, while a
+  `[1.2, 0.002, 2.4]` m plate matches within 10.00 / 2.00 / 10.00 mm. A duplicated
+  2 mm cladding panel offset 5 mm along its own normal is therefore not reported.
+
+  That is deliberate rather than newly broken — the previous IoU gate missed the
+  same pair, and inflating the touch test to make the pass isotropic reopens
+  exactly the case the touch test exists to close (a 5 mm fixing pairing with a
+  neighbour it never intersects); it breaks the two tests that pin that. So the
+  behaviour stands and the claim is corrected, in the 1.7.0 changelog entry, on
+  `positionTolerance`, on `boxDistance` and on `boxesTouch`, with a test pinning
+  the real per-axis property so prose and code cannot drift apart again.
+
+  Also corrected: a comment on the broad phase claimed "a pair that does not touch
+  is rejected by the gate anyway", which holds for the distance gate but not for
+  the deprecated IoU gate, whose degenerate fallback does match disjoint boxes.
+  Comment only — that behaviour predates the distance gate and is unchanged.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add the `distanceKind` getter to `ClashRunResult` (`rust/wasm-bindings/src/api/clash.rs`) that `@ifc-lite/clash`'s wasm engine reads.
+
+  Without this changeset `@ifc-lite/clash` would publish depending on `@ifc-lite/wasm: workspace:^`, which npm can satisfy with a pre-existing `@ifc-lite/wasm` build that lacks the getter — `wasm-kernel.ts` would then read `undefined` off the result and throw reading an out-of-range index, on the first clash. This bumps `@ifc-lite/wasm` alongside `@ifc-lite/clash` so the published dependency range only ever resolves to a build that has the field.
+
+- Updated dependencies [[`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`33eb685`](https://github.com/LTplus-AG/ifc-lite/commit/33eb685de6c1578727587d87af5c3cd4a30a4122), [`2421442`](https://github.com/LTplus-AG/ifc-lite/commit/2421442363c5adf39d9405bf7a0e16b72adc73d1), [`f5c96c5`](https://github.com/LTplus-AG/ifc-lite/commit/f5c96c581eebfcc627be96de0670c9540b61623f), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39)]:
+  - @ifc-lite/wasm@4.7.0
+
+## 1.7.0
+
+### Minor Changes
+
+- [#2530](https://github.com/LTplus-AG/ifc-lite/pull/2530) [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Report duplicates as coincident sets, not pairs. `findDuplicates` is pairwise, so N coincident copies of one object produce N(N−1)/2 rows and each copy is named in N−1 of them — three triplicated columns read as nine findings with every object mentioned twice. No row was ever literally repeated, but the list overstated the problem and the same object kept reappearing.
+
+  New `groupDuplicateSets(result)` partitions a duplicate result into the connected components of the pair graph: each reported clash is an edge between two model-qualified `(model, key, ref)` elements — `ref` is in the node identity so two elements that share a GlobalId within one model stay distinct nodes instead of collapsing into one — and each component becomes one `ClashGroup` titled e.g. "3 coincident IfcWall objects". Unlike `groupClashes({ by: 'cluster' })` it needs no epsilon and cannot fuse two unrelated duplicate sets that happen to stand within the 1.5 m cluster radius of each other. Sets that span models group correctly (the same object delivered in two files). A set's severity is its most severe member, so a set containing an exact-duplicate pair still surfaces as `major`.
+
+  Connected components treat coincidence as transitive, which under `positionTolerance` — the corner-distance gate `findDuplicates` uses by default — it strictly is not: A≈B and B≈C puts A and C in one set even if A≉C. That is deliberate — a chain of near-coincident objects is a single coordination issue, and the strict alternative would put the same object back into several findings.
+
+  Detection and thresholds are unchanged; `ClashResult` still carries the same pairwise clashes, so the other grouping modes and BCF export are unaffected. In the viewer, a duplicate scan now RENDERS these sets: the clash panel shows one section per coincident set ("3 coincident IfcColumn objects") with the member pair rows inside it, instead of bucketing the pairwise rows under the generic severity/rule/type-pair headers; the scan's telemetry counts sets rather than pairwise rows for the same reason. The duplicate scan's position tolerance is also now a setting (Clash settings → "Duplicate tolerance", default 10 mm) — it previously always ran at the library default, with no viewer control.
+
+  The panel's "Group by" control is now disabled during a coincident-set view: it previously stayed clickable and its selection persisted, but the sections it draws are always the coincident sets during a duplicates-only run, so choosing "By severity" or "By type pair" changed nothing on screen.
+
+- [#2530](https://github.com/LTplus-AG/ifc-lite/pull/2530) [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Decide duplicates by a distance in metres, not by AABB intersection-over-union.
+
+  `findDuplicates` called two elements the same object when their bounding boxes
+  overlapped at IoU ≥ 0.9. IoU is a ratio, so that setting carried no physical
+  tolerance: for two equal boxes offset by `d` along an axis of extent `e` the IoU
+  is `(e − d) / (e + d)`, and the 0.9 default therefore allowed `d ≤ e / 19`.
+  Measured over four common shapes and all three axes, the displacement that still
+  counted as a duplicate ranged from 5 mm (across a DN100 pipe) to 421 mm (in the
+  plane of an 8 m slab) — an 80× spread from one number nobody set. A duplicated
+  pipe nudged 5 mm was missed while a duplicated slab moved 400 mm was still
+  reported.
+
+  The gate is now `positionTolerance`, a distance in metres (default 10 mm),
+  applied to the largest distance any corner of one box has to travel to reach the
+  matching corner of the other. For two equally-sized boxes that is exactly the
+  distance between their centres, whatever the shape and whatever the direction —
+  the metric itself is isotropic, where IoU was not. A difference in size counts
+  too — concentric boxes whose faces differ by δ are δ apart — so position and
+  shape are checked by one number with no second, dimensionless knob.
+
+  One precondition bounds that, and the broad phase enforces it a second time:
+  boxes that do not touch at all are never paired,
+  so an element smaller than the tolerance cannot be matched to a neighbour it
+  does not intersect. Two copies stop touching once the offset exceeds the
+  element's own extent on the offset axis, so the **effective** tolerance is
+  `min(positionTolerance, extent on that axis)` — the full 10 mm on every axis of
+  anything thicker than 10 mm, but only 2 mm along the normal of a 2 mm cladding
+  panel (measured: a `[4, 0.2, 3]` m wall gets 10.00 mm on all three axes; a
+  `[1.2, 0.002, 2.4]` m plate gets 10.00 / 2.00 / 10.00 mm). Offsets in the plane
+  of that same panel still get the full 10 mm. A duplicated thin sheet nudged
+  along its own normal by more than its thickness is deliberately read as two
+  objects rather than one modelled twice — the same judgement that keeps a 5 mm
+  fixing from pairing with a neighbour it never intersects. The previous IoU gate
+  did not report that pair either, so this is a limitation the change did not
+  remove, not one it introduced.
+
+  `ClashResult.settings.tolerance` now reports the value that actually decided the
+  matches. It previously advertised `positionTolerance`, which governed only the
+  degenerate/planar fallback — the number on screen was not the number doing the
+  work.
+
+  What did not change: this is still a bounding-box test. Two elements with the
+  same bounds and different solids inside them — a duct inside a shaft, an assembly
+  and its own envelope — remain indistinguishable, and separating those needs a
+  narrow phase this pass deliberately does not run.
+
+  Compatibility. `positionTolerance` keeps its name and its default and is now the
+  primary control; callers that raised it to loosen the planar fallback will find
+  it loosens the whole pass. `exactTolerance` (default 1 mm) replaces
+  `exactThreshold` for the `major`/`minor` split. `iouThreshold` and
+  `exactThreshold` are deprecated but still honoured: passing either restores the
+  previous IoU **matching gate** for that call — which pairs are reported,
+  including the old degenerate/planar fallback, and the old `settings.tolerance`
+  reading — rather than silently reinterpreting a ratio as a distance. It does
+  not restore the rest of the old behaviour: severity and self-pair identity
+  follow the new rules in every mode (see the shape-signature changeset).
+
+  One matching change falls out of requiring the boxes to touch: two
+  zero-thickness sheets offset a few millimetres **along their own normal** are
+  disjoint and are no longer reported (the old planar fallback reported them).
+  Geometry with clear air between the surfaces is two objects; the legacy IoU
+  mode keeps the old reading.
+
+  Across five public models the set of reported pairs is unchanged (1 / 0 / 0 / 0 /
+  32). In the one model with a substantial count, eight same-triangle-count pairs
+  that sit 1.7–4.5 mm apart move from `major` to `minor`: they are near-coincident,
+  not exact copies, and the remaining 22 exact ones are all within 0.9 mm.
+
+- [#2530](https://github.com/LTplus-AG/ifc-lite/pull/2530) [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Decide "exact duplicate" from the geometry, and stop hiding duplicated GlobalIds.
+
+  **Triangle count was a two-way-wrong signature.** `findDuplicates` promoted a
+  near-coincident pair to `major` ("exact duplicate") only when the two elements
+  had the same number of triangles. That is a proxy for "same mesh", and it fails
+  in both directions: a genuine duplicate re-tessellated on re-import (12 vs 48
+  triangles, geometrically the identical box) was demoted to `minor`, while a
+  round column and a square column that happen to share a bounding box and a
+  triangle count were promoted to `major`. Users filtering to `major` therefore
+  lost real duplicates and gained fake ones.
+
+  Severity is now decided by a tessellation-invariant signature of the element's
+  world-space triangle soup: total surface area and enclosed (divergence-theorem)
+  volume. Both are integrals over the surface, so re-triangulating one copy leaves
+  them unchanged — a 12- and a 48-triangle 1×1×3 box both give area 14 and volume
+  3 — while a round and a square column of the same bounds differ by 22.7% in area
+  and 25.0% in volume. The two must agree to within 5%, which is wide enough to
+  hold together a 12- and a 36-segment column (4.0% apart in volume, the same
+  authored solid at two facet densities) and ~5× tighter than the gap between
+  genuinely different shapes. The tolerance is relative, so it means the same
+  thing on a 50 mm fixing and a 30 m tank.
+
+  The signature is per **element**, summed over the several meshes a
+  multi-material / CSG element emits. Those parts' cross pairs all collapse to
+  one clash id, so a per-mesh comparison would have let whichever part pairing
+  the sweep reached first decide the label — a two-material wall and its exact
+  copy could read `minor` because part 1 was first compared against part 2. The
+  deduped finding is also upgraded to `major` when any later part pairing shows
+  the copies coincide, so the label no longer depends on sweep order at all.
+
+  `major` now means: some pair of the elements' boxes coincides within
+  `exactTolerance` **and** the two elements' meshes agree on area and volume. It still cannot distinguish two different
+  solids that happen to agree on both numbers, nor an element from its mirror
+  image, and an element whose geometry the caller did not supply is never promoted
+  at all. Matching — which pairs are reported — is unchanged and still
+  bounding-box-only, so a duct inside a shaft that shares its bounds is still
+  reported (as `minor`); separating nested from coincident needs a narrow phase
+  this pass deliberately does not run.
+
+  **Duplicated GlobalIds were invisible.** The self-pair guard skipped any pair
+  sharing a key and a model. But a file can carry one GlobalId on two genuinely
+  different entities — a defect `ifc-lite validate` reports — and that is exactly
+  the "same element exported twice" case a duplicate hunt exists to find. Identity
+  is now `(model, ref)`: `key` is the GlobalId, which a broken exporter can
+  repeat, while `ref` is the express id, unique by construction. The several
+  meshes one element emits (one per material or CSG part) share both key and ref,
+  so they are still skipped. `groupDuplicateSets` counts nodes the same way, so
+  such a pair now reads "2 coincident objects" rather than "1".
+
+  Clash ids are unchanged for well-formed files: the express id is folded into an
+  id only for a key that two different elements actually carry, which is also what
+  stops three copies under one GlobalId collapsing into a single deduped finding.
+
+  Cost is unchanged. The signature is O(triangles), computed at most once per
+  element and only for pairs that already coincide, so a model with no duplicates
+  never reads a vertex. Across five public models the reported pairs, their ids,
+  their severities and their groupings are all identical to the distance-tolerance
+  baseline this builds on (1 / 0 / 0 / 0 / 32, split 22 `major` / 10 `minor` —
+  "before" here means after that change, which itself moved eight pairs from
+  `major` to `minor`; see its changeset); computing every element's signature eagerly,
+  which the pass does not do, would cost 2.6 ms over the 236,795 triangles of the
+  largest of them against a 215 ms pass (the measurement the `findDuplicates`
+  docs cite).
+
+- [#2599](https://github.com/LTplus-AG/ifc-lite/pull/2599) [`8324512`](https://github.com/LTplus-AG/ifc-lite/commit/8324512daee39a018056aa88a148f72791db89c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Distinguish "the clash matrix found nothing" from "the clash matrix had nothing to check".
+
+  The built-in discipline matrix (`--matrix`) is shaped for MEP/HVAC/electrical/fire coordination: every preset's `selectorA` is one of those disciplines. Run it on a model with none of those element types — an infrastructure model, for instance — and every rule matches zero elements on the A side, so the matrix silently reports "0 clashes". That reads as "this model is clean" when it actually means no rule ever ran a real comparison.
+
+  `ClashResult` now carries a `ruleCoverage` field (per-rule counts of matched elements on each side), and `@ifc-lite/clash` exports `classifyRuleCoverage`/`ruleHadNoMatch` to turn that into one of `clean` / `partial` / `no-match` / `unknown`. The CLI's `--matrix` (and any other rule set) prints a loud `WARNING` when no rule matched anything, and a shorter note when some rules did not, in both the human summary and the `--json` output (`ruleCoverageOutcome` + `ruleCoverage`); the viewer's clash panel shows the same warning in place of the "No clashes found 🎉" empty state. Zero clashes is never treated as an error — the CLI still exits 0 — this only makes the _kind_ of zero visible.
+
+  The `no-match` warning's wording now depends on whether a real discipline matrix ran. `--matrix` runs many rules, so its "the matrix did NOT run" phrasing is accurate there. The default path (`ifc-lite clash <file> --a <selector> --b <selector>`, no `--matrix`) builds exactly one ad-hoc rule; when only one side's selector matches nothing (e.g. `--a IfcWall --b IfcRoof` on a model with no roofs), the _other_ side did match and no matrix was ever involved — the CLI now names the empty selector ("selector B (\"IfcRoof\") matched 0 elements") instead of claiming a matrix that never ran. The viewer's clash panel makes the same distinction for its own single-rule runs (`runAll`'s "Detect all clashes" and a one-off `runPreset`) versus a real multi-rule `runMatrix`.
+
+  Out of scope: adding infrastructure-discipline presets to the built-in matrix. That's a product decision about what an infra clash matrix should contain, not something to bundle into a diagnostic fix.
+
+- [#2645](https://github.com/LTplus-AG/ifc-lite/pull/2645) [`2d87b39`](https://github.com/LTplus-AG/ifc-lite/commit/2d87b3919c0ca5afff03e205c5f598142bbc980d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Re-export `triangleArea` and the `Triangle` type from `@ifc-lite/clash`'s public surface (issue [#2199](https://github.com/LTplus-AG/ifc-lite/issues/2199): "mesh analysis reachable from TypeScript"). It previously existed only inside the package's clash contact solver, so nothing outside `@ifc-lite/clash` — including the viewer's Measure tool — could reach a triangulated-mesh area even though every `MeshData` already carries the `positions`/`indices` a caller needs.
+
+  The Measure tool's Quantities panel ([#2199](https://github.com/LTplus-AG/ifc-lite/issues/2199) §1, element surface area) now reports a "mesh" area alongside the existing declared (net/gross/unqualified) and mesh volume rows: the selection's total triangulated surface area, summed live from mesh geometry via the newly-exported `triangleArea`. Unlike the mesh volume row, this needs no closed-solid proof, so it covers open shells and layered walls too — and unlike the mesh volume row, it is not invalidated by federation alignment re-baking, because it is recomputed from current vertex positions rather than read from a value cached before alignment ran. It is the sum of every meshed face (not one side), so it is labelled "mesh" and never presented as a `NetSideArea`/`GrossSideArea` equivalent. Where no mesh geometry exists for a selected element (e.g. an instanced-only occurrence with no flat mesh materialised), the panel says so rather than reporting zero.
+
+### Patch Changes
+
+- [#2600](https://github.com/LTplus-AG/ifc-lite/pull/2600) [`7f2d9cf`](https://github.com/LTplus-AG/ifc-lite/commit/7f2d9cf1fdcf8facd9bf3f1445ddf3c665206b76) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Scale the focused-clash contact-interface epsilon to coordinate magnitude, not a fixed 1e-6.
+
+  `contactClusters` (used by the viewer's focused clash detail view, `apps/viewer/src/hooks/useClash.ts`, via `@ifc-lite/clash/contact`) computes the real contact geometry — shared-face polygon, intersection line, or point — between one clashing pair, via a Möller triangle-triangle test whose plane-distance tolerance (`planeEps`) defaulted to a fixed `1e-6` in `narrowPhase`.
+
+  Geometry is ingested from f32 buffers throughout this codebase, so a fixed `1e-6` is only valid near the origin: the true discrete f32 ULP exceeds `1e-6` above 16 m and reaches ~4.9e-4 at 5 km. Two triangles authored to be exactly flush (a shared wall/slab boundary) round to _adjacent_, not bit-identical, f32 values once far from the origin, and the too-tight fixed epsilon then read that rounding noise as a genuine non-coplanar separation — dropping the shared-face contact entirely instead of reporting the surface. A synthetic pair of boxes flush at world x = 5000.5 m, with one side's boundary coordinate bumped by exactly one f32 ULP (the mechanism `fix(clash): float32-precision floor on penetration depth` measured directly on `Infra-Bridge.ifc`, 20 pairs bit-identical at the f32 ULP for their coordinate magnitude), lost its `surface` cluster entirely under the old fixed epsilon; the same case at 50 km showed the same loss.
+
+  The fix, following that same narrow-phase fix's approach: `narrowPhase`'s default `planeEps` is now `max(1e-6, maxAbsCoord * 2^-22)` — the pair's own coordinate magnitude (from the two meshes' already-computed BVH root bounds, so no extra pass over the geometry) times the same `2⁻²²` f32-ULP term `near_band_from_extent` uses in `rust/geometry/src/kernel/mesh_bridge.rs` and `precisionFloor` uses in `engine-ts/narrow.ts`, floored at the old fixed `1e-6` so the scaled term can only widen the tolerance, never narrow it below what the fixed constant already provided. An explicit `planeEps` passed by a caller is unchanged and still wins.
+
+  Near the origin, where the f32 ULP is far below `1e-6`, the new default is bit-for-bit identical to the old fixed constant on the existing near-origin fixtures in `contact.test.ts` (the overlapping-boxes and perpendicular-bars cases) — the focused-clash contact output for an ordinary building model near the origin is unaffected.
+
+  No API surface change: `planeEps` remains an optional field on `NarrowPhaseOptions`/`ContactOptions`.
+
+  A follow-up audit found a sibling defect one stage downstream in the same call path: `clusterSharedFaces` (`packages/clash/src/contact/shared-faces.ts`) hashes coplanar triangle pairs into shared-face clusters via `planeKey`, which quantises `plane.offset` — also a signed distance from the world origin — into buckets of fixed width `planeDistSnap`, default `1e-3`. Two triangle pairs that the now-fixed `planeEps` correctly recognises as coplanar can still round to f32 offsets that straddle a fixed `1e-3` bucket boundary once far from the origin, splitting one physical shared face into two `surface` clusters instead of merging it into one. Measured directly: a flat wall face triangulated as two independently-rounded patches, with the drift between them tuned to exactly one f32 ULP straddling a bucket boundary, reported 2 separate `surface` clusters at 5 km and 50 km from the origin under the old fixed `1e-3`; the same fixture reports 1 at both distances, matching the near-origin baseline, once `planeDistSnap` is instead scaled the same way as `planeEps` (`max(1e-3, maxAbsCoord * 2^-22)`, from a real extra pass over the pairs' own vertices — separate from the clustering loop, which only reads one vertex per triangle). This does not eliminate the underlying bug: `Math.round` still imposes a hard bucket boundary at whatever width `planeDistSnap` ends up, so a wider bucket only _reduces the probability_ that a given pair of offsets straddles it (roughly 48.8% down to 41.0% at 5 km, for a boundary drawn uniformly at random relative to the bucket) — it does not make straddling impossible, and a pair unlucky enough to straddle the (wider) bucket still splits into two clusters. `lineSnap` (the cross-line hash) was not touched: its base-point term has the same theoretical exposure, but no reproduction was attempted for it, so it is left as-is pending its own demonstration. Near the origin, the new default is bit-for-bit identical to the old fixed `1e-3` on the existing fixtures. `planeDistSnap` remains an optional field on `SharedFaceOptions`/`ContactOptions`; an explicit value passed by a caller still wins.
+
+- [#2530](https://github.com/LTplus-AG/ifc-lite/pull/2530) [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - clash: drop IFC type objects from the clash and duplicate candidate set
+
+  An `IfcWallType`/`IfcSpaceType`/`IfcDoorStyle` carries the `RepresentationMaps`
+  template that its occurrences instantiate. The mesher turns that template into
+  geometry, which lands on top of the very occurrences that use it — so the type
+  read as a duplicate of its own occurrence, and clashed against elements it never
+  physically touches. On one public sample model this accounted for 114 of 282
+  reported clashes and for the model's only reported duplicate.
+
+  Type objects are now filtered out alongside the other non-physical types, which
+  also closes the gap the earlier `IfcSpace` exclusion left open: the space was
+  excluded by name while `IfcSpaceType` sailed straight through.
+
+  `isIfcTypeLikeEntity` is now exported from `@ifc-lite/parser` so the clash
+  adapter uses the same predicate the parser classifies entities with.
+
+- [#2574](https://github.com/LTplus-AG/ifc-lite/pull/2574) [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop treating spatial containers as clash bodies in the STEP adapter.
+
+  `NON_CLASHABLE_TAGS` dropped `IfcSpace` and `IfcSpatialZone` ([#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464)) but nothing else from the spatial structure, so any container that carries tessellated geometry became a clash body and collided with the elements assigned to it. That is not a coordination problem — a storey's geometry is its extent, and by construction it encloses its contents.
+
+  It bites hardest on IFC4.3 infrastructure models, where storeys and facility parts routinely carry real bodies. On one road/bridge certification model a default `ifc-lite clash` run reported 235 clashes, of which 89 (37.9%) were an `IfcBuildingStorey` against an element it contains.
+
+  The check is now derived from the schema instead of enumerated: an element is dropped when `getInheritanceChainAcrossSchemas` puts `IfcSpatialElement` or `IfcSpatialStructureElement` in its chain. That walks the bundled IFC2X3 + IFC4 + IFC4X3 union, so `IfcSite`, `IfcBuilding`, `IfcBuildingStorey`, `IfcExternalSpatialElement` and the IFC4.3 facility leaves (`IfcFacility`, `IfcFacilityPart`, `IfcBridge`, `IfcRoad`, `IfcRailway`, `IfcMarineFacility`, …) are all covered without a second hand-maintained list, and `IfcSpatialStructureElement` is checked alongside `IfcSpatialElement` because IFC2X3 has no `IfcSpatialElement`. The two hand-listed space entries are removed as redundant.
+
+  Elements _contained in_ a container are unaffected — they still clash with each other, and still carry the storey name as metadata. Measured on the road/bridge model: 235 → 146 clashes, 89 pairs removed and none added, every removed pair involving `IfcBuildingStorey`. Building-model controls: 274 → 274 and 469 → 469 with byte-identical pair sets; 282 → 279 on a third, the three removed pairs all being the site's own terrain body.
+
+  No API surface change.
+
+- Updated dependencies [[`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6), [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f), [`5086c57`](https://github.com/LTplus-AG/ifc-lite/commit/5086c5729b6ae8ad967aafa91d96dfdb37327599), [`307693c`](https://github.com/LTplus-AG/ifc-lite/commit/307693c678d525ab007773f74e13a308bfe63b34), [`649aa0c`](https://github.com/LTplus-AG/ifc-lite/commit/649aa0ccbc4e67c233b9175a6a2f9c8e1ff310ec)]:
+  - @ifc-lite/parser@4.1.0
+  - @ifc-lite/wasm@4.6.0
+  - @ifc-lite/geometry@3.8.3
+  - @ifc-lite/ifcx@2.3.6
+
+## 1.6.8
+
+### Patch Changes
+
+- [#2594](https://github.com/LTplus-AG/ifc-lite/pull/2594) [`9cccc00`](https://github.com/LTplus-AG/ifc-lite/commit/9cccc002f5f03ad96c710b6d2a1e12b1bf61172c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop reporting float32-precision noise as hard clashes.
+
+  The narrow phase classified any genuine (non-coplanar) triangle-mesh crossing as `hard`, regardless of how tiny the measured penetration depth was — including depths that are literally float32 rounding noise. Geometry is ingested from f32 buffers and stored/queried in f64 (`rust/clash/src/tri_mesh.rs`), so f64 arithmetic cannot recover precision the source data never had: two surfaces authored to be flush round to adjacent f32 values, and the tiny "penetration" between them is bit-noise, not a measurement.
+
+  This defect is present broadly, not just on infrastructure models: on `ara3d/duplex.ifc` — an ordinary residential building, not previously wired into any clash regression test — CLI-default hard clashes drop from 274 to 184, a third of the total. Every one of the 90 removed pairs measures at or below 5.3 µm, and there is a clean, empty band between ~3 µm and ~20 µm with no clashes in it at all before the smallest surviving real clash appears. That empty band is the strongest evidence for the fix: the precision floor lands in a genuine valley in the data, three-plus orders of magnitude below any real construction tolerance, rather than cutting into a continuum of real small overlaps.
+
+  On buildingSMART's `Infra-Bridge.ifc` sample, the same defect reported 31 spurious hard clashes at CLI defaults (of 81 total): 20 were bit-identical at `-2.384185791015625e-7` m — exactly the float32 ULP at coordinate magnitude `[2,4)` — across unrelated element-type pairs (`IfcColumn`×`IfcWall`, `IfcColumn`×`IfcMember`, `IfcColumn`×`IfcBuildingElementProxy`) at different physical locations on the model; the rest sat in the same `1e-8`–`2e-6` m noise band. These are joints designed to be flush (a pier meeting a spandrel wall, a deck resting on a girder), not coordination issues.
+
+  The fix adds a penetration-depth floor scaled to the pair's own coordinate magnitude — `max(1.0, maxAbsCoord) * 2^-22`, the same `extent · 2⁻²²` term `near_band_from_extent` uses in `rust/geometry/src/kernel/mesh_bridge.rs` — rather than a fixed constant, since the float32 ULP at a coordinate near the origin is not the ULP at a coordinate far from it, and infrastructure models routinely sit far from the origin. A crossing at or below the floor is reclassified as `touch`, not `hard`: the surfaces genuinely are in contact, which is real information this codebase already tracks separately (the viewer's `clashHideTouching` toggle), so it is not silently dropped. CLI-default rules don't opt into `reportTouch`, so these pairs report zero clashes rather than a spurious hard one.
+
+  Measured: `Infra-Bridge.ifc` 81 → 50 hard clashes at CLI defaults (TS and WASM/Rust backends agree); `ara3d/duplex.ifc` 274 → 184. The 8 real `IfcBeam`×`IfcBeam` coordination-issue pairs on Infra-Bridge are unaffected. The existing 193 synthetic clash-package tests (explicit mm/cm-scale overlaps, including the differential TS/WASM parity suite) show no count changes, since none of them exercise coordinates near the precision floor.
+
+  Because the floor scales with coordinate magnitude, it grows with distance from the origin — see the `precisionFloor` / `precision_floor` doc comments in `narrow.ts` / `narrow.rs` for what that means on far-from-origin (e.g. georeferenced) models.
+
+  No API surface change.
+
+## 1.6.7
+
+### Patch Changes
+
+- [#2604](https://github.com/LTplus-AG/ifc-lite/pull/2604) [`3af6d2a`](https://github.com/LTplus-AG/ifc-lite/commit/3af6d2ad076e76fc95e58a9252bf712f8513c6e9) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Scale the "touching" band (`isTouching`, used by the viewer's `hideTouching` clash filter, touching-count badge, and per-row touching indicator) to a clash's own coordinate magnitude, not a fixed 1e-4 metres.
+
+  Geometry is ingested from f32 buffers, so a fixed `TOUCHING_EPSILON` is only valid near the origin: the f32 ULP for a coordinate of magnitude `extent` is `extent * 2^-22`, and exceeds `1e-4` once `extent` passes ~1 km. Past that distance, a genuinely flush pair (a wall meeting a slab) can pick up more than `1e-4` of pure f32 rounding noise in its measured penetration depth, and the fixed band then misses it — the pair silently reappears as a hard clash in a list the user explicitly asked to de-noise. Demonstrated directly through `isTouching`: a flush pair 1 f32 ULP apart at each corner classifies as touching near the origin, but past the ULP-crossover distance (~1024 m for a single-ULP-scale overlap; real models with multiple rounding operations can cross earlier) the same pair's measured depth exceeds the fixed `1e-4` and it stops being flagged touching, under the old fixed constant, while an epsilon scaled to the identical coordinates keeps it flagged.
+
+  The fix: `isTouching`'s default `eps` is now derived per-clash from `Clash.bounds` (the clash's own contact/overlap region — the only element-scale coordinates a bare `Clash` carries, since `ClashElement`'s bounds aren't available at this call site) as `max(TOUCHING_EPSILON, maxAbsCoord(bounds) * 2^-22)` — the same `2^-22` f32-ULP term used by `precisionFloor` in `engine-ts/narrow.ts` and `planeEps` in `contact/narrow-phase.ts`. Floored at `TOUCHING_EPSILON` itself (not the raw single-metre f32 floor those two use) so near the origin the new default is bit-for-bit identical to the old fixed constant — verified against the existing `analysis.test.ts` fixtures. An explicit `eps` argument is unchanged and still overrides the default entirely.
+
+  `TOUCHING_EPSILON` remains exported with its existing value and meaning (the near-origin/floor band); `isTouching`'s signature is unchanged.
+
+- Updated dependencies [[`cd72412`](https://github.com/LTplus-AG/ifc-lite/commit/cd724127245fcb767894642cd0994baaba88ff7d), [`b85b2be`](https://github.com/LTplus-AG/ifc-lite/commit/b85b2be4dd79045f1dd02ed344d102f27ecc2594), [`cd72412`](https://github.com/LTplus-AG/ifc-lite/commit/cd724127245fcb767894642cd0994baaba88ff7d)]:
+  - @ifc-lite/geometry@3.8.2
+  - @ifc-lite/parser@4.0.3
+  - @ifc-lite/wasm@4.5.1
+
+## 1.6.6
+
+### Patch Changes
+
+- [#2571](https://github.com/LTplus-AG/ifc-lite/pull/2571) [`495cc38`](https://github.com/LTplus-AG/ifc-lite/commit/495cc388ea95f6e55aee76ea37bcf6d11c99558b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Report it when `groupClashes({ by: 'cluster' })` consolidates nothing, instead of silently returning one group per clash.
+
+  Measured on a real MEP model (self-clash among drainage `IfcFlowSegment`s, distribution-run contact points scattered several metres apart): cluster grouping at the default 1.5 m epsilon produced 15 groups from 18 clashes — barely different from no grouping at all. The default epsilon was investigated separately and deliberately kept: across 12 public models there is no defensible constant (raising it to 2.0 m collapses an unrelated structural model's 10 real clashes into one group), so this is not a tuning fix.
+
+  Adds `isClusterGroupingIneffective(clashes, groups)` to `@ifc-lite/clash`: a narrow, exact check — true only when every clash landed in its own singleton group (`groups.length === clashes.length`, with more than one clash) — deliberately not a fuzzy "mostly ineffective" threshold, which would repeat the epsilon problem with a different undefensible constant.
+
+  `ifc-lite clash --bcf ... --group cluster` now prints a stderr note when this fires, naming the other grouping modes (`rule`, `typePair`, `element`) rather than picking one — none of them is a reliable universal answer either: on the measured model, `--group element` produced _more_ groups than clashes (33 from 18), since it files each clash under both participating elements rather than merging along the run.
+
+- [`081ed7e`](https://github.com/LTplus-AG/ifc-lite/commit/081ed7e7e38072ecb307c01c0512cd911be886a6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop treating spatial containers as clash bodies in the STEP adapter.
+
+  `NON_CLASHABLE_TAGS` dropped `IfcSpace` and `IfcSpatialZone` ([#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464)) but nothing else from the spatial structure, so any container that carries tessellated geometry became a clash body and collided with the elements assigned to it. That is not a coordination problem — a storey's geometry is its extent, and by construction it encloses its contents.
+
+  It bites hardest on IFC4.3 infrastructure models, where storeys and facility parts routinely carry real bodies. On one road/bridge certification model a default `ifc-lite clash` run reported 235 clashes, of which 89 (37.9%) were an `IfcBuildingStorey` against an element it contains.
+
+  The check is now derived from the schema instead of enumerated: an element is dropped when `getInheritanceChainAcrossSchemas` puts `IfcSpatialElement` or `IfcSpatialStructureElement` in its chain. That walks the bundled IFC2X3 + IFC4 + IFC4X3 union, so `IfcSite`, `IfcBuilding`, `IfcBuildingStorey`, `IfcExternalSpatialElement` and the IFC4.3 facility leaves (`IfcFacility`, `IfcFacilityPart`, `IfcBridge`, `IfcRoad`, `IfcRailway`, `IfcMarineFacility`, …) are all covered without a second hand-maintained list, and `IfcSpatialStructureElement` is checked alongside `IfcSpatialElement` because IFC2X3 has no `IfcSpatialElement`. The two hand-listed space entries are removed as redundant.
+
+  Elements _contained in_ a container are unaffected — they still clash with each other, and still carry the storey name as metadata. Measured on the road/bridge model: 235 → 146 clashes, 89 pairs removed and none added, every removed pair involving `IfcBuildingStorey`. Building-model controls: 274 → 274 and 469 → 469 with byte-identical pair sets; 282 → 279 on a third, the three removed pairs all being the site's own terrain body.
+
+  No API surface change.
+
+## 1.6.5
+
+### Patch Changes
+
+- [#2424](https://github.com/LTplus-AG/ifc-lite/pull/2424) [`dae94e2`](https://github.com/LTplus-AG/ifc-lite/commit/dae94e23f7514945ca60f7074f50f196a90dfc5d) Thanks [@louistrue](https://github.com/louistrue)! - Cancel clash detection when the script run that asked for it ends.
+
+  A sandbox run that exceeded `limits.timeoutMs`, or a sandbox disposed mid-run, stopped _waiting_ for `bim.clash.run` / `bim.clash.matrix` but never stopped the engine: it kept intersecting geometry to completion in the background, on the user's machine, for a result that was discarded on arrival. The bridge now hands every call an `AbortSignal` and aborts it on both paths, and the clash namespace forwards it as `ClashSettings.signal`.
+
+  `@ifc-lite/sandbox` is a minor rather than a patch because `BridgeCallContext.hostSignal` is new capability surface for schema authors, reachable through the `@ifc-lite/sandbox/schema` subpath. Nothing was removed or renamed.
+
+  `ClashSettings.signal` also now works the way its name implies. The TypeScript engine checked it periodically but only yielded to the event loop when an `onProgress` callback was supplied — and every realistic canceller (a deadline timer, a cancel button, a host teardown) fires _from_ the event loop, so without `onProgress` the flag could never flip mid-run. A caller that supplies a signal now gets the periodic yields too, the check runs every 256 candidate pairs rather than every 1024, and the signal is rechecked immediately after each yield, since the yield is the window the abort arrives in.
+
+  One bound is worth stating plainly: those handlers can only run during a yield, and the first yield comes after ~50 ms of held thread time, so a run that finishes inside that window completes rather than cancelling. Cancellation is for runs long enough to be worth cancelling.
+
+  No API changed shape: `ClashSettings.signal` already existed, and cancellation stays opt-in for direct engine callers.
+
+- Updated dependencies [[`1843d9f`](https://github.com/LTplus-AG/ifc-lite/commit/1843d9f13a7a10183f780ae0a1df9dd225938e73), [`8b09cfd`](https://github.com/LTplus-AG/ifc-lite/commit/8b09cfdadafaea9806e79b73deb9119ea66b5aa4), [`d260a35`](https://github.com/LTplus-AG/ifc-lite/commit/d260a35669e379e5f465861294391c95ee48cb3d), [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146), [`c866bee`](https://github.com/LTplus-AG/ifc-lite/commit/c866bee62a7d6e40b15a7de63948354cbbe049a7), [`262b9df`](https://github.com/LTplus-AG/ifc-lite/commit/262b9df485e4bfd3760f73c30d93bb518e599b72), [`2e16736`](https://github.com/LTplus-AG/ifc-lite/commit/2e167367037fa3b5d1d2d5d26dd4fb7ac169e2f5), [`d89960a`](https://github.com/LTplus-AG/ifc-lite/commit/d89960aaab08387fbd2307c0f238bd112c684933), [`51ec81b`](https://github.com/LTplus-AG/ifc-lite/commit/51ec81b125532cd0efe4f004c7ab01f4efe55cb8), [`958aef1`](https://github.com/LTplus-AG/ifc-lite/commit/958aef125743682da75c3da7b41991abd9d36d32), [`de7bd04`](https://github.com/LTplus-AG/ifc-lite/commit/de7bd04619a43a32900b188e0507b95e7542d8c8), [`09d67c7`](https://github.com/LTplus-AG/ifc-lite/commit/09d67c780bf68f58dec3f77920927857c752f8da)]:
+  - @ifc-lite/bcf@1.17.0
+  - @ifc-lite/query@1.14.16
+  - @ifc-lite/ifcx@2.3.4
+  - @ifc-lite/parser@4.0.0
+  - @ifc-lite/geometry@3.7.1
+
 ## 1.6.4
 
 ### Patch Changes

@@ -29,6 +29,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { modelSwapNotice, type SwapModelRef } from './playground-model-swap.js';
 import Anthropic from '@anthropic-ai/sdk';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -51,7 +52,13 @@ import {
   type ToolDispatchResult,
 } from './playground-dispatcher';
 import { playgroundFiles, formatBytes as formatFileBytes } from './playground-files';
-import { playgroundUploads, usePlaygroundUploads, type UploadedFile } from './playground-uploads';
+import {
+  playgroundUploads,
+  usePlaygroundUploads,
+  mergeAttachmentNames,
+  resolveAttachments,
+  type UploadedFile,
+} from './playground-uploads';
 import { Paperclip, X } from 'lucide-react';
 
 const MAX_TOOL_CALLS = 25;
@@ -137,10 +144,49 @@ export function PlaygroundChat({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   // Files attached since the last send. They land in the playgroundUploads
-  // store (so the dispatcher can resolve them by name) AND get listed in
-  // a "to send" array we drain on each submit.
+  // store (so the dispatcher can resolve them by name); we track only the
+  // NAMES pending this turn and project them through the store's current
+  // contents on every render. That projection is what keeps the chip list
+  // structurally unable to disagree with the store: the store already
+  // collapses same-basename uploads to one entry (last-wins), so a name
+  // list can never show two chips — or stale content — for one basename.
   const uploads = usePlaygroundUploads();
-  const [pendingAttachments, setPendingAttachments] = useState<UploadedFile[]>([]);
+  const [pendingNames, setPendingNames] = useState<string[]>([]);
+  const pendingAttachments = useMemo(
+    () => resolveAttachments(uploads, pendingNames),
+    [uploads, pendingNames],
+  );
+
+  // Swapping the loaded model invalidates every expressId already in the
+  // transcript: they are unique inside ONE STEP file, not across files. The
+  // conversation is deliberately kept (losing the user's thread on a file swap
+  // would be worse), so the boundary is stated in-band instead — the agent
+  // re-reads the whole transcript every turn, and this notice is the only
+  // thing standing between it and confidently acting on a stale id (#2471).
+  //
+  // `lastLoaded` is NOT cleared when the model is closed. It has to survive
+  // that, or load A -> close -> load B reads as a first load and says nothing
+  // — and the close button sits in the same toolbar as the file picker.
+  const lastLoaded = useRef<SwapModelRef | null>(null);
+  const loadCounter = useRef(0);
+  const nextRef = useRef<SwapModelRef | null>(null);
+  const currentModelObject = useRef<LoadedPlaygroundModel | null>(null);
+  if (model !== currentModelObject.current) {
+    currentModelObject.current = model;
+    // A new model OBJECT is a new load. The id is a slug of the filename, so
+    // re-dropping a revised `model.ifc` keeps the id while every expressId may
+    // have moved — the load counter is what distinguishes them.
+    loadCounter.current += 1;
+    nextRef.current = model ? { loadId: loadCounter.current, name: model.name } : null;
+  }
+  const next = nextRef.current;
+  useEffect(() => {
+    setMessages((prior) => {
+      const notice = modelSwapNotice(lastLoaded.current, next, prior.length);
+      return notice ? [...prior, notice] : prior;
+    });
+    if (next !== null) lastLoaded.current = next;
+  }, [next]);
 
   // Auto-scroll on new content
   useEffect(() => {
@@ -219,7 +265,7 @@ export function PlaygroundChat({
     if ((!trimmed && pendingAttachments.length === 0) || isStreaming) return;
     const attachedThisTurn = pendingAttachments;
     setInput('');
-    setPendingAttachments([]);
+    setPendingNames([]);
     void send(trimmed || '(see attached file)', attachedThisTurn);
   };
 
@@ -238,7 +284,9 @@ export function PlaygroundChat({
         setError(`Failed to read ${f.name}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    if (list.length > 0) setPendingAttachments((prev) => [...prev, ...list]);
+    if (list.length > 0) {
+      setPendingNames((prev) => mergeAttachmentNames(prev, list.map((e) => e.name)));
+    }
   }, []);
 
   /** Per-kind system note so the agent knows what to do with the file
@@ -338,7 +386,7 @@ export function PlaygroundChat({
                   type="button"
                   onClick={() => {
                     playgroundUploads.remove(f.name);
-                    setPendingAttachments((prev) => prev.filter((x) => x.name !== f.name));
+                    setPendingNames((prev) => prev.filter((n) => n !== f.name));
                   }}
                   className="ml-0.5 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full text-white/50 hover:bg-white/10 hover:text-white"
                   aria-label={`Remove ${f.name}`}
@@ -737,8 +785,11 @@ type ApiMessage =
  * tool_result message → standalone user text message) breaks that contract
  * the moment the user asks a follow-up after a tool round, because the
  * NEW user text lands AFTER the tool_result, separating it from the
- * tool_use by an extra turn (and yielding a double-user pair Anthropic
- * also rejects).
+ * tool_use by an extra turn (and yielding a double-user pair, which the
+ * Messages API now merges into one turn rather than rejecting — the
+ * tool_result-must-come-first ordering below is the part that still
+ * matters, and the model-swap notice at #2471 deliberately relies on
+ * consecutive user turns being accepted).
  *
  * Fix: merge an assistant turn's pending tool_results into the very next
  * user turn as combined blocks (`[tool_result_*…, { type:'text', text }]`).

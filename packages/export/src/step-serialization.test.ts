@@ -5,8 +5,6 @@
 import { describe, expect, it } from 'vitest';
 import { PropertyValueType } from '@ifc-lite/data';
 import {
-  assembleStepBlob,
-  assembleStepBytes,
   serializePropertyValue,
   serializeAttributeValue,
   serializeStepValue,
@@ -14,7 +12,9 @@ import {
   resolveExpressBase,
   tokenIsRealLiteral,
   toStepReal,
+  escapeStepString,
 } from './step-serialization.js';
+import { toStepRealScaled } from './unit-normalize.js';
 
 describe('resolveExpressBase', () => {
   it('resolves defined types to their EXPRESS primitive, following alias chains', () => {
@@ -181,8 +181,7 @@ describe('serializeAttributeValue (string attributes)', () => {
 });
 
 describe('toStepRealScaled', () => {
-  it('formats scaled values through the shared STEP REAL rewrite', async () => {
-    const { toStepRealScaled } = await import('./unit-normalize.js');
+  it('formats scaled values through the shared STEP REAL rewrite', () => {
     expect(toStepRealScaled(5e-8)).toBe('5.E-8');
     expect(toStepRealScaled(1e21)).toBe('1.E+21');
     expect(toStepRealScaled(-0)).toBe('0.');
@@ -197,117 +196,27 @@ describe('toStepRealScaled', () => {
   });
 });
 
-/**
- * Reference implementation of the OLD (pre-rewrite) `assembleStepBytes`:
- * single-pass `encoder.encode()` per entity, keeping every encoded chunk
- * alive in a persistent `Uint8Array[]` until the final copy. Kept here
- * (rather than trusting a snapshot) so the byte-identity test fails loudly
- * if the new two-pass `encodeInto` assembler ever drifts from it, on a
- * UTF-8 corpus that specifically exercises multi-byte characters.
- */
-function assembleStepBytesReference(header: string, entities: string[]): Uint8Array {
-  const encoder = new TextEncoder();
-  const headBytes = encoder.encode(`${header}DATA;\n`);
-  const tailBytes = encoder.encode('ENDSEC;\nEND-ISO-10303-21;\n');
-  const newline = encoder.encode('\n');
-
-  let totalSize = headBytes.byteLength + tailBytes.byteLength;
-  const entityBytes: Uint8Array[] = new Array(entities.length);
-  for (let i = 0; i < entities.length; i++) {
-    entityBytes[i] = encoder.encode(entities[i]);
-    totalSize += entityBytes[i].byteLength + newline.byteLength;
-  }
-
-  const result = new Uint8Array(totalSize);
-  let offset = 0;
-  result.set(headBytes, offset);
-  offset += headBytes.byteLength;
-  for (let i = 0; i < entityBytes.length; i++) {
-    result.set(entityBytes[i], offset);
-    offset += entityBytes[i].byteLength;
-    result.set(newline, offset);
-    offset += newline.byteLength;
-  }
-  result.set(tailBytes, offset);
-  return result;
-}
-
-const HEADER = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\n";
-
-/** UTF-8 corpus: ASCII, Latin-1 accents, 2/3-byte BMP chars, and a 4-byte
- * surrogate-pair emoji, all inside STEP entity strings (the realistic case:
- * IFCLABEL/IFCTEXT attribute values carry user text). */
-const UTF8_ENTITIES = [
-  "#1=IFCWALL('0000000000000000000001',$,'Plain ASCII wall',$,$,$,$,$,$);",
-  "#2=IFCLABEL('Wand mit Umlauten: äöüÄÖÜß und Zeichen: café, naïve');",
-  "#3=IFCTEXT('日本語のテキスト and 中文文本 mixed with ASCII');",
-  "#4=IFCLABEL('Emoji stress test: 🏗️🏢🧱🪟 and combining marks: é');",
-  "#5=IFCLABEL('');", // empty string entity
-  `#6=IFCTEXT('${'x'.repeat(5000)}${'ü'.repeat(2000)}${'文'.repeat(1000)}');`, // forces scratch-buffer growth
-];
-
-describe('assembleStepBytes', () => {
-  it('is byte-identical to the pre-rewrite single-pass reference on ASCII-only entities', () => {
-    const entities = [
-      "#1=IFCPROJECT('0000000000000000000001',$,'Project',$,$,$,$,$,$);",
-      "#2=IFCWALL('0000000000000000000002',$,'Wall 1',$,$,$,$,$,$);",
-    ];
-    const expected = assembleStepBytesReference(HEADER, entities);
-    const actual = assembleStepBytes(HEADER, entities);
-    expect(actual).toEqual(expected);
+describe('escapeStepString non-ASCII encoding (ISO 10303-21 6.3.3.4)', () => {
+  // ISO 10303-21 restricts a string literal's plain-text bytes to the "basic
+  // graphic" range 32-126; anything outside it is a control directive
+  // (\X\HH, \X2\HHHH\X0\, \X4\HHHHHHHH\X0\), never a raw byte. buildingSMART's
+  // own IFC string-encoding guidance states the same for IFC2X3/IFC4/IFC4X3:
+  // "characters ... represented by decimal value 32 to 126 ... any other
+  // character ... has to be encoded" (e.g. German 'Ä' as '\X2\00C4\X0\').
+  // A reader that treats the file bytes as ISO-8859-1 (the byte encoding real
+  // consumers - and the base standard - assume) turns a raw UTF-8 multi-byte
+  // sequence into mojibake or an outright parse break; this is a reported,
+  // reproduced defect in real IFC tooling (IfcOpenShell#699, files rejected
+  // by Solibri) for exactly this shape of writer bug.
+  it('encodes a BMP character as \\X2\\HHHH\\X0\\, not raw UTF-8', () => {
+    expect(escapeStepString('Trümpler')).toBe('Tr\\X2\\00FC\\X0\\mpler');
   });
 
-  it('is byte-identical to the pre-rewrite reference on a multi-byte UTF-8 corpus', () => {
-    const expected = assembleStepBytesReference(HEADER, UTF8_ENTITIES);
-    const actual = assembleStepBytes(HEADER, UTF8_ENTITIES);
-    expect(actual.length).toBe(expected.length);
-    expect(actual).toEqual(expected);
+  it('encodes a non-BMP character (emoji) as \\X4\\HHHHHHHH\\X0\\', () => {
+    expect(escapeStepString('😀')).toBe('\\X4\\0001F600\\X0\\');
   });
 
-  it('handles zero entities', () => {
-    const expected = assembleStepBytesReference(HEADER, []);
-    const actual = assembleStepBytes(HEADER, []);
-    expect(actual).toEqual(expected);
-  });
-
-  it('round-trips through TextDecoder back to the original entity text', () => {
-    const bytes = assembleStepBytes(HEADER, UTF8_ENTITIES);
-    const text = new TextDecoder('utf-8').decode(bytes);
-    for (const entity of UTF8_ENTITIES) {
-      expect(text).toContain(entity);
-    }
-  });
-});
-
-describe('assembleStepBlob', () => {
-  it('has byte content identical to assembleStepBytes on a multi-byte UTF-8 corpus', async () => {
-    const blob = assembleStepBlob(HEADER, UTF8_ENTITIES);
-    const blobBytes = new Uint8Array(await blob.arrayBuffer());
-    const bytes = assembleStepBytes(HEADER, UTF8_ENTITIES);
-    expect(blobBytes).toEqual(bytes);
-  });
-
-  it('has byte content identical to assembleStepBytes on ASCII-only entities', async () => {
-    const entities = [
-      "#1=IFCPROJECT('0000000000000000000001',$,'Project',$,$,$,$,$,$);",
-      "#2=IFCWALL('0000000000000000000002',$,'Wall 1',$,$,$,$,$,$);",
-    ];
-    const blob = assembleStepBlob(HEADER, entities);
-    const blobBytes = new Uint8Array(await blob.arrayBuffer());
-    const bytes = assembleStepBytes(HEADER, entities);
-    expect(blobBytes).toEqual(bytes);
-  });
-
-  it('handles zero entities identically to assembleStepBytes', async () => {
-    const blob = assembleStepBlob(HEADER, []);
-    const blobBytes = new Uint8Array(await blob.arrayBuffer());
-    const bytes = assembleStepBytes(HEADER, []);
-    expect(blobBytes).toEqual(bytes);
-  });
-
-  it('reports the combined byte size via blob.size', async () => {
-    const blob = assembleStepBlob(HEADER, UTF8_ENTITIES);
-    const bytes = assembleStepBytes(HEADER, UTF8_ENTITIES);
-    expect(blob.size).toBe(bytes.byteLength);
+  it('leaves printable ASCII untouched', () => {
+    expect(escapeStepString('plain text 123')).toBe('plain text 123');
   });
 });

@@ -14,7 +14,7 @@
  *    localStorage; shareable via export / import.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Settings2, Plus, Pencil, Trash2, RotateCcw, Upload, Download, Check, X,
 } from 'lucide-react';
@@ -32,7 +32,8 @@ import { cn } from '@/lib/utils';
 import { toast } from '@/components/ui/toast';
 import { useViewerStore } from '@/store';
 import { matchesSelector, type ClashSeverity } from '@ifc-lite/clash';
-import { exportPresets, importPresets, type ClashPreset } from '@/lib/clash/persistence';
+import { exportPresets, importPresets, type ClashPreset, type SaveResult } from '@/lib/clash/persistence';
+import { setClashSettingsSaveReporter } from '@/lib/clash/settings-save-notice';
 
 const SEVERITY: Record<ClashSeverity, { label: string; color: string }> = {
   critical: { label: 'Critical', color: '#f7768e' },
@@ -58,6 +59,7 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
   const mode = useViewerStore((s) => s.clashMode);
   const tolerance = useViewerStore((s) => s.clashTolerance);
   const clearance = useViewerStore((s) => s.clashClearance);
+  const duplicateTolerance = useViewerStore((s) => s.clashDuplicateTolerance);
   const clusterEpsilon = useViewerStore((s) => s.clashClusterEpsilon);
   const reportTouch = useViewerStore((s) => s.clashReportTouch);
   const showRegionBox = useViewerStore((s) => s.showClashRegionBox);
@@ -68,6 +70,7 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
   const setMode = useViewerStore((s) => s.setClashMode);
   const setTolerance = useViewerStore((s) => s.setClashTolerance);
   const setClearance = useViewerStore((s) => s.setClashClearance);
+  const setDuplicateTolerance = useViewerStore((s) => s.setClashDuplicateTolerance);
   const setClusterEpsilon = useViewerStore((s) => s.setClashClusterEpsilon);
   const setReportTouch = useViewerStore((s) => s.setClashReportTouch);
   const setShowRegionBox = useViewerStore((s) => s.setShowClashRegionBox);
@@ -82,6 +85,14 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Detection settings commit optimistically and persist in the background, so
+  // a refused write (quota, or storage blocked) is only visible if something
+  // says so. This component is mounted with the clash panel header — i.e.
+  // whenever the user can reach the Detection tab — so give the slice's
+  // once-per-session notice a toast to land in; it falls back to console.warn
+  // when nothing is mounted. The effect returns the unregister.
+  useEffect(() => setClashSettingsSaveReporter(toast.error), []);
 
   const matchCount = useCallback(
     (selector: string): number | null => {
@@ -140,6 +151,13 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
     },
     [importClashPresets],
   );
+
+  // Delete / toggle / reset only commit when the write landed (clashSlice), so
+  // a refused write leaves the row, the switch and the rule set exactly as they
+  // were — all this has to add is the reason.
+  const reportSaveFailure = useCallback((result: SaveResult) => {
+    if (!result.ok) toast.error(result.message);
+  }, []);
 
   const enabledCount = useMemo(() => presets.filter((p) => p.enabled).length, [presets]);
 
@@ -202,6 +220,10 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
               <NumberField value={clearance} step={0.01} min={0} onCommit={setClearance} suffix="m" />
             </SettingRow>
 
+            <SettingRow label="Duplicate tolerance" hint="How far apart (m) two elements may be and still count as the same object in the duplicate scan. Capped by each element's own thickness: a 2 mm plate gets 2 mm across its thickness, not the full value.">
+              <NumberField value={duplicateTolerance} step={0.001} min={0} onCommit={setDuplicateTolerance} suffix="m" />
+            </SettingRow>
+
             <SettingRow label="Cluster radius" hint="How far apart clashes can be and still merge into one BCF topic (m).">
               <NumberField value={clusterEpsilon} step={0.1} min={0.01} onCommit={setClusterEpsilon} suffix="m" />
             </SettingRow>
@@ -239,7 +261,7 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
                 <Plus className="h-3.5 w-3.5 mr-1" /> Add rule
               </Button>
               <div className="ml-auto flex items-center gap-1">
-                <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" title="Reset to the built-in rules" onClick={resetPresets}>
+                <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" title="Reset to the built-in rules" onClick={() => reportSaveFailure(resetPresets())}>
                   <RotateCcw className="h-3.5 w-3.5" />
                 </Button>
                 <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" title="Export rules" onClick={() => exportPresets(presets)}>
@@ -275,7 +297,7 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
                       !p.enabled && 'opacity-55',
                     )}
                   >
-                    <Switch checked={p.enabled} onCheckedChange={(v) => setPresetEnabled(p.id, v)} />
+                    <Switch checked={p.enabled} onCheckedChange={(v) => reportSaveFailure(setPresetEnabled(p.id, v))} />
                     <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: SEVERITY[p.severity].color }} />
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-xs font-medium">
@@ -292,7 +314,7 @@ export function ClashSettingsDialog({ trigger }: ClashSettingsDialogProps) {
                     {p.builtin ? (
                       <span className="w-6" />
                     ) : (
-                      <Button variant="ghost" size="icon" className="h-6 w-6" title="Delete" onClick={() => deletePreset(p.id)}>
+                      <Button variant="ghost" size="icon" className="h-6 w-6" title="Delete" onClick={() => reportSaveFailure(deletePreset(p.id))}>
                         <Trash2 className="h-3 w-3" />
                       </Button>
                     )}

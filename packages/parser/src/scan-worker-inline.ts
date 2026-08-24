@@ -192,6 +192,41 @@ self.onmessage = function(e) {
     } else if (ch === 0x0A) {
       line++;
       pos++;
+    } else if (ch === 0x27) { // quote
+      // Consume a string literal whole. HEADER records carry no '#', so this
+      // loop walks them byte by byte, and a '/*' inside a description would
+      // otherwise open a comment that never closes and take DATA with it.
+      var sp = pos + 1;
+      while (sp < len) {
+        if (buf[sp] === 0x27) {
+          if (sp + 1 < len && buf[sp + 1] === 0x27) { sp += 2; continue; }
+          sp++;
+          break;
+        }
+        if (buf[sp] === 0x0A) { line++; }
+        sp++;
+      }
+      pos = sp;
+    } else if (ch === 0x2F && pos + 1 < len && buf[pos + 1] === 0x2A) {
+      // Skip a /* */ region. A record that is commented out is still a
+      // well-formed #id = TYPE(...), so every check above accepts it and only
+      // skipping the region rejects it. Kept byte-identical to
+      // step-lexing.ts, which this cannot import: the worker source is a
+      // string, so the third copy of this loop has to carry its own copy of
+      // the rule. Comments do not nest, per ISO 10303-21.
+      var cp = pos + 2;
+      var closed = false;
+      while (cp + 1 < len) {
+        if (buf[cp] === 0x2A && buf[cp + 1] === 0x2F) { closed = true; break; }
+        if (buf[cp] === 0x0A) { line++; }
+        cp++;
+      }
+      if (!closed) {
+        // Unterminated: everything to EOF is commented out.
+        pos = len;
+        break;
+      }
+      pos = cp + 2;
     } else {
       pos++;
     }
@@ -238,10 +273,24 @@ export function scanEntitiesInWorker(
   buffer: ArrayBuffer | SharedArrayBuffer,
 ): Promise<EntityRefWorkerResult[]> {
   return new Promise((resolve, reject) => {
+    // Declared outside the try so the catch block below can still reach it:
+    // `new Worker(...)` can succeed and a later step in this same try (e.g.
+    // `postMessage` on an already-detached buffer, or under memory pressure
+    // while cloning a large one) can still throw. A `worker` scoped to the
+    // try block would be unreachable from `catch`, leaking the spawned
+    // worker — construct-then-fail with no handle to dispose it.
+    let worker: Worker | undefined;
     try {
-      const worker = new Worker(getWorkerBlobUrl());
+      worker = new Worker(getWorkerBlobUrl());
+      // TS loses the `worker` narrowing inside these closures (a captured
+      // `let` is re-widened to `Worker | undefined` at the point the
+      // callback body reads it), even though it is definitely assigned by
+      // the time either callback can run. Alias to a const so the handlers
+      // reference a known-`Worker` binding instead of asserting past the
+      // checker.
+      const activeWorker = worker;
 
-      worker.onmessage = (e: MessageEvent) => {
+      activeWorker.onmessage = (e: MessageEvent) => {
         const { ids, offsets, lengths, lines, types, count } = e.data;
         const idArr = new Uint32Array(ids);
         const offsetArr = new Uint32Array(offsets);
@@ -259,19 +308,20 @@ export function scanEntitiesInWorker(
           };
         }
 
-        worker.terminate();
+        activeWorker.terminate();
         resolve(refs);
       };
 
-      worker.onerror = (e) => {
-        worker.terminate();
+      activeWorker.onerror = (e) => {
+        activeWorker.terminate();
         reject(new Error(`Scan worker error: ${e.message}`));
       };
 
       // Send buffer copy to worker (structured clone — browser copies efficiently).
       // Do NOT transfer: caller needs the original buffer for columnar parsing.
-      worker.postMessage(buffer);
+      activeWorker.postMessage(buffer);
     } catch (err) {
+      worker?.terminate();
       reject(err);
     }
   });

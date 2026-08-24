@@ -27,7 +27,7 @@ describe('addBeamToStore', () => {
 
     const result = addBeamToStore(
       editor,
-      { ownerHistoryId: 5, bodyContextId: 14, storeyId: 43, storeyPlacementId: 54 },
+      { ownerHistoryId: 5, bodyContextId: 14, axisContextId: 15, storeyId: 43, storeyPlacementId: 54 },
       { Start: [0, 0, 3], End: [4, 0, 3], Width: 0.3, Height: 0.5 },
     );
 
@@ -54,13 +54,28 @@ describe('addBeamToStore', () => {
     const editor = new StoreEditor(makeStore(10), view);
     expect(() => addBeamToStore(
       editor,
-      { ownerHistoryId: 1, bodyContextId: 2, storeyId: 3, storeyPlacementId: 4 },
+      { ownerHistoryId: 1, bodyContextId: 2, axisContextId: 5, storeyId: 3, storeyPlacementId: 4 },
       { Start: [0, 0, 0], End: [0, 0, 0], Width: 0.3, Height: 0.5 },
     )).toThrow(/distinct/);
     expect(() => addBeamToStore(
       editor,
-      { ownerHistoryId: 1, bodyContextId: 2, storeyId: 3, storeyPlacementId: 4 },
+      { ownerHistoryId: 1, bodyContextId: 2, axisContextId: 5, storeyId: 3, storeyPlacementId: 4 },
       { Start: [0, 0, 0], End: [1, 0, 0], Width: 0, Height: 0.5 },
     )).toThrow(/positive/);
+  });
+
+  it.each([
+    ['NaN Start[0]', [Number.NaN, 0, 0] as const, [5, 0, 0] as const],
+    ['Infinity Start[2]', [0, 0, Number.POSITIVE_INFINITY] as const, [5, 0, 0] as const],
+    ['NaN End[1]', [0, 0, 0] as const, [5, Number.NaN, 0] as const],
+    ['-Infinity End[2]', [0, 0, 0] as const, [5, 0, Number.NEGATIVE_INFINITY] as const],
+  ])('rejects non-finite coordinates (%s)', (_label, Start, End) => {
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(makeStore(10), view);
+    expect(() => addBeamToStore(
+      editor,
+      { ownerHistoryId: 1, bodyContextId: 2, axisContextId: 5, storeyId: 3, storeyPlacementId: 4 },
+      { Start: [...Start], End: [...End], Width: 0.3, Height: 0.5 },
+    )).toThrow(/finite/);
   });
 });

@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
-import { FederationRegistry } from './federation-registry.ts';
+import { FederationRegistry } from './federation-registry.js';
 
 describe('FederationRegistry - offset assignment', () => {
   it('registers models with non-overlapping offsets and a +1 gap', () => {
@@ -46,6 +46,19 @@ describe('FederationRegistry - offset assignment', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 1_999_999_990);
     assert.throws(() => reg.registerModel('modelB', 100), /exceed safe ID limit/);
+  });
+
+  it('allows registration landing EXACTLY on the MAX_SAFE_OFFSET boundary, rejects one past it', () => {
+    // The guard is `nextOffset + maxExpressId > MAX_SAFE_OFFSET`: landing
+    // exactly ON the limit must be allowed (the boundary itself is safe),
+    // only crossing it must throw. Testing only far past the limit (as the
+    // test above does) cannot tell `>` apart from `>=` at the boundary.
+    const reg = new FederationRegistry();
+    reg.registerModel('modelA', 0); // offset 0, nextOffset -> 1
+    // sum = nextOffset(1) + maxExpressId(1_999_999_999) = 2_000_000_000 exactly.
+    assert.doesNotThrow(() => reg.registerModel('modelB', 1_999_999_999));
+    // nextOffset is now 2_000_000_001; any further model overflows by exactly 1.
+    assert.throws(() => reg.registerModel('modelC', 0), /exceed safe ID limit/);
   });
 });
 

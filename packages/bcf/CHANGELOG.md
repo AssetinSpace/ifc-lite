@@ -1,5 +1,167 @@
 # @ifc-lite/bcf
 
+## 1.18.2
+
+### Patch Changes
+
+- [#2900](https://github.com/LTplus-AG/ifc-lite/pull/2900) [`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fail `writeBCF` for a BCF 3.0 topic missing `TopicType` or `TopicStatus` instead of silently emitting invalid markup.
+  
+  buildingSMART/BCF-XML `markup.xsd` (`release_3_0`) tightens both attributes
+  from optional (2.1) to `use="required"`:
+  
+  ```
+  <xs:attribute name="TopicType" type="NonEmptyOrBlankString" use="required"/>
+  <xs:attribute name="TopicStatus" type="NonEmptyOrBlankString" use="required"/>
+  ```
+  
+  `BCFTopic.topicType`/`topicStatus` are optional in our type, and the writer
+  previously omitted the attribute entirely when either was unset, at both
+  versions -- valid for 2.1, but schema-invalid for 3.0. Every first-party call
+  site (`createBCFTopic`, the viewer's topic form, the IDS-to-BCF reporter, the
+  clash bridge) already defaults both fields, so the gap was unreachable from
+  the shipped app; it is reachable from the public `@ifc-lite/bcf` API
+  (`createBCFProject({version:'3.0'})` + a hand-built `BCFTopic` +
+  `addTopicToProject` + `writeBCF`), which SDK/script consumers can call
+  directly.
+  
+  `writeBCF` now throws when writing a 3.0 topic without `topicType` or
+  `topicStatus`, naming the missing attribute and the topic's guid, rather than
+  inventing a default status the caller never chose -- a fabricated "Open" or
+  "Issue" would misrepresent a topic's real state to every downstream
+  consumer that reads `TopicStatus` for workflow logic. 2.1 output is
+  unaffected; both attributes stay optional there.
+
+- [#2758](https://github.com/LTplus-AG/ifc-lite/pull/2758) [`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readBCF` silently dropping topics from spec-legal BCF files written by other tools.
+  
+  `reader.ts`'s regexes for `<Topic>`, `<RelatedTopic>`, `<Comment>`, and the
+  comment's `<Viewpoint>` reference required `Guid` to be the attribute
+  immediately after the tag name. XML attribute order is not semantically
+  significant, so a file written with e.g. `<Topic TopicType="Issue"
+  TopicStatus="Open" Guid="topic-1">` failed to match: `readTopic` logged
+  "missing Topic element" and the whole topic -- title, comments, viewpoints --
+  was silently dropped with no throw and no partial result.
+  
+  Our own `writer.ts` always emits `Guid` first, so every self round-trip
+  passed and no existing test caught this; only a file from another tool
+  exposed it.
+  
+  Each affected site now matches the opening tag generically (`<Tag\b([^>]*)>`)
+  and pulls individual attributes out of the captured attribute string with a
+  new shared `extractAttr` helper, so attribute order can no longer matter at
+  any of these call sites.
+
+- [#2899](https://github.com/LTplus-AG/ifc-lite/pull/2899) [`bc179f6`](https://github.com/LTplus-AG/ifc-lite/commit/bc179f6a1091c8c307a07b31d8c30fbba140e4a9) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `markup.bcf`'s `<Topic>` children being written out of `xs:sequence` order.
+  
+  buildingSMART's BCF `markup.xsd` `Topic` sequence — identical in release_2_1 and release_3_0 — is `Title, Priority, Index, Labels, CreationDate, CreationAuthor, ModifiedDate, ModifiedAuthor, DueDate, AssignedTo, Stage, Description, BimSnippet, ...`. The writer previously emitted `Description` right after `Title` (before `Priority`/`Index`/`Labels`/the creation and modification fields/`Stage`) and `Labels` after `Stage` (long after `Priority`/`Index`) — both schema-invalid, since `xs:sequence` enforces element order, whenever a topic actually had a `Description` or non-empty `Labels` to write (an absent `Description` or empty `Labels` produced no element to be out of order). Confirmed against buildingSMART/BCF-XML's own release_3_0 conformance fixture (`Test Cases/v3.0/Visualization/Perspective camera`), whose `markup.bcf` places `Description` right before `BimSnippet`/`DocumentReferences`, matching the schema.
+
+- [#2900](https://github.com/LTplus-AG/ifc-lite/pull/2900) [`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `writeBCF` accepting a BCF 3.0 topic whose `topicType` or `topicStatus`
+  is XML-whitespace-only (e.g. `'   '` or `'\t'`) and writing it verbatim.
+  
+  `writeMarkupFile`'s BCF 3.0 required-attribute check used a bare `!value`
+  test, which is falsy only for `undefined`/`''`. `markup.xsd` types both
+  attributes as `NonEmptyOrBlankString`: after XML whitespace (`#x9`, `#xA`,
+  `#xD`, `#x20`) is collapsed, the value must have length >= 1, so a
+  whitespace-only value is schema-invalid even though it is JS-truthy. The
+  check now also rejects a value that is entirely XML whitespace, with the
+  same "fail the write rather than invent a value" behavior as the
+  already-existing absent-value case.
+
+- [#2760](https://github.com/LTplus-AG/ifc-lite/pull/2760) [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readBCF` failing to resolve a viewpoint's snapshot when `markup.bcf` names
+  it with a non-buildingSMART-convention filename.
+  
+  `parseViewpoints` looked up each viewpoint's declared `<Viewpoint>`/`<Snapshot>`
+  filenames in `markup.bcf` with a regex matching the singular tag
+  `<Viewpoint Guid="...">`. The markup element that actually carries those
+  filenames is plural — `<Viewpoints Guid="...">`, per the BCF 2.1/3.0 schema and
+  this package's own writer (`writer.ts` `writeMarkupFile` emits exactly that tag)
+  — so the regex could never match a spec-correct file, and the lookup map was
+  always empty. Every snapshot resolution silently fell through to a
+  filename-guessing fallback (`Viewpoint_<guid>.bcfv` → `Snapshot_<guid>.png` and
+  similar patterns). That fallback happens to cover buildingSMART's own reference
+  fixtures, which follow the convention, but a third-party file is free to name
+  its entries however it likes; when the filenames don't match a guessed
+  pattern, the snapshot markup.bcf explicitly names was silently dropped even
+  though it exists in the archive.
+  
+  The viewpoint's own GUID was never at risk — it comes from the `.bcfv` file's
+  `<VisualizationInfo Guid="...">` element directly, independent of this lookup
+  — so this was a snapshot-association defect, not a GUID/identity defect.
+  
+  Fixed the regex to match the plural `<Viewpoints>` tag, so the markup-declared
+  filename is used when present and the naming-convention fallback now only
+  runs when markup.bcf genuinely doesn't declare a snapshot. Added a test using
+  a synthetic third-party-shaped archive (custom filenames, spec-legal) that
+  previously lost its snapshot and now resolves it, plus a regression test
+  against the buildingSMART `PerspectiveCamera.bcf` fixture.
+
+- [#2902](https://github.com/LTplus-AG/ifc-lite/pull/2902) [`5a9ecfb`](https://github.com/LTplus-AG/ifc-lite/commit/5a9ecfb6bcd3190eae4463bd8926cf38a2143496) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Harden the IDS→BCF reporter's camera-direction test so a sign-flipped viewpoint camera can't pass silently.
+  
+  `computeCameraFromBounds` (`ids-reporter.ts`) places the BCF viewpoint camera
+  off-center and points it back at the failing entity. The only test covering
+  that direction, `should point camera toward entity center`, checked just
+  `Math.sqrt(x²+y²+z²) ≈ 1` — true for *any* unit vector, including one
+  pointing the camera at empty space away from the entity. Reversing the
+  `dx/dy/dz` sign in `computeCameraFromBounds` (camera looking away from the
+  entity instead of at it) left all 48 `ids-reporter.test.ts` tests green.
+  
+  The test now asserts `cameraDirection` equals the normalized vector from the
+  (converted) camera position to the (converted) entity center, so a reversed
+  sign fails. No production code changed — `computeCameraFromBounds` already
+  computes the correct direction; this closes the fixture gap that couldn't
+  have caught a regression there. Confirmed by mutation: reversing the sign in
+  `computeCameraFromBounds` now fails the new assertion; reverting restores 48/48.
+
+## 1.18.1
+
+### Patch Changes
+
+- Updated dependencies [[`b4b3e0c`](https://github.com/LTplus-AG/ifc-lite/commit/b4b3e0cfa8ffa9185e96dc266dd6fdc3fef34797)]:
+  - @ifc-lite/encoding@2.0.0
+
+## 1.18.0
+
+### Minor Changes
+
+- [#2479](https://github.com/LTplus-AG/ifc-lite/pull/2479) [`d38e71f`](https://github.com/LTplus-AG/ifc-lite/commit/d38e71feb2778cc2e9a5ee333b4f01339600dc9e) Thanks [@louistrue](https://github.com/louistrue)! - Close the five remaining paths by which a non-finite value reaches camera state: gesture arguments, model bounds, the unprojection basis, the `normalize` floor that both the picking ray and the pose pass through, and a viewpoint restore's reference distance.
+
+  The gestures validated the pose but took their arguments on trust, so a finite pose could be destroyed from the caller's side instead of the file's. `orbit`, `pan` and `moveFirstPerson` each turned a healthy pose non-finite in one call for both NaN and Infinity, and `zoom` did for NaN — its delta clamp `Math.min(|d| * s, MAX)` absorbs Infinity but not NaN, an asymmetry the rest of this family does not share. The inertia velocities are worse than one bad frame: they accumulate in place and are only spent while `Math.abs(v) > minVelocity`, which is false for NaN, so a single poisoned argument would latch orbit, pan or zoom inertia dead for the session, never applied and never decaying. The cursor-anchored zoom divides by the canvas dimensions; the old truthiness test rejected `0` and `NaN` because both are falsy, but accepted a negative width, which mirrors the anchor, and `Infinity`, which pins it to a screen edge — and it never checked the cursor coordinates at all. A non-finite gesture argument now leaves the pose exactly as it found it, and an unusable cursor anchor — a non-finite coordinate or an unusable canvas extent — degrades to the un-anchored zoom, `orthoSize` included, rather than refusing to zoom. In-app event handlers cannot produce these values — wheel and pointer deltas are browser-guaranteed finite, the SpaceMouse driver clamps its axes, the pinch delta is a subtraction rather than a division, and every canvas writer floors the drawing buffer — so the route this guards is the published one, which `docs/guide/quickstart.md` and the `create-ifc-lite` template both teach by wiring raw browser input straight into these methods. `Renderer.resize` is hardened for the same reason: `canvas.width` is an IDL `unsigned long`, so it silently coerces a non-finite argument to `0`, and no pick guard in the package checks the drawing buffer.
+
+  `frameBounds`, `zoomExtent`, `fitToBounds`, `setPresetView` and `fitBoundsAdaptive` all compute a centre and an extent from an AABB and write both into the pose — and, orthographically, into `orthoSize`, which `getOrthoSize()` reads and a saved viewpoint persists, so a bad fit outlived the session. The bounds are not caller-authored constants: every AABB accumulator in the package seeds `min = +Infinity, max = -Infinity` and narrows on a bare comparison, which is false for a non-finite vertex, so a mesh with no finite vertex hands out that inverted sentinel as if it were a real box — `model-bounds-tracker.test.ts` already pinned exactly that value — and `Scene.getEntityBoundingBox` neither filters it nor declines to cache it. An unusable box is now rejected and the camera keeps the pose it had, which is the same policy `setAspect`, `setFOV` and `setOrthoSize` settled on; there is no meaningful clamp for an infinite extent and no previous bounds to fall back to at these stateless entry points. A _degenerate_ box — a flat wall, a single point — is explicitly still framed. The two writers that bypassed `setOrthoSize` (the orthographic zoom and the animator's interpolation) now go through the same clamp, which also catches the reachable overflow of a legitimately huge half-height scaled by one more zoom-out notch.
+
+  `unprojectToRay` returned a `(NaN, NaN, NaN)` ray origin for a non-finite `camera.up`, for both flavours, while the rendered frame stayed perfectly finite. That value leaves the package into picking and measurement, which test hits with comparisons — all false against NaN — so the click read as empty space rather than as an error. The orthographic branch was rebuilding its own screen basis with none of `lookAt`'s degeneracy handling, and that is what settles the design question: because `lookAt` substitutes a deterministic basis when `up` carries no usable orientation, there _is_ a well-defined frame on screen, and the ray must belong to it. `viewBasis` is now the single source of both, so they cannot drift; returning `null` instead would have failed a pick on a frame the user can see and pushed a branch onto every caller of a published API. The same function supplies the ray origin, so a non-finite camera position no longer produces a ray for a pose that was never rendered, and a viewport with no extent reads as a centred cursor rather than as an infinite one.
+
+  The last member of the family is the floor inside `normalize` itself, in both copies of it: `MathUtils.normalize` (published) floored on `len < 1e-10` and the camera controls' private copy on `len > 1e-10`. Both are magnitude tests, so an infinite length passes them, and scaling by `1 / Infinity` turns an infinite component into NaN while the finite ones go to a clean `0` — a result that is neither finite nor the zero vector every caller falls back on, so the degenerate-case branch could not see it. Both are reached from inputs that are finite throughout, which is why no earlier guard in this family caught them: `MathUtils.invert` stores its result in a `Float32Array`, so an inverse component past 3.4e38 saturates to `Infinity` and `unprojectToRay` returned a direction of `{NaN, 0, -0}` — the silent picking miss again, this time in the perspective branch; and `cross(forward, up)` overflows component-wise for an `up` at the top of the double range, which put NaN into all six coordinates of `position` and `target` on one cursor-anchored wheel notch, past an `isUsableUp` that is a finiteness test and therefore accepts `Number.MAX_VALUE`. `normalize` is now total in both places: everything it cannot normalize is the zero vector, which is what its callers already handle.
+
+  On the BCF side, `parsePoint` extracted coordinates with a bare `parseFloat`, which has no out-of-band failure value: `"NaN"` parses to `NaN` and the well-formed literal `"1e999"` parses to `Infinity`. A coordinate, `FieldOfView` or `ViewToWorldScale` that is not a real number is now reported the same way a missing element already was, so the camera is dropped and the rest of the viewpoint — selection, visibility, clipping, snapshot — still applies; every call site already handled that signal, so this adds no new branch. Separately, the conversions that turn a viewpoint into a viewer pose take the viewer's live `camera.getDistance()` as their reference distance, and that value is raw by contract, so once a pose was broken by any route every restore computed `target = viewPoint + direction * NaN` — meaning restoring a known-good viewpoint, the obvious way out, could not repair the camera. `perspectiveToCamera`, `orthogonalToCamera` and `computeMarkerPositions` now fall back to their documented defaults for a reference distance that is not usable, which is one guard at the sink every restore path funnels through rather than one per app-layer consumer; there are six of those, and guarding them individually is the arrangement that produced the gap.
+
+### Patch Changes
+
+- Updated dependencies [[`eb39b27`](https://github.com/LTplus-AG/ifc-lite/commit/eb39b27f5eba186b23b3a683c25fff2c60084d9c), [`7c686f9`](https://github.com/LTplus-AG/ifc-lite/commit/7c686f9ac39f78a707dc083c798b6ef3d255e171)]:
+  - @ifc-lite/encoding@1.16.0
+
+## 1.17.0
+
+### Minor Changes
+
+- [#2315](https://github.com/LTplus-AG/ifc-lite/pull/2315) [`1843d9f`](https://github.com/LTplus-AG/ifc-lite/commit/1843d9f13a7a10183f780ae0a1df9dd225938e73) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix BCF 3.0 `BimSnippet` and `DocumentReference` being written and read in the BCF 2.1 shape, which made our 3.0 output schema-invalid and silently dropped or corrupted the equivalent fields when reading a spec-correct 3.0 file from another vendor's tool.
+
+  Three divergences between the two schema versions were unhandled (all per `buildingSMART/BCF-XML` `markup.xsd`):
+
+  - `BimSnippet`'s external flag is `isExternal` in 2.1 and `IsExternal` in 3.0. The reader only matched the lowercase spelling, so a spec-correct 3.0 file with `IsExternal="true"` read back as `isExternal: false` — a silent wrong value, not a parse failure. The writer emitted lowercase at version 3.0. The same rename is already handled for the `Header`/`<File>` attribute; this applies the identical treatment to `BimSnippet`.
+  - `DocumentReference` replaced 2.1's `<ReferencedDocument>` plus `isExternal` with a choice of `<DocumentGuid>` (a reference into `project.bcfp`'s Documents) or `<Url>`, dropping `isExternal` entirely. The reader required `<ReferencedDocument>` to be present, so every reference in a 3.0 file was dropped; the writer emitted the 2.1 shape regardless of version.
+  - 3.0 groups the entries under a single `<DocumentReferences>` container, while 2.1 repeats `<DocumentReference>` directly under `<Topic>`. The writer emitted the 2.1 containment at version 3.0.
+
+  `BCFDocumentReference` gains optional `documentGuid` and `url`, and `isExternal`/`referencedDocument` become optional since 3.0 has no equivalent — hence a minor rather than a patch, as reading either field now requires a presence check.
+
+### Patch Changes
+
+- [#2310](https://github.com/LTplus-AG/ifc-lite/pull/2310) [`8b09cfd`](https://github.com/LTplus-AG/ifc-lite/commit/8b09cfdadafaea9806e79b73deb9119ea66b5aa4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a zip-slip hazard in `writeBCF`: a viewpoint GUID is parsed unvalidated from untrusted markup XML on read, and was used verbatim in the `Viewpoint_<guid>.bcfv` / `Snapshot_<guid>.*` zip entry names. A crafted GUID containing `../` on a read-modify-save (e.g. `ifc-lite bcf add-comment`) could write a zip entry outside the archive root. The topic GUID already went through a sanitizer for the same reason; the viewpoint GUID now goes through the same sanitizer, computed once per viewpoint so the markup `<Viewpoint>` filename reference and the actual zip entry always agree.
+
+  ifc-lite's own reader is in-memory and unaffected by this; the risk is a re-exported `.bcfzip` containing entries with literal `../` segments that could escape the archive root in a downstream tool that extracts entries by joining names onto a directory.
+
+- Updated dependencies [[`273b068`](https://github.com/LTplus-AG/ifc-lite/commit/273b06827ef1469f63c396d204474a9f2400c642)]:
+  - @ifc-lite/encoding@1.15.1
+
 ## 1.16.3
 
 ### Patch Changes

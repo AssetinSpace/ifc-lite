@@ -8,6 +8,7 @@
  */
 
 import { Camera } from './camera.js';
+import { isEntityVisible } from './entity-visibility.js';
 import { Scene } from './scene.js';
 import { Raycaster, type Intersection, type Ray } from './raycaster.js';
 import { SnapDetector, SnapType, type SnapTarget, type SnapOptions, type EdgeLockInput, type MagneticSnapResult } from './snap-detector.js';
@@ -113,14 +114,7 @@ export class RaycastEngine {
 
             for (const piece of pieces) {
                 // Apply visibility filtering
-                if (options?.hiddenIds?.has(piece.expressId)) continue;
-                if (
-                    options?.isolatedIds !== null &&
-                    options?.isolatedIds !== undefined &&
-                    !options.isolatedIds.has(piece.expressId)
-                ) {
-                    continue;
-                }
+                if (!isEntityVisible(piece.expressId, options?.hiddenIds, options?.isolatedIds)) continue;
 
                 // Avoid duplicates when a piece is reachable from both regular and
                 // batched passes — but DON'T collapse distinct pieces of one entity.
@@ -148,10 +142,17 @@ export class RaycastEngine {
             pushVisiblePieces(mesh.expressId, mesh.modelIndex);
         }
 
-        // Collect mesh data from batched meshes
+        // Collect mesh data from batched meshes. Batches group by colour, NOT
+        // by model (see Scene.bucketBaseKey / BatchedMesh.modelIndices), so
+        // two federated models sharing an expressId AND colour can be
+        // co-batched. Scope each entry to ITS OWN modelIndex (parallel array,
+        // same index = same source piece) rather than calling
+        // getMeshDataPieces(expressId) unscoped, which would return every
+        // model's pieces for that id — including ones with no entry in this
+        // batch or scene at all.
         for (const batch of batchedMeshes) {
-            for (const expressId of batch.expressIds) {
-                pushVisiblePieces(expressId);
+            for (let i = 0; i < batch.expressIds.length; i++) {
+                pushVisiblePieces(batch.expressIds[i], batch.modelIndices?.[i]);
             }
         }
 
@@ -162,14 +163,7 @@ export class RaycastEngine {
         // is supplied (defensive) we skip instanced rather than expand everything.
         if (ray) {
             for (const eid of this.scene.getInstancedEntityIds()) {
-                if (options?.hiddenIds?.has(eid)) continue;
-                if (
-                    options?.isolatedIds !== null &&
-                    options?.isolatedIds !== undefined &&
-                    !options.isolatedIds.has(eid)
-                ) {
-                    continue;
-                }
+                if (!isEntityVisible(eid, options?.hiddenIds, options?.isolatedIds)) continue;
                 const bounds = this.scene.getInstancedEntityBounds(eid);
                 if (!bounds || !this.rayHitsBounds(ray, bounds)) continue;
                 const pieces = this.scene.getInstancedMeshDataPieces(eid);
