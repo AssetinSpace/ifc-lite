@@ -23,6 +23,20 @@ import type {
 import { decodeParquetGeometry, decodeOptimizedParquetGeometry, isParquetAvailable } from './parquet-decoder.js';
 
 /**
+ * Raised when an SSE parse stream ends with no terminal event.
+ *
+ * Shared by `parseStream` and `parseStreamToParquet` so the two cannot drift
+ * apart by an article. The wording has to hold on BOTH paths, which it does:
+ * `parseStreamToParquet` throws on an `error` event at its own `case 'error'`,
+ * so it can only reach its `!stats || !metadata` check in the same state
+ * `parseStream`'s `!terminated` describes — the stream stopped without ever
+ * saying why. Not exported: it is an internal guarantee about two call sites,
+ * not part of the published surface.
+ */
+const STREAM_ENDED_WITHOUT_TERMINAL_EVENT =
+  'Stream ended without a complete event (connection dropped or the server failed mid-parse)';
+
+/**
  * Compress a file or ArrayBuffer using gzip compression.
  * Uses the browser's CompressionStream API for efficient compression.
  *
@@ -362,83 +376,90 @@ export class IfcServerClient {
     let metadata: ModelMetadata | null = null;
     let symbolic_data: SymbolicData | undefined;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    // A thrown 'error' event (or any other exception mid-loop) must not
+    // leave the reader locked on `response.body` — mirrors the try/finally
+    // `parseStream` already uses for the same SSE-reading shape.
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true });
 
-      // Process complete SSE events
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        // Process complete SSE events
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-      for (const line of lines) {
-        if (!line.startsWith('data:')) continue;
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
 
-        const jsonStr = line.slice(5).trim();
-        if (!jsonStr) continue;
+          const jsonStr = line.slice(5).trim();
+          if (!jsonStr) continue;
 
-        try {
-          const event: ParquetStreamEvent = JSON.parse(jsonStr);
+          try {
+            const event: ParquetStreamEvent = JSON.parse(jsonStr);
 
-          switch (event.type) {
-            case 'start':
-              cache_key = event.cache_key;
-              console.log(`[client] Stream started: ${event.total_estimate} entities, cache_key: ${cache_key.substring(0, 16)}...`);
-              break;
+            switch (event.type) {
+              case 'start':
+                cache_key = event.cache_key;
+                console.log(`[client] Stream started: ${event.total_estimate} entities, cache_key: ${cache_key.substring(0, 16)}...`);
+                break;
 
-            case 'progress':
-              // Progress events can be used for UI feedback
-              break;
+              case 'progress':
+                // Progress events can be used for UI feedback
+                break;
 
-            case 'batch': {
-              const decodeStart = performance.now();
-              // Decode base64 Parquet data
-              const binaryStr = atob(event.data);
-              const bytes = new Uint8Array(binaryStr.length);
-              for (let i = 0; i < binaryStr.length; i++) {
-                bytes[i] = binaryStr.charCodeAt(i);
+              case 'batch': {
+                const decodeStart = performance.now();
+                // Decode base64 Parquet data
+                const binaryStr = atob(event.data);
+                const bytes = new Uint8Array(binaryStr.length);
+                for (let i = 0; i < binaryStr.length; i++) {
+                  bytes[i] = binaryStr.charCodeAt(i);
+                }
+
+                // Decode Parquet to meshes
+                const meshes = await decodeParquetGeometry(bytes.buffer);
+                const decodeTime = performance.now() - decodeStart;
+
+                total_meshes += meshes.length;
+                console.log(`[client] Batch #${event.batch_number}: ${meshes.length} meshes, decode: ${decodeTime.toFixed(0)}ms`);
+
+                // Call the batch callback for immediate rendering
+                onBatch({
+                  meshes,
+                  batch_number: event.batch_number,
+                  decode_time_ms: decodeTime,
+                });
+                break;
               }
 
-              // Decode Parquet to meshes
-              const meshes = await decodeParquetGeometry(bytes.buffer);
-              const decodeTime = performance.now() - decodeStart;
+              case 'complete':
+                stats = event.stats;
+                metadata = event.metadata;
+                symbolic_data = event.symbolic_data;
+                const totalTime = performance.now() - uploadStart;
+                console.log(`[client] Stream complete: ${total_meshes} meshes in ${totalTime.toFixed(0)}ms`);
+                break;
 
-              total_meshes += meshes.length;
-              console.log(`[client] Batch #${event.batch_number}: ${meshes.length} meshes, decode: ${decodeTime.toFixed(0)}ms`);
-
-              // Call the batch callback for immediate rendering
-              onBatch({
-                meshes,
-                batch_number: event.batch_number,
-                decode_time_ms: decodeTime,
-              });
-              break;
+              case 'error':
+                throw new Error(`Stream error: ${event.message}`);
             }
-
-            case 'complete':
-              stats = event.stats;
-              metadata = event.metadata;
-              symbolic_data = event.symbolic_data;
-              const totalTime = performance.now() - uploadStart;
-              console.log(`[client] Stream complete: ${total_meshes} meshes in ${totalTime.toFixed(0)}ms`);
-              break;
-
-            case 'error':
-              throw new Error(`Stream error: ${event.message}`);
-          }
-        } catch (e) {
-          if (e instanceof SyntaxError) {
-            console.warn('[client] Failed to parse SSE event:', jsonStr);
-          } else {
-            throw e;
+          } catch (e) {
+            if (e instanceof SyntaxError) {
+              console.warn('[client] Failed to parse SSE event:', jsonStr);
+            } else {
+              throw e;
+            }
           }
         }
       }
+    } finally {
+      reader.releaseLock();
     }
 
     if (!stats || !metadata) {
-      throw new Error('Stream ended without complete event');
+      throw new Error(STREAM_ENDED_WITHOUT_TERMINAL_EVENT);
     }
 
     return {
@@ -860,6 +881,9 @@ export class IfcServerClient {
    *
    * @param file - File or ArrayBuffer containing IFC data
    * @yields Stream events (start, progress, batch, complete, error)
+   * @throws If the stream ends without a `complete` or `error` event — a
+   *   dropped connection or a server-side failure mid-parse. Breaking out
+   *   of the loop early does not trigger this.
    *
    * @example
    * ```typescript
@@ -917,6 +941,24 @@ export class IfcServerClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    // A stream that stops before `complete`/`error` is a failed parse, not
+    // a finished one — the same contract `parseStreamToParquet` enforces.
+    let terminated = false;
+
+    // Decode one SSE frame. Returns undefined (and warns) for a frame we
+    // cannot parse, so a dropped event is never invisible. The yield must
+    // stay outside the try: an error thrown *into* this generator by the
+    // consumer surfaces at the yield point and would be swallowed as if it
+    // were a malformed frame.
+    const decodeFrame = (frame: string): StreamEvent | undefined => {
+      if (!frame.startsWith('data: ')) return undefined;
+      try {
+        return JSON.parse(frame.slice(6)) as StreamEvent;
+      } catch (err) {
+        console.warn('[client] Skipping malformed SSE event:', frame, err);
+        return undefined;
+      }
+    };
 
     try {
       while (true) {
@@ -930,25 +972,22 @@ export class IfcServerClient {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as StreamEvent;
-              yield data;
-            } catch {
-              // Skip malformed events
-            }
-          }
+          const data = decodeFrame(line);
+          if (!data) continue;
+          if (data.type === 'complete' || data.type === 'error') terminated = true;
+          yield data;
         }
       }
 
       // Process remaining buffer
-      if (buffer.startsWith('data: ')) {
-        try {
-          const data = JSON.parse(buffer.slice(6)) as StreamEvent;
-          yield data;
-        } catch {
-          // Skip malformed events
-        }
+      const tail = decodeFrame(buffer);
+      if (tail) {
+        if (tail.type === 'complete' || tail.type === 'error') terminated = true;
+        yield tail;
+      }
+
+      if (!terminated) {
+        throw new Error(STREAM_ENDED_WITHOUT_TERMINAL_EVENT);
       }
     } finally {
       reader.releaseLock();
@@ -1014,6 +1053,7 @@ export class IfcServerClient {
    */
   async getCached(key: string): Promise<ParseResponse | null> {
     const response = await fetch(`${this.baseUrl}/api/v1/cache/${key}`, {
+      headers: this.authHeaders(),
       signal: AbortSignal.timeout(this.timeout),
     });
 

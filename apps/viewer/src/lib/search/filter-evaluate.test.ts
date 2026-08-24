@@ -120,6 +120,23 @@ describe('evaluateFilterRules — column-only rules', () => {
     assert.strictEqual(out[0].modelId, 'm1');
     assert.strictEqual(out[0].ifcType, 'IfcDoor');
     assert.strictEqual(out[0].globalId, '3abcdefghijklmnopqrstu');
+    // `name` was previously unasserted here — buildResult() populating it
+    // from getTypeName() instead of getName() survived every prior test.
+    assert.strictEqual(out[0].name, 'Door-A-201');
+  });
+
+  it('skips the zero-padded expressId slot (guard clause on the raw column source)', () => {
+    // Full-table iteration walks the raw expressId column, which can carry
+    // zero-padded slots on real cache-loaded stores. `candidateExpressIds`
+    // lets us plant a literal 0 without needing a padded EntityTable. A
+    // phantom id-0 row resolves to getTypeName()==='Unknown' / getName()==='',
+    // so a rule matching an empty name would wrongly include it if the
+    // `if (!expressId) continue` guard were ever deleted.
+    const store = buildStore(rows);
+    const out = evaluateFilterRules('m1', store, [Rule.name('eq', '')], 'AND', {
+      candidateExpressIds: [0, 10, 20],
+    });
+    assert.deepStrictEqual(out, []);
   });
 });
 
@@ -185,7 +202,11 @@ describe('flattenPsets / matchPropertyRule', () => {
         ],
       },
     ]);
-    assert.deepStrictEqual(flat.map((r) => r.value), ['true', '0.24', 'EXT-A', '']);
+    // Boolean renders as "True" — matching the property table / list
+    // engine's display (`@ifc-lite/encoding`'s `parsePropertyValue`), not
+    // a bespoke lowercase convention. `valueOpMatches`'s eq/ne stay
+    // case-insensitive, so this doesn't change match outcomes.
+    assert.deepStrictEqual(flat.map((r) => r.value), ['True', '0.24', 'EXT-A', '']);
   });
 
   it('matches isSet / isNotSet by (set, prop) presence only', () => {
@@ -383,6 +404,26 @@ describe('evaluateFilterRulesFederated — per-model candidate narrowing', () =>
     assert.deepStrictEqual(out, []);
   });
 
+  it('materialises a Set candidate (not just Array) so progress reports a known total', async () => {
+    // materialiseIterable() has an `instanceof Set` branch distinct from the
+    // Array/ArrayLike fast-path exercised by every other federated test —
+    // deleting that branch was previously invisible (falls back to the
+    // streaming iterator branch, which is still correct, just reports
+    // total = -1 instead of the real count).
+    const a = buildStore(rows);
+    const candidatesByModel = new Map<string, Iterable<number>>([['a', new Set([10, 20, 30])]]);
+    let lastTotal = -999;
+    const out = await evaluateFilterRulesFederated(
+      [{ id: 'a', store: a }],
+      [Rule.ifcType(['IfcWall'])],
+      'AND',
+      { candidateExpressIdsByModel: candidatesByModel, onProgress: (_s, total) => { lastTotal = total; } },
+    );
+    assert.deepStrictEqual(out.map((r) => r.expressId).sort(), [10, 20]);
+    // A materialised Set reports the real candidate count (3), not -1.
+    assert.strictEqual(lastTotal, 3);
+  });
+
   it('omitting the map keeps the legacy full-scan behaviour', async () => {
     const a = buildStore(rows);
     const out = await evaluateFilterRulesFederated(
@@ -427,12 +468,41 @@ describe('orderRulesByCost — cheap-first reordering', () => {
     assert.deepStrictEqual(reordered.map((r) => r.kind), ['ifcType', 'name', 'property', 'quantity']);
   });
 
-  it('is a stable sort — two equal-cost rules keep their input order', () => {
+  // NOTE on what this can and cannot catch. `Array.prototype.sort` has been
+  // stable BY SPECIFICATION since ES2019, so no fixture at any size can make
+  // deleting the explicit `|| a.i - b.i` tie-break in orderRulesByCost fail —
+  // equal-comparing elements keep their input order either way. This test
+  // therefore does not guard the tie-break's existence; it guards its
+  // DIRECTION, which is a real mutation (`b.i - a.i` reverses equal-cost rules
+  // and reddens this assertion). The tie-break stays in production because it
+  // states the intended ordering at the comparator rather than leaving it to
+  // an implicit language guarantee — and because its direction is pinned here.
+  it('keeps equal-cost rules in authored order, ascending by input index', () => {
     const a = Rule.name('contains', 'a');
     const b = Rule.name('contains', 'b');
     const reordered = order([a, b]);
     assert.strictEqual(reordered[0], a);
     assert.strictEqual(reordered[1], b);
+
+    // Same guarantee when the sort actually has work to do: three equal-cost
+    // `name` rules interleaved with cheaper and dearer kinds must come out in
+    // authored order relative to one another, not merely undisturbed.
+    const n1 = Rule.name('contains', '1');
+    const n2 = Rule.name('contains', '2');
+    const n3 = Rule.name('contains', '3');
+    const mixed = order([
+      Rule.property('Pset_X', 'P', 'eq', 'v'),
+      n1,
+      Rule.ifcType(['IfcWall']),
+      n2,
+      Rule.quantity('Qto_X', 'Q', 'gt', 1),
+      n3,
+    ]);
+    assert.deepStrictEqual(
+      mixed.map((r) => r.kind),
+      ['ifcType', 'name', 'name', 'name', 'property', 'quantity'],
+    );
+    assert.deepStrictEqual(mixed.slice(1, 4), [n1, n2, n3]);
   });
 
   it('does not mutate the input array', () => {
@@ -491,6 +561,32 @@ describe('selectIterationSource — index prefilter (AND + op:in)', () => {
     const store = buildStore(rows);
     const source = select(store, [Rule.ifcType(['IfcWall'])], 'AND', [99]);
     assert.deepStrictEqual(Array.from(source as Iterable<number>), [99]);
+  });
+
+  it('AND + storey op:in narrows via unionByStorey (previously untested — no fixture built a spatialHierarchy.byStorey bucket)', () => {
+    const store = buildStore(rows);
+    // byStorey keys are storey expressIds; unionByStorey resolves each
+    // storey's *name* via store.entities.getName(storeyId), so the storey
+    // "entity" needs a real row too. Reuse expressId 40 (Slab) as a stand-in
+    // storey id isn't valid — instead add a dedicated storey row via a
+    // second builder pass through buildStore with an extra row.
+    const storeyRows = [
+      ...rows,
+      { expressId: 500, type: 'IFCBUILDINGSTOREY', globalId: '5abcdefghijklmnopqrstu', name: 'Level 1' },
+      { expressId: 600, type: 'IFCBUILDINGSTOREY', globalId: '6abcdefghijklmnopqrstu', name: 'Level 2' },
+    ];
+    const s2 = buildStore(storeyRows);
+    (s2 as unknown as { spatialHierarchy: unknown }).spatialHierarchy = {
+      byStorey: new Map<number, number[]>([
+        [500, [10, 30]], // Level 1: Wall-EXT-001, Door-A-201
+        [600, [20, 40]], // Level 2: Wall-INT-002, Slab-G-1
+      ]),
+    };
+    const source = select(s2, [Rule.storey(['Level 1'])], 'AND', undefined);
+    const ids = Array.from(source as Iterable<number>);
+    // The prefilter must pick the Level-1 bucket, not fall through to a
+    // full-table scan (which would also include the two storey rows).
+    assert.deepStrictEqual(ids.sort(), [10, 30]);
   });
 });
 

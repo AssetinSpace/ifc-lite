@@ -8,6 +8,7 @@
 
 import type { IfcStoreBase as IfcDataStore, IfcEntity, IfcAttributeValue, PropertySet, QuantitySet, PropertyValue } from '@ifc-lite/data';
 import { getRawNamedAttributes, extractRootAttributesFromEntity } from '@ifc-lite/parser';
+import { resolveEntityTypeName } from './resolve-type-name.js';
 import { RelationshipType } from '@ifc-lite/data';
 
 function coerceRaw(raw: IfcAttributeValue): string | number | boolean | null {
@@ -130,8 +131,9 @@ export class EntityNode {
   }
 
   get type(): string {
-    return this.store.entities.getTypeName(this.expressId);
+    return resolveEntityTypeName(this.store, this.expressId);
   }
+
 
   // Spatial containment
   contains(): EntityNode[] {
@@ -154,13 +156,23 @@ export class EntityNode {
   }
   
   // Types
+  /**
+   * The type object defining this occurrence.
+   *
+   * `IfcRelDefinesByType` has the type as its relating object, and the parser
+   * stores edges relating -> related, so the type is the source and each
+   * occurrence the target. Reaching the type from an occurrence is therefore
+   * an inverse traversal — matching the element -> type lookups in
+   * `on-demand-extractors.ts`.
+   */
   definingType(): EntityNode | null {
-    const nodes = this.getRelated(RelationshipType.DefinesByType, 'forward');
+    const nodes = this.getRelated(RelationshipType.DefinesByType, 'inverse');
     return nodes[0] ?? null;
   }
   
+  /** The occurrences defined by this type — forward, from the type source. */
   instances(): EntityNode[] {
-    return this.getRelated(RelationshipType.DefinesByType, 'inverse');
+    return this.getRelated(RelationshipType.DefinesByType, 'forward');
   }
   
   // Openings
@@ -168,8 +180,16 @@ export class EntityNode {
     return this.getRelated(RelationshipType.VoidsElement, 'forward');
   }
   
+  /**
+   * The elements filling this opening (doors, windows).
+   *
+   * `IfcRelFillsElement` is (RelatingOpeningElement, RelatedBuildingElement),
+   * so the opening is the relating object and the filler the related one —
+   * reaching the filler from the opening is a forward traversal, the same
+   * orientation `voids()` uses to reach the opening from its host.
+   */
   filledBy(): EntityNode[] {
-    return this.getRelated(RelationshipType.FillsElement, 'inverse');
+    return this.getRelated(RelationshipType.FillsElement, 'forward');
   }
 
   // Multi-hop traversal

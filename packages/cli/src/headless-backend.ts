@@ -21,6 +21,7 @@ import type {
   MutateBackendMethods,
   StoreBackendMethods,
   SpacesBackendMethods,
+  StyleBackendMethods,
   SpatialBackendMethods,
   ExportBackendMethods,
   LensBackendMethods,
@@ -39,9 +40,9 @@ import type {
   QueryDescriptor,
   ModelInfo,
 } from '@ifc-lite/sdk';
+import { createHeadlessMutateAdapter } from '@ifc-lite/sdk';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
-import { GeometryProcessor } from '@ifc-lite/geometry';
 import {
   addBeamToStore,
   addColumnToStore,
@@ -49,6 +50,7 @@ import {
   addMemberToStore,
   addPlateToStore,
   addRoofToStore,
+  applyStylesInStore,
   addSlabToStore,
   addSpaceToStore,
   addWallToStore,
@@ -69,64 +71,48 @@ import {
   type GenerateSpacesAllOptions,
 } from '@ifc-lite/create';
 import { EntityNode } from '@ifc-lite/query';
-import { RelationshipType, IfcTypeEnum, IfcTypeEnumFromString } from '@ifc-lite/data';
+
 import {
   extractAllEntityAttributes,
   extractClassificationsOnDemand,
   extractMaterialsOnDemand,
+  extractPropertiesOnDemand,
+  extractQuantitiesOnDemand,
   extractTypePropertiesOnDemand,
   extractDocumentsOnDemand,
   extractRelationshipsOnDemand,
+  expandTypes,
+  QUERY_REL_TYPE_MAP,
   extractScheduleOnDemand,
+  isQueryableObjectType,
 } from '@ifc-lite/parser';
-import { exportToStep, StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { escapeCsvCell, exportToStep, StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { exportHbjson, exportDfjson } from './energy-export.js';
+
+// `expandTypes` used to be defined here; it now comes from `@ifc-lite/parser`,
+// shared with the other query backends (see `query-backend-maps.ts`). Re-exported
+// so this module's consumers are unaffected by where it lives.
+export { expandTypes };
 
 const MODEL_ID = 'default';
 
-const REL_TYPE_MAP: Record<string, RelationshipType> = {
-  IfcRelContainedInSpatialStructure: RelationshipType.ContainsElements,
-  IfcRelAggregates: RelationshipType.Aggregates,
-  IfcRelDefinesByType: RelationshipType.DefinesByType,
-  IfcRelVoidsElement: RelationshipType.VoidsElement,
-  IfcRelFillsElement: RelationshipType.FillsElement,
-};
-
-const IFC_SUBTYPES: Record<string, string[]> = {
-  IFCWALL: ['IFCWALLSTANDARDCASE', 'IFCWALLELEMENTEDCASE'],
-  IFCBEAM: ['IFCBEAMSTANDARDCASE'],
-  IFCCOLUMN: ['IFCCOLUMNSTANDARDCASE'],
-  IFCDOOR: ['IFCDOORSTANDARDCASE'],
-  IFCWINDOW: ['IFCWINDOWSTANDARDCASE'],
-  IFCSLAB: ['IFCSLABSTANDARDCASE', 'IFCSLABELEMENTEDCASE'],
-  IFCMEMBER: ['IFCMEMBERSTANDARDCASE'],
-  IFCPLATE: ['IFCPLATESTANDARDCASE'],
-  IFCOPENINGELEMENT: ['IFCOPENINGSTANDARDCASE'],
-};
-
-export function expandTypes(types: string[]): string[] {
-  const result: string[] = [];
-  for (const type of types) {
-    const upper = type.toUpperCase();
-    result.push(upper);
-    const subtypes = IFC_SUBTYPES[upper];
-    if (subtypes) {
-      for (const sub of subtypes) result.push(sub);
-    }
-  }
-  return result;
+/**
+ * Strip a real IFC source-file extension from a filename-derived model name.
+ * Only applied to the `modelName` fallback: an explicitly supplied export name
+ * is a display name where a trailing dotted segment is meaningful (`Tower.v2`).
+ */
+function stripIfcExtension(name: string): string {
+  return name.replace(/\.(ifc|ifcx|ifczip)$/i, '');
 }
 
-export function isProductType(type: string): boolean {
-  const enumVal = IfcTypeEnumFromString(type);
-  if (enumVal === IfcTypeEnum.Unknown) return false;
-  const upper = type.toUpperCase();
-  if (upper.startsWith('IFCREL')) return false;
-  if (upper.startsWith('IFCPROPERTY')) return false;
-  if (upper.startsWith('IFCQUANTITY')) return false;
-  if (upper === 'IFCELEMENTQUANTITY') return false;
-  if (upper.endsWith('TYPE')) return false;
-  return true;
-}
+/**
+ * Which classes an unfiltered query answers with.
+ *
+ * Thin alias: the predicate is schema logic and lives in `@ifc-lite/parser`, so
+ * the CLI and MCP backends cannot drift apart on it. Kept as a named export
+ * here because both packages already publish it under this name.
+ */
+export const isProductType = isQueryableObjectType;
 
 /**
  * Normalize boolean-like values for comparison.
@@ -168,6 +154,7 @@ export class HeadlessBackend implements BimBackend {
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
   readonly spaces: SpacesBackendMethods;
+  readonly style: StyleBackendMethods;
 
   private dataStore: IfcDataStore;
   private modelName: string;
@@ -190,6 +177,25 @@ export class HeadlessBackend implements BimBackend {
     this.files = this.createFilesAdapter();
     this.schedule = this.createScheduleAdapter();
     this.spaces = this.createSpacesAdapter();
+    this.style = this.createStyleAdapter();
+  }
+
+  private createStyleAdapter(): StyleBackendMethods {
+    return {
+      // Same arrangement as the spaces adapter: the work happens in
+      // @ifc-lite/create against the shared StoreEditor, so the new entities
+      // land in the overlay this backend's export adapter already reads.
+      applyColors: (batches, options) => applyStylesInStore(
+        this.getOrCreateStoreEditor(),
+        this.dataStore,
+        batches.map(batch => ({
+          products: batch.refs.map(r => r.expressId),
+          color: batch.color,
+          name: batch.name,
+        })),
+        options,
+      ),
+    };
   }
 
   private createSpacesAdapter(): SpacesBackendMethods {
@@ -342,8 +348,36 @@ export class HeadlessBackend implements BimBackend {
           }
         }
 
-        if (descriptor.offset != null && descriptor.offset > 0) filtered = filtered.slice(descriptor.offset);
-        if (descriptor.limit != null && descriptor.limit > 0) filtered = filtered.slice(0, descriptor.limit);
+        // `!= null` alone lets a NaN offset/limit through (NaN is neither
+        // null nor undefined); a bare `> 0` then silently drops it (every
+        // NaN comparison is false), which used to IGNORE a garbage value
+        // instead of rejecting it -- and, by the same reasoning, silently
+        // ignored a deliberate `limit: 0`. Reject non-finite/negative
+        // values loudly instead of quietly serving the wrong slice; the
+        // The CLI's own `--limit`/`--offset` flags are validated before they
+        // reach this descriptor, so this guards callers that build one
+        // directly — and it makes `limit: 0` mean "no rows" rather than being
+        // silently ignored, matching what `--limit 0` documents.
+        //
+        // NOTE this does NOT cover @ifc-lite/mcp. That package has its own
+        // backend (`packages/mcp/src/backend-query.ts`), a parallel
+        // implementation rather than a shared import, and its equivalent lines
+        // still read `descriptor.limit && descriptor.limit > 0` — so a NaN is
+        // silently ignored there and `limit: 0` is a no-op. Same defect,
+        // different package, its own tests and release cadence; tracked as a
+        // separate change rather than folded into this CLI-scoped PR.
+        if (descriptor.offset != null) {
+          if (!Number.isFinite(descriptor.offset) || descriptor.offset < 0) {
+            throw new TypeError(`Invalid offset: ${descriptor.offset} (must be a non-negative finite number)`);
+          }
+          if (descriptor.offset > 0) filtered = filtered.slice(descriptor.offset);
+        }
+        if (descriptor.limit != null) {
+          if (!Number.isFinite(descriptor.limit) || descriptor.limit < 0) {
+            throw new TypeError(`Invalid limit: ${descriptor.limit} (must be a non-negative finite number)`);
+          }
+          filtered = filtered.slice(0, descriptor.limit);
+        }
 
         return filtered;
       },
@@ -386,7 +420,7 @@ export class HeadlessBackend implements BimBackend {
         return extractRelationshipsOnDemand(store, ref.expressId);
       },
       related(ref: EntityRef, relType: string, direction: 'forward' | 'inverse'): EntityRef[] {
-        const relEnum = REL_TYPE_MAP[relType];
+        const relEnum = QUERY_REL_TYPE_MAP[relType];
         if (relEnum === undefined) return [];
         const targets = store.relationships.getRelated(ref.expressId, relEnum, direction);
         return targets.map((expressId: number) => ({ modelId: ref.modelId, expressId }));
@@ -425,20 +459,38 @@ export class HeadlessBackend implements BimBackend {
   }
 
   private createMutateAdapter(): MutateBackendMethods {
-    return {
-      setProperty() { /* no-op in headless mode */ },
-      setAttribute() { /* no-op in headless mode */ },
-      deleteProperty() { /* no-op in headless mode */ },
-      batchBegin() { /* no-op */ },
-      batchEnd() { /* no-op */ },
-      undo() { return false; },
-      redo() { return false; },
-    };
+    return createHeadlessMutateAdapter(() => this.getOrCreateMutationView());
+  }
+
+  /**
+   * The overlay every write goes through, created on first use.
+   *
+   * Built by `getOrCreateStoreEditor` so the property and quantity extractors
+   * are wired exactly once, whichever adapter writes first.
+   */
+  private getOrCreateMutationView(): MutablePropertyView {
+    this.getOrCreateStoreEditor();
+    // Non-null immediately after: getOrCreateStoreEditor assigns both fields
+    // together and never clears them.
+    return this.mutationView as MutablePropertyView;
   }
 
   private getOrCreateStoreEditor(): StoreEditor {
     if (this.storeEditor) return this.storeEditor;
     this.mutationView = new MutablePropertyView(this.dataStore.properties || null, MODEL_ID);
+    // Give the overlay a base to merge against. The columnar parser leaves
+    // `store.properties` empty and serves properties on demand, so without these
+    // the view's *only* source is the overlay itself and `getForEntity` answers
+    // with the one edited pset and nothing else. `StepExporter` re-emits
+    // `getForEntity(id)` for every entity with a property mutation and skips the
+    // original records, so editing one property would drop every sibling
+    // property in that pset on save. Same wiring, same reason, as
+    // `packages/mcp/src/headless-backend.ts` and
+    // `apps/viewer/src/utils/configureMutationView.ts` (#2000, #2004).
+    if (this.dataStore.source?.length > 0) {
+      this.mutationView.setOnDemandExtractor((entityId) => extractPropertiesOnDemand(this.dataStore, entityId));
+      this.mutationView.setQuantityExtractor((entityId) => extractQuantitiesOnDemand(this.dataStore, entityId));
+    }
     this.storeEditor = new StoreEditor(this.dataStore, this.mutationView);
     return this.storeEditor;
   }
@@ -533,17 +585,14 @@ export class HeadlessBackend implements BimBackend {
     const modelName = this.modelName;
     const queryAdapter = this.query;
 
+    /**
+     * RFC 4180 quoting + the CWE-1236 formula-injection guard, delegated to
+     * `@ifc-lite/export`'s single escaper. The copy that used to live here
+     * tested the trigger anchored at offset 0, so a BOM/ZWSP/LRM/NBSP/U+2028
+     * in front of `=` walked past it.
+     */
     function escapeCsv(value: string, sep: string): string {
-      // CSV/formula-injection guard (CWE-1236): prefix a leading spreadsheet
-      // formula trigger so Excel/Sheets treat the cell as text, not a formula.
-      let str = value;
-      if (/^[=+\-@\t\r]/.test(str)) {
-        str = `'${str}`;
-      }
-      if (str.includes(sep) || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
+      return escapeCsvCell(value, { delimiter: sep });
     }
 
     function resolveColumn(data: EntityData, col: string, props: PropertySetData[] | null, qsets: QuantitySetData[] | null): string {
@@ -635,24 +684,15 @@ export class HeadlessBackend implements BimBackend {
         }
         return exportToStep(store, exportOpts);
       },
-      hbjson: async (name?: string): Promise<string> => {
-        // HBJSON is rebuilt analytically from the source IFC bytes (rooms/openings/
-        // shades/constructions/adjacency) via the wasm geometry engine.
-        const bytes = store.source;
-        if (!bytes || bytes.length === 0) {
-          throw new Error('HBJSON export needs the source IFC bytes, which this store did not retain.');
-        }
-        const processor = new GeometryProcessor();
-        await processor.init();
-        const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');
-        const result = processor.exportHbjson(bytes, baseName);
-        if (result === null) {
-          throw new Error('Geometry engine unavailable for HBJSON export.');
-        }
-        // The lens contract carries a string; HBJSON payloads are far below the
-        // V8 string ceiling, so decoding here is safe.
-        return new TextDecoder().decode(result);
-      },
+      // Both energy formats apply the mutation view — see energy-export.ts
+      // (issues #1908, #1344). An explicit `name` is a display/model name, so
+      // it is kept verbatim (dotted identifiers like `Tower.v2` are valid);
+      // only the `modelName` fallback is a filename, so only it gets a real
+      // IFC extension stripped.
+      hbjson: (name?: string): Promise<string> =>
+        exportHbjson(store, this.mutationView, name ?? stripIfcExtension(modelName)),
+      dfjson: (name?: string): Promise<string> =>
+        exportDfjson(store, this.mutationView, name ?? stripIfcExtension(modelName)),
       download(_content: string, _filename: string, _mimeType: string): void {
         /* no-op — CLI writes to stdout/file directly */
       },

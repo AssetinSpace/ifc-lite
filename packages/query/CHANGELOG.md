@@ -1,5 +1,127 @@
 # @ifc-lite/query
 
+## 1.14.17
+
+### Patch Changes
+
+- [#2861](https://github.com/LTplus-AG/ifc-lite/pull/2861) [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `ifc-lite query`'s DuckDB SQL integration reading a NULL string-typed property as an empty string instead of SQL `NULL`.
+  
+  `createPropertiesTable` (duckdb-integration.ts) resolved `PropertyTable.valueString` with `valueStringIdx >= 0 ? ... : ''`. `valueString` is a `Uint32Array`, so the NULL sentinel written by `StringTable.intern(null)` (-1) wraps to 4294967295 rather than going negative — the `>= 0` check was always true and never caught it, and the row was inserted with `value_string = ''`, indistinguishable from a genuine empty-string property. `WHERE value_string IS NULL` silently matched nothing.
+  
+  Two siblings on the same column family already guard this correctly: `getPropertyValue`'s String branch in `@ifc-lite/data`'s `property-table.ts` and its cache-restored twin in `@ifc-lite/cache`'s `properties.ts`, both checking `idx < strings.count`. This DuckDB path is named as a sibling in `property-table.ts`'s own doc comment ("the on-demand fallback in `@ifc-lite/query`") but used an independent, unguarded decode. The fix extracts the shared logic into `resolveDuckDBStringLiteral` and applies the same in-range check, emitting the bare `NULL` keyword — matching how this same file already handles the `containedInStorey`/`definedByType` sentinels a few lines above.
+
+- [#2907](https://github.com/LTplus-AG/ifc-lite/pull/2907) [`b7d2a11`](https://github.com/LTplus-AG/ifc-lite/commit/b7d2a11345add8acdf0926ade5d4c1ca19ccecf7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `PropertyTable.getProperty` returning null when an entity carries two property sets with the same name and the property lives only on the second one.
+  
+  `getProperty` stopped scanning at the first pset whose name matched, and returned whatever that pset had for the property (`null` if it lacked it) instead of continuing to the next same-named pset. `findEntities`, right below it in the same class, already handled two same-named psets correctly by scanning all of them; `getProperty` now does the same — it keeps checking subsequent same-named sets until it finds the property, matching the semantics IFC's `IfcRelDefinesByProperties` allows (an entity can be targeted by more than one property set sharing a name).
+- Updated dependencies [[`c688a12`](https://github.com/LTplus-AG/ifc-lite/commit/c688a1272ec72d575e8ecf78072e0a0084b517ca), [`79322b6`](https://github.com/LTplus-AG/ifc-lite/commit/79322b6e76049be0df3b07149c711414bd80863e), [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`be6b43c`](https://github.com/LTplus-AG/ifc-lite/commit/be6b43c2b334811422c1cbfbea5d6e6d1b9a401d), [`989ee2c`](https://github.com/LTplus-AG/ifc-lite/commit/989ee2c4e396575529488c17b73e1a884e4e8b9d), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`105eb31`](https://github.com/LTplus-AG/ifc-lite/commit/105eb31e7ccdd697f74db3bc9fac41396cdc6faa), [`5254699`](https://github.com/LTplus-AG/ifc-lite/commit/52546994268440a468de81ce6ac0b385e6ef73d7), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`ae5a5ca`](https://github.com/LTplus-AG/ifc-lite/commit/ae5a5caa3e20304085ba14c0708cd026c1d4bf16)]:
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/data@3.4.0
+  - @ifc-lite/spatial@1.14.14
+
+## 1.14.16
+
+### Patch Changes
+
+- [#2218](https://github.com/LTplus-AG/ifc-lite/pull/2218) [`d260a35`](https://github.com/LTplus-AG/ifc-lite/commit/d260a35669e379e5f465861294391c95ee48cb3d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix three `EntityNode` relationship helpers that traversed the graph in the wrong direction.
+
+  The parser builds every edge as `addEdge(relatingObject, relatedObject)` (`columnar-parser.ts:476`), so `forward` always means relating → related. Three helpers were oriented against that:
+
+  - `filledBy()` used `inverse`. `IfcRelFillsElement` is `(RelatingOpeningElement, RelatedBuildingElement)`, so the opening is the source and the filler the target — reaching the filler from the opening is a forward traversal. As written the method returned an empty array for every opening, which is indistinguishable from "this opening has no filler".
+  - `definingType()` used `forward` and `instances()` used `inverse`. `IfcRelDefinesByType` has the type as its relating object, so the type is the source and each occurrence the target; both helpers were the wrong way round. The element → type lookups in `on-demand-extractors.ts` already used `inverse` for this, so the two disagreed.
+
+  `filledBy()` is the one with an observable consequence today: `@ifc-lite/clash` calls `opening.filledBy()` to exclude a host element from clashing with the door or window filling its own opening (`adapters/step.ts:172`). Because the call always returned nothing, that exclusion never fired and every door and window could report a false-positive clash against the opening it legitimately fills. `definingType()` and `instances()` have no in-repo callers, so their fix is latent — but they are public API.
+
+  The gap survived because the unit-test fixture encoded the reverse orientation for `IfcRelDefinesByType`, so the mock and the reversed code agreed with each other. The fixture is corrected to match the parser, and `IfcRelFillsElement` — previously absent from it entirely — is now covered.
+
+- [#2321](https://github.com/LTplus-AG/ifc-lite/pull/2321) [`51ec81b`](https://github.com/LTplus-AG/ifc-lite/commit/51ec81b125532cd0efe4f004c7ab01f4efe55cb8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `EntityQuery.first()` permanently capping the query it was called on. `first()` narrowed the result set by calling `this.limit(1)` — which mutates the query object itself rather than a clone — so the cap outlived the call: every subsequent `execute()`, `ids()` or `first()` on the same query returned at most one row. A caller's own explicit `limit(n)` was overwritten too, silently collapsing to 1.
+
+  Building a query, peeking at the first match, then iterating it in full is ordinary usage of a fluent query API, and `EntityQuery` is published surface — so "no in-repo caller does that" is not a defence here, the same reasoning applied to `ParquetExporter`'s un-memoised overlay index in the [#2111](https://github.com/LTplus-AG/ifc-lite/issues/2111) review.
+
+  `first()` now narrows for the duration of the call only, restoring whatever limit was previously set rather than clearing it.
+
+- Updated dependencies [[`d75786f`](https://github.com/LTplus-AG/ifc-lite/commit/d75786f631047d234f204289426f708f0be8674b), [`58fbc63`](https://github.com/LTplus-AG/ifc-lite/commit/58fbc634994742c79375830c1983508752fd78e9), [`2e16736`](https://github.com/LTplus-AG/ifc-lite/commit/2e167367037fa3b5d1d2d5d26dd4fb7ac169e2f5), [`d9490e6`](https://github.com/LTplus-AG/ifc-lite/commit/d9490e6e2ecacb65aea42fcaef73fd292a4c3095), [`d89960a`](https://github.com/LTplus-AG/ifc-lite/commit/d89960aaab08387fbd2307c0f238bd112c684933), [`deb54d3`](https://github.com/LTplus-AG/ifc-lite/commit/deb54d3ff75f35c3c9206c8ea9a1e875426352c6), [`958aef1`](https://github.com/LTplus-AG/ifc-lite/commit/958aef125743682da75c3da7b41991abd9d36d32), [`de7bd04`](https://github.com/LTplus-AG/ifc-lite/commit/de7bd04619a43a32900b188e0507b95e7542d8c8), [`09d67c7`](https://github.com/LTplus-AG/ifc-lite/commit/09d67c780bf68f58dec3f77920927857c752f8da)]:
+  - @ifc-lite/data@3.2.2
+  - @ifc-lite/parser@4.0.0
+  - @ifc-lite/geometry@3.7.1
+
+## 1.14.15
+
+### Patch Changes
+
+- [#1935](https://github.com/LTplus-AG/ifc-lite/pull/1935) [`9a7b5a2`](https://github.com/LTplus-AG/ifc-lite/commit/9a7b5a2fc1bb85ce60e954ccf7819829e43431d6) Thanks [@louistrue](https://github.com/louistrue)! - fix(query): make `whereProperty` actually filter STEP-parsed models
+
+  `EntityQuery.whereProperty()` returned `[]` for every `.ifc` (STEP) model, for
+  any property-set name, silently — no error, no warning. `applyPropertyFilters`
+  only consulted `store.properties.findByProperty`, but a STEP parse deliberately
+  leaves the columnar property/quantity tables empty and routes reads through the
+  on-demand maps (issue [#577](https://github.com/LTplus-AG/ifc-lite/issues/577)), so that lookup could only ever return nothing. The
+  read path (`EntityNode.property`, `QueryResultEntity.getProperty`) resolved the
+  same data correctly, so a model that plainly carried the property still filtered
+  to nothing. [#577](https://github.com/LTplus-AG/ifc-lite/issues/577) / [#578](https://github.com/LTplus-AG/ifc-lite/issues/578) fixed this class on the read path and left the filter
+  path behind; this is that other half.
+
+  `whereProperty` now picks a strategy per store. When the property table reports
+  an explicit zero row count it resolves the surviving candidates through
+  `store.getProperties` / `store.getQuantities`, the same accessors the read path
+  uses; otherwise it answers off the table's name indices as before. Only an
+  explicit zero selects the fallback — a duck-typed store whose table omits the
+  optional `count` keeps the indexed path, because every store written before
+  `count` existed implements `findByProperty` for real. The fallback is
+  candidate-scoped, and each entity is resolved at most once _per source_ across
+  all filters: property sets and quantity sets have separate caches, so an entity
+  reached by both sides costs one `getProperties` and one `getQuantities`, never
+  one per filter.
+  Nothing is materialised onto `store.properties`, so IDS keeps reading the richer
+  on-demand property shape.
+
+  Quantity sets are folded into the same call on every store, making the
+  documented `whereProperty('Qto_WallBaseQuantities', 'NetSideArea', '>', 10)`
+  form work; previously a `Qto_` filter matched nothing on any path.
+
+  Matching is ANY-match: an entity passes when any property of that name, in any
+  set of that name, satisfies the operator. That is what
+  `PropertyTable.findByProperty` already did, so the two strategies agree with
+  each other. It deliberately differs from the single-value read path, which
+  returns the first match — the two disagree only for an entity carrying the same
+  property twice, and that divergence is pinned by a test.
+
+  `@ifc-lite/data` gains two additive optional interface members and one new
+  export: `QuantityTable.findByQuantity` (the quantity mirror of `findByProperty`,
+  answered off the quantity-name index), `count` on `IfcStoreBase`'s property and
+  quantity tables, and `comparePropertyValues` — the definition of property-filter
+  comparison semantics shared by the store-level property tables (same-type only,
+  `null` never matches, `==` aliases `=`). `@ifc-lite/cache` and the viewer's
+  server-converted store now use
+  `comparePropertyValues` instead of local copies: the cache copy had no boolean
+  branch, so a cache-restored `findByProperty('IsExternal', '=', true)` silently
+  returned `[]`, and the server copy ignored the operator entirely and compared
+  with `===`, so `'>' 60` answered `= 60`.
+
+  **Cost.** Filtering a STEP model is now real work where it used to be an instant
+  wrong answer. The shape of that work: the filter resolves property sets **per
+  candidate**, so cost is proportional to how many entities reach the filter, not
+  to how many carry the property. Scope with `ofType(...)` / `onStorey(...)` before
+  `whereProperty(...)` — an unscoped `query.all().whereProperty(...)` resolves
+  every entity in the model. The guide and the package README now say so.
+
+  This per-candidate path covers more than a fresh `.ifc` parse. A cache written
+  from a STEP parse serialises the empty property table verbatim, so a
+  cache-restored `.ifc` model reports `count === 0` and takes the same fallback;
+  the viewer's server-converted store reports `count: 0` too. What decides the
+  path is the store rather than the file format: a store carrying table rows is
+  answered from the index, and one reporting no rows resolves per candidate.
+
+  Those indexed stores are deliberately kept off the per-candidate path: folding
+  quantities by resolving every candidate would have made a `Qto_` filter cost
+  them per candidate as well, so the quantity side goes through the new
+  `findByQuantity` name index instead. Where an indexed store's cost moves at all
+  it is because the query is answered rather than silently returning nothing — a
+  `Qto_` filter that used to match zero entities now matches the real set.
+
+- Updated dependencies [[`9a7b5a2`](https://github.com/LTplus-AG/ifc-lite/commit/9a7b5a2fc1bb85ce60e954ccf7819829e43431d6)]:
+  - @ifc-lite/data@3.1.0
+
 ## 1.14.14
 
 ### Patch Changes

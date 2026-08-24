@@ -5,12 +5,12 @@
 import type { StoreApi } from './types.js';
 import type { EntityRef, EntityData, PropertySetData, QuantitySetData, ExportBackendMethods } from '@ifc-lite/sdk';
 import { EntityNode } from '@ifc-lite/query';
-import { StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { escapeCsvCell, StepExporter, type StepExportOptions } from '@ifc-lite/export';
 import { getModelForRef, LEGACY_MODEL_ID } from './model-compat.js';
 import { applyAttributeMutationsToEntityData, getMutationViewForModel } from './mutation-view.js';
 import { serializeScheduleToStep, type ScheduleExtraction, type IfcDataStore } from '@ifc-lite/parser';
 import { spliceScheduleIntoExport } from './export-schedule-splice.js';
-import { downloadFile } from '../../lib/export/download.js';
+import { downloadFile, sanitizeFilename, buildExportFilename } from '../../lib/export/download.js';
 
 /** Options for CSV export */
 interface CsvOptions {
@@ -105,19 +105,13 @@ export function resolveVisibilityFilterSets(
 }
 
 /**
- * Escape a CSV cell value — wrap in quotes if it contains the separator,
- * double-quotes, or newlines.
+ * RFC 4180 quoting + the CWE-1236 formula-injection guard, delegated to
+ * `@ifc-lite/export`'s single escaper. The copy that used to live here tested
+ * the trigger anchored at offset 0, so a BOM/ZWSP/LRM/NBSP/U+2028 in front of
+ * `=` walked past it.
  */
 function escapeCsv(value: string, sep: string): string {
-  // Neutralize spreadsheet formula injection (CWE-1236): a leading
-  // =, +, -, @, TAB or CR makes a cell execute as a formula in Excel/
-  // LibreOffice/Sheets. IFC values are attacker-controllable, so prefix
-  // such cells with an apostrophe.
-  if (/^[=+\-@\t\r]/.test(value)) value = `'${value}`;
-  if (value.includes(sep) || value.includes('"') || value.includes('\n') || value.includes('\r')) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
+  return escapeCsvCell(value, { delimiter: sep });
 }
 
 /**
@@ -395,7 +389,23 @@ export function createExportAdapter(store: StoreApi): ExportBackendMethods {
     },
 
     download(content: string | Uint8Array, filename: string, mimeType?: string) {
-      triggerDownload(content, filename, mimeType ?? 'text/plain');
+      // `filename` is API input (scripts pass arbitrary strings) — sanitize at
+      // this single chokepoint so every SDK download path honors the repo's
+      // filename contract, keeping a real extension intact.
+      //
+      // Split the extension off, then hand both halves to `buildExportFilename`
+      // rather than sanitizing them here: it is the canonical builder, and it
+      // caps the extension at EXTENSION_MAX_LENGTH and budgets the stem so the
+      // whole result fits. A local `[^\w]+` pass instead would silently rewrite
+      // legitimate extensions (`report.energy-json` -> `report.energyjson`,
+      // and anything non-ASCII outright) and skip the length budgeting.
+      const dot = filename.lastIndexOf('.');
+      const stem = dot > 0 ? filename.slice(0, dot) : filename;
+      const ext = dot > 0 ? filename.slice(dot + 1) : '';
+      const safe = ext
+        ? buildExportFilename(stem, ext)
+        : sanitizeFilename(filename, { fallback: 'export' });
+      triggerDownload(content, safe, mimeType ?? 'text/plain');
       return undefined;
     },
   };

@@ -1,5 +1,50 @@
 # @ifc-lite/collab
 
+## 0.5.0
+
+### Minor Changes
+
+- [#2801](https://github.com/LTplus-AG/ifc-lite/pull/2801) [`b14e710`](https://github.com/LTplus-AG/ifc-lite/commit/b14e710ae8d56f518f84abb4d4ec8d1f98aacad8) Thanks [@louistrue](https://github.com/louistrue)! - `BlobStore.put` now accepts an optional `AbortSignal`, and `HttpBlobStore`
+  forwards it to `fetch`.
+  
+  A hung upload was worse than a failed one: a rejection is counted, retried and
+  can trip a caller's failure ceiling, but a request that never settles produces
+  no failure at all, so nothing retries, no ceiling trips, and a geometry seed
+  never resolves while the UI reports work in progress. `LayeredBlobStore` also
+  forwards the signal, since its `Promise.all` cannot settle while the remote half
+  hangs and its `.catch` never runs when nothing rejects.
+  
+  Additive and optional: existing callers are unaffected, and implementations that
+  cannot abort may ignore the option.
+
+### Patch Changes
+
+- [#2706](https://github.com/LTplus-AG/ifc-lite/pull/2706) [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Dispose the presence object (and its two live timers — the awareness eviction sweep and y-protocols' own outdated-clients timer) when `createCollabSession` fails after `createPresence` has already run, instead of leaking it. `presence` is constructed before either persistence provider comes up; if the IndexedDB or WebSocket provider then throws (for example `createIndexedDbProvider` rejecting outside a browser, where `indexedDB` is undefined), the function rejected without a `session` object for the caller to call `.dispose()` on, so nothing ever cleared those timers. In a browser this went unnoticed because navigating away reclaims everything; in a Node test process it kept the event loop alive indefinitely — `startCollab`'s entry-race regression test, run together with its sibling collab test files in one process, would pass every assertion and then never let the process exit.
+- Updated dependencies [[`05592f8`](https://github.com/LTplus-AG/ifc-lite/commit/05592f8c1ef5b34a00c2ea077542dc68107a7ae5), [`be6b43c`](https://github.com/LTplus-AG/ifc-lite/commit/be6b43c2b334811422c1cbfbea5d6e6d1b9a401d), [`a29b040`](https://github.com/LTplus-AG/ifc-lite/commit/a29b04069fec3c6b726f49fc58054e535c255034), [`cc19a8d`](https://github.com/LTplus-AG/ifc-lite/commit/cc19a8d4a79a5e8563a90ab663b28e1b93ef9c18), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2)]:
+  - @ifc-lite/mutations@1.26.1
+  - @ifc-lite/data@3.4.0
+  - @ifc-lite/ifcx@2.3.7
+
+## 0.4.2
+
+### Patch Changes
+
+- [#2336](https://github.com/LTplus-AG/ifc-lite/pull/2336) [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `promoteEntityType` silently discarding data when its target path already exists. `createEntity` is documented as idempotent — a pre-existing path is a no-op that returns the existing entity unchanged — but `promoteEntityType` deletes the source path unconditionally before calling it. If the target already existed (e.g. seeded by a concurrent peer, or a prior promotion that landed on the same path), the call reported success with a truthy `Y.Map` while the source entity's carried attributes, children and meta were permanently lost and the target kept its stale data. `promoteEntityType` now throws before deleting the source when the target path is already occupied, matching this file's existing convention of throwing on precondition violations (`setAttribute`, `setChild`, etc.) instead of silently discarding data.
+
+- [#2337](https://github.com/LTplus-AG/ifc-lite/pull/2337) [`29409e5`](https://github.com/LTplus-AG/ifc-lite/commit/29409e57227d3c458707dbc2cf0cb2e8ae8fcf7b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two gaps found while auditing files with no direct test coverage:
+
+  - `createConflictDetector` classified concurrent writes to a Pset property as a `pset-property` conflict but had no matching case for the structurally identical Qset (quantity) shape — concurrent quantity writes from two peers landed silently with no conflict event, a false negative. `classify()` now handles `ENTITY_KEY.QUANTITIES` the same way it handles `ENTITY_KEY.PSETS`, emitting a new `quantity` `ConflictKind`.
+  - `redactAuthorMeta` (the "anonymise this project" GDPR helper) blanked `createdBy`/`lastEditedBy` on every entity but never touched the `annotations` map, so a markup pin's `authorId`/`authorName` (real display name) survived redaction untouched. It now blanks both fields on every annotation alongside the existing entity-meta redaction; annotation `note` text and position are left as-is.
+
+- [#2220](https://github.com/LTplus-AG/ifc-lite/pull/2220) [`512406f`](https://github.com/LTplus-AG/ifc-lite/commit/512406f0d21c7e33b8c84a83865ffaff299e7cc1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a snapshot -> seed round trip silently dropping an explicitly-cleared `classifications` or `materials` attribute.
+
+  `inflateStructuredAttributes` (`packages/collab/src/snapshot/structured-attrs.ts`) shape-gated these attributes with `Array.isArray(value) && value.every(isClassificationRefShaped)` (same for materials). `[].every(...)` is vacuously true, so an entity whose classifications/materials were explicitly cleared to `[]` passed the gate, got pulled out of the flat attributes into the structured branch, and `flattenStructuredBranches` only re-emits that branch when it's non-empty — so the key never came back on the next snapshot. A reader who took a snapshot after the clearing landed would see the attribute vanish entirely rather than resolve to `[]`, and could keep serving a stale non-empty value from before the clear. Both branches now require a non-empty array before taking the structured path (mirroring the existing `geometryRefs` guard), so an explicit `[]` stays in the flat attributes and survives the round trip.
+
+- Updated dependencies [[`d75786f`](https://github.com/LTplus-AG/ifc-lite/commit/d75786f631047d234f204289426f708f0be8674b), [`58fbc63`](https://github.com/LTplus-AG/ifc-lite/commit/58fbc634994742c79375830c1983508752fd78e9), [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146), [`c866bee`](https://github.com/LTplus-AG/ifc-lite/commit/c866bee62a7d6e40b15a7de63948354cbbe049a7), [`262b9df`](https://github.com/LTplus-AG/ifc-lite/commit/262b9df485e4bfd3760f73c30d93bb518e599b72), [`710fd83`](https://github.com/LTplus-AG/ifc-lite/commit/710fd83638b51b2e4744a1ac364827a27dc0fc73), [`d9490e6`](https://github.com/LTplus-AG/ifc-lite/commit/d9490e6e2ecacb65aea42fcaef73fd292a4c3095), [`8751ba4`](https://github.com/LTplus-AG/ifc-lite/commit/8751ba41dc4d1893530b0f1db6ad0f8fa0d5d3fd), [`deb54d3`](https://github.com/LTplus-AG/ifc-lite/commit/deb54d3ff75f35c3c9206c8ea9a1e875426352c6), [`35e37ac`](https://github.com/LTplus-AG/ifc-lite/commit/35e37ac99ab444773bfec669cfc5cf3937443942)]:
+  - @ifc-lite/data@3.2.2
+  - @ifc-lite/ifcx@2.3.4
+  - @ifc-lite/mutations@1.24.2
+
 ## 0.4.1
 
 ### Patch Changes

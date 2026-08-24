@@ -13,7 +13,7 @@ import type { EntityRef } from './types.js';
 import { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
 import { EntityExtractor } from './entity-extractor.js';
 import { extractLengthUnitScale } from './unit-extractor.js';
-import { getAttributeNames, getInheritanceChain } from './ifc-schema.js';
+import { getAttributeNames, getAttributeNamesAcrossSchemas, getInheritanceChain } from './ifc-schema.js';
 import { parsePropertyValue } from './on-demand-extractors.js';
 import { buildCompactEntityIndexAsync } from './compact-entity-index.js';
 import { yieldToEventLoop } from './yield-to-event-loop.js';
@@ -48,13 +48,25 @@ import { parseSourceHeader } from './source-header.js';
 
 import type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
+import { contiguousSourceBytes, type IfcSourceBytes } from './source-bytes.js';
+
 // Re-export interfaces/types from extracted modules for public API compatibility
 export type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
 export interface IfcDataStore extends IfcStoreBase {
     parseTime: number;
 
-    source: Uint8Array;
+    /**
+     * The IFC source bytes, behind an accessor rather than a resident
+     * `Uint8Array` (#2183). Read ranges with `slice`/`decodeUtf8`; use
+     * `withMaterialized` for the genuine whole-file consumers, and
+     * `toTransferable()` to hand it to a worker without materialising here.
+     *
+     * `byteLength === 0` is a supported state (server-parsed, synthetic, GLB,
+     * point-cloud), and `length` is aliased so existing presence guards keep
+     * their meaning.
+     */
+    source: IfcSourceBytes;
     entityIndex: { byId: EntityByIdIndex; byType: Map<string, number[]> };
     deferredEntityIndex?: EntityByIdIndex;
 
@@ -342,7 +354,7 @@ export class ColumnarParser {
         const associationTargetIds = new Set<number>();
         for (const ref of associationRelRefs) {
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
-            if (result) associationTargetIds.add(result.relatingDef);
+            if (result) for (const id of result.relatingDefs) associationTargetIds.add(id);
         }
 
         // Collect EntityRefs for association targets that aren't already categorised.
@@ -568,14 +580,26 @@ export class ColumnarParser {
         // The hierarchy panel can render immediately while property/association
         // parsing continues. This lets the panel appear at the same time as
         // geometry streaming completes.
-        const entitySource = new BufferEntitySource(uint8Buffer, entityIndex);
+        // ONE accessor, shared by the store field and the entity source.
+        //
+        // These used to be built separately -- `BufferEntitySource` got the raw
+        // `uint8Buffer` and wrapped it in its own accessor, while `source` got
+        // another. That is invisible while both are resident views over the
+        // same bytes, and fatal once the source can switch to compressed
+        // storage in place (#2183): `getEntity` would keep reading its private
+        // resident accessor, so the original buffer would never be released and
+        // the store would serve entities from one representation and properties
+        // from the other. Measured: with two accessors the buffer survives GC
+        // after the swap; with one it is collected.
+        const source = contiguousSourceBytes(uint8Buffer);
+        const entitySource = new BufferEntitySource(source, entityIndex);
         const earlyStore: IfcDataStore = {
             fileSize: buffer.byteLength,
             schemaVersion,
             sourceHeader,
             entityCount: totalEntities,
             parseTime: performance.now() - startTime,
-            source: uint8Buffer,
+            source,
             entityIndex,
             strings,
             entities: entityTable,
@@ -617,23 +641,29 @@ export class ColumnarParser {
             const ref = propertyRelRefs[pi];
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
             if (result) {
-                const { relatedObjects, relatingDef } = result;
+                const { relatedObjects, relatingDefs } = result;
                 totalPropRelObjects += relatedObjects.length;
 
-                for (const objId of relatedObjects) {
-                    relationshipGraphBuilder.addEdge(relatingDef, objId, RelationshipType.DefinesByProperties, ref.expressId);
-                }
-
-                // Build on-demand property/quantity maps using pre-built Sets (O(1) vs binary search)
-                const isPropSet = propertySetIds.has(relatingDef);
-                const isQtySet = !isPropSet && quantitySetIds.has(relatingDef);
-
-                if (isPropSet || isQtySet) {
-                    const targetMap = isPropSet ? onDemandPropertyMap : onDemandQuantityMap;
+                // RelatingPropertyDefinition is IfcPropertySetDefinitionSelect, whose
+                // second alternative (IfcPropertySetDefinitionSet) is a SET of pset/
+                // qset definitions — `relatingDefs` has more than one entry for that
+                // case. Every entry in the group applies to every related object.
+                for (const relatingDef of relatingDefs) {
                     for (const objId of relatedObjects) {
-                        let list = targetMap.get(objId);
-                        if (!list) { list = []; targetMap.set(objId, list); }
-                        list.push(relatingDef);
+                        relationshipGraphBuilder.addEdge(relatingDef, objId, RelationshipType.DefinesByProperties, ref.expressId);
+                    }
+
+                    // Build on-demand property/quantity maps using pre-built Sets (O(1) vs binary search)
+                    const isPropSet = propertySetIds.has(relatingDef);
+                    const isQtySet = !isPropSet && quantitySetIds.has(relatingDef);
+
+                    if (isPropSet || isQtySet) {
+                        const targetMap = isPropSet ? onDemandPropertyMap : onDemandQuantityMap;
+                        for (const objId of relatedObjects) {
+                            let list = targetMap.get(objId);
+                            if (!list) { list = []; targetMap.set(objId, list); }
+                            list.push(relatingDef);
+                        }
                     }
                 }
             }
@@ -659,7 +689,12 @@ export class ColumnarParser {
             const ref = associationRelRefs[i];
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
             if (result) {
-                const { relatedObjects, relatingDef: relatingRef } = result;
+                // IfcRelAssociates{Material,Classification,Document}'s Relating*
+                // selects are always single refs (unlike RelatingPropertyDefinition
+                // above, none of IfcMaterialSelect/IfcClassificationSelect/
+                // IfcDocumentSelect admit a SET alternative) — take the one entry.
+                const { relatedObjects, relatingDefs } = result;
+                const relatingRef = relatingDefs[0];
                 const typeUpper = getTypeUpper(ref.type);
 
                 if (typeUpper === 'IFCRELASSOCIATESCLASSIFICATION') {
@@ -960,7 +995,23 @@ export function extractAllEntityAttributes(
     // resolution still works for those types.
     const tableName = store.entities.getTypeName(entityId);
     const typeName = tableName && tableName !== 'Unknown' ? tableName : ref.type;
-    const attrNames = getAttributeNames(typeName);
+    // Named across the bundled schema union (2X3 + 4 + 4X3), not through the
+    // IFC4 codegen pin alone. The pin answers an EMPTY list — not a wrong one —
+    // for every class it does not carry, and 251 real classes are outside it:
+    // the IFC2X3 ones IFC4 dropped and the whole IFC4X3 infrastructure
+    // vocabulary (`IfcCourse`, `IfcPavement`, `IfcKerb`, `IfcSignal`, `IfcRoad`,
+    // …). An empty list means this function returns NO attributes for such an
+    // entity, so every caller that looks one up by name silently finds nothing
+    // and cannot tell that apart from an unset slot. The model-diff adapters
+    // read `PredefinedType` this way, which made a cleared `PredefinedType` —
+    // the single most common edit in a real infrastructure revision — compare
+    // equal to itself on exactly the classes IFC4X3 exists for. Same pinned-
+    // registry family as #2001/#2003/#2021.
+    //
+    // Provably additive: `getAttributeNamesAcrossSchemas` returns the pinned
+    // result unchanged whenever the pin has one, so no IFC2X3 or IFC4 entity's
+    // attribute list — or the hash anyone derives from it — moves.
+    const attrNames = getAttributeNamesAcrossSchemas(typeName);
 
     const result: Array<{ name: string; value: string | number | boolean }> = [];
     const len = Math.min(attrs.length, attrNames.length);
@@ -1144,6 +1195,7 @@ export function pickLongName(entity: IfcEntity): string {
 // Re-export on-demand extraction functions from focused module
 export {
     extractClassificationsOnDemand,
+    extractClassificationSystemsOnDemand,
     extractMaterialsOnDemand,
     extractAllMaterialsOnDemand,
     extractMaterialPropertiesOnDemand,
@@ -1164,6 +1216,8 @@ export {
     extractPsetsFromIds,
     extractQsetsFromIds,
 } from './on-demand-extractors.js';
+
+export { mergeInheritedPropertySets } from './property-set-merge.js';
 
 export type {
     ClassificationInfo,

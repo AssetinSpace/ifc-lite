@@ -1,5 +1,405 @@
 # @ifc-lite/wasm
 
+## 5.0.0
+
+### Major Changes
+
+- [#2766](https://github.com/LTplus-AG/ifc-lite/pull/2766) [`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f) Thanks [@louistrue](https://github.com/louistrue)! - BREAKING for the Rust crate `ifc-lite-export`: `GltfOptions` gains
+  `tessellation_quality: TessellationQuality` and becomes `#[non_exhaustive]`.
+  
+  `GltfOptions` was an exhaustive struct with public fields, so adding a field
+  already breaks every downstream struct literal. That is a major however it
+  ships. Taking the break once and pairing it with `#[non_exhaustive]` makes it
+  the last of its kind: every field added after this one is a minor. Build with
+  `GltfOptions::default()` and the new `with_*` methods, which is the shape
+  `ModelOptions` already uses, because `non_exhaustive` forbids every struct
+  expression from outside the crate and `..Default::default()` is one of them.
+  The fields stay public, so reading one or assigning to one still compiles.
+  
+  No JavaScript surface changes. `exportGlb` keeps its signature and its output
+  is byte-identical, since the viewer's export states `Medium` explicitly. The
+  major rides this package because the Cargo workspace version follows the
+  highest npm version after `changeset version`, and that is what publishes the
+  crates.
+
+## 4.7.0
+
+### Minor Changes
+
+- [#2573](https://github.com/LTplus-AG/ifc-lite/pull/2573) [`33eb685`](https://github.com/LTplus-AG/ifc-lite/commit/33eb685de6c1578727587d87af5c3cd4a30a4122) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `clashIntersectionSolid` — the overlap VOLUME of a clashing pair, as a solid.
+
+  Clash presentation today marks the contact _point_. A point cannot show how deep an overlap is, what shape it has, or which direction it runs. BIMcollab Zoom and Solibri instead draw the intersection volume as an opaque solid inside two ghosted parents, which reads at a glance. This is the engine half of that: given the world-space triangles of two clashing elements, return the mesh of their actual overlap.
+
+  It runs on the existing pure-Rust exact CSG kernel — the same arrangement that cuts opening voids — through `BoolOp::Intersection`, which the kernel already implements. No new geometry code, and no need for the `A − (A − B)` derivation: intersection is a first-class kernel op. A new `ifc_lite_geometry::intersection_solid` wraps it; the wasm export is a thin binding over that.
+
+  On demand, one pair per call. Nothing in the detection sweep touches it, so scan cost is unchanged. Measured on a road/bridge certification model via an internal test harness that enumerates 88 candidate pairs over a 48-element test-only allowlist (the CLI at defaults finds 50 clashes on the same model, with the shipped exclusions applied), one `intersection_solid` call costs a median of 0.59 ms and a max of 38.6 ms release-build; the max is a 264-triangle railing against a beam, and every pair not involving those railings is under 10 ms. Computing all 88 harness pairs eagerly would have cost 216 ms.
+
+  Results carry f64 positions rather than the f32 the mesh pipeline uses elsewhere, because the caller reports a volume: on the analytic rotated-box oracle the f64 path returns exactly 9.375 m³ where the f32 round-trip returns 9.374999882.
+
+  **The result is gated, and often absent.** The kernel snaps input coordinates to a `2^-16 m ≈ 15.26 µm` grid and treats faces inside `near_band_from_extent` as coplanar. Inside that band a thin overlap is resolved as a contact, not a solid, and the returned volume is _exactly 2/3_ of the truth — measured at world offsets 0, 10, 100 and 1000 m, at every tessellation. A −33 % solid is worse than no solid, because it looks plausible. So `intersection_solid` returns a solid only above 4× that band, where the volume is exact to f64, and otherwise reports why: `no-overlap`, `below-kernel-resolution` (with the measured thickness and the depth that would have been needed), `empty-operand` or `budget-exhausted`. Callers should keep the existing contact marker whenever `isSolid` is false.
+
+  How often that happens is the honest headline. The CLI at defaults finds 50 clashes on the bridge model (8 of them `IfcBeam`×`IfcBeam`, all authored bearing details rather than coordination defects); the coverage breakdown below is not that number — it comes from the internal harness's 88 candidate pairs over its 48-element allowlist, which bypasses the shipped element adapter and applies no void/host or spatial-container exclusions. Of those 88 harness pairs, **30 yield a solid, 54 return `no-overlap` and 4 `below-kernel-resolution`**. The 54 are pairs whose interpenetration is below the snap grid; their reported sub-micron distances land on the `f32` ULP at each pair's coordinate magnitude, so they are quantization noise rather than a measured graze — not evidence either way of a coordination issue. For those, no intersection solid exists at this kernel's resolution and the viewer will fall back to the contact marker. The feature helps most where clashes are deep; the largest solid found was 0.0727 m³ between two crossing beams.
+
+  **The gate is rotation-invariant for box pairs.** Its thickness measurement was originally taken against the world axes, which is only the penetration depth when the contact normal happens to be parallel to one — and a building grid rotated off the world frame is the common case, not the exception. Rotating the oracle's own 15–122 µm slab overlaps rigidly by an oblique angle (an isometry: the same overlap, the same answer required) made every one of them clear the gate, returning volumes of 36 % to 103 % of the truth and drifting with tessellation. The gate now measures along the pair's candidate contact normals, derived analytically from the operands' own face planes — the classical 15 OBB separating-axis candidates when both operands present a box frame — with the world axes always kept in the set, so the measure can only ever get stricter, never looser. For an operand that is not a box the set stays the world axes: that is conservative, not correct, and is documented as such in the code. On the bridge model every one of the 88 harness pairs returns a byte-identical outcome before and after, so this closes a reachable correctness hole without moving any number that was already right.
+
+  Verified against an analytic oracle before any wiring: axis-aligned and rotated boxes with hand-derived expected volumes, asserted at 12, 48 and 192 triangles per operand (and at every mixed pair of those) so a tessellation-sampling artifact cannot pass — the failure mode a previous clash depth metric shipped with. Degenerate inputs are covered: coplanar touching faces, sub-micron grazes, disjoint pairs and empty operands all return a reason rather than a sliver or a crash.
+
+### Patch Changes
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Replace the mesh-depth "measurement" with a real one, box-exact, for hard clashes.
+
+  PR [#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) was held on review with a measured refutation: `TriMesh.maxPenetrationInto` (the `'mesh'`-labelled depth introduced by `clash-mesh-penetration-depth.md` / `clash-distance-provenance.md` in this same release) measures the distance from the nearest crossing-triangle VERTEX to the other solid's surface — an O(edge length) sampling artifact. On two 2x2x2 boxes overlapping exactly 1.5 m, tessellated at 12/48/192 triangles per element, it reported **0.03 / 0.50 / 0.07**, all labelled `'mesh'` — a sampling artifact that converges to 0 under retessellation, the opposite of what a depth metric should do, while the AABB estimate (labelled `'estimate'`) was the correct 1.5 m the whole time. The labelling had it backwards.
+
+  This is fixed by removing `maxPenetrationInto` and replacing it with `obbPenetrationDepth` (`packages/clash/src/engine-ts/obb.ts`, `rust/clash/src/obb.rs`): when BOTH elements of a hard-clash pair are, within floating tolerance, rectangular boxes (`detectObb` — 3 mutually orthogonal face-normal families, 2 offset planes each, triangulation-independent), the reported depth is the minimum translation distance along a separating axis — the classical two-OBB penetration depth (Gottschalk), computed over the 15 canonical candidate axes (each box's 3 face normals plus the 9 pairwise cross products). This is provably exact for boxes, deterministic, and — because it is derived from the box's face-plane geometry rather than its triangulation — provably unchanged by retessellation; an analytic-oracle test suite (`obb.test.ts`, `tests.rs`) reproduces the maintainer's 0.03/0.50/0.07 numbers against the OLD metric, then asserts the NEW metric reports the true 1.5 m at all three tessellations, plus a 45°-rotated-box case with an independently-derived expected value and a barely-overlapping (5 mm) control.
+
+  **This narrows what the engine claims to measure.** When either element is not a box, there is no certified box-box depth, and the pair falls back to the AABB estimate — labelled `'estimate'`, honestly, not `'mesh'`. This is a real, known regression relative to the removed probe for a handful of non-box shapes (e.g. a concave L-shaped member contained in another element): the reported depth goes back to being a bounding-box dimension rather than the shape's true penetration, exactly as it was before [#1866](https://github.com/LTplus-AG/ifc-lite/issues/1866), and the test suite (`boundaries.test.ts`, `engine.test.ts`, `tests.rs`) now documents this residual explicitly rather than hiding it behind an artifact that only looked right. A non-box depth metric — the maintainer's other suggested option, an intersection-volume-derived depth — is future work; the divergence-theorem machinery already used for the shape-signature work in this package is a plausible starting point, but deriving a _distance_ (not a volume) from it for non-convex solids needs its own design and did not fit in this correction.
+
+  On a real model (AC20-FZK-Haus, 282 total distances across hard/clearance/touch), 9 pairs (3.2%) are now certified `'mesh'` (all box-box); the remaining 273 (96.8%) are `'estimate'`, numerically identical to the pre-[#1866](https://github.com/LTplus-AG/ifc-lite/issues/1866) baseline. This is a far smaller, more conservative change surface than the held PR's 71/282 relabelling, and none of the certified 9 can exhibit the sampling-artifact failure mode — the code path that produced it no longer exists.
+
+  Both kernels changed identically (`obb.ts` / `obb.rs`, bit-identical `OBB_EPS = 1e-6` and axis-projection arithmetic), and the differential suite asserts `distanceKind` parity on every fixture. `TriMesh.distanceToSurface` and `containsPoint` are kept — they are exact, independently tested primitives, just no longer on this hot path.
+
+  **Follow-up (review): a thin member piercing clean through another box was still mislabelled `'mesh'`, at up to 5.5x the true depth.** The box-box minimum translation distance is the wrong quantity for a through-penetration (a duct through a wall, a beam through a slab): it is dominated by the piercing member's own extent along the shared axis, not by the material actually crossed. A 0.4x0.4x2 m duct centred through a 5.0x0.2x3.0 m wall reported **1.1 m** (the duct's own half-length plus the wall's half-thickness) where the true wall thickness is **0.2 m** — and, unlike the pre-[#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) estimate, it carried the `'mesh'` label a coordinator would trust. `isThroughPenetration` (`obb.ts` / `obb.rs`) now detects this shape — one box's cross-section strictly inside the other's footprint along a shared axis, extending past it on both ends — and declines to certify it, falling back to the AABB estimate exactly as before [#2536](https://github.com/LTplus-AG/ifc-lite/issues/2536) existed. Only attempted when the two boxes share a common frame (every axis of one parallel to an axis of the other); at a generic relative rotation the box-box MTD is unchanged. Also closed: `detectObb` could certify a non-watertight mesh (e.g. a slab exported without its top face) as a zero-thickness box, because a face family whose triangles are all coplanar passed the 2-plane test with no positive extent — a positive-extent guard now rejects it.
+
+  **Follow-up (review): the cross-axis degeneracy guard is now scale-relative, not absolute.** `obbPenetrationDepth` rejected a near-degenerate cross-product candidate with an absolute `len > 1e-6` test and divided by any accepted `len` unconditionally. At large operand scale that absolute cutoff fails in both directions, verified against an exact-rational-arithmetic oracle over all 15 candidates: for two 2000 km near-parallel beams meeting edge-to-edge, the dropped common normal IS the minimum-translation axis, so the min over the remaining axes reported a certified 0.45 m depth for a 0.02 m edge contact (22x); and a disjoint pair of the same beams reported a 0.055 m penetration because the only separating axis of the 15 was the dropped one. Each candidate's verdict now carries a noise bound derived from the operands themselves (the summed half-extents of both boxes plus the center offset, times `8 * EPS / len` - the projection error the `1/len` normalisation can amplify); a verdict inside its own band is skipped, which in a separating-axis test is the conservative direction (skipping a candidate can only fail to find a separation, never invent one), and a verdict outside the band is kept whatever `len` is. Identical change in both kernels (`obb.ts` / `obb.rs`), pinned by mirrored beam fixtures that fail on the old guard with bit-identical wrong values in TS and Rust.
+
+- [#2598](https://github.com/LTplus-AG/ifc-lite/pull/2598) [`2421442`](https://github.com/LTplus-AG/ifc-lite/commit/2421442363c5adf39d9405bf7a0e16b72adc73d1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix half-space plane clipping (`IfcHalfSpaceSolid`/`IfcPolygonalBoundedHalfSpace`
+  subtracts, layered-material band splitting) dropping or misclassifying geometry far
+  from the model origin. `ClippingProcessor` classified each triangle vertex against
+  the clip plane with a fixed `epsilon = 1e-6`, while mesh vertices are f32-native
+  and the plane is f64 end to end. The two callers work in different frames — the
+  half-space path clips inside `BooleanProcessor::process`, in the representation
+  item's local, pre-scale, file-unit coordinates (the plane decoded in f64 from
+  `IfcAxis2Placement3D` before `apply_placement` or unit scaling run), whereas the
+  layered-material path clips an already-scaled, already-placed mesh against
+  interface planes built in metres — but the f32/f64 mismatch is the same in both.
+  Once a coordinate passes
+  16 m from the origin, the f32 rounding step exceeds that fixed epsilon, so a
+  vertex meant to sit exactly on the plane (e.g. a cut
+  flush with a box face) could land on the wrong side of it — non-monotonically, since
+  it depends on which way the rounding lands rather than on distance alone. A unit-box
+  flush cut at 1e-6 lost its entire cross-section at a 100.7 m offset and again at a
+  50000.7 m offset, while surviving at 1000.7 m and 5000.7 m in between.
+
+  `clip_mesh` now scales the classification epsilon to the coordinate magnitude of the
+  **mesh being clipped** (`2⁻²²`, the f32 ULP fraction), floored at the original `1e-6`
+  constant. Only the mesh contributes: the plane is f64 end to end and carries no
+  rounding noise, and its stored point is an arbitrary representative of the plane, so
+  letting it size the tolerance would make two descriptions of the same half-space clip
+  differently. The magnitude is tracked **per axis** and projected onto the clip plane's
+  own unit normal — `eps(n) = max(1e-6, |nₓ|·noiseₓ + |n_y|·noise_y + |n_z|·noise_z)` — rather
+  than collapsed to a single max over all three axes. The tolerance is compared against
+  a signed distance measured along one normal, so each coordinate's rounding noise
+  enters it weighted by that axis's normal component, and an axis orthogonal to the
+  normal contributes nothing. A max over all axes instead sizes the tolerance to the
+  operand's distance from the local origin along whichever axis happens to be largest,
+  even when that axis is irrelevant to the plane being tested: a site-offset model at
+  x = 1e6 mm clipped by a horizontal plane through a wall spanning z = 0..3000 mm got
+  0.238 mm where the real f32 rounding step at that z is 2.4e-4 mm — about 1000x too
+  loose on the only axis that matters, letting genuinely separated geometry classify
+  as on-plane. Same formulation as `ProjectedPlaneEps`/`epsForPlane` in
+  `@ifc-lite/clash`'s contact narrow phase.
+
+  Note the projected form is not uniformly tighter than a max over axes: for a unit
+  normal the weighted sum is bounded by `√3 · max` and reaches it for a body-diagonal
+  normal, so such a plane gets a `√3`-looser tolerance. That is the correct worst case
+  when all three axes' rounding errors align. The tolerance is also invariant under
+  negating the plane normal (each component enters as `|nᵢ|`), which the layered path
+  depends on: it clips one remainder with `+n` and `-n` and welds the two halves, so a
+  direction-dependent epsilon would leave a gap or an overlap at every material
+  interface. Evidence for all of the above is
+  synthetic (constructed box/slab/triangle fixtures at the stated offsets); no corpus
+  model has been shown to change output as a result.
+
+  Two things deliberately left alone. `ClippingProcessor::clip_triangle` — public API
+  with no in-tree production caller — keeps the flat `1e-6`, so external callers of
+  that entry point still get the pre-fix tolerance until it is migrated. And the floor
+  is still a raw constant never rescaled by `unit_scale`, so its physical size depends
+  on the caller's frame; below the ~4.19-unit crossover where the floor rather than the
+  projected term wins, a metre-authored and a millimetre-authored file can pick
+  epsilons differing by `4.194 / E` for a real-world amplitude of `E` metres (~4x at
+  1 m, ~42x at 0.1 m, unbounded as `E` shrinks). Both sides stay sub-micrometre.
+  Rescaling that floor is its own change with its own corpus evidence.
+
+  This does not reuse the exact CSG kernel's `near_band_from_extent` helper
+  (`kernel::mesh_bridge`): that helper's floor is `8·SNAP_GRID` ≈ 1.22e-4, sized for
+  its own snap grid, and its scaling term only exceeds that floor past ~512 m — so for
+  ordinary building-scale models it would have replaced the old `1e-6` with a flat
+  122x-looser epsilon everywhere, not a magnitude-proportional one.
+
+- [#2681](https://github.com/LTplus-AG/ifc-lite/pull/2681) [`f5c96c5`](https://github.com/LTplus-AG/ifc-lite/commit/f5c96c581eebfcc627be96de0670c9540b61623f) Thanks [@louistrue](https://github.com/louistrue)! - Fix the exact CSG kernel welding genuinely separate surfaces together in models
+  placed far from the project origin. The kernel's near-coplanar band
+  (`near_band_from_extent`) sized itself from ONE scalar extent, the max
+  |coordinate| over all three axes of both operands, and then compared that band
+  against a PERPENDICULAR distance to a specific plane. A signed plane distance is
+  `dot(v - p, n)`, so each axis's f32 rounding noise enters it weighted by that
+  axis's normal component and an axis orthogonal to the normal contributes
+  nothing; collapsing to the max therefore sized the band from an axis the plane
+  never sees.
+
+  A georeferenced model 10 km out in X, cut by a Z-normal plane, got a ~2.4 mm
+  band derived entirely from the X magnitude where the real f32 rounding step in Z
+  is the ~122 um floor. Surfaces a genuine 2 mm apart fell inside it, were
+  reconciled as flush, and thin cuts collapsed: the same 2 mm recess that cuts
+  correctly at the origin returned the uncut slab 10 km out (volume
+  0.3000030517580399 instead of 0.29968), i.e. the recess vanished from the
+  result.
+
+  The band is now kept PER AXIS and projected onto the plane's own normal,
+  `sum_i |n_i| * extent_i * 2^-22`, floored at the unchanged `8 * SNAP_GRID` snap
+  scatter envelope. This is the formulation already adopted for the CSG clipper's
+  plane epsilon (`csg/plane_eps.rs`), the clash narrow phase
+  (`packages/clash/src/contact/narrow-phase.ts`) and the section cutter
+  (`packages/drawing-2d/src/section-cutter.ts`), not a fourth one. Comparisons are
+  made in the `|n|`-scaled space, so no normal is normalised and no square root is
+  taken: determinism (byte-identical native == wasm) is unchanged, as is behaviour
+  at the origin.
+
+- [#2536](https://github.com/LTplus-AG/ifc-lite/pull/2536) [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add the `distanceKind` getter to `ClashRunResult` (`rust/wasm-bindings/src/api/clash.rs`) that `@ifc-lite/clash`'s wasm engine reads.
+
+  Without this changeset `@ifc-lite/clash` would publish depending on `@ifc-lite/wasm: workspace:^`, which npm can satisfy with a pre-existing `@ifc-lite/wasm` build that lacks the getter — `wasm-kernel.ts` would then read `undefined` off the result and throw reading an out-of-range index, on the first clash. This bumps `@ifc-lite/wasm` alongside `@ifc-lite/clash` so the published dependency range only ever resolves to a build that has the field.
+
+## 4.6.0
+
+### Minor Changes
+
+- [#2574](https://github.com/LTplus-AG/ifc-lite/pull/2574) [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `clashIntersectionSolid` — the overlap VOLUME of a clashing pair, as a solid.
+
+  Clash presentation today marks the contact _point_. A point cannot show how deep an overlap is, what shape it has, or which direction it runs. BIMcollab Zoom and Solibri instead draw the intersection volume as an opaque solid inside two ghosted parents, which reads at a glance. This is the engine half of that: given the world-space triangles of two clashing elements, return the mesh of their actual overlap.
+
+  It runs on the existing pure-Rust exact CSG kernel — the same arrangement that cuts opening voids — through `BoolOp::Intersection`, which the kernel already implements. No new geometry code, and no need for the `A − (A − B)` derivation: intersection is a first-class kernel op. A new `ifc_lite_geometry::intersection_solid` wraps it; the wasm export is a thin binding over that.
+
+  On demand, one pair per call. Nothing in the detection sweep touches it, so scan cost is unchanged. Measured on a road/bridge certification model via an internal test harness that enumerates 88 candidate pairs over a 48-element test-only allowlist (the CLI at defaults finds 50 clashes on the same model, with the shipped exclusions applied), one `intersection_solid` call costs a median of 0.59 ms and a max of 38.6 ms release-build; the max is a 264-triangle railing against a beam, and every pair not involving those railings is under 10 ms. Computing all 88 harness pairs eagerly would have cost 216 ms.
+
+  Results carry f64 positions rather than the f32 the mesh pipeline uses elsewhere, because the caller reports a volume: on the analytic rotated-box oracle the f64 path returns exactly 9.375 m³ where the f32 round-trip returns 9.374999882.
+
+  **The result is gated, and often absent.** The kernel snaps input coordinates to a `2^-16 m ≈ 15.26 µm` grid and treats faces inside `near_band_from_extent` as coplanar. Inside that band a thin overlap is resolved as a contact, not a solid, and the returned volume is _exactly 2/3_ of the truth — measured at world offsets 0, 10, 100 and 1000 m, at every tessellation. A −33 % solid is worse than no solid, because it looks plausible. So `intersection_solid` returns a solid only above 4× that band, where the volume is exact to f64, and otherwise reports why: `no-overlap`, `below-kernel-resolution` (with the measured thickness and the depth that would have been needed), `empty-operand` or `budget-exhausted`. Callers should keep the existing contact marker whenever `isSolid` is false.
+
+  How often that happens is the honest headline. The CLI at defaults finds 50 clashes on the bridge model (8 of them `IfcBeam`×`IfcBeam`, all authored bearing details rather than coordination defects); the coverage breakdown below is not that number — it comes from the internal harness's 88 candidate pairs over its 48-element allowlist, which bypasses the shipped element adapter and applies no void/host or spatial-container exclusions. Of those 88 harness pairs, **30 yield a solid, 54 return `no-overlap` and 4 `below-kernel-resolution`**. The 54 are pairs whose interpenetration is below the snap grid; their reported sub-micron distances land on the `f32` ULP at each pair's coordinate magnitude, so they are quantization noise rather than a measured graze — not evidence either way of a coordination issue. For those, no intersection solid exists at this kernel's resolution and the viewer will fall back to the contact marker. The feature helps most where clashes are deep; the largest solid found was 0.0727 m³ between two crossing beams.
+
+  **The gate is rotation-invariant for box pairs.** Its thickness measurement was originally taken against the world axes, which is only the penetration depth when the contact normal happens to be parallel to one — and a building grid rotated off the world frame is the common case, not the exception. Rotating the oracle's own 15–122 µm slab overlaps rigidly by an oblique angle (an isometry: the same overlap, the same answer required) made every one of them clear the gate, returning volumes of 36 % to 103 % of the truth and drifting with tessellation. The gate now measures along the pair's candidate contact normals, derived analytically from the operands' own face planes — the classical 15 OBB separating-axis candidates when both operands present a box frame — with the world axes always kept in the set, so the measure can only ever get stricter, never looser. For an operand that is not a box the set stays the world axes: that is conservative, not correct, and is documented as such in the code. On the bridge model every one of the 88 harness pairs returns a byte-identical outcome before and after, so this closes a reachable correctness hole without moving any number that was already right.
+
+  Verified against an analytic oracle before any wiring: axis-aligned and rotated boxes with hand-derived expected volumes, asserted at 12, 48 and 192 triangles per operand (and at every mixed pair of those) so a tessellation-sampling artifact cannot pass — the failure mode a previous clash depth metric shipped with. Degenerate inputs are covered: coplanar touching faces, sub-micron grazes, disjoint pairs and empty operands all return a reason rather than a sliver or a crash.
+
+## 4.5.1
+
+### Patch Changes
+
+- [#2539](https://github.com/LTplus-AG/ifc-lite/pull/2539) [`cd72412`](https://github.com/LTplus-AG/ifc-lite/commit/cd724127245fcb767894642cd0994baaba88ff7d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the wasm panic hook so it actually survives `new IfcAPI()`: every realm was constructing an
+  `IfcAPI` before doing any work, and `IfcAPI::new()` called `console_error_panic_hook::set_once()`
+  directly — which owns its own `Once` and unconditionally replaces whatever panic hook is currently
+  installed. That silently overwrote the panic-location-stashing hook installed at module init,
+  so `globalThis.__ifclite_wasm_panic` was never written and the source-location attribution added
+  for [#2527](https://github.com/LTplus-AG/ifc-lite/issues/2527) was inert in production. `IfcAPI::new()` now calls the crate's own idempotent
+  `set_panic_hook()`, which no-ops if the stashing hook is already installed.
+
+  This is a runtime behavior change for the published `@ifc-lite/wasm` package: every uncaught Rust
+  panic now stashes `{ location, at }` on the realm's JS global (source location only, sanitised of
+  build-machine paths — never the panic message) for the duration of the panic hook's lifetime, where
+  downstream consumers (the viewer's error tracking) can read and consume it.
+
+## 4.5.0
+
+### Minor Changes
+
+- [#2579](https://github.com/LTplus-AG/ifc-lite/pull/2579) [`6d09c4a`](https://github.com/LTplus-AG/ifc-lite/commit/6d09c4a768a9caa1600fb6db38d0e80ec8051aee) Thanks [@louistrue](https://github.com/louistrue)! - `splitMeshByZones(positions, indices, zones, footprints?, footprintCounts?)` cuts one element into one closed solid per location zone, plus the remainder (issue [#2508](https://github.com/LTplus-AG/ifc-lite/issues/2508) item 2).
+
+  Everything is in the caller's frame, and positions cross as f64: the split's whole value over an AABB estimate is exactness, and an f64 to f32 round trip at the boundary would put a crack back into every shared zone plane. A zone is an oriented box by default, or a vertical prism when its `footprintCounts` entry is non-zero.
+
+  Each result carries its own enclosed volume, and the handle carries `sumErrorRel` - how far the pieces are from summing to the whole. That is the invariant the issue puts above every other for this feature, and it is exposed rather than enforced: the expected cause of a failure is zones that overlap each other, and a number the caller can show beats a silent refusal.
+
+## 4.4.1
+
+### Patch Changes
+
+- [#2556](https://github.com/LTplus-AG/ifc-lite/pull/2556) [`b10224f`](https://github.com/LTplus-AG/ifc-lite/commit/b10224f6541212227fc011ba1184fd52ad206447) Thanks [@mpancera](https://github.com/mpancera)! - Write the IFCX header version under `ifcxVersion`, so exported files can be read back. The Rust IFC5 exporter emitted `header.version`, but readers look for `header.ifcxVersion` — the key buildingSMART's own reference files use and the one `@ifc-lite/ifcx` requires. Every file `ifc-lite export --format ifcx` produced was therefore rejected by our own parser with "Invalid IFCX file: missing or invalid header.ifcxVersion", which also meant an exported file could not be opened in the viewer. Every other IFCX writer in the repo (the TS `ifc5-exporter`, `packages/ifcx`'s writer, the layer-stack publish path) already used `ifcxVersion`; the Rust exporter was the only outlier. Verified by changing only that header key on an exported file, leaving the rest of the document untouched: it goes from rejected to parsed.
+
+## 4.4.0
+
+### Minor Changes
+
+- [#1344](https://github.com/LTplus-AG/ifc-lite/pull/1344) [`63496ec`](https://github.com/LTplus-AG/ifc-lite/commit/63496ec0ae63c54c3bcbc5ecaec537877dc48831) Thanks [@louistrue](https://github.com/louistrue)! - Add DFJSON (Dragonfly) energy-model export alongside HBJSON. Each `IfcSpace` becomes an extruded `Room2D` (floor polygon + floor-to-ceiling height) grouped into stories — the simpler Ladybug Tools target for mostly-vertical-wall models. Surfaces:
+
+  - `GeometryProcessor.exportDfjson(buffer, name)` (`@ifc-lite/geometry`)
+  - `bim.export.dfjson({ name, filename })` + `ExportDfjsonOptions` (`@ifc-lite/sdk`)
+  - `ifc-lite export <file> --format dfjson` (`@ifc-lite/cli`)
+
+  The Rust source of truth is `ifc-lite-export::export_dfjson`, reusing the same analytic floor-footprint extraction as HBJSON, so the two exports agree on where a footprint lands.
+
+  They do not cover the same set of spaces, by design: each builder applies its own admissibility rules downstream of that shared extraction. A `Room2D` is a floor polygon swept straight up, so DFJSON reports a space as `skipped` when it cannot be represented that way — a zero-height extrusion, an extrusion that leans more than ~2° off vertical, or a sloped floor ring — where HBJSON still emits a solid. Emitting those as vertical plates anyway would land the floor correctly and every wall wrongly, with nothing in the stats to say so. Conversely DFJSON keeps a space that HBJSON's watertightness gate rejects, since a 2D plate has nothing to fail. On real models that runs in both directions — 19 HBJSON rooms vs 17 DFJSON on one file, 46 vs 47 on another.
+
+  A model carrying duplicated `IfcSpace` geometry (Revit does this) runs the same `dedupe_colliding` pass HBJSON uses, so overlapping plates drop the same copies rather than double-counting floor area.
+
+  The `Building` → `Story` → `Room2D` nesting comes from the file's own `IfcBuilding` / `IfcBuildingStorey` / `IfcSpace` containment, and both carry their IFC `Name` into `display_name` — the point of the format for an IFC-shaped model, and the thing HBJSON's flat `rooms` array drops. Grouping by floor elevation instead would only approximate the partition the file already states: on `Office_A_20110811.ifc` a 1 m elevation band splits the model's two populated storeys into three stories. That heuristic survives as the fallback for spaces the file places nowhere, and for models that declare no spatial structure at all.
+
+  Known v1 limitation: `Room2D.display_name` is still `R{expressId}` rather than the `IfcSpace` `Name` — the same as HBJSON's rooms today, so the two stay in step.
+
+  Both energy exports apply the mutation view, so entities authored in-session (drawn spaces, in particular) are visible to the analytic exporter rather than silently missing — the DFJSON half of [#1908](https://github.com/LTplus-AG/ifc-lite/issues/1908). Regeneration through `StepExporter` happens only when the overlay actually carries edits (`hasPendingChanges()`), so an unedited model still hands its retained source bytes straight to the exporter. The gate, the byte resolution and the WASM handle lifecycle are shared between the two formats rather than written twice.
+
+## 4.3.1
+
+### Patch Changes
+
+- [#2068](https://github.com/LTplus-AG/ifc-lite/pull/2068) [`d85ef9b`](https://github.com/LTplus-AG/ifc-lite/commit/d85ef9bb725843f682463496e7a8f2d2ab9b83f1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop dropping the geometry of an `IfcMappedItem` nested inside another mapped item's representation.
+
+  `process_mapped_item_cached` walked the items of a `RepresentationMap`'s mapped representation and `continue`d past every item that was itself an `IfcMappedItem`, as a guard against unbounded recursion on a malformed model. The nested item's geometry contributed nothing, silently: the map's cached source mesh held only its direct solids.
+
+  Its sibling walker `collect_submeshes_from_item_inner` — the per-style sub-mesh path the viewer takes for a normal occurrence — has always recursed into nested mapped items, bounded by `MAX_MAPPED_ITEM_DEPTH` plus a per-walk visited set. So the same file rendered differently depending on which of the two walkers processed it. Paths in the shipping product that take the cached one:
+
+  - Type-product geometry (`IfcTypeProduct` `RepresentationMaps` with no instantiating occurrence, [#957](https://github.com/LTplus-AG/ifc-lite/issues/957)/[#961](https://github.com/LTplus-AG/ifc-lite/issues/961)). The type's own items are walked directly and a mapped item among them is processed, but a mapped item nested one level deeper inside it was dropped, so part of the type's body was missing from the render and from every export fed by it.
+  - Void cutters and the void probes. An `IfcOpeningElement` whose body is a mapped representation is meshed through this path to build the cutter; a nested mapped item inside the map left the cutter truncated or empty, so the opening was cut short or not cut at all and the host rendered solid.
+
+  - The whole-element fallback. When the sub-mesh walker yields nothing for an element, meshing falls back to `process_element`, which walks representation items through this path.
+
+  The cached path now recurses like its sibling, under the same `MAX_MAPPED_ITEM_DEPTH` cap and a visited set, so a cyclic or absurdly deep mapped-item chain still terminates instead of overflowing the stack. The recursive result is already unit-scaled with its own `MappingTarget` applied, so composing the outer level's transform over the merge reproduces the nesting algebra the sub-mesh walker applies per sub-mesh.
+
+  When one of those bounds does cut a walk short, the mesh it produces is no longer published to the model-wide source cache. That cache is keyed on the `IfcRepresentationMap` id alone, but with recursion a source's mesh also depends on the depth at which the walk reached it — a source first met near the cap loses everything below it, and caching that would serve the short mesh to a later occurrence that entered at depth 0 and would otherwise walk the whole chain. The existing guard could not catch this: a depth-truncated mesh is non-empty and trips no CSG budget. Sources whose walk ran to completion are cached exactly as before.
+
+## 4.3.0
+
+### Minor Changes
+
+- [#1988](https://github.com/LTplus-AG/ifc-lite/pull/1988) [`e4782e8`](https://github.com/LTplus-AG/ifc-lite/commit/e4782e8362c0899d0df1070d5eafb70ef18481b6) Thanks [@louistrue](https://github.com/louistrue)! - `MeshCollection.geometryAabbValues`: per-entity world bounding boxes from the geometry-hash pass.
+
+  A new read-only member on the committed type surface (`packages/wasm/pkg/ifc-lite.d.ts`), so this is additive public API. Nothing was removed or renamed.
+
+  Six `f64` per entry, `[minX, minY, minZ, maxX, maxY, maxZ]`, in `geometryHashIds` order — entry `i` occupies `[6*i, 6*i+6)`, so the array is always exactly `6 * geometryHashCount` long. An entity with a hash but no box reserves its six slots as `NaN` rather than shortening the array, which would mis-attribute every later entry. Populated only when `IfcAPI.setComputeGeometryHashes()` is on, the same switch that gates the hashes; empty otherwise, so nothing is computed when the diff feature is off.
+
+  The box is in the WebGL Y-up frame, like every other box, position, origin and placement crossing this boundary. It carries absolute world coordinates (the file's RTC folded back in) while `positions` are RTC-relative, so a consumer comparing the two folds `rtcOffset*` in. See `docs/api/wasm.md`.
+
+  Why: a changed geometry hash conflates _moved_, _reshaped_ and _re-tessellated_ into one bit, which is what makes the diff engine's `moved` match kind a guess. The box separates them — same extent at a new centre is a move, a different extent is a reshape, an identical box with a different hash is retriangulation.
+
+  Two companions ship alongside it, same switch, same index-parallel rule, same NaN-means-absent convention: `MeshCollection.geometryVolumeValues` (enclosed volume in m³) and `MeshCollection.geometryClosureFlags` (packed topology verdict). A divergence-theorem volume needs a closed, consistently wound surface, so a volume is emitted ONLY where the entity produced exactly one segment and that segment was exactly one closed, orientable component — `NaN` otherwise, which is roughly a third of entities by design. The flags name which clause failed (bit 0 closed, 1 orientable, 2 single component, 3 one segment; `0x0F` is exactly the set carrying a volume), because a refusal without a reason is not actionable. A clear bit means NOT PROVED rather than proved-false: an element whose mesh was edited after the verdict was taken (the f32-collapse degenerate backstop drops triangles, which opens their neighbours) has bits 0-2 retracted and ships no volume.
+
+### Patch Changes
+
+- [#1977](https://github.com/LTplus-AG/ifc-lite/pull/1977) [`59792cc`](https://github.com/LTplus-AG/ifc-lite/commit/59792cc7d15bba68708a88475861f499f7b15647) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Skip the content-dedup signature walk on large single-instance faceted BREPs ([#1909](https://github.com/LTplus-AG/ifc-lite/issues/1909)). A model consisting of one large `IfcFacetedBrep` took ~30 s to reach geometry where web-ifc does open + geometry in ~2.85 s. The cost was not exact arithmetic — a faceted BREP never enters the exact kernel — but a duplicate full traversal: `item_dedup_key` walked every face, bound, loop and point to build a dedup key, mirroring the mesher's own traversal, for a key that cannot pay off when there is exactly one instance.
+
+  `item_dedup_key` now skips the signature walk for an `IfcFacetedBrep` above `FACETED_BREP_DEDUP_FACE_LIMIT` (20,000 faces), determined from the shell reference and face-list length without decoding any points.
+
+  Dedup and GPU instancing are **not** disabled for large repeated geometry — only the pre-mesh, item-level cache is skipped. `get_or_cache_by_hash` (post-mesh, sampled, O(1) in mesh size) and `direct_rep_identity` still run, so two structurally identical large BREPs still mesh identically and still share a `rep_identity`. That is asserted by test rather than reasoned about, since trading a load-time win for a rendering regression would be a bad bargain. What is genuinely lost is the mesh-skip-on-cache-hit optimisation for a >20k-face item that really is duplicated.
+
+  Measured with a deterministic counter rather than wall-clock: on a synthetic 980,000-face BREP, dedup on did 5,880,000 point-cache accesses against 2,940,000 with it off — exactly 2.00× — and 1.00× after the fix.
+
+  An end-to-end suite verdict **cannot** be produced for this change and none is claimed: the largest BREP across all 163 fixtures is 8,848 faces, so nothing in the corpus crosses the gate, and a base-vs-branch A/B swings with run order. That finding, and the instruction not to repeat the experiment, are recorded in the perf lever ledger. The 20,000 threshold is a judgement call chosen an order of magnitude clear of realistic repeated parts (connection plates and bolts run to low hundreds of faces), not a measured optimum.
+
+- [#2025](https://github.com/LTplus-AG/ifc-lite/pull/2025) [`40e9c59`](https://github.com/LTplus-AG/ifc-lite/commit/40e9c5931fab27b0de05655e08804562dd794389) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Make the world geometry hash invariant to `IfcRelVoidsElement` statement order ([#2019](https://github.com/LTplus-AG/ifc-lite/issues/2019)).
+
+  Each host's opening list was accumulated in file order (and extended in hashmap-iteration order during aggregate propagation), then subtracted sequentially by the void CSG kernel. Sequential cuts are not associative — every pass snaps f64 to f32 — so two exports of the same design that differ only in the order of their `IFCRELVOIDSELEMENT` statements produced numerically different, geometrically equivalent meshes, and therefore different world geometry hashes for walls, wall standard cases and coverings.
+
+  Since that hash is the "did this element's shape or position change" signal, a re-export that merely reordered statements reported a false _changed_ in Compare. Opening lists are now sorted by express id before the cut.
+
+  What this buys, precisely: the hash is stable under any reordering that preserves express ids — which is what [#2019](https://github.com/LTplus-AG/ifc-lite/issues/2019) measured — and under a monotone renumber such as a merge offset, since neither changes the openings' relative order. It is **not** stable under an arbitrary id permutation: if a re-export renumbers two openings so their relative order flips, the sorted sequence changes and the hash moves with it. Express ids are themselves a property of the byte layout, so this narrows the dependency rather than removing it. Surviving a cross-tool re-export needs an id-independent canonical key — opening GlobalId, or a geometric key — which is worth its own issue.
+
+  Note for consumers treating the hash as a stable content address: elements whose `IFCRELVOIDSELEMENT` statements were not already in ascending express-id order hash differently once, after which the value is stable under the reorderings above. Measured against the committed corpus that is 283 of 5,577 voided hosts, roughly 5%.
+
+- [#1970](https://github.com/LTplus-AG/ifc-lite/pull/1970) [`af869bd`](https://github.com/LTplus-AG/ifc-lite/commit/af869bd6c8133d8d13c9d62edecf04c37baa0245) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Render geometry attached to any representationless spatial container, not just `IfcBuilding` ([#1910](https://github.com/LTplus-AG/ifc-lite/issues/1910)). [#1969](https://github.com/LTplus-AG/ifc-lite/issues/1969) exempted `IfcBuilding` class-wide, which covers terrain/DGM exports that hang an `IfcShellBasedSurfaceModel` off the building. A DGM attached to an `IfcBuildingStorey` — or to any other container still blocked by name — still rendered nothing.
+
+  The exception is instance-level rather than class-level: a spatial container is admitted **only when that specific instance's `Representation` attribute is non-null**. Containers normally carry a null representation, so every file that works today takes the byte-identical prior path; the gate only permits a job that the overwhelmingly common case never creates.
+
+  Applied at all three discovery paths, which is the part that had to be got right: the serial scanner, the sharded column classifier (`buildPrePassStreamingSharded` supplies precomputed class columns and never consults the serial branch), and `combined_pre_pass` behind `buildPrePassOnce`. Missing any one of them would have produced geometry that renders under some load paths and not others — and on the sharded path, behaviour varying with how many workers the browser spun up. `scan_shard_classified`'s class bytes stay byte-identical to the serial classification for every entity outside the exception, preserving the sharded-merge guarantee.
+
+  Geometry hashes are untouched: `geom_hash` is deliberately RTC-invariant and all 9 of its tests pass unchanged, so no determinism manifest moves.
+
+  **This renders geometry that was previously skipped, so some models will draw more than before and take longer doing it.** That is the point of the change, but it is a behaviour change and not only a bug fix. The committed `AB22.ifc` infrastructure fixture is the worked example: it carries ten `IfcFacilityPart` entities — roadway, shoulders, roadside parts — and every one has a non-null `Representation`. All ten were silently skipped before and are now meshed. For identical input its clash count goes from 19 to 75, the 56 new pairs all involving the newly-meshed road surfaces, and the model takes roughly twice as long to process (measured ~180-205 ms before, ~380-450 ms after).
+
+  Files whose spatial containers carry no representation — the overwhelmingly common case — are unaffected and take the byte-identical prior path. But an infrastructure model that hangs geometry off `IfcFacilityPart`, which is exactly the shape this change exists to support, will render more and cost more.
+
+  The per-entity cost of the gate itself is one memoised name lookup plus, only for the handful of names that pass it, one attribute-presence scan; that part is not measurable against run-to-run noise. The cost above is the meshing of geometry that should always have been drawn.
+
+- [#1990](https://github.com/LTplus-AG/ifc-lite/pull/1990) [`c868444`](https://github.com/LTplus-AG/ifc-lite/commit/c868444e94348a34cbea2b130968a6c7affc474e) Thanks [@louistrue](https://github.com/louistrue)! - fix(geometry): apply `IfcRepresentationMap.MappingOrigin`, and fix the operator frame/scale gaps around it
+
+  An `IfcMappedItem`'s transform is `MappingTarget · MappingOrigin`: the mapped
+  items are authored in the mapping source's coordinate system, whose placement
+  inside the map IS `MappingOrigin` (attribute 0), so it composes innermost — the
+  same order IfcOpenShell uses. The mesh path never read that attribute at all: it
+  resolved the map straight to its `MappedRepresentation` and applied only the
+  `MappingTarget` operator. Any map with a non-identity origin therefore placed
+  every occurrence at the wrong spot, and because the origin sits INSIDE the
+  target, a scaling target multiplied the error (a `Scale = 1000` target turns a
+  1 mm origin offset into a 1 m miss). Both mapped-item paths (the single-mesh
+  `process_mapped_item_cached` and the per-style sub-mesh collector), the void
+  fast-path probes, and the 2D drawing profile extractor now compose it; the 2D
+  symbolic path already did, which is where the composition order is pinned.
+
+  The void probes had been deferring any non-identity-origin opening to the exact
+  kernel _specifically because_ the mesh path dropped the origin, to keep the fast
+  path bit-consistent with the rendered geometry. They now compose the origin
+  themselves and keep the fast path.
+
+  Three smaller defects in the same operator code, found while confirming the
+  above:
+
+  - `IfcCartesianTransformationOperator2DnonUniform` keeps `Scale2` at attribute 4
+    (the 2D forms have no `Axis3`), but the parser read the 3D layout: `Scale2`
+    came from the nonexistent attribute 5, so Y silently fell back to the X scale,
+    and attribute 4 (a REAL) was fed to the `Axis3` direction parse.
+  - `Axis2` was never read. A mirroring frame — `Axis2` anti-parallel to
+    `Axis3 × Axis1`, which some exporters write — was silently un-mirrored into a
+    right-handed one. `Axis2` is now honoured via `IfcSecondProjAxis` semantics
+    (projected perpendicular to Z and X). An `Axis2` that AGREES with the
+    right-handed frame keeps the exact cross-product bits, so output for every
+    well-formed operator is bit-identical.
+  - The 2D drawing profile extractor ignored `Scale2`/`Scale3` entirely, so a
+    non-uniform operator collapsed to its X scale on all three axes there while
+    the 3D mesh honoured them, and the symbolic 2D path dropped `Scale` outright
+    (a metre-authored map instantiated at `Scale = 1000` into a millimetre model
+    drew its plan symbols 1000x too small while the 3D mesh was correct).
+
+  No fixture in the corpus changes: all 51,662 `IfcRepresentationMap` records
+  across the 63 test models carry an identity `MappingOrigin`, and every operator
+  in them is uniform with a consistent `Axis2`.
+
+- [#2028](https://github.com/LTplus-AG/ifc-lite/pull/2028) [`8967a03`](https://github.com/LTplus-AG/ifc-lite/commit/8967a033704a7edbb03140291df7a8536d3dd892) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the 2D symbolic transform (floor-plan / annotation rendering) to represent a mirroring `IfcMappedItem` MappingTarget ([#1994](https://github.com/LTplus-AG/ifc-lite/issues/1994)). `Transform2D` (`rust/processing/src/symbolic/transform.rs`) stored its linear block as a `(cos_theta, sin_theta)` similarity — rotation + uniform scale + translation — which has no reflection component, so a MappingTarget whose `Axis2` disagrees with the right-handed perpendicular of `Axis1` drew its plan symbols un-mirrored while the 3D mesh path (fixed in [#1990](https://github.com/LTplus-AG/ifc-lite/issues/1990)) mirrored correctly. `Transform2D` now carries a full 2x2 linear block (`m00, m01, m10, m11`), and `parse_cartesian_transformation_operator` derives handedness from `Axis2` the same way `router/transforms/operator.rs` does for the 3D path, so both paths agree.
+
+  Non-mirroring geometry (rotation, uniform scale, translation, identity) is bit-equivalent to before. Text/annotation glyphs stay non-mirrored under a mirroring transform by construction: their direction reads only the local X-axis column, which a mirroring `Axis2` never touches.
+
+  Impact is low — no model in the 63-model test corpus carries a mirroring operator — so this is a correctness fix demonstrated by a hand-authored fixture, not an observed rendering failure.
+
+## 4.2.2
+
+### Patch Changes
+
+- [#1969](https://github.com/LTplus-AG/ifc-lite/pull/1969) [`8793ffd`](https://github.com/LTplus-AG/ifc-lite/commit/8793ffd4948840fbd96bf745d8e9db71e139d350) Thanks [@louistrue](https://github.com/louistrue)! - Render geometry attached directly to `IfcBuilding` ([#1910](https://github.com/LTplus-AG/ifc-lite/issues/1910)). Terrain/DGM exports hang an `IfcShellBasedSurfaceModel` straight off the building rather than off a dedicated element. `is_non_geometric_spatial` blocked `IfcBuilding`, so `has_geometry_by_name` returned false, the building never became a geometry job, and the model loaded with correct metadata and hierarchy but rendered nothing at all.
+
+  The reported `(0,0,0)` RTC offset is a consequence, not the cause: with no job to sample, RTC detection had nothing to look at and fell through to the placement-bounds scan, which sees only the origin placements such files use. Once the building is sampled, the existing raw-vertex probe in `sample_element_translation` reads its first vertex and re-bases correctly — no change to RTC detection itself was needed.
+
+  `IfcBuilding` now joins `IfcSpace`, `IfcSite` and `IfcSpatialZone` in the exempt set, the same fix `IfcSpatialZone` got in [#1075](https://github.com/LTplus-AG/ifc-lite/issues/1075) once Revit Family/Dynamo exports were found emitting it with a body. The gate only _permits_ meshing — a building with no representation still produces nothing, which is the overwhelmingly common case — so the cost is one abandoned job per building. `IfcBuildingStorey` and the `IfcFacility`/`IfcFacilityPart` families stay blocked; no exporter has been observed giving them a body.
+
+  Perf verdict: mesh, vertex and triangle counts are byte-identical on every fixture in the perf suite (none of their buildings carries a representation), and the end-to-end suite total moved 2043 ms → 2034 ms (−0.4%, within noise) measured base-vs-branch with `scripts/perf/probe.sh --suite`, including the heavy-CSG Holter Tower model. The added work is one `is_subtype_of` inside `has_geometry_by_name`, which memoises per distinct type name, so it runs once per type per process.
+
+## 4.2.1
+
+### Patch Changes
+
+- [#1886](https://github.com/LTplus-AG/ifc-lite/pull/1886) [`8ba490e`](https://github.com/LTplus-AG/ifc-lite/commit/8ba490e6f64ce2ee9c564ff4c8b5be454d4f64b3) Thanks [@louistrue](https://github.com/louistrue)! - Stop the geometry kernel emitting NaN vertex normals.
+
+  `Triangle::normal()` normalized the edge cross product unconditionally. A zero-area
+  triangle — three collapsed or exactly collinear vertices — has a zero-length cross
+  product, so that was `0.0 / 0.0`: NaN in all three components. `add_triangle_to_mesh`,
+  its only production caller, wrote those NaNs straight into `Mesh::normals` for every
+  triangle `ClippingProcessor::clip_mesh` emits, which is the half-space clip and the
+  material-layer slicing path.
+
+  The mesh-hygiene pass did not clean them up, because it was never meant to:
+  `clean_degenerate` / `drop_thin_triangles` rewrites only `indices`. The degenerate
+  triangle disappears from the index buffer while its three vertices stay in
+  `positions` / `normals` as unreferenced orphans, still carrying NaN. On
+  `tests/models/ara3d/duplex.ifc` that shipped 81 NaN normal components across 6 of 622
+  meshes — all of them material-layer wall slices, all on vertices no triangle
+  references.
+
+  A degenerate triangle now gets `(0, 0, 1)`, the same undefined-normal convention
+  `csg::normals::calculate_normals` and the average-normals weld already use, stated in
+  the kernel's Z-up frame. Non-degenerate triangles are bit-identical: `try_normalize(0.0)`
+  computes exactly what `normalize()` did for every non-zero cross product. Measured over
+  duplex.ifc, the only meshes whose output moves are those same 6, and the triangle count
+  is unchanged (39,334 in both).
+
+  NaN normals were not merely cosmetic. They are unrepresentable in any consumer that
+  hashes or serializes the mesh — every NaN bit pattern collapses to a single quiet NaN,
+  so two different meshes could hash alike — and they defeat vertex welding, since
+  `NaN != NaN` keeps coincident vertices from merging.
+
 ## 4.2.0
 
 ### Minor Changes

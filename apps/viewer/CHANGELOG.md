@@ -1,5 +1,888 @@
 # @ifc-lite/viewer
 
+## 1.37.0
+
+### Minor Changes
+
+- [#2698](https://github.com/LTplus-AG/ifc-lite/pull/2698) [`c3a4690`](https://github.com/LTplus-AG/ifc-lite/commit/c3a46909e391e1aaf774ec183aec50a76452936a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a custom **XYZ/TMS** basemap to the 3D world context (issue [#2685](https://github.com/LTplus-AG/ifc-lite/issues/2685)). The Base map selector in Sun & Sky gains a "Custom (XYZ)" source: paste a tile URL template like `https://example.org/tiles/{z}/{x}/{y}.png`, give it the attribution its licence requires, and the globe drapes those tiles the same way it drapes the built-in OSM map. Only XYZ is implemented — WMTS needs a `WMTSCapabilities.xml` parse plus a layer and tileMatrixSetID choice, and WMS is not tiled at all; the stored value is a union tagged on `protocol` so either can be added as a new member rather than a migration of what users have already saved, and a stored protocol this build does not implement is rejected on read instead of half-honoured.
+  
+  **CORS is surfaced, not swallowed.** A tile server without `Access-Control-Allow-Origin` cannot be read from a browser at all, and the symptom is an empty globe rather than an error. Saving therefore fetches one zero tile in `mode: 'cors'`: the discrimination is not the status code but whether a response reaches JavaScript at all, since a cross-origin response that does has already passed the CORS check — so a 404 from a server whose pyramid starts deeper still counts as accessible (and says so), while only a rejected fetch reports "this server does not allow browser access". A 401 or 403 is called what it is instead — an authorisation failure that will refuse every zoom level, most often a missing or expired API key — rather than being folded into the reassuring "normal for a deeper-starting pyramid" wording. The save is not gated on the probe, because the same rejection is what an offline browser produces. At runtime the layer's `errorEvent` carries Cesium's `RequestErrorEvent`, whose absent `statusCode` marks the same refusal, and the viewport shows that message rather than leaving the user with a blank backdrop — and takes it back down again as soon as a tile request resolves, so one ad-blocker rule or DNS blip cannot leave the banner stranded over a basemap that is drawing.
+  
+  **Attribution is required, not optional.** An XYZ template carries no capabilities document, so there is nowhere but the user's own input for the credit to come from, and most public imagery is licensed on condition of visible credit — making the field optional would make unattributed use the default path. The credit is escaped text and the optional licence link becomes an anchor built here around an already-validated http(s) URL, so the field is never a markup channel.
+  
+  **The basemap is stored per browser**, in `localStorage` beside the existing ion token and data-source choice, and does not travel with a project: a tile URL is a property of the person viewing rather than of the building, it routinely embeds a personal API key that a shared project would hand to everyone it reaches, and the project artifact here is an IFC file with no viewer-preference channel. Clearing the basemap also leaves the custom source, and a stored `custom` selection whose basemap is missing or no longer valid falls back rather than opening on an empty globe.
+  
+  Templates are validated before they can be saved: http(s) only, `{z}`/`{x}`/`{y}` (or their reverse forms) all present, no unsupported placeholder passed to Cesium verbatim, no credentials embedded in the URL, and a whole-number maximum zoom. `{s}` is rejected with the reason, because this editor collects no `subdomains` list: accepting it would let a server sharding over `1,2,3,4` save cleanly and then 404 every tile from Cesium's `a`/`b`/`c` default — a silent blank globe, which is the exact failure the placeholder allowlist exists to prevent.
+  
+  The banner is also **bound to the effect that raised it**. Cesium frees a tile's texture on teardown but never cancels the in-flight request, and destroying the viewer does not detach the layer's error listener — so a provider belonging to an already-destroyed viewer could still write to the component. Both async callbacks now check the same cancellation flag their siblings already used, and the error listener is unsubscribed with the effect rather than living as long as the provider. The retraction path is the one that mattered most: switching away from a slow basemap to one that genuinely is refused could otherwise let a late tile from the discarded provider clear the new basemap's warning, leaving a blank globe with nothing on screen.
+  
+  The save probe is **bounded**. A host that accepts the connection and never answers does not reject the fetch, so Save would spin with no verdict; the probe now gives up after ten seconds and says the server did not respond — which is deliberately not the "does not allow browser access" wording, since a slow host may serve tiles perfectly once the globe is up.
+  
+  Clearing the basemap now goes through the same action any other base-map change goes through, so it clears the terrain elevation cache and resets the terrain state that was sampled under the removed basemap, instead of repeating a shorter version of that teardown. And the loading, error and basemap-warning banners stack instead of sharing one position — a slow or refused tile host is exactly the case where the warning and the loading indicator are both on screen.
+  
+  A template using `{reverseZ}` now **requires a maximum zoom**. Cesium only inverts the level when `maximumLevel` is defined (`defined(maximumLevel) && level < maximumLevel ? maximumLevel - level - 1 : level`); without it `{reverseZ}` silently resolves to the ordinary `{z}` numbering — no error, no blank globe, just the wrong tile at every level for a genuinely reverse-Z service. Unlike the CORS case, that failure has no visible signal, so it is rejected at input time instead.
+  
+  The stored entry is **type-checked on read**, not just re-validated. `localStorage` is hand-editable and shared with every tab on the origin, and the decoded basemap feeds the store's initial state on every boot — so a `"url": 123` would once have thrown a `TypeError` out of store creation and left a white screen with no way to reach the Remove button. Every field is now checked for its type before validation runs, and the decoder returns `null` for anything it dislikes rather than propagating. The input surface states plainly that tiles are fetched straight from that server, so it sees where the user pans — a custom basemap is a deliberate choice to send a viewport to a third party, and it should read as one.
+
+### Patch Changes
+
+- [#2849](https://github.com/LTplus-AG/ifc-lite/pull/2849) [`aa61c88`](https://github.com/LTplus-AG/ifc-lite/commit/aa61c889fb64c9a151ea4cffbb88732f653d332a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the Add Element panel's Auto Spaces preview staying on screen after switching the target storey or federated model.
+  
+  `AddElementAutoSpacePreview` is a dry-run wall-graph detection keyed to the storey it ran against (`storeyExpressId`), but nothing re-ran or cleared it when the target storey or model changed via the panel's selects — `AddElementOverlay` kept drawing the stale outlines at the old storey's elevation, and the panel kept reporting region/wall counts for a storey the user had since navigated away from. `setAddElementStoreyId` and `setAddElementModelId` now clear `addElementAutoSpacePreview` alongside the id, so a stale preview never outlives the selection it was computed for.
+
+- [#2780](https://github.com/LTplus-AG/ifc-lite/pull/2780) [`544dc41`](https://github.com/LTplus-AG/ifc-lite/commit/544dc417e47094eeec8041aa6f7638fa42c6e739) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a peer's deletion of one of your own annotation pins resurrecting on reload.
+  
+  `removeRemoteAnnotation` — the path a collab room's incoming delete event drives — dropped the id from the in-memory map but never touched `localStorage`. If the pin was locally-authored (persisted on creation), its id stayed in the stored JSON; `loadFromStorage()` reads that JSON on the next mount and put the "deleted" pin right back.
+  
+  Its two siblings already got this right: `removeAnnotation` (a local delete) and `upsertRemoteAnnotation` (a peer's edit of one of our pins arrives as non-remote and is persisted like any local edit) both call `saveToStorage`. `removeRemoteAnnotation` now mirrors `upsertRemoteAnnotation`'s condition — it persists the deletion when the pin being removed was not marked `remote` (i.e. it was ours and therefore already in storage), and skips the write for a purely-remote pin, which was never persisted in the first place.
+
+- [#2833](https://github.com/LTplus-AG/ifc-lite/pull/2833) [`6e2fe58`](https://github.com/LTplus-AG/ifc-lite/commit/6e2fe588caa6f4ad24602c4b17c726cd8382b525) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `upsertRemoteAnnotation` leaving a stale pin behind in `localStorage` when a previously-local pin's id later arrives flagged `remote`.
+  
+  `upsertRemoteAnnotation` only wrote to storage `if (!annotation.remote)`, on the assumption that a `remote`-flagged upsert never needs a write. That held for a fresh peer pin (never persisted, nothing to clean up) but not for an id that was persisted earlier while non-remote: skipping the write left the old local version sitting in storage, ready to resurrect on the next `loadFromStorage()` even though the in-memory map had already moved on. `saveToStorage` already filters its own output to non-remote entries, so the guard was redundant for the write-a-local-pin case and unsafe for the ownership-flip case — both `upsertRemoteAnnotation` and `removeRemoteAnnotation` now always call `saveToStorage`, letting it be the single source of truth for what belongs in storage.
+
+- [#2775](https://github.com/LTplus-AG/ifc-lite/pull/2775) [`5159383`](https://github.com/LTplus-AG/ifc-lite/commit/5159383eb060d0293a18ed20d47fa23256dee6d5) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a stray blank line in the exported BCF description for compare rows with a synthetic key.
+  
+  `bcfTextFromChange` builds its description as an array of lines, dropping the
+  GlobalId line for synthetic `missing:` keys by pushing `''` in its place, then
+  filtering with `lines.filter((l, i) => l !== '' || i > 0)`. That filter is a
+  no-op: `lines[0]` is always the `"Detected in model comparison: …"` line and is
+  never blank, so `i > 0` is true for every other index and nothing was ever
+  removed. A `missing:` row therefore kept an empty line where the GlobalId line
+  should have been omitted.
+  
+  The direct fix (`lines.filter(l => l !== '')`) would have broken a second,
+  unrelated use of `''`: the function also pushes an intentional blank separator
+  before the `"Data changes:"` block, and dropping every `''` removes that
+  separator too. `''` was overloaded between "omit this line" and "this line is
+  a deliberate blank" - two meanings needed two values.
+  
+  `lines` is now typed `(string | null)[]`; a synthetic-key row pushes `null`
+  (omitted) instead of `''`, and the filter drops only `null`, leaving the real
+  `''` separator before "Data changes:" untouched.
+  
+  Cosmetic only - an extra blank line in an exported BCF topic description for
+  rows with no GlobalId (deleted or added-without-GlobalId compare rows).
+
+- [#2704](https://github.com/LTplus-AG/ifc-lite/pull/2704) [`6a43522`](https://github.com/LTplus-AG/ifc-lite/commit/6a43522cdf3b0a9b0f7ce303b59f479dca2a2aca) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash element identity for federated models past the first.
+  
+  The viewer's loader shifts every `mesh.expressId` into the federated global id
+  space in place, while `IfcDataStore` keeps local express ids. `elementsFromStep`
+  used `mesh.expressId` to address the store anyway, so for any model with a
+  non-zero `idOffset` every lookup missed: `key` fell back to the synthetic
+  `expressid:N`, `tag` read `Unknown`, name and storey came back empty, and
+  `buildStepExclusions` found no relationships — so the void / host / assembly
+  exclusions silently stopped excluding, and a door in the opening it fills was
+  reported as a hard clash. `ref` was wrong in the other direction, with
+  `federation.toGlobalId` adding the offset a second time.
+  
+  `elementsFromStep` now takes `meshIdOffset`: the shift the host has already
+  applied to `mesh.expressId`. It subtracts that back out before touching the
+  store, so the store is addressed locally and the federation offset is applied
+  exactly once. Callers that pass local meshes (CLI, MCP, the playground) leave it
+  at its `0` default and are unaffected — it stays optional deliberately, since
+  `elementsFromStep` is published API and requiring it would break every external
+  caller. To keep a forgotten offset from being silent in any host, the adapter
+  now also warns once when every element in a model resolves to an empty GlobalId
+  *and the store does hold GlobalIds* — the signature of exactly this wiring
+  mistake. A model whose store has none (a GLB import, whose store carries
+  geometry and no IFC entities) is left alone: there, every element missing is the
+  normal state, not a defect.
+  
+  The synthetic key an element without a GlobalId falls back to is now scoped to
+  its model — `expressid:<encoded modelId>:<expressId>` rather than
+  `expressid:<expressId>`. Express ids are only unique within a model, and review
+  state and user element-pair exclusions are keyed on the element key alone
+  (deliberately, so they survive a reload), so in a federation the unqualified
+  form made two models' elements one identity: a review status or an exclusion set
+  on one model's element silently covered another model's element. Two federated
+  GLB models produced ONE review key where there should have been two.
+  
+  Migration: elements that have a GlobalId — nearly all of them, and every one
+  this fix restores — are unaffected; only the fallback changes shape. A review
+  status or an element-pair exclusion a previous session stored against the old
+  `expressid:N` string stops matching: the clash comes back as `open`, the
+  exclusion rule stays listed but suppresses nothing. Nothing is mis-applied, and
+  nothing else reads the string. In the viewer that fallback is per-load anyway
+  (the model id is a per-load uuid), which is the honest position for an element
+  that carries no durable identity of its own. Review status a pre-fix session
+  saved against a federated model past the first was likewise keyed on the old
+  fallback and no longer matches.
+
+- [#2878](https://github.com/LTplus-AG/ifc-lite/pull/2878) [`b699875`](https://github.com/LTplus-AG/ifc-lite/commit/b6998754039676def950735335147556afcb2977) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash detection silently skipping every GPU-instanced entity.
+  
+  `useClash` built its clash elements from `model.geometryResult.meshes` alone, which excludes every entity whose geometry was fully GPU-instanced — anything repeated 8 or more times (`INSTANCE_MIN_OCCURRENCES` in the wasm mesher). Doors, windows, columns, sprinklers, light fittings, and other repeated components vanished from clash detection with no error, no warning, and no count discrepancy: the report simply came back short.
+  
+  `gatherElements` now restores those entities with `withInstancedMeshes` — the same helper the glTF/IFC5 export path already uses ([#2558](https://github.com/LTplus-AG/ifc-lite/issues/2558)/[#2576](https://github.com/LTplus-AG/ifc-lite/issues/2576)) to reach instanced-only geometry through `Scene.getAllInstancedMeshData()`. This surfaces real triangles from the live renderer scene, not an AABB approximation, so a clash reported off an instanced entity is exactly as exact as one reported off a flat mesh.
+  
+  This also covers federated models. `withInstancedMeshes` used to gate on `isPrimary` and no-op for every non-primary model — correct when it was written, but GPU instancing stopped being primary-only once federated models got instanced shards too ([#2255](https://github.com/LTplus-AG/ifc-lite/issues/2255)), and the gate was never updated, so a federated model's own instanced entities were silently skipped for both clash and every glTF/IFC5/KMZ export call site. The helper now takes this model's `{ idOffset, maxExpressId }` id-range bracket instead of a boolean, scoping `getAllInstancedMeshData()`'s all-models output down to just this model's occurrences — restoring a federated model's own instanced entities without a federation of N models double-counting each other's.
+  
+  `elementsFromStep` (`@ifc-lite/clash`) now also keys an element's identity on `MeshData.occurrenceKey` when present, so distinct physical occurrences of one GPU-instanced expressId no longer collapse onto a single review/exclusion key, and a relationship-derived exclusion (void/host, assembly) fans out to every occurrence sharing that expressId instead of only the last one built.
+  
+  That per-occurrence `key` is one `ClashElement` per `MeshData`, so an entity with a mix of a flat submesh and an instanced occurrence (an ordinary shape once routing goes per-mesh, `rust/wasm-bindings/src/api/gpu_meshes/batch.rs:820-856`) now mints two elements with the SAME `ref` but DIFFERENT `key`s. The broad-phase self-clash guard only checked `key`, so that pair passed through as a false-positive self-clash — the entity clashing with itself. `candidatePairs`' guard (`@ifc-lite/clash`, `engine-ts/broad.ts`) now also treats a shared `ref` within the same model as the same entity.
+
+- [#2878](https://github.com/LTplus-AG/ifc-lite/pull/2878) [`b699875`](https://github.com/LTplus-AG/ifc-lite/commit/b6998754039676def950735335147556afcb2977) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the Location panel's KMZ export leaking every other loaded model's GPU-instanced geometry into a single model's export.
+  
+  `GeoreferencingPanel` computed the `InstancedModelRange` it hands to `LocationMap`'s KMZ export by looking up its own `modelId` in the loaded-models map, falling back to `null` (no per-model filter) whenever that lookup failed — including while more than one model was loaded (no entity selected in a federation, or a stale id after a model was removed). `withInstancedMeshes(geometryResult, null)` treats `null` as "already spans every loaded model", so an unresolved `modelId` in a federation spliced every OTHER loaded model's instanced occurrences into this model's export.
+  
+  `resolveInstancedExportGate` (new, in `@ifc-lite/viewer`'s `utils/instancedExport.ts`) makes `null` correct only when it's provably the sole loaded model, and otherwise withholds the export (`canExport: false`) rather than falling through to the leaky unfiltered case — mirroring the rule `KmzExportDialog` already followed for its own model list.
+
+- [#2697](https://github.com/LTplus-AG/ifc-lite/pull/2697) [`e0679f7`](https://github.com/LTplus-AG/ifc-lite/commit/e0679f7de9d5c2f8495372dbbee1100482a47720) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash rows being inert in a collaborative session, without letting a stale row target the wrong element.
+  
+  `useClash` resolved a clash ref back to its model through the `federationRegistry` singleton, which only knows models registered via `registerModelOffset`. The collab recipient's model is put into the store by `collabSlice` with `upsertModel({ id: 'room:<id>', ..., idOffset: 0 })` and never registered, so every ref resolved to `null` and `focusClash` / `selectElement` / `highlightAll` returned before doing anything — clicking a clash row in a room did nothing, while clicking the same element in the 3D view selected it normally.
+  
+  A `ClashElementRef` already carries the model id it was gathered from, so the ref is now resolved against that named model instead of by searching offset ranges two models can both claim. The lookup is delegated to `resolveGlobalIdInModel`, which shares its range and overlay predicates with the store's canonical `resolveGlobalIdFromModels` rather than repeating them — so overlay-allocated ids (StoreEditor duplicates, scripted adds) resolve here through the same rules a 3D click uses, instead of being rejected by a range check that does not know about them. A loaded model now answers for its own ids or not at all: the registry is consulted only when the named model is not loaded, so a ref that does not fit its own model goes inert rather than being resolved against some other model that happens to cover the number.
+  
+  Naming the model is not sufficient on its own, because the id space behind a model id can be replaced while the id stays. A collab peer edit re-derives the model from the CRDT and calls `setIfcDataStore`, swapping the entity table under the same key while `idOffset` and `maxExpressId` stay put, and express ids are a sequential counter that any structural edit renumbers. A stale ref would then still resolve — to a different element than the row names. The federation identity a run records is now bound to the published result, and a ref into a model whose id space has been replaced is refused, with the reason shown in the panel, instead of resolving to something else. The check is per model, so unloading one file does not disable rows that live entirely in another.
+  
+  The same check covers a model that has been UNLOADED rather than replaced. The room model is never registered with the federation singleton, so removing it — which is what leaving a room does, while keeping the published result — left its rows pointing at numbers a normally loaded file's registered range still covered: clicking one isolated and coloured two elements of that other file, with no error. A row naming a model the result was computed on and that is no longer loaded is now refused, and says so.
+  
+  Every refusal now explains itself, in its own words: id space replaced (re-run detection), model no longer loaded (load it again), or an id its own loaded model no longer has. Previously the last of the three refused silently, which reads as a broken click.
+
+- [#2717](https://github.com/LTplus-AG/ifc-lite/pull/2717) [`7607340`](https://github.com/LTplus-AG/ifc-lite/commit/7607340f02f697e4dd9dbf932857f6659519fa08) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add the missing `'malformed-operand'` member to `ClashSolidDegenerateReason`.
+  
+  The wasm binding `clashIntersectionSolid` returns five degenerate reason
+  strings, but the viewer's union declared only four. `'malformed-operand'` — the
+  binding's own verdict when an operand has a positions/indices length that is not
+  a multiple of 3, an index past its own operand's vertex count, or a non-finite
+  coordinate — was absent. The union's doc comment said it mirrored
+  `DegenerateReason` in `clash_solid.rs`, and it did: that reason is produced by
+  the binding's `mesh_from` guard and has no enum variant behind it, so mirroring
+  the enum missed it. Because the reason crosses the wasm boundary as an untyped
+  string and is cast on arrival, TypeScript could not catch the gap.
+  
+  No UI copy changes: the clash panel's reason chain already ends in a generic
+  "No solid could be computed for this pair" fallback, which is accurate for a
+  rejected operand, and every consumer of the union either handles the reason
+  positionally or falls through to that string. The defect was that the type
+  claimed a value the runtime can produce is impossible, so any future
+  exhaustiveness check over it would have been built on a set that is short by one.
+  
+  A new test confirms through the real wasm kernel that a malformed operand does
+  come back as `'malformed-operand'`. Declaration parity — that the union lists
+  exactly the reasons `clash_solid.rs` can emit, in both directions — can only be
+  claimed by reading both sources, which is a source-text assertion and banned in
+  test files, so it is a CI lint instead:
+  `scripts/check-clash-degenerate-reason-parity.mjs`. It refuses to pass on two
+  empty sets, and its own regression harness
+  (`scripts/check-clash-degenerate-reason-parity.test.mjs`) turns each drift and
+  each vacuity mode red against mutated copies of the real sources.
+
+- [#2854](https://github.com/LTplus-AG/ifc-lite/pull/2854) [`f191023`](https://github.com/LTplus-AG/ifc-lite/commit/f191023e063f27c892cdbb02acc9201f7a2b583e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `clearAllModels` leaving an active model-comparison result and lens still pointed at a federation that no longer exists, and fix `removeModel` leaving a comparison result stale when the removed model was either side of it.
+  
+  `federationRegistry.clear()` (called by `clearAllModels`) resets the offset counter to 0, so the next model registered can be handed the exact global-id offsets a surviving `compareResult` or lens state describes. `GeoreferencingPanel.tsx`'s `reloadModelsForAlignment` calls `clearAllModels()` directly, without `resetViewerState()` — the only other place either was cleared — then reloads every model. If a comparison or a lens was active, its `excludedHiddenIds`/`diff` or `lensHiddenIds`/`lensColorMap`/`lensAppliedColors` could then silently hide or tint elements of the freshly reloaded, unrelated model. `useLens.ts`'s effect deps (`[activeLensId, activeLens]`) also never re-run on a model add/remove on their own, so a lens stays stale across any such reload regardless.
+  
+  `clearAllModels` now clears `compareResult` and deactivates the lens (mirroring what `resetViewerState` already does on an ordinary file load). `removeModel` now clears `compareResult` when the removed model was the comparison's base or head — offsets are never reused on a partial removal, so this is precautionary consistency, not a misresolution fix — and leaves it alone otherwise, so removing an unrelated federated sibling does not disturb a comparison between two other still-loaded models.
+
+- [#2858](https://github.com/LTplus-AG/ifc-lite/pull/2858) [`e805e8c`](https://github.com/LTplus-AG/ifc-lite/commit/e805e8cfa0ee9227b5641dfd9731577fdca20f48) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `clearAllModels` leaving a registered 4D-animation overlay layer (`overlaySlice.overlayLayers`) pointed at a federation that no longer exists.
+  
+  `federationRegistry.clear()` (called by `clearAllModels`) resets the offset counter to 0, so the next model registered can be handed the exact global-id offsets a still-registered layer's `hiddenIds`/`colorOverrides` describe. `GeoreferencingPanel.tsx`'s `reloadModelsForAlignment` calls `clearAllModels()` directly, without `resetViewerState()`, then reloads every model — the same shape that made `compareResult` and the lens state misresolvable in [#2854](https://github.com/LTplus-AG/ifc-lite/issues/2854). `useConstructionSequence.ts` writes the 'animation' layer's ids as already-translated GLOBAL ids at registration time, and its registration effect's deps exclude `models`; `scheduleData` is untouched by `clearAllModels`, so a paused animation leaves the layer registered indefinitely across the reload. `useOverlayCompositor.ts` applies the composite straight to `hideEntities`/`setPendingColorUpdates` by global id, so a recycled offset would hide or tint whatever live entity the reloaded federation assigns that number to.
+  
+  `clearAllModels` now drops every registered overlay layer. `removeModel` is left alone: `unregisterModel` burns the freed offset range instead of reclaiming it, so a layer left registered after a partial removal cannot ever be handed to a new model.
+
+- [#2920](https://github.com/LTplus-AG/ifc-lite/pull/2920) [`e95a01e`](https://github.com/LTplus-AG/ifc-lite/commit/e95a01e7f314950bdacdcc8f195bc99ed7f14e3c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the AI chat's code-block extractor silently dropping every fenced code block in a CRLF-authored assistant message.
+  
+  `extractCodeBlocks`'s fence regex required a literal `\n` right after the opening fence's language tag. A message with `\r\n` line endings (pasted or Windows-authored content) has `\r` there instead, so the regex never matched the block at all — it rendered as plain text with no "Run" affordance, and a script referencing `bim.` silently lost its executability rather than surfacing an error. The regex now tolerates an optional `\r` before the newline.
+
+- [#2706](https://github.com/LTplus-AG/ifc-lite/pull/2706) [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Keep a shared room's edits inside the shared model, in both directions. In a collaborative session the viewer resolved the room's model as "whichever model is currently active", for peers' incoming edits and for mirroring your own edits out. Those are not the same model as soon as a second file is open: loading a file does not move the selection to it, so joining a room and then opening and selecting your own file — two clicks — leaves the room's model registered but not active. From that point a peer's edit was applied to *your* file instead of the shared one, using an entity id that means something else there, and it was recorded as a real edit — it counted towards your file's modified elements, survived a reload and was written into anything you exported. In the other direction, edits you made on your own private file were broadcast into the room and applied to whatever entity the id happened to match in the owner's model. Both directions now address the room's model by id, fixed when the session starts, and every action that carries an entity id also carries the model that id belongs to — so an edit on any other model stays local, the move gizmo no longer offers itself on a private model's entities, and an incoming edit that cannot be placed in the room's model is dropped rather than applied to a different one. Which model is active, and what joining a room with a file already open should do, are unchanged.
+
+- [#2708](https://github.com/LTplus-AG/ifc-lite/pull/2708) [`3f30a2c`](https://github.com/LTplus-AG/ifc-lite/commit/3f30a2ccb0f7aedfbbdb9911749c6555f1d4b89f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Keep moved elements where they were moved to when joining or working in a shared room. Geometry reaches a collaborator as mesh blobs baked at the position they had when they were shared, and the viewer only ever re-positioned them in response to a live "someone moved this" message — it never re-derived position from the shared document at load time. So a person joining a room after an element had been moved got it back at its original position, with no message coming to correct it, and the model simply looked wrong. Worse, whenever anyone in the room added or deleted an element, every mesh was rebuilt from its baked blob and all previously applied moves snapped back — permanently, and with no indication anything had happened, in the ordinary course of two people working together. The recipient now compares each element's current placement in the document against the position its geometry was baked at, and re-applies the difference after every rebuild.
+
+- [#2706](https://github.com/LTplus-AG/ifc-lite/pull/2706) [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fail closed, instead of silently falling back to whatever model you have selected, when a live collaboration session's room model cannot be resolved. Opening the Share dialog mints a join token before starting the session; if you remove your last model while that request is in flight, the session used to start anyway with no room model recorded, and every inbound/outbound room-edit resolver would then quietly target whichever model you loaded next — the same private-model corruption already fixed for the ordinary case. Those resolvers now distinguish "no session yet" (where falling back to the active model is correct and unchanged) from "a session is live but its room model is unknown" (where nothing is guessed at: incoming edits are dropped and outgoing edits are not mirrored, exactly as when the room model is legitimately not yet registered). Also: a peer deleting an entity while your own file is still loading into the room can no longer hide a mesh of your own model, and a peer's edit to the shared model while a different model is active now correctly invalidates the merged viewport's render cache instead of leaving stale geometry on screen.
+
+- [#2706](https://github.com/LTplus-AG/ifc-lite/pull/2706) [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop a collaborator's edit from overwriting another model's geometry and data store. When a recipient joins a shared room, the viewer rebuilds the shared model from the CRDT on every peer edit and pushed the result through `setIfcDataStore` / `setGeometryResult` — both of which write to `activeModelId`, an unstated assumption that the reconstructed `room:<roomId>` model is the active one. It need not be: `upsertModel` keeps the existing `activeModelId` rather than switching to the new model, so a recipient who also has their own file open (a link carrying both `?room=` and `?model=`, or a file opened while the room was still syncing) — or who joined normally, loaded a second model and selected it in the hierarchy — has a different model active. The next peer edit then replaced that model's meshes and store with the room's, so the user's own geometry was gone and only a reload brought it back. The reconstruct path now addresses the room model by id: when it is active the write still goes through the active-model setters (so the top-level store the outbound mutation mirror reads stays in sync and the renderer's geometry tick is bumped), and when it is not, the room model's record is patched in place and the active model is left untouched.
+
+- [#2831](https://github.com/LTplus-AG/ifc-lite/pull/2831) [`8ef2e5b`](https://github.com/LTplus-AG/ifc-lite/commit/8ef2e5bf896e0a88484e8a2ddb2979861e8f0259) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Reset `collabRoomId`, `collabRole` and `collabSelfToken` when `startCollab` fails to bring up a session, instead of leaving them naming the room that never started. `startCollab` sets those three fields synchronously (so an early `ShareDialog` subscriber sees the join token) before it awaits `createCollabSession`; if that rejects — for example a browser without IndexedDB, or a WebSocket provider that never connects — the failure handler cleared `collabConnecting` and `collabStatus` but left the room id, role and token in place with no live session behind them. Anything reading "is `collabRoomId` set" as "still in a room" (the toolbar indicator, the Share dialog) kept showing a joined room, and `canCollabEdit()` / `canCollabComment()` — the gate `mutationSlice` checks every write against — kept applying the failed room's role instead of falling back to single-user editing rules, silently blocking edits for a viewer/commenter role even though the session that role belonged to never came up.
+
+- [#2847](https://github.com/LTplus-AG/ifc-lite/pull/2847) [`f4d419b`](https://github.com/LTplus-AG/ifc-lite/commit/f4d419b9a4a04e06008d390f3e0c84b8c3b5069a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the BIM ↔ scan deviation heatmap (`DeviationPanel`) staying "computed" — slider, legend and colours all left showing — after removing a federated model whose geometry the heatmap was built against.
+  
+  `DeviationComputer.compute` builds its BVH from every triangle currently in the scene, not just one model's, so removing any federated model invalidates a prior compute. `pointCloudDeviationComputed` is the flag that gates both the panel's "Recompute" vs. "Compute deviation" label and its auto-recompute effect (`!computed && ...`), so leaving it `true` meant nothing ever re-triggered a rebuild — the panel kept presenting a heatmap computed against a triangle set that no longer existed until the user happened to click Recompute themselves.
+  
+  `removeModel` already tears down this same "references geometry that just changed" class of staleness for the clash focus, the IDS validation report and the compare result; the deviation flag was the one sibling it left out. `clearAllModels` gets the same fix for the full-teardown path.
+
+- [#2825](https://github.com/LTplus-AG/ifc-lite/pull/2825) [`2335dc4`](https://github.com/LTplus-AG/ifc-lite/commit/2335dc4411aec5a2aca749c7b1ddaf1d776f00e7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `clearDrawing2D` wiping graphic overrides, DXF underlays, and all 2D
+  annotations instead of just the generated drawing.
+  
+  `clearDrawing2D` called `set(getDefaultState())`, resetting the entire
+  `Drawing2DSlice` to its initial values. The "View 2D" button
+  (`SectionPanel.tsx`) calls it solely to force drawing regeneration with the
+  current settings -- but the whole-state reset also discarded the user's
+  custom graphic-override rules, the enabled/disabled state of the built-in
+  overrides, every DXF underlay they had imported, and every measurement,
+  polygon-area, text, and cloud annotation on the 2D sheet.
+  
+  `clearDrawing2D` now resets only the drawing-generation fields
+  (`drawing2D`, `drawing2DStatus`, `drawing2DProgress`, `drawing2DPhase`,
+  `drawing2DError`, `drawing2DSvgContent`).
+
+- [#2770](https://github.com/LTplus-AG/ifc-lite/pull/2770) [`75c327c`](https://github.com/LTplus-AG/ifc-lite/commit/75c327c30acbc63957b01b44055084845ce8e76a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a federated GLB/IFCX/point-cloud add being marked `loadState: 'error'` after it had already loaded successfully.
+  
+  `useIfcLoader`'s shared `finalizeModel` closure read a `const allInstancedShards`
+  that is declared ~800 lines further down the same `loadFile` function, inside
+  the WASM-streaming section. GLB, IFCX, and point-cloud federated adds call
+  `finalizeModel` before that section ever runs, so the read landed in the
+  binding's temporal dead zone and threw `ReferenceError: Cannot access
+  'allInstancedShards' before initialization` — *after* `addModel` had already
+  registered the model with its correctly parsed geometry. The surrounding
+  catch then wrote `loadState: 'error'` onto the now-live model, so a user
+  federating one of these formats saw a failed model that had, in fact, loaded.
+  
+  `finalizeModel` now takes the GPU-instancing shard bytes as an explicit
+  parameter (default `[]`), forwarded by the WASM streaming path once it has
+  populated them. GLB/IFCX/point-cloud loads have no instancing concept, so an
+  empty array is the correct value on their path, not a placeholder.
+
+- [#2859](https://github.com/LTplus-AG/ifc-lite/pull/2859) [`f2fa69e`](https://github.com/LTplus-AG/ifc-lite/commit/f2fa69e1ed6a11638e402e16c9cef1d5f3ffd6bb) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the Georeferencing panel's double-georeference banner reading the wrong scale for IFC2x3 `ePSet_MapConversion` files with no explicit ePset `MapUnit` — a 1000x scale error for millimetre projects.
+  
+  `getEffectiveGeoreference` (`effective-georef.ts`) resolves this case via `resolveEpsetMapUnitScale`: when an ePSet-sourced georeference has no explicit `MapUnit`, its offsets are in the project length unit per the buildingSMART convention, not metres. Every other consumer of the georeference — `ViewportContainer`, `BasepointOverlay`, `FederationAlignmentControls`, `federationAlign.ts`, `useAnchorGeoreference.ts` — reaches that fix by calling `getEffectiveGeoreference`.
+  
+  `GeoreferencingPanel.tsx` built its `mergedCRS` from `mergeProjectedCRS` alone, fed by `ModelMetadataPanel.tsx`'s own direct `extractGeoreferencingOnDemand` call rather than `getEffectiveGeoreference`. For an ePSet-sourced file with no explicit MapUnit this left `mapUnitScale` `undefined`, which `resolveMapUnitToMetreScale` reads as "treat offsets as metres" — the panel's `detectDoubleGeoreference` check then scaled a millimetre project's eastings/northings by 1 instead of 0.001, a 1000x error in the reported residual/displacement.
+  
+  `mergedCRS` now applies `resolveEpsetMapUnitScale` after `mergeProjectedCRS`, matching `getEffectiveGeoreference`'s composition exactly.
+
+- [#2879](https://github.com/LTplus-AG/ifc-lite/pull/2879) [`48dadab`](https://github.com/LTplus-AG/ifc-lite/commit/48dadaba0e2582cb52399a64577b5c17ea8ddda1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix KMZ export scaling a millimetre IFC2x3 project's `ePset_MapConversion` offsets by 1 instead of 0.001.
+  
+  `kmzSuggestsAbsoluteAltitude` and `buildKmzForModel` (kmz-export.ts) built their `ProjectedCRS` via `extractGeoreferencingOnDemand` + `mergeProjectedCRS` directly, without the `resolveEpsetMapUnitScale` correction `getEffectiveGeoreference` applies for every other georeference consumer. For a file whose only georeference is an IFC2x3 `ePset_MapConversion` property set with no explicit `MapUnit` — the buildingSMART convention is to read those offsets in the project length unit — `mapUnitScale` stayed `undefined`, so `resolveMapUnitToMetreScale`'s "no MapUnit ⇒ treat offsets as metres" heuristic took over instead: eastings, northings and OrthogonalHeight were all read as metres rather than the project's millimetres, a 1000× error in every exported KMZ placement and the "True elevation (MSL)" altitude-mode hint. Both functions now apply `resolveEpsetMapUnitScale`, matching the correction `GeoreferencingPanel.tsx` already applies ([#2859](https://github.com/LTplus-AG/ifc-lite/issues/2859)).
+
+- [#2777](https://github.com/LTplus-AG/ifc-lite/pull/2777) [`731dc06`](https://github.com/LTplus-AG/ifc-lite/commit/731dc06ec28043f5b7869f1bf8e2f732ceec7f5e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the material totals panel dropping area/weight for vendor-named quantities.
+  
+  `MaterialTotalsPanel`'s `pickQuantity` docstring promised "pick a quantity
+  value by candidate names (case-insensitive), else by type," but only the
+  volume total implemented the else-by-type fallback. An element whose only
+  area (or weight) quantity used a name outside the IFC-standard candidate
+  list — a vendor-specific `PerimeterArea` or `TopArea`, say — contributed
+  zero to that material's area/weight total and its row stayed hidden, while
+  the identical situation for volume was counted correctly.
+  
+  `pickQuantity` now applies the else-by-type fallback uniformly to volume,
+  area and weight, picking the alphabetically-first named quantity of that
+  type when nothing matches a candidate name — a deterministic tiebreak,
+  rather than depending on the qset scan order the previous volume-only
+  fallback relied on. The per-element map-building + pick logic that all
+  three totals shared is now a single extracted function instead of three
+  call sites that could (and did) drift apart.
+  
+  Follow-up fix: the alphabetical fallback could select `CrossSectionArea` —
+  a beam/column/member's section (profile) property, not a surface extent —
+  as the element's Area, because no candidate name matched it and it sorts
+  before every real surface-area name those elements carry
+  (`GrossSurfaceArea`, `NetSurfaceArea`, `OuterSurfaceArea`). Proven on the
+  app's own shipped `infra-bridge.ifc` sample, this reported a bridge beam's
+  0.12 m² cross-section as its material area instead of leaving the total
+  unset. `AREA_CANDIDATES` now recognises the standard surface-area names by
+  name (so standard beams/columns resolve without reaching the fallback at
+  all), and the fallback itself excludes `crosssectionarea` so it can never
+  be picked even as a last resort — degrading to "no value" rather than a
+  wrong one when it's the only area quantity present.
+
+- [#2781](https://github.com/LTplus-AG/ifc-lite/pull/2781) [`0112cf0`](https://github.com/LTplus-AG/ifc-lite/commit/0112cf0a54ff862f5c74fef5edc02908f194784f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the MCP playground chat attaching two files with the same basename in one batch showing two chips for what the upload store treats as one attachment.
+  
+  `playground-uploads.ts`'s `UploadStore` intentionally de-dupes uploads by basename (last file wins — see its `add()` comment), but `PlaygroundChat`'s `attachFiles` tracked its own `pendingAttachments` list independently, pushing every resolved entry with no such de-dupe. Attaching `spec.ids` (A) and `spec.ids` (B) in one drop produced two chips while the store held only B: the first file's content became unreachable through `ids_validate`/`ids_explain` (which resolve by name through the store) even though its chip was still shown as attached, the duplicate `key={f.name}` in the chip list violated React's key-uniqueness contract, and clicking Remove on either chip — filtering by name — dropped both at once.
+  
+  The chat panel now tracks only the pending *names* for the current turn and projects them through the store's live contents on every render, so the chip list can no longer disagree with what the store actually holds — there is structurally only one thing to render per name. The store's last-wins behavior is unchanged.
+  
+  The outbound chat-turn text was never affected: `describeAttachment` reads each in-memory attachment object directly, not through the store.
+
+- [#2832](https://github.com/LTplus-AG/ifc-lite/pull/2832) [`75ea8c7`](https://github.com/LTplus-AG/ifc-lite/commit/75ea8c790600f7b158e8d9ade6d72bcabedf9ce6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `removeModel`/`clearAllModels` leaving the AddElement panel's target-model pin, and every global-id set (isolate, ghost, hidden, selection, class filter), pointing at a model that no longer exists.
+  
+  `removeModel`'s selection cleanup (added for [#2654](https://github.com/LTplus-AG/ifc-lite/issues/2654)) purged `selectedEntity`/`activeStorey`/`selectedEntities` by comparing `.modelId`, but never touched the id-keyed state on the same slices: `addElementModelId`/`addElementStoreyId` (addElementSlice — the panel keeps naming a removed model and every placement click then fails with "No model loaded for id"), and `selectedEntityIds`/`selectedStoreys`/`hiddenEntities`/`isolatedEntities`/`ghostExceptEntities`/`classFilter`/`hiddenEntitiesByModel`/`isolatedEntitiesByModel` (selectionSlice/visibilitySlice — keyed by bare `globalId`, not `{modelId, expressId}`, so `.modelId` comparisons can't see them stale). A stale `isolatedEntities` was the worst of these: `syncSourceModel.ts`'s `purgeStaleEntityState` already runs the equivalent purge on the same-modelId resync path, and its own comment explains why an empty-but-non-null isolate set is worse than leaving it alone — `effectiveIsolatedIds` keeps returning it, so `isolatedIds` matches nothing in the surviving federation and the entire remaining scene renders as hidden. `removeModel` never got that treatment for the full-removal path.
+  
+  Now `removeModel` resolves each id against which surviving model's parse range or mutation-view overlay owns it (mirroring `purgeStaleEntityState`), drops only the ids the removed model owned, and collapses an isolate/ghost set to `null` (not an empty `Set`) when nothing survives. `clearAllModels` clears all of it unconditionally, since no model survives.
+
+- [#2817](https://github.com/LTplus-AG/ifc-lite/pull/2817) [`ed35801`](https://github.com/LTplus-AG/ifc-lite/commit/ed35801c639cdd8c3a76b2b406b9f45f8e550c01) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin `loadExclusions`'s unreadable-entry recovery guard with the same coverage its three sibling loaders (presets, reviews, settings) already had: corrupt JSON, an empty stored string, the quota-exhausted-backup path, and a later clean read clearing the latch.
+  
+  While auditing the three siblings, the same "clean read clears the flag" guard turned out to be unpinned for all four loaders — no existing test killed a mutation removing `unwritableKeys.delete(...)` from the top of `readStoredPresets`, `loadReviews`, or `loadSettings` either. Added one targeted test per loader.
+  
+  Also pinned (not fixed) a real behavioral difference: unlike its three siblings, which distinguish a missing key (`raw === null`) from an empty stored string, `loadExclusions` uses `if (!raw)`, so an empty string is treated as "no entry" rather than a read failure — it is never backed up and never blocks the next write. No production code changed; this is coverage only.
+
+- [#2853](https://github.com/LTplus-AG/ifc-lite/pull/2853) [`794cf14`](https://github.com/LTplus-AG/ifc-lite/commit/794cf1451d7015519ba9f3a8498e921956a3bb5c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the 2D sheet drawing rendering at the wrong position/scale after swapping paper size, scale, or a saved sheet template while "keep position on regenerate" (pinned) was on.
+  
+  `Drawing2DCanvas` reuses `cachedSheetTransformRef.current` whenever pinned, instead of recomputing the transform from the active sheet's viewport/scale/paper. `useViewControls` only cleared that cache on an axis/flip change or a `sheetEnabled` on/off toggle — but `setPaperSize`, `setFrameStyle`, `updateFrameMargins`, and `setDrawingScale` all mutate the same sheet in place (same id), and `loadTemplate` swaps in a different sheet entirely, none of which ever touch `sheetEnabled`. The cache kept the OLD sheet's transform applied to the new paper/scale/viewport until the user toggled sheet mode off and back on, or changed the section axis.
+  
+  `useViewControls` now also invalidates the cache whenever the sheet's id, paper size, viewport bounds, or scale factor changes.
+
+- [#2851](https://github.com/LTplus-AG/ifc-lite/pull/2851) [`8c9e3d3`](https://github.com/LTplus-AG/ifc-lite/commit/8c9e3d34d83709e8ffa8f734762fcfb74662d038) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `removeModel`/`clearAllModels` leaving the pinboard/basket (`pinboardEntities`, `hierarchyBasketSelection`) pointing at a model that no longer exists.
+  
+  `pinboardEntities` is pinboardSlice's documented source of truth for the basket: every basket edit (`addToBasket`/`removeFromBasket`/`showPinboard`) re-derives `isolatedEntities` from it via `toGlobalIdForRef` → `toGlobalIdFromModels`, which falls back to the raw, un-offset `expressId` once a ref's `modelId` is no longer in `models`. A basket ref surviving model removal therefore doesn't just dangle: the next basket operation can resolve it to a bare id that collides with a real entity in any surviving model whose own offset range covers that number (any model loaded at `idOffset` 0, notably), silently co-isolating or co-hiding an entity the user never touched — on top of inflating the basket's visible entity count in the toolbar/dock indefinitely. Same shape as the globalId-keyed selection/isolation state `removeModel` already purges ([#2832](https://github.com/LTplus-AG/ifc-lite/issues/2832)); the basket's own `Set<string>` state was the one sibling that was missed. `clearAllModels` gets the matching unconditional clear for the full-teardown path.
+
+- [#2855](https://github.com/LTplus-AG/ifc-lite/pull/2855) [`5dec9ba`](https://github.com/LTplus-AG/ifc-lite/commit/5dec9ba9759e8170fec87321e6338deaca23f516) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix EPSG:2065 (S-JTSK Ferro Krovak) and EPSG:27700 (OSGB36 British National Grid, when its precision-grid fetch is unavailable) silently getting zero datum shift on reprojection.
+  
+  `sanitizeProj4`'s `DATUM_TOWGS84` fallback table is keyed by the datum name reported by the bundled EPSG index (`packages/data`), lowercased. For EPSG:2065 that name is `"S-JTSK (Ferro)"`, and for EPSG:27700 it is `"OSGB36"` — neither matched the table's existing `'s-jtsk'` / `'osgb 1936'` keys, so the lookup missed silently (no warning either, since the OSGB36 case only warns when a `+nadgrids` reference is present to strip, and the 2065 def carries none). EPSG:2065 has no precision-grid coverage at all (see `precision-grids.ts`), so this fallback was its only datum shift — every EPSG:2065 model reprojected with the source CRS's raw coordinates read as if they were already WGS84, landing roughly 100+ m off. EPSG:27700 is normally rescued by the OSTN15 precision grid, so this only bit when that fetch failed (offline, CDN down, or in a Node test environment, which always skips the network fetch).
+  
+  Added `'osgb36'` and `'s-jtsk (ferro)'` as additional keys carrying the same published Bursa-Wolf parameters already used under the existing aliases. `reproject.test.ts`'s EPSG:2065 fixture previously passed the idealized datum name `'S-JTSK'` rather than the real `'S-JTSK (Ferro)'` the bundled index reports for that code, which is why the mismatch went unnoticed — it now uses the real value, plus a new OSGB36 case.
+
+- [#2714](https://github.com/LTplus-AG/ifc-lite/pull/2714) [`7862e92`](https://github.com/LTplus-AG/ifc-lite/commit/7862e929e7b8644c9df6a87f90f151901d33fc77) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Make the section plane's in-plane basis continuous in the normal.
+  
+  `planeBasis` picked its reference axis with `Math.abs(ny) < 0.9`, switching
+  from world-Y to world-X at that threshold. `|ny| = 0.9` is a plane 25.8 degrees
+  off horizontal — an ordinary ~6:12 roof pitch — and `setSectionPlaneFromFace`
+  reaches it from a face pick, so two picks on roof faces either side of that
+  pitch got bases that were nowhere near each other. Measured across the
+  boundary: at `nz = 0` the tangent inverted exactly (`dot = -1`, a 180-degree
+  flip); at `nz = 0.3` it was an arbitrary 133-degree rotation, the size of the
+  jump depending on `nz`; and it was asymmetric — the `ny < 0` crossing did not
+  move at all. Nothing pinned it: the existing test asserted only orthonormality,
+  which every rotation and sign flip of an in-plane basis satisfies.
+  
+  That basis is the coordinate frame a face-picked drawing is generated in —
+  `useDrawingGeneration` hands `custom.tangent`/`custom.bitangent` to the cutter
+  as `customPlane`, and `drawing-generator` works in it — so the jump was a
+  drawing that came out rotated between two nearly identical picks. (The cap
+  hatch is screen-space and its 2D→3D round-trip uses one basis at both ends, so
+  it self-cancels; the module doc's stated victim was in fact immune.)
+  
+  The threshold is gone. World-Y is now the reference for every normal except
+  exactly `±Y`, where the cross product genuinely vanishes; the tangent is
+  `normalize(normal × Ŷ)`, which depends only on the normal's azimuth and is
+  continuous over the whole sphere minus those two points. Continuity everywhere
+  is not available — the hairy-ball theorem forbids a nowhere-zero tangent field
+  on a sphere, so some normal has to be singular — and `±Y` is the cheapest place
+  for it: the plane is exactly horizontal there, so the drawing is a plan whose
+  in-plane rotation carries no meaning. At those two normals the historical basis
+  is kept unchanged, so a picked horizontal floor still reproduces the "Down"
+  preset's hatch orientation. The branchless Frisvad/Duff construction was
+  measured and rejected: its `copysign` variant is itself discontinuous across
+  `nz = 0` (`dot = -1` at `n = +X`), and pinning the singularity to one point
+  costs `bitangent · Y = -nx`, i.e. every elevation on half the sphere upside
+  down. The chosen field keeps `bitangent · Y = sin(tilt) >= 0` everywhere, so
+  face-picked elevations stay upright — which the old code did not manage either,
+  since its X-fallback pointed the bitangent downward for every `ny > 0.9`.
+  
+  Behaviour change: for normals with `|ny| > 0.9` — near-horizontal planes,
+  including every horizontal-ish face pick except an exactly axis-aligned one —
+  the basis is different from before. A section drawing regenerated from such a
+  pick can come out rotated relative to one generated before this change, and a
+  saved section plane reloads with the new basis. Cardinal presets, exactly
+  axis-aligned picks (`±X`, `±Y`, `±Z`) and every normal with `|ny| < 0.9` are
+  bit-for-bit unchanged. No golden or snapshot moved: the renderer, drawing-2d
+  and viewer suites pass unmodified.
+
+- [#2823](https://github.com/LTplus-AG/ifc-lite/pull/2823) [`89ea6bd`](https://github.com/LTplus-AG/ifc-lite/commit/89ea6bd2043528d7463cf57644bd0ce43d2360af) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two dead-field defects found while adding coverage for [#2802](https://github.com/LTplus-AG/ifc-lite/issues/2802)'s zero-coverage store slices.
+  
+  `sheetSlice`'s `clearSheet` reused the same `getDefaultState()` helper the store uses to seed its initial state, so clicking "clear sheet" reset `savedSheetTemplates` to `[]` along with the active sheet — silently deleting every saved template. `clearSheet` now preserves `savedSheetTemplates` across the reset.
+  
+  `idsSlice`'s `clearIdsValidationReport` already reset `idsIsolateMode` when it invalidated the validation report, but its two siblings that also invalidate the report — `setIdsDocument` (loading a new IDS document) and `clearIdsDocument` — did not. The isolate-panel "pressed" state and the 3D isolation built from `idsIsolateMode` in `useIDS.ts` were left pointing at a report that no longer existed after loading or clearing a document. Both now reset `idsIsolateMode` and `idsIsolationScope` the same way `clearIdsValidationReport` does.
+
+- [#2635](https://github.com/LTplus-AG/ifc-lite/pull/2635) [`f1db423`](https://github.com/LTplus-AG/ifc-lite/commit/f1db4237b257e908b0af3926cec890237cf547f6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `@ifc-lite/source-dropbox`: a Dropbox file-source provider implementing `FileSourceProvider` from `@ifc-lite/plugin-api`. Browses the signed-in user's Dropbox (folders and files), lists version history, and downloads any revision — current or historical — directly through `files/download`, using Dropbox's `"rev:<rev-id>"` path form for a specific historical revision (Dropbox serves this as a normal, non-redirecting, CORS-safe response, unlike Microsoft Graph's browser-only current-revision limitation).
+  
+  Authentication is delegated OAuth 2.0 Authorization Code + PKCE (`@ifc-lite/oauth-pkce`), scope `account_info.read files.metadata.read files.content.read` — no client secret. Getting a refresh token requires `token_access_type=offline` on the authorization request (a Dropbox-specific requirement, distinct from Microsoft Graph's `offline_access` scope); omitting it silently yields a session that stops working the moment its access token expires. No client ID is committed; it's a required, non-secret `clientId` preference the deployment configures (see the package README for what to register in the Dropbox App Console, including the 50-linked-user production-approval constraint).
+  
+  Registered alongside `@ifc-lite/source-dalux` and `@ifc-lite/source-msgraph` in the viewer's `createRegisteredProviders()`.
+  
+  The popup-callback channel this needs (`OAUTH_CALLBACK_CHANNEL`, `waitForOAuthCallback` and the `OAuthCallbackMessage` / `WaitForOAuthCallbackOptions` types) is imported from `@ifc-lite/oauth-pkce`, which already ships it. It lives there, not in this provider, because the defect it works around is a property of the browser's COOP handling and of that package's popup-based authorization flow, not of any one provider: every provider built on it inherits both the failure and the fix. `@ifc-lite/source-dropbox` keeps no copy of its own and deliberately does not re-export those names.
+  
+  The popup handoff is a `BroadcastChannel` from the redirect page, not the usual `popup.closed`/`popup.location` poll. A host that serves `Cross-Origin-Opener-Policy: same-origin` (the viewer does, for `SharedArrayBuffer`) has its opener link severed by the cross-origin authorization hop: `popup.closed` reads `true` while the popup is visibly open, so the poll loop rejects every sign-in as "cancelled" before the user has even consented. The viewer now serves the redirect path as a small static page (`apps/viewer/public/oauth/dropbox/callback.html`, routed in dev by `apps/viewer/vite-plugins/oauth-callback.ts` and in production by a `vercel.json` rewrite) instead of letting the SPA fallback boot a second copy of the whole application inside the popup.
+
+- [#2827](https://github.com/LTplus-AG/ifc-lite/pull/2827) [`56fbd50`](https://github.com/LTplus-AG/ifc-lite/commit/56fbd50c01fdb94d8af2b9eed4d7a1be46dbb518) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the Split tool committing a slab cut against a stale anchor from a different element.
+  
+  `setSplitTarget` preserved `splitMode: 'first-anchor'` whenever the slice was mid-slab-cut, regardless of whether the new target was the same element the anchor was latched against. Retargeting Split to a different element — e.g. picking a different row in the Hierarchy panel and re-triggering "Split selected entity" from the Command Palette while a slab's first click was still latched — moved `splitTargetModelId`/`splitTargetExpressId` to the new element but left `slabCutAnchor`/`slabCutFootprint`/`slabCutStoreyElevation` pointing at the old one. The next click then committed `splitSlabByLine` against the new target using an anchor point and footprint from an unrelated slab's coordinate space.
+  
+  `setSplitTarget` now only preserves the latched anchor when the retarget re-enters the *same* element; retargeting to anything else drops back to `'idle'` and clears the anchor/footprint/elevation, matching what `clearSplitHover` already does for every other exit path.
+
+- [#2837](https://github.com/LTplus-AG/ifc-lite/pull/2837) [`6beb3f4`](https://github.com/LTplus-AG/ifc-lite/commit/6beb3f4885ce2f52fc0a136ea4a05912b6b3ced9) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a slower clash run overwriting a newer, faster one in the Clash panel.
+  
+  `publishClashResult` in `useClash.ts` guarded every write to `clashResult` with a federation-identity check (`clashFederationIsCurrent`) - but that identity is keyed on the model set, not on which call started it. Two detection jobs issued while the federation is untouched (an "All elements" run, then a duplicate scan started while it is still going) carry the identical identity, so the guard could not tell a call the user is still waiting on from one they have moved past. An older, slower call finishing after a newer one had already published overwrote its answer.
+  
+  `run()` and `runDuplicates()` now capture a per-call epoch and re-check it, together with the federation identity, immediately before every store write - the publish, the "no geometry loaded" error, the caught-exception error, and the `finally` that flips `clashRunning` / `clashProgress` back off. The `finally` check matters as much as the publish one: without it, an older call's `finally` running after a newer one has already started reports "not running" while the newer job is still genuinely in flight. `clearAll()` also bumps the epoch, so a clear mid-run cannot be resurrected by the run it cleared landing afterwards.
+
+- [#2829](https://github.com/LTplus-AG/ifc-lite/pull/2829) [`ffd7fbe`](https://github.com/LTplus-AG/ifc-lite/commit/ffd7fbe96a4087149c2688b2650b0f2c59ca8c47) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a superseded model comparison overwriting a newer one in the Compare panel.
+  
+  `isCurrentFor` / `buildAtCurrentVersion` in `useCompare.ts` guard the fingerprint cache against a federation re-alignment moving meshes in place — they say nothing about whether a given `runComparison()` call is still the one the user is waiting on. Three ways an in-flight comparison could clobber the panel after the fact, all now fixed:
+  
+  - A slower `runComparison()` call finishing after a newer one (a different A/B pair, or a re-run) published its answer over it.
+  - `clearCompare()` mid-flight did not stick: the in-flight run's eventual result or error resurrected what the user had just cleared.
+  - Changing the A/B selection mid-flight (without clicking Run again) still published a result for the old pair, which nothing checked against the currently selected pair — the panel could show a diff that didn't match its own selectors.
+  
+  `runComparison` now captures a per-call epoch and re-checks it, together with the live `compareBaseModelId`/`compareHeadModelId`, immediately before every write to the store (success, the exhausted-retries error, and the failure path) — never earlier, so nothing can supersede between the check and the write. `clearCompare` is now returned from `useCompare()` and bumps that epoch before delegating to the store action, so `ComparePanel` (and the hook's own re-alignment cleanup) route through it instead of calling the raw store action directly.
+
+- [#2837](https://github.com/LTplus-AG/ifc-lite/pull/2837) [`6beb3f4`](https://github.com/LTplus-AG/ifc-lite/commit/6beb3f4885ce2f52fc0a136ea4a05912b6b3ced9) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a slower IDS validation run overwriting a newer, faster one in the IDS panel.
+  
+  `runValidation()` in `useIDS.ts` resolved its target model once, awaited the (potentially long, worker-or-main-thread) validation, and then wrote `setIdsValidationReport(...)` unconditionally - with no guard of any kind, not even a federation-identity check. Two validations issued back to back (a re-run, or a different target model picked from the federation dropdown while one was still running) raced: whichever finished last won the store, regardless of which the user actually issued last.
+  
+  `runValidation()` now captures a per-call epoch and re-checks it immediately before every store write that follows an `await` - the progress updates, the published report, the caught-exception error, and the `finally` that flips `idsLoading` back off. The `finally` check matters as much as the report write: without it, an older call's `finally` running after a newer one has already started reports "not loading" while the newer validation is still genuinely in flight. `clearIDS()` and `clearValidation()` also bump the epoch, so a clear mid-run cannot be resurrected by the run it cleared landing afterwards.
+
+- [#2856](https://github.com/LTplus-AG/ifc-lite/pull/2856) [`74f51f5`](https://github.com/LTplus-AG/ifc-lite/commit/74f51f585625fea16f32bc2c0a7a35b886bbdd46) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix an active lens keeping a removed model's colors and clearing them onto a new model that reuses its global-id range.
+  
+  `useLens`'s evaluation effect only depended on `[activeLensId, activeLens]`; it read `models` / `ifcDataStore` from `getState()` without subscribing to either, so removing a model or calling `clearAllModels` never triggered a re-evaluation. `lensColorMap`, `lensHiddenIds`, `lensRuleCounts`, `lensRuleEntityIds`, and `lensAppliedColors` kept referencing the departed model's entities. This wasn't just dangling: `clearAllModels` also resets the federation registry's offset counter, so the next model loaded can be handed the exact global-id range those stale entries still point at — a lens rule that matched the old model's entity keeps "matching" whatever unrelated entity now occupies that id, and `useCompareOverlay`'s teardown resends `lensAppliedColors` to the renderer verbatim.
+  
+  The effect now also depends on a lightweight fingerprint of the loaded model id set (add/remove only, not in-place field patches like loading progress or visibility toggles), and clears the lens-derived state when the model set empties out — mirroring what already happens on lens deactivation.
+
+- [#2779](https://github.com/LTplus-AG/ifc-lite/pull/2779) [`216446a`](https://github.com/LTplus-AG/ifc-lite/commit/216446af6a698e11f69652f09c8a07da263a78db) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a crashed extension widget masking every widget viewed afterward in the same dock slot.
+  
+  `WidgetErrorBoundary` never cleared its caught error, and `ExtensionDockHost` rendered it (and its `DockBody` parent) without a `key`, so switching the active dock tab reused the same React instance. Once any widget in a dock slot threw during render, every subsequently-viewed widget in that slot showed the first widget's stale crash banner instead of its own content — the panel effectively froze until it fully unmounted.
+  
+  `DockBody` and `WidgetErrorBoundary` are now keyed on the widget's identity (`extensionId`/`widget` path), so switching tabs discards the crashed instance and mounts a fresh one; re-rendering the *same* widget keeps the same key, so a widget that throws on every render still shows its own crash and does not enter a remount/crash retry loop.
+
+- [#2703](https://github.com/LTplus-AG/ifc-lite/pull/2703) [`2f46c0d`](https://github.com/LTplus-AG/ifc-lite/commit/2f46c0d06e6dd51cf0c98f74c5d57ab3cbcbd112) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix "select elements in this zone" selecting nothing inside a collaborative room.
+  
+  Zone selection resolved each matched element through the `federationRegistry`
+  singleton alone, and dropped every id the registry could not place. The collab
+  recipient seeds its room model with `upsertModel` and never calls
+  `registerModelOffset` (`collabSlice.ts`), so the registry knew none of the
+  room's ids: every match was dropped, and the panel then took its empty-result
+  branch and answered `No elements in this zone` — a confident, false statement
+  about the zone's contents rather than a silent no-op. Federated-IFCX
+  composition seeds its layers the same way.
+  
+  Resolution now goes through the store's canonical `resolveGlobalIdFromModels`
+  — the resolver `resolveEntityRef.ts` calls the single source of truth, and the
+  only one that also sees overlay-allocated ids via its `mutationViews` pass —
+  falling back to the registry for a model that has left `state.models` but is
+  still registered. `useIfcFederation`'s `findModelForEntity` / `resolveGlobalId`
+  get the same delegation. Sibling of the clash-path fix in [#2697](https://github.com/LTplus-AG/ifc-lite/issues/2697).
+  
+  This is complete only while the room's id space stays inside the first
+  snapshot's maximum. `collabSlice` computes the room model's `maxExpressId` in
+  its first-reconstruct branch only; every later peer edit goes through
+  `setIfcDataStore`, which replaces the store and leaves `maxExpressId` at the
+  first value. Ids allocated after that snapshot fall outside the model's
+  recorded range and still resolve to nothing — measured in review at 3 of 4
+  assigned elements once a peer adds one, and 0 of 3 when the first build saw an
+  empty doc and the bound froze at 0. That is a pre-existing `collabSlice`
+  defect, degrading every `resolveGlobalIdFromModels` consumer in a room rather
+  than zone selection specifically, and it is not fixed here.
+- Updated dependencies [[`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911), [`bc179f6`](https://github.com/LTplus-AG/ifc-lite/commit/bc179f6a1091c8c307a07b31d8c30fbba140e4a9), [`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542), [`b14e710`](https://github.com/LTplus-AG/ifc-lite/commit/b14e710ae8d56f518f84abb4d4ec8d1f98aacad8), [`05592f8`](https://github.com/LTplus-AG/ifc-lite/commit/05592f8c1ef5b34a00c2ea077542dc68107a7ae5), [`7b3617f`](https://github.com/LTplus-AG/ifc-lite/commit/7b3617f2ec9a6e9e8a57127d2ec61f9c33cadf3a), [`432fdb8`](https://github.com/LTplus-AG/ifc-lite/commit/432fdb8dd12dd90af17d1ca3ce24a2fd5b7168b0), [`6a43522`](https://github.com/LTplus-AG/ifc-lite/commit/6a43522cdf3b0a9b0f7ce303b59f479dca2a2aca), [`b699875`](https://github.com/LTplus-AG/ifc-lite/commit/b6998754039676def950735335147556afcb2977), [`b3a4d30`](https://github.com/LTplus-AG/ifc-lite/commit/b3a4d307c50c9b0a8b8bb0e29952c4a98e417c16), [`0a10389`](https://github.com/LTplus-AG/ifc-lite/commit/0a1038972a72b27bda99c8793055efe39d623f10), [`5334bd1`](https://github.com/LTplus-AG/ifc-lite/commit/5334bd1589acb1c4b81a1f255d1a9171530b1467), [`b1ac6be`](https://github.com/LTplus-AG/ifc-lite/commit/b1ac6be425cd89ff90eaab02636211f0d928b3e6), [`c688a12`](https://github.com/LTplus-AG/ifc-lite/commit/c688a1272ec72d575e8ecf78072e0a0084b517ca), [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4), [`79322b6`](https://github.com/LTplus-AG/ifc-lite/commit/79322b6e76049be0df3b07149c711414bd80863e), [`a257092`](https://github.com/LTplus-AG/ifc-lite/commit/a2570927c5496fc4a6e3a54183a4f6d99c6f5edf), [`5103734`](https://github.com/LTplus-AG/ifc-lite/commit/51037344717fe3d4c7c138e03f709a01a19ddccd), [`3329521`](https://github.com/LTplus-AG/ifc-lite/commit/33295218a3a2ecd35671483bc92bbf018807ae1e), [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65), [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`be6b43c`](https://github.com/LTplus-AG/ifc-lite/commit/be6b43c2b334811422c1cbfbea5d6e6d1b9a401d), [`989ee2c`](https://github.com/LTplus-AG/ifc-lite/commit/989ee2c4e396575529488c17b73e1a884e4e8b9d), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f), [`b4740a1`](https://github.com/LTplus-AG/ifc-lite/commit/b4740a1fb18050c065e8fbd58714626bdf852f00), [`5a9ecfb`](https://github.com/LTplus-AG/ifc-lite/commit/5a9ecfb6bcd3190eae4463bd8926cf38a2143496), [`9fb50eb`](https://github.com/LTplus-AG/ifc-lite/commit/9fb50ebcfaaf2926b2badd4d4d8dfc6ca55b762f), [`969cff9`](https://github.com/LTplus-AG/ifc-lite/commit/969cff95a77ce4c17a949a93632c8a0378fd3ede), [`a29b040`](https://github.com/LTplus-AG/ifc-lite/commit/a29b04069fec3c6b726f49fc58054e535c255034), [`cc19a8d`](https://github.com/LTplus-AG/ifc-lite/commit/cc19a8d4a79a5e8563a90ab663b28e1b93ef9c18), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`ccc38b0`](https://github.com/LTplus-AG/ifc-lite/commit/ccc38b0de9925a3de1106893a5785117e0e7551d), [`105eb31`](https://github.com/LTplus-AG/ifc-lite/commit/105eb31e7ccdd697f74db3bc9fac41396cdc6faa), [`4f01d5c`](https://github.com/LTplus-AG/ifc-lite/commit/4f01d5caf469c380c5e1a15d807a5ebb7f6de86e), [`679c7cb`](https://github.com/LTplus-AG/ifc-lite/commit/679c7cb680ab0d8f17e8f5c267fdb424049ec0d0), [`ae14cd3`](https://github.com/LTplus-AG/ifc-lite/commit/ae14cd3036f11c039d9b7cd786acf51a68b884dc), [`8226c0a`](https://github.com/LTplus-AG/ifc-lite/commit/8226c0aae9c4ca641b970873c0a0adf648429205), [`2edf1c6`](https://github.com/LTplus-AG/ifc-lite/commit/2edf1c60023832a7a9a3629e9d5aaa40e4be1e35), [`f31822b`](https://github.com/LTplus-AG/ifc-lite/commit/f31822b0833e1bcd76c43736daf1d76cb3e59914), [`4d1c611`](https://github.com/LTplus-AG/ifc-lite/commit/4d1c611b822e80a6123b040887a31cdb43c460da), [`5660d53`](https://github.com/LTplus-AG/ifc-lite/commit/5660d53f5326188c474bb0c31d3e1ff6b104426c), [`5254699`](https://github.com/LTplus-AG/ifc-lite/commit/52546994268440a468de81ce6ac0b385e6ef73d7), [`c233d48`](https://github.com/LTplus-AG/ifc-lite/commit/c233d48a935a70851271b61a305f43dd9261dcca), [`b28a629`](https://github.com/LTplus-AG/ifc-lite/commit/b28a629d49f279ce01537cb06ae4c28f32beb2bb), [`1900a1a`](https://github.com/LTplus-AG/ifc-lite/commit/1900a1a9f8174ef874dddbd1541ccadd9a89415e), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`b7d2a11`](https://github.com/LTplus-AG/ifc-lite/commit/b7d2a11345add8acdf0926ade5d4c1ca19ccecf7), [`c849b13`](https://github.com/LTplus-AG/ifc-lite/commit/c849b1395511e48ed6c8b6bd01bc0b1a66d60bfa), [`7862e92`](https://github.com/LTplus-AG/ifc-lite/commit/7862e929e7b8644c9df6a87f90f151901d33fc77), [`5d68a13`](https://github.com/LTplus-AG/ifc-lite/commit/5d68a13f7e2ed9c9754242b624abfa7343888f14), [`7862c03`](https://github.com/LTplus-AG/ifc-lite/commit/7862c0360c7297c0b24f100b62c55abc8e612b75), [`f1db423`](https://github.com/LTplus-AG/ifc-lite/commit/f1db4237b257e908b0af3926cec890237cf547f6), [`ae5a5ca`](https://github.com/LTplus-AG/ifc-lite/commit/ae5a5caa3e20304085ba14c0708cd026c1d4bf16), [`adc37ca`](https://github.com/LTplus-AG/ifc-lite/commit/adc37cac288e53be88796fddf06b0a7ae179f451), [`2affb53`](https://github.com/LTplus-AG/ifc-lite/commit/2affb534e8ed7b339dc52984789638d4ea4774bc), [`adc37ca`](https://github.com/LTplus-AG/ifc-lite/commit/adc37cac288e53be88796fddf06b0a7ae179f451), [`f19206b`](https://github.com/LTplus-AG/ifc-lite/commit/f19206b8912ba418627373e147c1699019450ebf), [`c49c7f6`](https://github.com/LTplus-AG/ifc-lite/commit/c49c7f644cd7930bd3937ed850f3864aa516934b)]:
+  - @ifc-lite/bcf@1.18.2
+  - @ifc-lite/collab@0.5.0
+  - @ifc-lite/mutations@1.26.1
+  - @ifc-lite/cache@3.0.5
+  - @ifc-lite/clash@1.9.0
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/source-dalux@0.3.0
+  - @ifc-lite/drawing-2d@2.1.1
+  - @ifc-lite/query@1.14.17
+  - @ifc-lite/data@3.4.0
+  - @ifc-lite/wasm@5.0.0
+  - @ifc-lite/ids@1.15.48
+  - @ifc-lite/create@2.1.2
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/lens@1.18.1
+  - @ifc-lite/sdk@2.1.3
+  - @ifc-lite/export@2.9.4
+  - @ifc-lite/mcp@0.11.3
+  - @ifc-lite/merge@0.4.3
+  - @ifc-lite/renderer@1.49.1
+  - @ifc-lite/server-client@1.22.2
+  - @ifc-lite/solar@1.15.5
+  - @ifc-lite/source-dropbox@0.2.0
+  - @ifc-lite/spatial@1.14.14
+  - @ifc-lite/lists@1.23.2
+
+## 1.36.0
+
+### Minor Changes
+
+- [#2688](https://github.com/LTplus-AG/ifc-lite/pull/2688) [`58ae85b`](https://github.com/LTplus-AG/ifc-lite/commit/58ae85bbb9c42506850db1ff2efa1debe379f799) Thanks [@Blogbotana](https://github.com/Blogbotana)! - Phase 1 of the Blender-like lighting work ([#2670](https://github.com/LTplus-AG/ifc-lite/issues/2670)): expose light-hardness and shadow-feel controls in the standalone WebGPU viewer.
+  
+  **Renderer** — `LightingEnvironment` gains a `sunSoftness` field: the diffuse-wrap that sets the sun terminator, previously hardcoded to `0.3` in the shader. `0` is a crisp light/shadow boundary (harder shadows), larger values soften it (overcast). Resolved into the existing environment uniform (a spare pad slot, no UBO size change) and clamped to `[0, 1]`; omitting it reproduces the historic look exactly.
+  
+  **Viewer** — the Sun & Sky panel adds two sliders (WebGPU shading, hidden in world-context mode): **Light hardness** (deepens shadows by cutting hemisphere ambient + fill) and **Terminator softness** (trims the preset's `sunSoftness`). Both are user trims composed onto the active preset — switching presets changes the base, the trims persist — mirroring Exposure. Presets now carry per-preset softness (crisp Day/Evening, soft Overcast) so the terminator changes with the sky being simulated. Settings persist in localStorage.
+
+### Patch Changes
+
+- [#2696](https://github.com/LTplus-AG/ifc-lite/pull/2696) [`572100f`](https://github.com/LTplus-AG/ifc-lite/commit/572100fcdc3df89bd0461445e14e05809d1581a8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a clash run that finishes after the models it examined are gone repopulating the result list. Both publish sites in `useClash` wrote `setClashResult` unconditionally, so clearing the federation mid-run ("Clear all", "Open file", "Remove model", or a collab peer edit replacing the active model's data store) was undone seconds later by the finishing run. After a teardown every restored row is inert — focusing one resolves no entity refs — and after a collab peer edit the rows still focus but point at entities the peer's edit renumbered, so they select the wrong elements. Each run now records the identity of the federation it actually gathered elements from (each contributing model id mapped to its entity table, the express-id space its refs are derived from) and both sites publish through one guard that drops the result if any of those models is gone or has been re-parsed. The identity is read off the federation rather than bumped by each teardown, so no enumeration of teardown paths can fall out of date; and because it is keyed on the entity table rather than the `ifcDataStore` wrapper, a background spatial-index publish — which replaces the wrapper while every express id stays put — leaves a correct run alone.
+
+- [#2633](https://github.com/LTplus-AG/ifc-lite/pull/2633) [`c706f34`](https://github.com/LTplus-AG/ifc-lite/commit/c706f3452df4ab64a17966d5e965cf6518ccd417) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `@ifc-lite/source-msgraph`: a Microsoft Graph (OneDrive/SharePoint) file-source provider implementing `FileSourceProvider` from `@ifc-lite/plugin-api`. Browses the signed-in user's OneDrive (folders and files), lists version history, and downloads the current revision of a file via Graph's pre-signed `@microsoft.graph.downloadUrl` — never `GET .../content` directly, which 302-redirects in a way a browser can't follow under a CORS preflight.
+  
+  Authentication is delegated OAuth 2.0 Authorization Code + PKCE (`@ifc-lite/oauth-pkce`), scope `offline_access https://graph.microsoft.com/Files.Read` — no admin consent required, no client secret. No client ID is committed; it's a required, non-secret `clientId` preference the deployment configures (see the package README for what to register in Azure AD).
+  
+  Registered alongside `@ifc-lite/source-dalux` in the viewer's `createRegisteredProviders()`.
+  
+  The popup handoff is a `BroadcastChannel` from the redirect page, not the usual `popup.closed`/`popup.location` poll. A host that serves `Cross-Origin-Opener-Policy: same-origin` (the viewer does, for `SharedArrayBuffer`) has its opener link severed by the cross-origin authorization hop: `popup.closed` reads `true` while the popup is visibly open, so the poll loop rejects every sign-in as "cancelled" before the user has even consented. The viewer now serves the redirect path as a small static page (`apps/viewer/public/oauth/msgraph/callback.html`, routed in dev by `apps/viewer/vite-plugins/oauth-callback.ts` and in production by a `vercel.json` rewrite) instead of letting the SPA fallback boot a second copy of the whole application inside the popup.
+  
+  Because that failure is a property of the popup being cross-origin rather than of any one provider, the waiting side ships as `waitForOAuthCallback` (plus the `OAUTH_CALLBACK_CHANNEL` name and its `OAuthCallbackMessage` shape) in `@ifc-lite/oauth-pkce`, so every provider built on that package shares one implementation. Messages are routed by the sign-in attempt's `state`, which is what keeps two concurrent sign-ins from completing each other's flow; `parseAuthorizationCallback` still performs the authoritative CSRF check. One consequence is deliberate: cancellation is no longer detectable, because `popup.closed` is the only signal a browser gives for it and that is exactly what COOP made unusable, so closing the popup now waits out the timeout.
+- Updated dependencies [[`d1fb40d`](https://github.com/LTplus-AG/ifc-lite/commit/d1fb40d1f72bb0b8345644e83e410cc8c240cf38), [`58ae85b`](https://github.com/LTplus-AG/ifc-lite/commit/58ae85bbb9c42506850db1ff2efa1debe379f799), [`d1fb40d`](https://github.com/LTplus-AG/ifc-lite/commit/d1fb40d1f72bb0b8345644e83e410cc8c240cf38), [`d1fb40d`](https://github.com/LTplus-AG/ifc-lite/commit/d1fb40d1f72bb0b8345644e83e410cc8c240cf38), [`c706f34`](https://github.com/LTplus-AG/ifc-lite/commit/c706f3452df4ab64a17966d5e965cf6518ccd417), [`b8fb71e`](https://github.com/LTplus-AG/ifc-lite/commit/b8fb71e5c19ddf405563664f29e8a6ec22f36b63)]:
+  - @ifc-lite/drawing-2d@2.1.0
+  - @ifc-lite/renderer@1.49.0
+  - @ifc-lite/source-msgraph@0.2.0
+
+## 1.35.0
+
+### Minor Changes
+
+- [#2535](https://github.com/LTplus-AG/ifc-lite/pull/2535) [`e5acbb2`](https://github.com/LTplus-AG/ifc-lite/commit/e5acbb2589628d7e9f8a9d640c4b82d11f510929) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Surface the existing spatial clash grouping (`groupClashes({ by: 'cluster' })`, already used for BCF export) in the Clash panel's results list itself. Previously the panel only ever listed raw element pairs, so a model where several nearby pairs are really one coordination problem (e.g. a cluster of beam clashes at a single connection) read as many rows instead of one issue.
+
+  The panel now shows a "Pairs" / "Issues" toggle plus an issue count next to the pair total. In the Issues view, results are grouped by spatial proximity (default cluster radius 1.5 m, adjustable in Clash settings' existing "Cluster radius" field); each group is expandable to the individual pairs it contains — nothing is hidden, only re-organized.
+
+- [#2641](https://github.com/LTplus-AG/ifc-lite/pull/2641) [`743d4db`](https://github.com/LTplus-AG/ifc-lite/commit/743d4db5396447317999032b024e31491630d129) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a multi-click polyline measurement mode to the Measure tool, alongside the existing drag-to-measure distance gesture.
+
+  A new "Polyline" toggle in the Measure panel switches the tool from the original drag (A to B) gesture to accumulating points via successive clicks. Double-click or Enter finishes the sequence as an open polyline (reports the sum-of-segments length); clicking back near the first point (once at least 3 points are placed) closes it into a loop instead, reporting the perimeter (the same sum plus the closing segment). Escape cancels an in-progress sequence without recording anything. The panel always prints which basis a number was computed under ("Length" vs. "Perimeter (closed)") rather than leaving it implicit.
+
+  The two gestures are mutually exclusive by construction: switching modes cancels whichever gesture was in progress in the mode being left (`setMeasureMode` in `measurementSlice.ts`), and polyline mode never starts a drag measurement (`shouldStartDragMeasurement` gates `mousedown` in `useMouseControls.ts`) — the original drag-to-measure flow is unchanged.
+
+  This is the first consumer of the mode; distances continue to route through the existing `formatDistance`/`resolveQuantityDisplay` unit-display path, honouring the same `unitDisplayOverrides`. Neither toolbar hosts any of this UI — it lives entirely in the shared Measure panel, per the existing `measure-parity.test.tsx` guard.
+
+  Deliberately out of scope for this change: free-polygon/rectangle area, three-point angle, minimum distance, diameter/radius, and circle-centre snapping — each still needs either mesh analysis reachable from TypeScript or its own interaction beyond the polyline primitive shipped here.
+
+- [#2675](https://github.com/LTplus-AG/ifc-lite/pull/2675) [`aea7c6b`](https://github.com/LTplus-AG/ifc-lite/commit/aea7c6b08f1f3bc5577ff190f3ec594403d64cd2) Thanks [@louistrue](https://github.com/louistrue)! - Clash exclusions: mark an overlap as by design and stop it counting.
+
+  A coordinator can exclude a whole IFC type pair, a one-sided type rule that
+  excludes every clash involving one type regardless of what it meets, or one
+  specific element pair. Each rule shows how many clashes it is hiding, and rules
+  can be disabled or removed. They persist in local storage and apply to the last
+  run without re-detecting.
+
+  This note exists because the feature shipped in [#2535](https://github.com/LTplus-AG/ifc-lite/issues/2535) under a changeset that
+  named only `@ifc-lite/clash`. Consuming a changeset deletes it, so the
+  viewer-facing description of a viewer feature would otherwise have been lost
+  from `apps/viewer/CHANGELOG.md` permanently rather than merely delayed.
+
+### Patch Changes
+
+- [#2654](https://github.com/LTplus-AG/ifc-lite/pull/2654) [`6b1b5a2`](https://github.com/LTplus-AG/ifc-lite/commit/6b1b5a23e72b998b242b3443c5d7ff453c2d6305) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix an orphaned clash intersection-solid render surviving the clash tour and Home / "Show all".
+
+  `focusClash` (`apps/viewer/src/hooks/useClash.ts`) computes the true intersection solid for a focused clash pair asynchronously, ghosts the whole model, and draws the solid opaque. The in-flight compute was staled out by `solidRequestGuard`, a `useRef` private to one `useClash()` hook instance — no code outside that hook's own callbacks could ever invalidate it.
+
+  Two teardown paths reset the same fields `useClash.clearHighlight()` resets (selection, isolation, ghost, pair colours, the contact overlay, `clashSelectedId`) directly against the store, written before the on-demand solid feature landed:
+
+  - the clash tour's "zoom-to-clash" step cleanup (`apps/viewer/src/lib/tours/tours/clash.ts`)
+  - the Home / "Show all" reset, `resetVisibilityForHomeFromStore` (`apps/viewer/src/store/homeView.ts`)
+
+  Neither called anything that could invalidate the guard, so running the clash tour to completion, or clicking Home / "Show all", while a clash solid was showing (or its compute was still in flight) left an orphaned opaque intersection-solid mesh rendering with nothing selected and no clash focused — or let a since-superseded compute land afterward and reapply the full-model ghost the user had just cleared.
+
+  Rather than adding `clearClashSolid()` calls at these two sites (which would leave the same gap for the next teardown path that forgets to), the invalidation now lives in the clash store slice itself: `setClashSelectedId`, `clearClashSolid` and `clearClash` (`apps/viewer/src/store/slices/clashSlice.ts`) all reset the solid presentation and bump a new `clashSolidRequestSeq` counter. `focusClash`'s async compute checks that counter instead of a private ref, so any code path that changes or clears the focused **clash** — including ones not written yet — invalidates an in-flight solid compute by construction. `Viewport.tsx` additionally gates the solid draw on `clashSelectedId !== null` as defence in depth.
+
+  That "by construction" property covers clash-_focus_ teardown. The paths that replace or unload the **model** the presentation belongs to are a separate, pre-existing gap and touched no clash field at all, so a resolved solid and a non-null `clashSelectedId` both survived them — which meant the render gate passed too, and the previous model's solid was eligible to be re-pushed into the new scene when the renderer re-initialised. All three now route through the same store invalidation:
+
+  - `resetViewerState()` (`apps/viewer/src/store/index.ts`), the primary-file "open another model" reset. Same stale-model-reference class as the `compareResult` / `zoneAssignments` / `searchIndexes` drops beside it — a clash result is keyed by `model:expressId` pairs from the outgoing model, and an IFCX recomposition reassigns expressIds outright.
+  - `clearAllModels()` (`apps/viewer/src/store/slices/modelSlice.ts`): a full federation teardown leaves nothing for a solid to be drawn against.
+  - `removeModel()` drops the focused-clash **presentation** but keeps the clash **result**: the result is a list the user is reading, while the solid is a mesh in the live scene whose model set just changed under it.
+
+  Clash presets and settings are workspace preferences and survive all three, as they do everywhere else `clearClash` is called.
+
+  The solid is not the only thing `focusClash` draws, though, and the same "one decision, several spellings" shape produced a second ghost. Ending a clash focus means clearing the A/B pair tint, the contact marker (`clashContactLines`, or the `clashOverlapBox` AABB fallback) and the solid — but that field list was written out by hand in seven callers, and they had drifted to different subsets. `Viewport.tsx` draws the contact marker from an effect keyed on `[clashOverlapBox, clashContactLines, showClashRegionBox]` alone — it reads neither `clashSelectedId` nor `clashSolidStatus` — so a teardown that cleared only the solid and the selected id did not retract the wireframe. Two callers had that bug:
+
+  - `removeModel()` left the contact outline drawn in world space over models that had just been unloaded.
+  - `ClashPanel`'s unmount cleanup cleared `clashOverlapBox` but not `clashContactLines`, which is the field that carries the marker in the common case: `focusClash` prefers the real contact interface and nulls the box when it can build one. Closing the panel on such a clash left its outline behind.
+
+  Both are fixed by making the field list exist once. `clearClashFocus()` (`apps/viewer/src/store/slices/clashSlice.ts`) is now the single complete spelling of "stop drawing the focused clash" — tint, marker, solid, selected id and the `clashSolidRequestSeq` bump — and `clearClash` composes the same shared constant, so the two cannot drift. Every teardown path (`removeModel`, `ClashPanel`'s unmount, the clash tour cleanup, Home / "Show all", `useClash`'s `clearHighlight` / `clearAll` / pre-run discard) calls it instead of listing fields, so a teardown path added later is complete by construction rather than by remembering.
+
+  The clash-slice fields are not the whole presentation, though. `focusClash` writes two more channels that no clash action can reach, and the model-lifecycle paths were leaving both behind:
+
+  - The shared **visibility** channels (`ghostExceptEntities` / `isolatedEntities`, `visibilitySlice`). `focusClash` writes exactly one of them per focus: `isolate` hides everything but the pair (one click from every panel row), `ghost` fades the pair's context, and the resolved-solid path ghosts the _entire_ model (`installClashGhost(new Set())`) so nothing opaque buries the overlap. Focus a clash in a federated session, then remove the model it belongs to: the solid, the marker and the selected id all went, while every surviving model stayed translucent — or, in isolate mode, invisible — with nothing selected and no way to tell why.
+  - The **colour-override** channel (`pendingColorUpdates`, `dataSlice`). `clashHighlightColors` is only a record of the A/B tint; the albedo override the user actually sees is pushed separately into a fire-and-forget effect (`useGeometryStreaming.ts` → `scene.setColorOverrides`) that is undone only by a _later_ push. Clearing the record left the amber/cyan pair painted on the models that survived, and kept lens colouring suppressed with it. Every user-initiated end of a focus already ends with `setPendingColorUpdates(lensAppliedColors ?? new Map())` for exactly this reason.
+
+  `removeModel()`, `clearAllModels()` and `resetViewerState()` now end all three channels through one helper, `endClashScenePresentation` (`apps/viewer/src/lib/clash/visibility-ownership.ts`), so a fourth model-lifecycle teardown is complete by construction rather than by remembering. `resetViewerState` was the odd one out: it set `pendingColorUpdates: null`, and `null` is a **no-op** in the effect that owns that channel — only a non-null _empty_ map reaches `scene.clearColorOverrides()` — so the outgoing file's pair tint stayed pushed at the renderer across a model switch.
+
+  The two shared channels are released **by ownership, not unconditionally** — they have several owners besides clash (`LayerDiffView`, Space Sketch's ghost preview, "Isolate in 3D", IDS/BCF isolation, and `syncSourceModel`'s post-removal purge), and the last is a hard contract: `syncSourceModel` calls `removeModel` one line before `purgeStaleEntityState`, which deliberately _keeps_ the part of the user's X-ray or isolation still owned by a surviving model and drops only the ids burned with the replaced one. An unconditional clear would make that filter dead code on its only production path, so "Sync from source" would silently wipe the user's X-ray.
+
+  Clash's ownership record therefore moved out of `useClash` and into the store, as `clashVisibilityOwned` on the clash slice — the channel it installed into plus the exact content it installed. It is written by the two install helpers, dropped by `applyFocusMode`'s `highlight` branch (which clears both channels and owns neither afterwards), and read by one shared predicate, `releaseOwnedClashVisibility`, which releases a channel only while it still content-matches the record. Both `useClash`'s run-start discard and every model-lifecycle teardown call that one predicate over that one record, so there is no hook-private copy left for the store's view to diverge from. It is the same shape as the lens slice's `lensRuleIsolation` / `lensAppliedHiddenIds`, which record lens ownership of these same channels in the store for the same reason.
+
+  An earlier revision of this fix inferred ownership at the store level from `clashSelectedId` instead, because the record was unreachable there. That inference is wrong in both directions, and both are now covered by tests driving the real hook: `applyFocusMode`'s `highlight` mode — the panel's default row click — leaves a clash _selected_ while owning neither channel, so an unrelated model removal destroyed the ghost the next owner installed (on the `syncSourceModel` path, the original regression above); and `selectElement` — the chevron expand and the per-side button — installs a non-empty clash isolation and never writes `clashSelectedId`, so that isolation survived the removal and `isEntityVisible` returned false for everything.
+
+  The colour channel has no ownership record of its own, so it is released on the two facts that do mean clash painted: a recorded pair tint (`clashHighlightColors`, written only by clash), or a visibility release that verifiably succeeded. An unrelated model removal therefore cannot switch off Pset / IDS / schedule colouring clash never took. A full teardown (`clearAllModels` / `resetViewerState`) clears all three outright and releases the colour channel to an _empty_ map rather than replaying `lensAppliedColors`: those overrides are keyed by the outgoing models' global ids.
+
+  This is also why the visibility **channels** stay out of the clash slice's shared `CLASH_FOCUS_RESET` constant, even though that is where the rest of the field list lives: `clearClashFocus()` is also called at run start, where the release must be ownership-aware so a user's own X-ray survives pressing Run.
+
+  The ownership **record** is a different thing, and leaving it out of that constant left one residual hole. `releaseOwnedClashVisibility` and `applyFocusMode`'s `highlight` branch were the only two places that dropped it, so every path that clears both channels _by hand_ — `useClash.clearHighlight` / `clearAll`, `ClashPanel`'s unmount, the clash tour cleanup, Home / "Show all" — ended the focus while leaving the record standing. Because ownership is tested by **value**, that stale record goes matching → cleared → _matching again_ the moment any other owner installs a set with equal content: focus a clash in ghost mode, clear the highlight, let the spaces X-ray ghost the same two elements, then remove an unrelated model, and that owner's ghost was destroyed — "Sync from source wipes the user's X-ray" all over again, by a narrower route. `clashVisibilityOwned` is therefore now a member of `CLASH_FOCUS_RESET` itself: every one of those paths already routes through `clearClashFocus()` / `clearClash()`, so ending the focus ends the claim by construction rather than by each caller remembering to.
+
+  That only works in one order. Since the clash clear now nulls the record, the release must run **before** it; released afterwards, the predicate reads `null`, finds nothing to release, and leaves clash's own ghost or isolation standing over a scene whose models just changed — the originally reported bug, reopened. `endClashScenePresentation` is ordered accordingly (sample the paint fact, release the visibility channels, then clear the focus), as `useClash.discardSolidPresentation` already was. The order is also self-enforcing rather than merely documented: each step re-reads the store instead of sharing one snapshot, so a reordering cannot hide behind a stale read — it fails eight tests across three files.
+
+  `removeModel()` is now also a genuine no-op for an id that is not loaded, matching `updateModel`. `syncSourceModel` and the collab room teardown can both re-enter with an already-removed id, and every other cleanup in `removeModel` is keyed to that model — but the clash teardown is not, so a stale id used to drop the user's focused clash as the side effect of a removal that removed nothing.
+
+  One known gap remains, pre-existing and out of scope here: `useClash.run()` writes its result without a staleness check, so a run that finishes _after_ `clearAllModels()` can repopulate `clashResult` with pairs from models that are no longer loaded. The teardown paths themselves are complete; that race is a separate defect on the write side.
+
+- [#2641](https://github.com/LTplus-AG/ifc-lite/pull/2641) [`743d4db`](https://github.com/LTplus-AG/ifc-lite/commit/743d4db5396447317999032b024e31491630d129) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix three defects in the multi-click polyline measurement mode found by adversarial review:
+
+  - Switching away from the Measure tool with a polyline sequence in progress (or a drag mid-flight) no longer strands it. `setActiveTool` now clears the in-progress gesture whenever it leaves `'measure'` — the only way `MeasureOverlay` ever unmounts, since it is gated purely on `activeTool === 'measure'`. Switching back to Measure always starts clean.
+  - Finishing a polyline with a physical double-click no longer appends a spurious near-duplicate vertex. Browsers dispatch `click, click, dblclick` for one gesture; `finishPolyline` now drops a trailing point that lands within a couple CSS px of the previous one before validating/recording, the same fix `SpaceSketchOverlay`'s polygon tool already applies to its own double-click-to-close gesture. That duplicate check is scoped to the double-click gesture alone: the screen coordinates it compares are reprojected on every camera move, so running it on the Enter or close-loop-click paths deleted genuinely distinct vertices that happened to line up after an orbit and reported a short length with nothing on screen to say so.
+  - Pressing Enter (or double-clicking) on a 1-point sequence — too few points to finish — now shows an error toast instead of doing nothing silently. The sequence is left in progress rather than cancelled, matching how the AddElement polygon tool handles the same too-few-points case.
+
+- Updated dependencies [[`90d5b35`](https://github.com/LTplus-AG/ifc-lite/commit/90d5b3563c7732c674dfd4890ab94d201b83db3d), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`33eb685`](https://github.com/LTplus-AG/ifc-lite/commit/33eb685de6c1578727587d87af5c3cd4a30a4122), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`33eb685`](https://github.com/LTplus-AG/ifc-lite/commit/33eb685de6c1578727587d87af5c3cd4a30a4122), [`e5acbb2`](https://github.com/LTplus-AG/ifc-lite/commit/e5acbb2589628d7e9f8a9d640c4b82d11f510929), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39), [`2421442`](https://github.com/LTplus-AG/ifc-lite/commit/2421442363c5adf39d9405bf7a0e16b72adc73d1), [`2297fa9`](https://github.com/LTplus-AG/ifc-lite/commit/2297fa9ceeda69d754d77b83aba86152e2dee02b), [`3dd3dd4`](https://github.com/LTplus-AG/ifc-lite/commit/3dd3dd41c50f027b705b3a3b04c72f3aea66c0df), [`f5c96c5`](https://github.com/LTplus-AG/ifc-lite/commit/f5c96c581eebfcc627be96de0670c9540b61623f), [`1419b86`](https://github.com/LTplus-AG/ifc-lite/commit/1419b86206d7bc10c6f80ff6d2c33eb5958466dc), [`4a0897c`](https://github.com/LTplus-AG/ifc-lite/commit/4a0897cd5ebcfb9f0f79dc181d243bd618853a3a), [`cc8cfcf`](https://github.com/LTplus-AG/ifc-lite/commit/cc8cfcf426b02bd999aa37e0fa12ca2ff3ee18de), [`79503d3`](https://github.com/LTplus-AG/ifc-lite/commit/79503d3346c6c383c831b08ecaab94c6da13192d), [`20d27aa`](https://github.com/LTplus-AG/ifc-lite/commit/20d27aaae4ce1d00bccd8a5a8a4c8410cbe1ba39)]:
+  - @ifc-lite/clash@1.8.0
+  - @ifc-lite/wasm@4.7.0
+  - @ifc-lite/create@2.1.1
+  - @ifc-lite/renderer@1.48.1
+  - @ifc-lite/export@2.9.3
+
+## 1.34.0
+
+### Minor Changes
+
+- [#2645](https://github.com/LTplus-AG/ifc-lite/pull/2645) [`2d87b39`](https://github.com/LTplus-AG/ifc-lite/commit/2d87b3919c0ca5afff03e205c5f598142bbc980d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Re-export `triangleArea` and the `Triangle` type from `@ifc-lite/clash`'s public surface (issue [#2199](https://github.com/LTplus-AG/ifc-lite/issues/2199): "mesh analysis reachable from TypeScript"). It previously existed only inside the package's clash contact solver, so nothing outside `@ifc-lite/clash` — including the viewer's Measure tool — could reach a triangulated-mesh area even though every `MeshData` already carries the `positions`/`indices` a caller needs.
+
+  The Measure tool's Quantities panel ([#2199](https://github.com/LTplus-AG/ifc-lite/issues/2199) §1, element surface area) now reports a "mesh" area alongside the existing declared (net/gross/unqualified) and mesh volume rows: the selection's total triangulated surface area, summed live from mesh geometry via the newly-exported `triangleArea`. Unlike the mesh volume row, this needs no closed-solid proof, so it covers open shells and layered walls too — and unlike the mesh volume row, it is not invalidated by federation alignment re-baking, because it is recomputed from current vertex positions rather than read from a value cached before alignment ran. It is the sum of every meshed face (not one side), so it is labelled "mesh" and never presented as a `NetSideArea`/`GrossSideArea` equivalent. Where no mesh geometry exists for a selected element (e.g. an instanced-only occurrence with no flat mesh materialised), the panel says so rather than reporting zero.
+
+### Patch Changes
+
+- [#2530](https://github.com/LTplus-AG/ifc-lite/pull/2530) [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Report duplicates as coincident sets, not pairs. `findDuplicates` is pairwise, so N coincident copies of one object produce N(N−1)/2 rows and each copy is named in N−1 of them — three triplicated columns read as nine findings with every object mentioned twice. No row was ever literally repeated, but the list overstated the problem and the same object kept reappearing.
+
+  New `groupDuplicateSets(result)` partitions a duplicate result into the connected components of the pair graph: each reported clash is an edge between two model-qualified `(model, key, ref)` elements — `ref` is in the node identity so two elements that share a GlobalId within one model stay distinct nodes instead of collapsing into one — and each component becomes one `ClashGroup` titled e.g. "3 coincident IfcWall objects". Unlike `groupClashes({ by: 'cluster' })` it needs no epsilon and cannot fuse two unrelated duplicate sets that happen to stand within the 1.5 m cluster radius of each other. Sets that span models group correctly (the same object delivered in two files). A set's severity is its most severe member, so a set containing an exact-duplicate pair still surfaces as `major`.
+
+  Connected components treat coincidence as transitive, which under `positionTolerance` — the corner-distance gate `findDuplicates` uses by default — it strictly is not: A≈B and B≈C puts A and C in one set even if A≉C. That is deliberate — a chain of near-coincident objects is a single coordination issue, and the strict alternative would put the same object back into several findings.
+
+  Detection and thresholds are unchanged; `ClashResult` still carries the same pairwise clashes, so the other grouping modes and BCF export are unaffected. In the viewer, a duplicate scan now RENDERS these sets: the clash panel shows one section per coincident set ("3 coincident IfcColumn objects") with the member pair rows inside it, instead of bucketing the pairwise rows under the generic severity/rule/type-pair headers; the scan's telemetry counts sets rather than pairwise rows for the same reason. The duplicate scan's position tolerance is also now a setting (Clash settings → "Duplicate tolerance", default 10 mm) — it previously always ran at the library default, with no viewer control.
+
+  The panel's "Group by" control is now disabled during a coincident-set view: it previously stayed clickable and its selection persisted, but the sections it draws are always the coincident sets during a duplicates-only run, so choosing "By severity" or "By type pair" changed nothing on screen.
+
+- [#2599](https://github.com/LTplus-AG/ifc-lite/pull/2599) [`8324512`](https://github.com/LTplus-AG/ifc-lite/commit/8324512daee39a018056aa88a148f72791db89c4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Distinguish "the clash matrix found nothing" from "the clash matrix had nothing to check".
+
+  The built-in discipline matrix (`--matrix`) is shaped for MEP/HVAC/electrical/fire coordination: every preset's `selectorA` is one of those disciplines. Run it on a model with none of those element types — an infrastructure model, for instance — and every rule matches zero elements on the A side, so the matrix silently reports "0 clashes". That reads as "this model is clean" when it actually means no rule ever ran a real comparison.
+
+  `ClashResult` now carries a `ruleCoverage` field (per-rule counts of matched elements on each side), and `@ifc-lite/clash` exports `classifyRuleCoverage`/`ruleHadNoMatch` to turn that into one of `clean` / `partial` / `no-match` / `unknown`. The CLI's `--matrix` (and any other rule set) prints a loud `WARNING` when no rule matched anything, and a shorter note when some rules did not, in both the human summary and the `--json` output (`ruleCoverageOutcome` + `ruleCoverage`); the viewer's clash panel shows the same warning in place of the "No clashes found 🎉" empty state. Zero clashes is never treated as an error — the CLI still exits 0 — this only makes the _kind_ of zero visible.
+
+  The `no-match` warning's wording now depends on whether a real discipline matrix ran. `--matrix` runs many rules, so its "the matrix did NOT run" phrasing is accurate there. The default path (`ifc-lite clash <file> --a <selector> --b <selector>`, no `--matrix`) builds exactly one ad-hoc rule; when only one side's selector matches nothing (e.g. `--a IfcWall --b IfcRoof` on a model with no roofs), the _other_ side did match and no matrix was ever involved — the CLI now names the empty selector ("selector B (\"IfcRoof\") matched 0 elements") instead of claiming a matrix that never ran. The viewer's clash panel makes the same distinction for its own single-rule runs (`runAll`'s "Detect all clashes" and a one-off `runPreset`) versus a real multi-rule `runMatrix`.
+
+  Out of scope: adding infrastructure-discipline presets to the built-in matrix. That's a product decision about what an infra clash matrix should contain, not something to bundle into a diagnostic fix.
+
+- Updated dependencies [[`7f2d9cf`](https://github.com/LTplus-AG/ifc-lite/commit/7f2d9cf1fdcf8facd9bf3f1445ddf3c665206b76), [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6), [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6), [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6), [`85ae89d`](https://github.com/LTplus-AG/ifc-lite/commit/85ae89d915937be21dde174db6a123e883189be6), [`8324512`](https://github.com/LTplus-AG/ifc-lite/commit/8324512daee39a018056aa88a148f72791db89c4), [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f), [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f), [`5cf117d`](https://github.com/LTplus-AG/ifc-lite/commit/5cf117d1eb16dba7f3e7be67114e26ce3ec44a8f), [`a351839`](https://github.com/LTplus-AG/ifc-lite/commit/a35183910da35bd44dd38c5ed50d49d5f73b9f4a), [`5086c57`](https://github.com/LTplus-AG/ifc-lite/commit/5086c5729b6ae8ad967aafa91d96dfdb37327599), [`307693c`](https://github.com/LTplus-AG/ifc-lite/commit/307693c678d525ab007773f74e13a308bfe63b34), [`7cb7394`](https://github.com/LTplus-AG/ifc-lite/commit/7cb73940e0c23cd6b93c4483bfddb7b45cbb363a), [`649aa0c`](https://github.com/LTplus-AG/ifc-lite/commit/649aa0ccbc4e67c233b9175a6a2f9c8e1ff310ec), [`004b2ff`](https://github.com/LTplus-AG/ifc-lite/commit/004b2ff636fc0299ff669d14e6fbe1ed97881e21), [`004b2ff`](https://github.com/LTplus-AG/ifc-lite/commit/004b2ff636fc0299ff669d14e6fbe1ed97881e21), [`fffc0ee`](https://github.com/LTplus-AG/ifc-lite/commit/fffc0ee91c0c7c63955993faf470fa0581303005), [`2d87b39`](https://github.com/LTplus-AG/ifc-lite/commit/2d87b3919c0ca5afff03e205c5f598142bbc980d), [`2bd854d`](https://github.com/LTplus-AG/ifc-lite/commit/2bd854de15965b0fee684ef6fda90f2984d3e6f0), [`fffc0ee`](https://github.com/LTplus-AG/ifc-lite/commit/fffc0ee91c0c7c63955993faf470fa0581303005), [`5086c57`](https://github.com/LTplus-AG/ifc-lite/commit/5086c5729b6ae8ad967aafa91d96dfdb37327599), [`7cd8193`](https://github.com/LTplus-AG/ifc-lite/commit/7cd81939ed4acf9e93686d1d96dddcf7606fb59a)]:
+  - @ifc-lite/clash@1.7.0
+  - @ifc-lite/parser@4.1.0
+  - @ifc-lite/wasm@4.6.0
+  - @ifc-lite/renderer@1.48.0
+  - @ifc-lite/drawing-2d@2.0.0
+  - @ifc-lite/geometry@3.8.3
+  - @ifc-lite/lens@1.18.0
+  - @ifc-lite/pointcloud@0.7.0
+  - @ifc-lite/solar@1.15.4
+  - @ifc-lite/diff@0.7.0
+  - @ifc-lite/export@2.9.2
+  - @ifc-lite/ids@1.15.47
+  - @ifc-lite/sdk@2.1.2
+  - @ifc-lite/ifcx@2.3.6
+  - @ifc-lite/mcp@0.11.2
+  - @ifc-lite/merge@0.4.2
+
+## 1.33.10
+
+### Patch Changes
+
+- [#2640](https://github.com/LTplus-AG/ifc-lite/pull/2640) [`6d45c9d`](https://github.com/LTplus-AG/ifc-lite/commit/6d45c9d214069ff05e843028c081562960b5eead) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Honour the LENGTHUNIT display override in the 2D section/drawing canvas's on-canvas distance and perimeter labels ([#2199](https://github.com/LTplus-AG/ifc-lite/issues/2199) slice).
+
+  `0de10a0fd` ([#2538](https://github.com/LTplus-AG/ifc-lite/issues/2538)) wired `unitDisplayOverrides` through every measure-tool distance readout — `MeasurePanel.tsx`, `MeasurementVisuals.tsx`, `MeasurePointReadout.tsx` — but `Drawing2DCanvas.tsx`'s own measure-line and polygon-area-perimeter labels still called `formatDistance()` with no `overrides` argument, so a user who set feet as their display unit still saw metres there. `Drawing2DCanvas` now accepts a `unitDisplayOverrides` prop (defaulting to `{}`, so the no-override behaviour is unchanged) and threads it into both `formatDistance()` call sites; `Section2DPanel.tsx` reads the override map from the store and passes it down.
+
+- Updated dependencies [[`9cccc00`](https://github.com/LTplus-AG/ifc-lite/commit/9cccc002f5f03ad96c710b6d2a1e12b1bf61172c), [`118188b`](https://github.com/LTplus-AG/ifc-lite/commit/118188b22c0685f07c3537f0500b0bcb2aa4b33f), [`9d6daac`](https://github.com/LTplus-AG/ifc-lite/commit/9d6daac8133a6f41e3d400aa597f73029fde4376), [`2a03d0f`](https://github.com/LTplus-AG/ifc-lite/commit/2a03d0fd0897f0c382c7e9b51947daad1ebb3c28)]:
+  - @ifc-lite/clash@1.6.8
+  - @ifc-lite/drawing-2d@1.21.2
+  - @ifc-lite/plugin-api@0.3.0
+  - @ifc-lite/source-dalux@0.2.3
+  - @ifc-lite/renderer@1.47.0
+
+## 1.33.9
+
+### Patch Changes
+
+- [#2601](https://github.com/LTplus-AG/ifc-lite/pull/2601) [`ef09a5b`](https://github.com/LTplus-AG/ifc-lite/commit/ef09a5b7d8435f84d9f6534ab967aa56794e5c88) Thanks [@louistrue](https://github.com/louistrue)! - Split `CesiumOverlay.tsx` into the four responsibilities it had accumulated.
+
+  The file had grown past 1,000 lines carrying the Cesium viewer's lifecycle, the coordinate bridge, the model lifecycle and the solar study at once — four subjects with four different histories, interleaved. It is now 377 lines and reads as what it is: create the viewer, render the container, and call four hooks in the order their effects used to sit in.
+
+  `cesium/useCesiumBridge` owns where the model sits (ENU/ECEF framing, grid convergence, geoid undulation, terrain clamping, placement drafts). `cesium/useCesiumModel` owns what is drawn (GLB build, readiness-gated swap, matrix updates). `cesium/useCesiumSolar` owns lighting, shadows, the sun-path dome and the sky. `cesium/useCesiumCameraSync` owns the per-frame camera mirror, and `cesium/cesium-module` the lazy CesiumJS import they share.
+
+  Behaviour is unchanged, and the ordering that makes it unchanged is now written down: within a component React runs effect setups AND cleanups in declaration order, so the viewer effect — declared first — also cleans up first, and nothing in a later hook's cleanup may assume a live scene. Each hook documents where it must be called and what that buys it. Two teardown paths that the viewer effect cannot reach on unmount — the model's and the solar study's — are exposed as explicit `invalidate()` callbacks rather than left implicit.
+
+- [#2595](https://github.com/LTplus-AG/ifc-lite/pull/2595) [`4ea38db`](https://github.com/LTplus-AG/ifc-lite/commit/4ea38db9f7d9d8006ae1f29b27f075202d75d286) Thanks [@louistrue](https://github.com/louistrue)! - Ribbon search moves right, Cloud sources reaches the toolbars, and a detached panel stops lying about being closed.
+
+  The inline search field sat immediately after the ribbon tabs, competing with them for the same reading position and sliding sideways whenever the tab set changed. It now docks to the right, beside the rest of the always-on chrome, where users expect to find a search field. Load progress and the error line moved to the left of the spacer in the same pass. Parked on the right they shoved the search field every time a model started or finished loading.
+
+  Cloud sources (CDE integrations) had the ActivityBar rail as its only entry point. Location zones had the same gap before [#2508](https://github.com/LTplus-AG/ifc-lite/issues/2508). Cloud sources is now a command on both toolbar styles, routed through `useWorkspacePanelControls` so the panel's single-tenant docking, its float and pop-out re-docking, and its latched state are one implementation rather than two. Both panels reach the command palette too, along with World context, Sun & Sky and SpaceMouse. Location zones is the cautionary case: it was wired into both toolbars at [#2508](https://github.com/LTplus-AG/ifc-lite/issues/2508) and still never reached the palette, so a fix that looked complete left a third door shut.
+
+  **A detached panel now reads as open, and toggling it brings it home.** A panel lives in one of four places, but the toolbars only read the dock flags, and the two answers come apart the moment a panel is floated or popped out. `floatPanel` leaves the dock flag set, then the sidebar's exclusivity rule clears it as soon as any other panel docks, without touching the float channel. Float BCF, open IDS, and the BCF window sat on screen with every toolbar latch dark. Clicking a floating panel was worse than useless: the bottom strip cleared the flag and orphaned the window, while a side panel was torn down entirely instead of re-docking. The activity bar never had either bug because it asks `panelLocation`. The shared hook now asks the same question, and hands bottom-strip clicks to the store's `toggleBottomPanel` rather than re-deriving the flag flips. It could not delegate before, because it spelled the entity-list panel `'list'` where the registry and store spell it `'lists'`.
+
+  **The mobile bottom sheet showed the wrong panel.** It hand-wrote a chain over the seven panels it knew and fell through to the Properties panel for the rest, so Compare, Clash, Cloud sources, the Layer stack, Location zones and the collab Room all opened on a phone as Properties, titled "Properties". It now renders through `renderPanelBody`, the same map the sidebar, the floating host and the pop-out windows use, and titles from the registry.
+
+  **Controls that did nothing now say so.** Add Element is disabled for viewer and commenter roles on the classic Panels menu, matching the ribbon; the palette withholds its three authoring commands for those roles instead of listing commands the store silently rejects. The ribbon's collab Room button is no longer hidden until you are already in a room, which is how the other three surfaces have always offered it.
+
+  Naming and shortcut corrections across surfaces: the Information panel was also called "Inspector" and "Properties"; Hierarchy was also "Spatial Tree"; Frame Selection was "Focus" on the ribbon; Show all was "Display all". The Isolate button advertised `I / =`, but `=` runs set-basket, which differs once the basket is non-empty; the palette advertised `I` for a command that runs set-basket. Ribbon button labels were split between Title Case and sentence case, and the minority is converted.
+
+  Tests: `cloud-sources-parity` clicks the real control on all three surfaces, `detached-panel-latch` covers the float and pop-out cases in both regions, and `mobile-sheet-coverage` fails if a registry panel renders nothing or renders another panel's body. Each was mutation-checked against the defect it describes. Testing the palette needed one harness gap closed: `vite-module-hooks` now serves Vite's `?raw` imports as file text, which is what made `CommandPalette` unmountable under `tsx --test`.
+
+- [#2607](https://github.com/LTplus-AG/ifc-lite/pull/2607) [`2bb936c`](https://github.com/LTplus-AG/ifc-lite/commit/2bb936c213fdb7ca78d42b14a4cb207fbcfd6f18) Thanks [@louistrue](https://github.com/louistrue)! - X-Ray now reaches 3D World Context, and glass on the map looks like glass.
+
+  The world view drew every element fully opaque no matter its alpha. Clash focus in ghost mode, the Space Sketch preview and layer diff all faded the model in the viewport and changed nothing on the map; authored `IfcSurfaceStyleRendering` transparency was ignored there too. The cause was one line that was never written: a glTF material with no `alphaMode` is `OPAQUE` per spec, so Cesium discarded the per-vertex alpha the exporter had been packing all along.
+
+  The merged GLB now emits up to two primitives over the same vertex buffers — one opaque, one `alphaMode: 'BLEND'` — split by mesh alpha. Splitting rather than blending the whole model keeps the bulk of the geometry out of the translucent pass, where triangles are not depth-sorted against each other. A model with no translucent geometry still emits exactly one primitive, as before.
+
+  `@ifc-lite/renderer` exports `DEFAULT_GHOST_ALPHA` and `OPAQUE_ALPHA_CUTOFF` so the world view matches the viewport's ghosting rather than inventing its own; the ghost alpha was previously a literal inside `Renderer.render`. Selection is exempt from ghosting on the map exactly as it is in the viewport, and the GLB cache key carries a content-based ghost epoch so an equal set does not rebuild.
+
+  One deliberate difference: GPU-instanced occurrences ghost on the map but not in the viewport, because the renderer's instanced pass never receives the ghost set. That is the viewport being wrong, and replicating it to stay symmetrical would have meant copying a defect.
+
+- Updated dependencies [[`3af6d2a`](https://github.com/LTplus-AG/ifc-lite/commit/3af6d2ad076e76fc95e58a9252bf712f8513c6e9), [`9e6020d`](https://github.com/LTplus-AG/ifc-lite/commit/9e6020d116b2669cfb934cfa40b9f4f74d87fad5), [`cd72412`](https://github.com/LTplus-AG/ifc-lite/commit/cd724127245fcb767894642cd0994baaba88ff7d), [`b85b2be`](https://github.com/LTplus-AG/ifc-lite/commit/b85b2be4dd79045f1dd02ed344d102f27ecc2594), [`c9953ec`](https://github.com/LTplus-AG/ifc-lite/commit/c9953ec6691003a2cfada80da28effcdfcf5e56c), [`bd92912`](https://github.com/LTplus-AG/ifc-lite/commit/bd92912965b6b1ab6573a4b304b1e54d494c22b7), [`9175e35`](https://github.com/LTplus-AG/ifc-lite/commit/9175e35b29ff57b39b671e5db33f38c7807fb0fd), [`9b4d791`](https://github.com/LTplus-AG/ifc-lite/commit/9b4d791990cf72786b04f5b02933395fed1fe085), [`cd72412`](https://github.com/LTplus-AG/ifc-lite/commit/cd724127245fcb767894642cd0994baaba88ff7d), [`2bb936c`](https://github.com/LTplus-AG/ifc-lite/commit/2bb936c213fdb7ca78d42b14a4cb207fbcfd6f18), [`e51f5cb`](https://github.com/LTplus-AG/ifc-lite/commit/e51f5cb82d10b6c7d73186d8126f788b48c7f3a1)]:
+  - @ifc-lite/clash@1.6.7
+  - @ifc-lite/source-dalux@0.2.2
+  - @ifc-lite/geometry@3.8.2
+  - @ifc-lite/parser@4.0.3
+  - @ifc-lite/renderer@1.46.0
+  - @ifc-lite/extensions@0.4.2
+  - @ifc-lite/create@2.1.0
+  - @ifc-lite/export@2.9.0
+  - @ifc-lite/wasm@4.5.1
+  - @ifc-lite/ids@1.15.46
+
+## 1.33.8
+
+### Patch Changes
+
+- [#2588](https://github.com/LTplus-AG/ifc-lite/pull/2588) [`21fece1`](https://github.com/LTplus-AG/ifc-lite/commit/21fece1f4848fe34c8070f9e3d79b89a1ef0576b) Thanks [@louistrue](https://github.com/louistrue)! - Split the Location panel's helpers out of `LocationMap.tsx`, and cover them with tests they never had.
+
+  `LocationMap.tsx` was past the ~400-line rule and kept growing. Four units that had no business living inside a component moved out: MapLibre load/dispose/purge (`location-map-lifecycle`), the footprint polygon's matched add/remove pair (`location-map-footprint`), Nominatim place search (`location-map-geocode`), and the generic `useDebouncedValue` hook.
+
+  None of them had a single test before. They do now, covering the parts that actually bite: the footprint pair must leave nothing behind, because MapLibre throws on a duplicate source and the panel re-runs this on every style toggle; the geocoder must resolve to `[]` rather than reject on a rate-limit, an offline network or an HTML error page, because the panel calls it from an effect with no rejection handling; the debounce must DROP intermediate values, not merely delay them, or it would still hammer the geocoder per keystroke; and the map teardown must contain a throw from `map.remove()`, because it runs from an effect cleanup where an escaping error would strand the panel half torn down.
+
+- [#2586](https://github.com/LTplus-AG/ifc-lite/pull/2586) [`48683a0`](https://github.com/LTplus-AG/ifc-lite/commit/48683a0816f5332a40f73eabde613301026d9744) Thanks [@louistrue](https://github.com/louistrue)! - 3D World Context no longer blinks out while it rebuilds.
+
+  The world view dropped its model the moment anything invalidated it — a streaming geometry batch, a type toggle, a georef edit, a hide — and only then started a one-second debounce, a GLB build and a glTF load. The building disappeared from the map for over a second on every edit, which reads as the model being broken rather than reloading.
+
+  The model now stays on the globe while its replacement is built, and the two are exchanged only once the new one can actually draw. That last part matters: `Model.fromGltfAsync` resolving means the glTF was fetched and parsed, not that the model is renderable — Cesium creates its WebGL resources across later frames and skips one more frame after raising `readyEvent`. Swapping at construction time would have replaced a drawable primitive with a blank one and left the map empty for several frames, a much shorter version of the same defect. The effect cleanup only cancels the in-flight build; the model is torn down when its geometry goes away, or with the viewer.
+
+  A rebuild no longer flips `cesiumGlbLoaded` false and back, so the solar study — which relied on that flip to re-apply shadow settings to the new primitive — now keys on a model epoch that changes whenever a different primitive reaches the globe.
+
+- Updated dependencies [[`495cc38`](https://github.com/LTplus-AG/ifc-lite/commit/495cc388ea95f6e55aee76ea37bcf6d11c99558b), [`081ed7e`](https://github.com/LTplus-AG/ifc-lite/commit/081ed7e7e38072ecb307c01c0512cd911be886a6), [`a38012f`](https://github.com/LTplus-AG/ifc-lite/commit/a38012f6d9fec6b9ea934b22016c9005579a54b7)]:
+  - @ifc-lite/clash@1.6.6
+  - @ifc-lite/renderer@1.45.1
+
+## 1.33.7
+
+### Patch Changes
+
+- [#2576](https://github.com/LTplus-AG/ifc-lite/pull/2576) [`e09f824`](https://github.com/LTplus-AG/ifc-lite/commit/e09f8247eae1a7291f4e2ce18272ec4c2c7660ae) Thanks [@louistrue](https://github.com/louistrue)! - 3D World Context now shows the whole model — repeated geometry (curtain-wall facades, mullions, windows) no longer disappears on the map.
+
+  The Cesium overlay built its GLB from `geometryResult.meshes`, which by design holds only part of the model: GPU-instanced occurrences render from compact shards and are deliberately absent from that flat list, as `utils/instancedExport.ts` documents and as the glTF and IFC exporters already compensate for. The world view never did, so every repeated occurrence was dropped from the map while the WebGPU viewport drew it correctly. On the model from issue [#2558](https://github.com/LTplus-AG/ifc-lite/issues/2558) that was 9,950 of 18,555 meshes and 396K of 655K triangles — a tower's entire facade gone, leaving bare floor slabs over Google's imagery.
+
+  Building the GLB and its cache key now live together in `lib/geo/cesium-model-glb.ts`, which materialises the instanced half through the same `withInstancedMeshes` helper the exporters use. The cache key also counts instanced entities rather than flat meshes alone, so a geometry batch whose occurrences are all instanced — one that adds no flat meshes at all — no longer reads as "unchanged". It also folds in `geometryContentVersion`, so an in-place edit such as a gizmo move, which changes no count at all, invalidates the cached bytes too.
+
+- [#2582](https://github.com/LTplus-AG/ifc-lite/pull/2582) [`f01588b`](https://github.com/LTplus-AG/ifc-lite/commit/f01588bc83593c621d521233cf697393c6df1936) Thanks [@louistrue](https://github.com/louistrue)! - KMZ export no longer ships a model with its repeated geometry missing.
+
+  `buildKmzForResolvedGeoref` was handed `geometryResult.meshes`, which holds only part of the model: GPU-instanced occurrences render from compact shards and are deliberately absent from that flat list. Both surfaces that export a KMZ — the Export KMZ dialog and the Location panel's "Google Earth" button — passed it, so a tower whose facade is repeated panels exported to Google Earth as bare floor slabs. Same defect [#2576](https://github.com/LTplus-AG/ifc-lite/issues/2576) fixed for the on-screen world view, in the file the user hands to someone else.
+
+  The complete set is now derived inside the shared builder, from a `geometryResult` rather than a mesh array, so there is no way for a call site to pass a pre-flattened list — the same reason the builder refuses a pre-guarded conversion. Callers pass `isPrimaryModel` alongside it, since instanced shard occurrences live in the primary model's id space and a federated model must not adopt them.
+
+- [#2581](https://github.com/LTplus-AG/ifc-lite/pull/2581) [`645b066`](https://github.com/LTplus-AG/ifc-lite/commit/645b066cfb2ab0f09c076df17cadca9a79d525fe) Thanks [@louistrue](https://github.com/louistrue)! - 3D World Context now hides what you hide: hide and isolate reach the map, not just the viewport.
+
+  The world view renders the model through its own glTF pipeline, so it never inherited the per-frame hide/isolate filtering the WebGPU renderer applies. It honoured type visibility (its mesh list arrives pre-filtered) but nothing else — hide an element, or isolate a storey, and the map kept drawing everything. Since [#2576](https://github.com/LTplus-AG/ifc-lite/issues/2576) gave the world view the GPU-instanced half of the model as well, that gap covered both geometry channels.
+
+  `@ifc-lite/renderer` now exports the rule itself rather than leaving each surface to restate it. `isEntityVisible(expressId, hiddenIds, isolatedIds)` was written out separately at the flat-draw and instanced-draw sites; both now call the shared helper, and so does the world view. `VisibilityEpochTracker` — already used internally for content-based change detection on those two sets — is exported alongside it, so a consumer outside the render loop can tell a real visibility change from a store handing out a fresh Set with identical content.
+
+  Two details the shared rule pins down, both easy to get wrong when restating it: an EMPTY isolation set isolates _nothing_ (it hides everything) and is not the same as `null` (no isolation), and hiding wins over isolation.
+
+- Updated dependencies [[`6d09c4a`](https://github.com/LTplus-AG/ifc-lite/commit/6d09c4a768a9caa1600fb6db38d0e80ec8051aee), [`02079a6`](https://github.com/LTplus-AG/ifc-lite/commit/02079a66042a6e446b9f83f656685f6056020718), [`6d09c4a`](https://github.com/LTplus-AG/ifc-lite/commit/6d09c4a768a9caa1600fb6db38d0e80ec8051aee), [`6d09c4a`](https://github.com/LTplus-AG/ifc-lite/commit/6d09c4a768a9caa1600fb6db38d0e80ec8051aee), [`645b066`](https://github.com/LTplus-AG/ifc-lite/commit/645b066cfb2ab0f09c076df17cadca9a79d525fe)]:
+  - @ifc-lite/export@2.8.6
+  - @ifc-lite/data@3.3.0
+  - @ifc-lite/ifcx@2.3.5
+  - @ifc-lite/mutations@1.26.0
+  - @ifc-lite/wasm@4.5.0
+  - @ifc-lite/renderer@1.45.0
+  - @ifc-lite/ids@1.15.45
+  - @ifc-lite/lists@1.23.1
+
+## 1.33.6
+
+### Patch Changes
+
+- Updated dependencies [[`2e18adc`](https://github.com/LTplus-AG/ifc-lite/commit/2e18adc0e6983dbd5832367429cc3782e2cb2d1e), [`2e18adc`](https://github.com/LTplus-AG/ifc-lite/commit/2e18adc0e6983dbd5832367429cc3782e2cb2d1e), [`2e18adc`](https://github.com/LTplus-AG/ifc-lite/commit/2e18adc0e6983dbd5832367429cc3782e2cb2d1e), [`0ab480d`](https://github.com/LTplus-AG/ifc-lite/commit/0ab480dd78fbce9f8159b6248579356cfa25bfaa), [`7ee619f`](https://github.com/LTplus-AG/ifc-lite/commit/7ee619f8c6a7490982136d5677674f4f6355a568), [`bb0c1fe`](https://github.com/LTplus-AG/ifc-lite/commit/bb0c1feab74d0e4b76b66acbabf7bebe45144b25), [`1e13943`](https://github.com/LTplus-AG/ifc-lite/commit/1e139434adac8e98e6e40c989b257e5ec87aa20a), [`b4b3e0c`](https://github.com/LTplus-AG/ifc-lite/commit/b4b3e0cfa8ffa9185e96dc266dd6fdc3fef34797), [`7ec9876`](https://github.com/LTplus-AG/ifc-lite/commit/7ec9876202b3fd4d83fda5f23931740a6b0e4e25), [`c532d6a`](https://github.com/LTplus-AG/ifc-lite/commit/c532d6a9cb9397a24e718bcfe09f1c515067852d), [`1de1696`](https://github.com/LTplus-AG/ifc-lite/commit/1de16969db1c56f4901e4af49da74085bae3b3fe), [`ed9acf0`](https://github.com/LTplus-AG/ifc-lite/commit/ed9acf0d5a11c291caa70165e9d673812c75c7fa)]:
+  - @ifc-lite/cache@3.0.4
+  - @ifc-lite/geometry@3.8.1
+  - @ifc-lite/parser@4.0.2
+  - @ifc-lite/renderer@1.44.1
+  - @ifc-lite/server-client@1.22.1
+  - @ifc-lite/encoding@2.0.0
+  - @ifc-lite/lists@1.23.0
+  - @ifc-lite/ids@1.15.44
+  - @ifc-lite/bcf@1.18.1
+  - @ifc-lite/create@2.0.3
+  - @ifc-lite/data@3.2.4
+  - @ifc-lite/export@2.8.5
+  - @ifc-lite/sdk@2.1.1
+
+## 1.33.5
+
+### Patch Changes
+
+- [#2369](https://github.com/LTplus-AG/ifc-lite/pull/2369) [`884ba81`](https://github.com/LTplus-AG/ifc-lite/commit/884ba8117ed819f88d0abc20a8d662d8eb52e774) Thanks [@louistrue](https://github.com/louistrue)! - Hand workers a source _envelope_ instead of the whole source bytes ([#2183](https://github.com/LTplus-AG/ifc-lite/issues/2183)).
+
+  `getWholeSourceForWorker` now returns an `IfcSourceTransfer` rather than a `Uint8Array`, and the overlay-parse and IDS workers rebuild it on their own thread with `sourceBytesFromTransferable`.
+
+  Behaviour-neutral today: a resident source describes itself as its underlying view, and a `SharedArrayBuffer` survives structured clone by reference, so the handoff stays exactly as cheap as it was. It matters once a source can be block-compressed, because materializing on the main thread would reintroduce the whole-file allocation the issue exists to remove — on the render thread, on every overlay re-parse.
+
+  The IDS client also drops its manual copy-then-transfer step. This is a simplification, not a speed-up: structured clone serializes on the _sending_ thread, so a non-shared buffer costs the main thread an O(N) write either way. What it removes is the explicit `slice()`; what it must keep is that nothing goes into a transfer list, since transferring the source would detach the viewer's own bytes. On the paths that matter the source is `SharedArrayBuffer`-backed and crosses by reference, so neither form copies at all.
+
+- Updated dependencies [[`1843d9f`](https://github.com/LTplus-AG/ifc-lite/commit/1843d9f13a7a10183f780ae0a1df9dd225938e73), [`8b09cfd`](https://github.com/LTplus-AG/ifc-lite/commit/8b09cfdadafaea9806e79b73deb9119ea66b5aa4), [`a500a98`](https://github.com/LTplus-AG/ifc-lite/commit/a500a9892ef1e40a0b42db37023c07c62259abdc), [`51cd3ab`](https://github.com/LTplus-AG/ifc-lite/commit/51cd3ab46c7f9d40588e319e7b2c24ce66e99c29), [`341901f`](https://github.com/LTplus-AG/ifc-lite/commit/341901f94c7ae16cb6b2e34542ee2958f1a9ae95), [`c8f771c`](https://github.com/LTplus-AG/ifc-lite/commit/c8f771ca15754cf314288f6797ac05a674a1e6b1), [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146), [`29409e5`](https://github.com/LTplus-AG/ifc-lite/commit/29409e57227d3c458707dbc2cf0cb2e8ae8fcf7b), [`5dd1d18`](https://github.com/LTplus-AG/ifc-lite/commit/5dd1d181437bf0d1d357f3c5505049f802beb2cf), [`6635ddf`](https://github.com/LTplus-AG/ifc-lite/commit/6635ddfa91911b0fbc489452c02cf19e232201c3), [`6f5566f`](https://github.com/LTplus-AG/ifc-lite/commit/6f5566fa761f25a02818a750351b0b0db785ef9b), [`3029cb2`](https://github.com/LTplus-AG/ifc-lite/commit/3029cb2813940438dd43de3cca9e6b25546dad80), [`70c431d`](https://github.com/LTplus-AG/ifc-lite/commit/70c431d3d9a12a5217ac0c1912da18bce7548e4e), [`55f7591`](https://github.com/LTplus-AG/ifc-lite/commit/55f759154421bd002d0bdc171e82aa93b574470d), [`d260a35`](https://github.com/LTplus-AG/ifc-lite/commit/d260a35669e379e5f465861294391c95ee48cb3d), [`d75786f`](https://github.com/LTplus-AG/ifc-lite/commit/d75786f631047d234f204289426f708f0be8674b), [`51cd3ab`](https://github.com/LTplus-AG/ifc-lite/commit/51cd3ab46c7f9d40588e319e7b2c24ce66e99c29), [`e20c520`](https://github.com/LTplus-AG/ifc-lite/commit/e20c520b0c898ecd3c418e338e3684d6f9f39fed), [`273b068`](https://github.com/LTplus-AG/ifc-lite/commit/273b06827ef1469f63c396d204474a9f2400c642), [`79781f5`](https://github.com/LTplus-AG/ifc-lite/commit/79781f57c50bbc9641516a42d0de53e5b9d89932), [`403f448`](https://github.com/LTplus-AG/ifc-lite/commit/403f4485c21b9928f16566fa482c170f230852b0), [`58fbc63`](https://github.com/LTplus-AG/ifc-lite/commit/58fbc634994742c79375830c1983508752fd78e9), [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146), [`c866bee`](https://github.com/LTplus-AG/ifc-lite/commit/c866bee62a7d6e40b15a7de63948354cbbe049a7), [`262b9df`](https://github.com/LTplus-AG/ifc-lite/commit/262b9df485e4bfd3760f73c30d93bb518e599b72), [`d4d980b`](https://github.com/LTplus-AG/ifc-lite/commit/d4d980bc3847ae94bfb043f447cb893b43d48077), [`e47a8f0`](https://github.com/LTplus-AG/ifc-lite/commit/e47a8f0f56800af1d6cbee3d63dfe9b106c9b343), [`bf44de2`](https://github.com/LTplus-AG/ifc-lite/commit/bf44de2d8d023f22e2f4010a0c7832543221909e), [`d954df3`](https://github.com/LTplus-AG/ifc-lite/commit/d954df35ef9e01f30e0a26333381b4dd50f9e59e), [`d27d043`](https://github.com/LTplus-AG/ifc-lite/commit/d27d043c62a0243ac95c4b25d7262e96622f3e3e), [`4565cf3`](https://github.com/LTplus-AG/ifc-lite/commit/4565cf3bf8e04a289cf066a8858ded7c972c1c21), [`15f3c23`](https://github.com/LTplus-AG/ifc-lite/commit/15f3c23a417d3af29a0a8302ce68173b016c6369), [`22a1eae`](https://github.com/LTplus-AG/ifc-lite/commit/22a1eae0d2b349d9abd18c7aced0c57a2f90c03a), [`2e16736`](https://github.com/LTplus-AG/ifc-lite/commit/2e167367037fa3b5d1d2d5d26dd4fb7ac169e2f5), [`ef2accf`](https://github.com/LTplus-AG/ifc-lite/commit/ef2accf9bde98e0e5dd9fcb56a1b82d385f604ff), [`710fd83`](https://github.com/LTplus-AG/ifc-lite/commit/710fd83638b51b2e4744a1ac364827a27dc0fc73), [`d9490e6`](https://github.com/LTplus-AG/ifc-lite/commit/d9490e6e2ecacb65aea42fcaef73fd292a4c3095), [`55f7591`](https://github.com/LTplus-AG/ifc-lite/commit/55f759154421bd002d0bdc171e82aa93b574470d), [`d89960a`](https://github.com/LTplus-AG/ifc-lite/commit/d89960aaab08387fbd2307c0f238bd112c684933), [`f67c622`](https://github.com/LTplus-AG/ifc-lite/commit/f67c622147ea51f2b04b93a7b7a9b485160b3e9c), [`33f11a8`](https://github.com/LTplus-AG/ifc-lite/commit/33f11a82d34b622c9d6d2c417e9fb38a7ace816e), [`c8f771c`](https://github.com/LTplus-AG/ifc-lite/commit/c8f771ca15754cf314288f6797ac05a674a1e6b1), [`8751ba4`](https://github.com/LTplus-AG/ifc-lite/commit/8751ba41dc4d1893530b0f1db6ad0f8fa0d5d3fd), [`deb54d3`](https://github.com/LTplus-AG/ifc-lite/commit/deb54d3ff75f35c3c9206c8ea9a1e875426352c6), [`51ec81b`](https://github.com/LTplus-AG/ifc-lite/commit/51ec81b125532cd0efe4f004c7ab01f4efe55cb8), [`35e37ac`](https://github.com/LTplus-AG/ifc-lite/commit/35e37ac99ab444773bfec669cfc5cf3937443942), [`2618511`](https://github.com/LTplus-AG/ifc-lite/commit/26185118071131a995b2d6a7e9f83bf1c9d578e4), [`acdddd9`](https://github.com/LTplus-AG/ifc-lite/commit/acdddd91b205d83374e2f820fcfe17db1c9abc4d), [`641530e`](https://github.com/LTplus-AG/ifc-lite/commit/641530e73c73bda24b6dc69d3a9fd8910ee16ec8), [`858fd6b`](https://github.com/LTplus-AG/ifc-lite/commit/858fd6bb0c92140bf6c3752cdc37e705e8202425), [`c589d5a`](https://github.com/LTplus-AG/ifc-lite/commit/c589d5af185d25efc20ec56b8f97849e2a20de7e), [`6668c66`](https://github.com/LTplus-AG/ifc-lite/commit/6668c66f02542cfb31e9c9c679e0c80f9a3abc40), [`dae94e2`](https://github.com/LTplus-AG/ifc-lite/commit/dae94e23f7514945ca60f7074f50f196a90dfc5d), [`b57f04c`](https://github.com/LTplus-AG/ifc-lite/commit/b57f04c45082bad7269e7f103f361b0947435cc4), [`c777cad`](https://github.com/LTplus-AG/ifc-lite/commit/c777cadde939b4bc84b08bc0366d54d34601d66c), [`8d1972d`](https://github.com/LTplus-AG/ifc-lite/commit/8d1972d059fe5e8725fffbf661cc56bb6a23767b), [`07d5309`](https://github.com/LTplus-AG/ifc-lite/commit/07d53098b7e9099152300e705d8a41430831f81c), [`958aef1`](https://github.com/LTplus-AG/ifc-lite/commit/958aef125743682da75c3da7b41991abd9d36d32), [`de7bd04`](https://github.com/LTplus-AG/ifc-lite/commit/de7bd04619a43a32900b188e0507b95e7542d8c8), [`09d67c7`](https://github.com/LTplus-AG/ifc-lite/commit/09d67c780bf68f58dec3f77920927857c752f8da), [`f86436b`](https://github.com/LTplus-AG/ifc-lite/commit/f86436bb464349c7ae653c275cdc13c6c4b1ca8f), [`72bf949`](https://github.com/LTplus-AG/ifc-lite/commit/72bf949bd3a58dfb460c2c445e546d930a248e02), [`512406f`](https://github.com/LTplus-AG/ifc-lite/commit/512406f0d21c7e33b8c84a83865ffaff299e7cc1), [`81e5415`](https://github.com/LTplus-AG/ifc-lite/commit/81e541588ff5e5665b9091179a87bc4d03cd77f9), [`5d763d6`](https://github.com/LTplus-AG/ifc-lite/commit/5d763d6bde10c0232cbf28e7d8e4e956ebaf4ff1), [`0671811`](https://github.com/LTplus-AG/ifc-lite/commit/0671811856888b8b930d3068166cff286a21a8c2), [`f9f5fb7`](https://github.com/LTplus-AG/ifc-lite/commit/f9f5fb701ea0ace55a68c7d53085774052ee8995), [`a803c35`](https://github.com/LTplus-AG/ifc-lite/commit/a803c3599d777669341b69309e7dab20cdf16db0)]:
+  - @ifc-lite/bcf@1.17.0
+  - @ifc-lite/cache@3.0.3
+  - @ifc-lite/renderer@1.43.0
+  - @ifc-lite/plugin-api@0.2.0
+  - @ifc-lite/collab@0.4.2
+  - @ifc-lite/create@2.0.2
+  - @ifc-lite/merge@0.4.1
+  - @ifc-lite/drawing-2d@1.21.1
+  - @ifc-lite/export@2.8.3
+  - @ifc-lite/query@1.14.16
+  - @ifc-lite/data@3.2.2
+  - @ifc-lite/mcp@0.11.1
+  - @ifc-lite/encoding@1.15.1
+  - @ifc-lite/ids@1.15.42
+  - @ifc-lite/ifcx@2.3.4
+  - @ifc-lite/pointcloud@0.6.1
+  - @ifc-lite/lists@1.22.4
+  - @ifc-lite/server-client@1.22.0
+  - @ifc-lite/parser@4.0.0
+  - @ifc-lite/mutations@1.24.2
+  - @ifc-lite/geometry@3.7.1
+  - @ifc-lite/sandbox@2.1.0
+  - @ifc-lite/clash@1.6.5
+  - @ifc-lite/sdk@2.0.3
+  - @ifc-lite/source-dalux@0.2.0
+
+## 1.33.4
+
+### Patch Changes
+
+- Updated dependencies [[`58f0473`](https://github.com/LTplus-AG/ifc-lite/commit/58f0473b792e6bd29b42f16bac41fc398ecb600d), [`2c47277`](https://github.com/LTplus-AG/ifc-lite/commit/2c47277ee6dfbd9779eb4948d1f2e7b0ea61d00e), [`5371d7d`](https://github.com/LTplus-AG/ifc-lite/commit/5371d7def2671f6568c838879b8be058bb6247c9), [`bdeb80d`](https://github.com/LTplus-AG/ifc-lite/commit/bdeb80d79443d89027a4d96879116e99dcc989a4), [`b3742d9`](https://github.com/LTplus-AG/ifc-lite/commit/b3742d9d29c3adfcbf67f573c62194547d7d172d), [`803005f`](https://github.com/LTplus-AG/ifc-lite/commit/803005f1c8d976350111c2f52a6b41b584393ca6), [`9d9c804`](https://github.com/LTplus-AG/ifc-lite/commit/9d9c8049075c9d8692a483ef1fa75325e822c15a), [`a25dd32`](https://github.com/LTplus-AG/ifc-lite/commit/a25dd32a78626a0ed697a21ed2c4963641bb7b89), [`07c0b4c`](https://github.com/LTplus-AG/ifc-lite/commit/07c0b4cc5a0b5617ed6ad300639e5c52ce225d44), [`4c739be`](https://github.com/LTplus-AG/ifc-lite/commit/4c739be2aba74ad6868b6dca51dad441c6fa9903), [`d85ef9b`](https://github.com/LTplus-AG/ifc-lite/commit/d85ef9bb725843f682463496e7a8f2d2ab9b83f1), [`f493930`](https://github.com/LTplus-AG/ifc-lite/commit/f4939309aed136979bd5cc1f95a25c2a0ebe779f), [`befc108`](https://github.com/LTplus-AG/ifc-lite/commit/befc1083e377315231006352cb3fe95949e92b47), [`6722e08`](https://github.com/LTplus-AG/ifc-lite/commit/6722e08b76c4cd89d8e7e1bbd06c768a36ae93ac), [`6cbf69a`](https://github.com/LTplus-AG/ifc-lite/commit/6cbf69acb2163ab671c41df36878f4d4e490e244), [`f566a3a`](https://github.com/LTplus-AG/ifc-lite/commit/f566a3af5d92728d682a150282e37de3ece3a613), [`f566a3a`](https://github.com/LTplus-AG/ifc-lite/commit/f566a3af5d92728d682a150282e37de3ece3a613), [`0ceb99a`](https://github.com/LTplus-AG/ifc-lite/commit/0ceb99a36125a2dfc8775e762d9f4f9ddb69d733), [`996f50f`](https://github.com/LTplus-AG/ifc-lite/commit/996f50f6749182f3eb3465bd390ce75fe68e549c), [`5befec5`](https://github.com/LTplus-AG/ifc-lite/commit/5befec5b6b73d2293f058b3c010c8553429f6178), [`1dade49`](https://github.com/LTplus-AG/ifc-lite/commit/1dade49f39833b1d95eb8c5b78297f77bbddca15), [`9b53852`](https://github.com/LTplus-AG/ifc-lite/commit/9b53852464b1329733cd954754923b16abf9060d), [`b47928f`](https://github.com/LTplus-AG/ifc-lite/commit/b47928f9c684413a8762330320c6ebaf02ffbbeb), [`d1d82aa`](https://github.com/LTplus-AG/ifc-lite/commit/d1d82aae99386505917a68551f033299ed8b4924), [`1303515`](https://github.com/LTplus-AG/ifc-lite/commit/1303515b8aa87cd6e8215ecf88fdf5a406b545d8), [`e03d879`](https://github.com/LTplus-AG/ifc-lite/commit/e03d879a96ba9a5818a7264d713237833e201ba3), [`a2787fa`](https://github.com/LTplus-AG/ifc-lite/commit/a2787fab292e50d60ed0081fd3d458e7555c5cb2), [`a77fbd1`](https://github.com/LTplus-AG/ifc-lite/commit/a77fbd1f4c52a5d13bd51fe37a70d306315df7fa), [`ae2debf`](https://github.com/LTplus-AG/ifc-lite/commit/ae2debf665fdbe25afd9e16411bd2347dcd4f39d), [`3c2ffa6`](https://github.com/LTplus-AG/ifc-lite/commit/3c2ffa6a1bd0a04d3d73e2ea7c0fb1a2233599a9), [`d44b6c1`](https://github.com/LTplus-AG/ifc-lite/commit/d44b6c1710ee86596e96e0204785d2bf7c0940a9)]:
+  - @ifc-lite/renderer@1.42.0
+  - @ifc-lite/geometry@3.7.0
+  - @ifc-lite/export@2.8.2
+  - @ifc-lite/pointcloud@0.6.0
+  - @ifc-lite/mcp@0.11.0
+  - @ifc-lite/mutations@1.24.1
+  - @ifc-lite/wasm@4.3.1
+  - @ifc-lite/data@3.2.1
+  - @ifc-lite/cache@3.0.2
+  - @ifc-lite/create@2.0.1
+  - @ifc-lite/server-client@1.21.1
+  - @ifc-lite/extensions@0.4.1
+  - @ifc-lite/sdk@2.0.2
+  - @ifc-lite/drawing-2d@1.21.0
+  - @ifc-lite/sandbox@2.0.1
+  - @ifc-lite/spatial@1.14.13
+  - @ifc-lite/parser@3.15.1
+  - @ifc-lite/ifcx@2.3.3
+  - @ifc-lite/ids@1.15.41
+  - @ifc-lite/lists@1.22.3
+
+## 1.33.3
+
+### Patch Changes
+
+- Updated dependencies [[`59792cc`](https://github.com/LTplus-AG/ifc-lite/commit/59792cc7d15bba68708a88475861f499f7b15647), [`40e9c59`](https://github.com/LTplus-AG/ifc-lite/commit/40e9c5931fab27b0de05655e08804562dd794389), [`af869bd`](https://github.com/LTplus-AG/ifc-lite/commit/af869bd6c8133d8d13c9d62edecf04c37baa0245), [`d42fbf1`](https://github.com/LTplus-AG/ifc-lite/commit/d42fbf1c7a4abed637b7e80e28cbed69088bc943), [`e651699`](https://github.com/LTplus-AG/ifc-lite/commit/e651699180b791b95cbd721ad66d5f38e03eca2b), [`0adb741`](https://github.com/LTplus-AG/ifc-lite/commit/0adb7413b869c9d50bdcdae5c00a730d17c2823f), [`0adb741`](https://github.com/LTplus-AG/ifc-lite/commit/0adb7413b869c9d50bdcdae5c00a730d17c2823f), [`63905dc`](https://github.com/LTplus-AG/ifc-lite/commit/63905dc3993ad227500a0f68c406276c909eb6f5), [`a8e58a2`](https://github.com/LTplus-AG/ifc-lite/commit/a8e58a2b5e75db8388835c77b2688240667f68ab), [`a8e58a2`](https://github.com/LTplus-AG/ifc-lite/commit/a8e58a2b5e75db8388835c77b2688240667f68ab), [`0adb741`](https://github.com/LTplus-AG/ifc-lite/commit/0adb7413b869c9d50bdcdae5c00a730d17c2823f), [`263c3ef`](https://github.com/LTplus-AG/ifc-lite/commit/263c3efba5baf503f192700ba7f70ce08a1dafc8), [`e4782e8`](https://github.com/LTplus-AG/ifc-lite/commit/e4782e8362c0899d0df1070d5eafb70ef18481b6), [`a2ca053`](https://github.com/LTplus-AG/ifc-lite/commit/a2ca0535c14cd1bf9d55713584766dff55430158), [`e4d2db5`](https://github.com/LTplus-AG/ifc-lite/commit/e4d2db5f11798e3ec78f45249139d69aa1e65275), [`c868444`](https://github.com/LTplus-AG/ifc-lite/commit/c868444e94348a34cbea2b130968a6c7affc474e), [`084c32c`](https://github.com/LTplus-AG/ifc-lite/commit/084c32c26c82dedb32ef62d38fc60c4965c741e1), [`678e90d`](https://github.com/LTplus-AG/ifc-lite/commit/678e90d93e97d2b9ec3c8de9f2713e83361cab18), [`678e90d`](https://github.com/LTplus-AG/ifc-lite/commit/678e90d93e97d2b9ec3c8de9f2713e83361cab18), [`a5cc568`](https://github.com/LTplus-AG/ifc-lite/commit/a5cc568a642d7dd8d17f1ed7858844f9289bc841), [`a8e58a2`](https://github.com/LTplus-AG/ifc-lite/commit/a8e58a2b5e75db8388835c77b2688240667f68ab), [`a5cc568`](https://github.com/LTplus-AG/ifc-lite/commit/a5cc568a642d7dd8d17f1ed7858844f9289bc841), [`dc000cf`](https://github.com/LTplus-AG/ifc-lite/commit/dc000cff25a647d2a224f34a063f84b3d2d84ca8), [`e4d2db5`](https://github.com/LTplus-AG/ifc-lite/commit/e4d2db5f11798e3ec78f45249139d69aa1e65275), [`2716893`](https://github.com/LTplus-AG/ifc-lite/commit/2716893ac9d825fc529f3fd8164d9a6f766e87f8), [`620f4d2`](https://github.com/LTplus-AG/ifc-lite/commit/620f4d2100b397d33d2e61440950b7a31660dbb8), [`7261f1a`](https://github.com/LTplus-AG/ifc-lite/commit/7261f1a6a8595350d3ec400212e293a8924d57bf), [`8967a03`](https://github.com/LTplus-AG/ifc-lite/commit/8967a033704a7edbb03140291df7a8536d3dd892), [`8f139a8`](https://github.com/LTplus-AG/ifc-lite/commit/8f139a8ef44235b68c2f97c032419fa586111b62), [`ed63063`](https://github.com/LTplus-AG/ifc-lite/commit/ed63063c952bd1804ce83922da80635f03c77193)]:
+  - @ifc-lite/wasm@4.3.0
+  - @ifc-lite/diff@0.6.0
+  - @ifc-lite/export@2.8.0
+  - @ifc-lite/mcp@0.10.0
+  - @ifc-lite/geometry@3.6.0
+  - @ifc-lite/parser@3.13.0
+  - @ifc-lite/data@3.2.0
+  - @ifc-lite/mutations@1.23.0
+  - @ifc-lite/sdk@2.0.0
+  - @ifc-lite/create@2.0.0
+  - @ifc-lite/sandbox@2.0.0
+  - @ifc-lite/merge@0.4.0
+  - @ifc-lite/ids@1.15.38
+  - @ifc-lite/lists@1.22.2
+
+## 1.33.2
+
+### Patch Changes
+
+- Updated dependencies [[`8793ffd`](https://github.com/LTplus-AG/ifc-lite/commit/8793ffd4948840fbd96bf745d8e9db71e139d350), [`15f5335`](https://github.com/LTplus-AG/ifc-lite/commit/15f53357f30a38d6aef7c9e4394c14400f5222e5), [`80051a5`](https://github.com/LTplus-AG/ifc-lite/commit/80051a51868b7343c4c3e08e335c0d5bdf900424), [`72b896b`](https://github.com/LTplus-AG/ifc-lite/commit/72b896b27eed3f394c76d602a2d1b2eb8db82e2f), [`4af7d75`](https://github.com/LTplus-AG/ifc-lite/commit/4af7d7590759bbcc7a39b0b48f06f980bb57414b), [`0571583`](https://github.com/LTplus-AG/ifc-lite/commit/05715834ce94a1f8e5dc20d6a60b7468190c2e88)]:
+  - @ifc-lite/wasm@4.2.2
+  - @ifc-lite/diff@0.5.0
+  - @ifc-lite/mutations@1.22.0
+  - @ifc-lite/export@2.7.1
+  - @ifc-lite/lens@1.17.3
+  - @ifc-lite/renderer@1.41.1
+  - @ifc-lite/parser@3.12.0
+  - @ifc-lite/ids@1.15.37
+  - @ifc-lite/merge@0.3.2
+
 ## 1.33.1
 
 ### Patch Changes

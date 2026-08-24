@@ -21,11 +21,12 @@ import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { parseUrlParams, assertFetchableUrl } from '../bridge/urlParams.js';
 import { initBridge, destroyBridge, emitEvent } from '../bridge/handler.js';
+import { mountBridgeLifecycle, unmountBridgeLifecycle } from '../bridge/lifecycle.js';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 
 export function EmbedViewer() {
   const webgpu = useWebGPU();
-  const { geometryResult, ifcDataStore, loadFile, loading, models, clearAllModels } = useIfc();
+  const { geometryResult, ifcDataStore, loadFile, loading, models, clearAllModels, addModel } = useIfc();
   const storeModels = useViewerStore((s) => s.models);
   const typeVisibility = useViewerStore((s) => s.typeVisibility);
   const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
@@ -45,63 +46,102 @@ export function EmbedViewer() {
     setTheme(urlParams.theme === 'dark' ? 'dark' : 'light');
   }, [urlParams.theme, setTheme]);
 
-  // Initialize the postMessage bridge
+  // Force hover picking on. `hoverState` (apps/viewer/src/store/slices/
+  // hoverSlice.ts) is populated by useMouseControls.ts's throttled
+  // renderer.pick() on mousemove — the same pipeline the main viewer uses —
+  // but that whole branch is gated behind `hoverTooltipsEnabled`, which
+  // defaults to false (a toolbar toggle). The embed has no toolbar to flip it,
+  // and the ENTITY_HOVERED effect below needs `hoverState` to ever populate.
+  // Safe to force on here: the embed shell never renders <HoverTooltip> (it
+  // lives in ViewerLayout, which the embed doesn't use), so this activates the
+  // picking pipeline only — no tooltip UI appears.
   useEffect(() => {
-    if (bridgeInitialized.current) return;
-    bridgeInitialized.current = true;
+    useViewerStore.setState({ hoverTooltipsEnabled: true });
+  }, []);
 
-    // Derive the expected parent origin (so content-bearing auto-load events
-    // are not broadcast to '*' before any inbound command arrives): prefer the
-    // explicit ?parentOrigin= param, then fall back to the referrer's origin.
-    let expectedParentOrigin = urlParams.parentOrigin;
-    if (!expectedParentOrigin && document.referrer) {
-      try {
-        expectedParentOrigin = new URL(document.referrer).origin;
-      } catch (error) {
-        // Malformed referrer — leave undefined and rely on the inbound handshake.
-        console.warn('[embed] Failed to derive parent origin from document.referrer', document.referrer, error);
-        expectedParentOrigin = undefined;
+  // Initialize the postMessage bridge.
+  //
+  // Guarded via mountBridgeLifecycle/unmountBridgeLifecycle so a React 19
+  // <StrictMode> mount -> cleanup -> remount cycle (dev only) re-initializes
+  // instead of leaving the bridge permanently dead: the mount side was
+  // ref-guarded but the cleanup never reset it, so the remount saw the guard
+  // already set, skipped initBridge(), and the inbound listener stayed removed.
+  useEffect(() => {
+    mountBridgeLifecycle(bridgeInitialized, () => {
+      // Derive the expected parent origin (so content-bearing auto-load events
+      // are not broadcast to '*' before any inbound command arrives): prefer the
+      // explicit ?parentOrigin= param, then fall back to the referrer's origin.
+      let expectedParentOrigin = urlParams.parentOrigin;
+      if (!expectedParentOrigin && document.referrer) {
+        try {
+          expectedParentOrigin = new URL(document.referrer).origin;
+        } catch (error) {
+          // Malformed referrer — leave undefined and rely on the inbound handshake.
+          console.warn('[embed] Failed to derive parent origin from document.referrer', document.referrer, error);
+          expectedParentOrigin = undefined;
+        }
       }
-    }
 
-    initBridge({
-      getState: () => useViewerStore.getState(),
-      loadModelFromUrl: async (url: string) => {
-        // Enforce the same http(s)-only allowlist as the URL-param path so the
-        // postMessage bridge can't be steered to file:/data:/internal targets.
-        const safeUrl = assertFetchableUrl(url);
-        const response = await fetch(safeUrl, { signal: AbortSignal.timeout(60_000) });
-        if (!response.ok) throw new Error(`Failed to fetch model: ${response.statusText}`);
-        const buffer = await response.arrayBuffer();
-        const filename = url.split('/').pop() || 'model.ifc';
-        const file = new File([buffer], filename);
-        await loadFile(file);
-        const state = useViewerStore.getState();
-        const gr = state.geometryResult;
-        return {
-          entities: state.ifcDataStore?.entities?.count ?? 0,
-          triangles: gr?.totalTriangles ?? 0,
-          vertices: gr?.totalVertices ?? 0,
-        };
-      },
-      loadModelFromBuffer: async (buffer: ArrayBuffer, name?: string) => {
-        const file = new File([buffer], name || 'model.ifc');
-        await loadFile(file);
-        const state = useViewerStore.getState();
-        const gr = state.geometryResult;
-        return {
-          entities: state.ifcDataStore?.entities?.count ?? 0,
-          triangles: gr?.totalTriangles ?? 0,
-          vertices: gr?.totalVertices ?? 0,
-        };
-      },
-    }, {
-      allowedOrigins: urlParams.allowOrigins,
-      expectedParentOrigin,
+      initBridge({
+        getState: () => useViewerStore.getState(),
+        loadModelFromUrl: async (url: string) => {
+          // Enforce the same http(s)-only allowlist as the URL-param path so the
+          // postMessage bridge can't be steered to file:/data:/internal targets.
+          const safeUrl = assertFetchableUrl(url);
+          const response = await fetch(safeUrl, { signal: AbortSignal.timeout(60_000) });
+          if (!response.ok) throw new Error(`Failed to fetch model: ${response.statusText}`);
+          const buffer = await response.arrayBuffer();
+          const filename = url.split('/').pop() || 'model.ifc';
+          const file = new File([buffer], filename);
+          await loadFile(file);
+          const state = useViewerStore.getState();
+          const gr = state.geometryResult;
+          return {
+            entities: state.ifcDataStore?.entities?.count ?? 0,
+            triangles: gr?.totalTriangles ?? 0,
+            vertices: gr?.totalVertices ?? 0,
+          };
+        },
+        loadModelFromBuffer: async (buffer: ArrayBuffer, name?: string) => {
+          const file = new File([buffer], name || 'model.ifc');
+          await loadFile(file);
+          const state = useViewerStore.getState();
+          const gr = state.geometryResult;
+          return {
+            entities: state.ifcDataStore?.entities?.count ?? 0,
+            triangles: gr?.totalTriangles ?? 0,
+            vertices: gr?.totalVertices ?? 0,
+          };
+        },
+        addModelFromUrl: async (url: string) => {
+          // Federation-aware add: routes through useIfcFederation's addModel,
+          // which loads with target `{ kind: 'federated' }` and therefore does
+          // NOT clear existing models (unlike loadFile's default primary
+          // target, which loadModelFromUrl above uses for LOAD_MODEL).
+          const safeUrl = assertFetchableUrl(url);
+          const response = await fetch(safeUrl, { signal: AbortSignal.timeout(60_000) });
+          if (!response.ok) throw new Error(`Failed to fetch model: ${response.statusText}`);
+          const buffer = await response.arrayBuffer();
+          const filename = url.split('/').pop() || 'model.ifc';
+          const file = new File([buffer], filename);
+          const modelId = await addModel(file);
+          if (!modelId) throw new Error('Failed to add model');
+          const added = useViewerStore.getState().models.get(modelId);
+          return {
+            modelId,
+            entities: added?.ifcDataStore?.entities?.count ?? 0,
+            triangles: added?.geometryResult?.totalTriangles ?? 0,
+            vertices: added?.geometryResult?.totalVertices ?? 0,
+          };
+        },
+      }, {
+        allowedOrigins: urlParams.allowOrigins,
+        expectedParentOrigin,
+      });
     });
 
-    return () => destroyBridge();
-  }, [loadFile, urlParams.allowOrigins, urlParams.parentOrigin]);
+    return () => unmountBridgeLifecycle(bridgeInitialized, () => destroyBridge());
+  }, [loadFile, addModel, urlParams.allowOrigins, urlParams.parentOrigin]);
 
   // Auto-load model from URL param
   useEffect(() => {
@@ -210,6 +250,32 @@ export function EmbedViewer() {
     }
   }, [selectedEntityId]);
 
+  // Emit hover events to parent. ENTITY_HOVERED is declared in the protocol
+  // and exposed by the SDK, but nothing in this app ever emitted it — the
+  // SDK's tests pass because they fabricate the event themselves (#2934).
+  //
+  // Subscribes to `hoverState.entityId` specifically, not the whole
+  // `hoverState` object: screenX/screenY/worldXYZ change on every
+  // hover-throttled mousemove even while the pointer stays on the same mesh,
+  // so selecting the object would re-post the event continuously instead of
+  // only on a hover-target change. The protocol declares no ENTITY_UNHOVERED
+  // counterpart to ENTITY_DESELECTED, so null (nothing hovered) is tracked but
+  // never emitted.
+  const hoveredEntityId = useViewerStore((s) => s.hoverState.entityId);
+  useEffect(() => {
+    if (hoveredEntityId === null) return;
+
+    const state = useViewerStore.getState();
+    const lookup = state.resolveGlobalIdFromModels(hoveredEntityId);
+    const model = lookup ? state.models.get(lookup.modelId) : undefined;
+    const entities = model?.ifcDataStore?.entities;
+    emitEvent('ENTITY_HOVERED', {
+      id: hoveredEntityId,
+      globalId: entities?.getGlobalId(lookup?.expressId ?? hoveredEntityId) ?? undefined,
+      ifcType: entities?.getTypeName(lookup?.expressId ?? hoveredEntityId) ?? undefined,
+    });
+  }, [hoveredEntityId]);
+
   // Emit camera rotation changes to parent (throttled)
   const cameraRotation = useViewerStore((s) => s.cameraRotation);
   const lastCameraEmit = useRef(0);
@@ -222,6 +288,22 @@ export function EmbedViewer() {
       elevation: cameraRotation.elevation,
     });
   }, [cameraRotation]);
+
+  // Emit section-plane changes to parent. Mirrors the CAMERA_CHANGED effect
+  // above: the bridge's SET_SECTION handler (apps/viewer-embed/src/bridge/
+  // handler.ts) only mutates `sectionPlane` via the store's setters and never
+  // emits an event itself, so this reactive subscription is what turns those
+  // mutations (from SET_SECTION *or* any in-viewer section-tool interaction)
+  // into the outbound SECTION_CHANGED event -- same source of truth as
+  // ENTITY_SELECTED/CAMERA_CHANGED, not a handler.ts-local special case.
+  const sectionPlane = useViewerStore((s) => s.sectionPlane);
+  useEffect(() => {
+    emitEvent('SECTION_CHANGED', {
+      axis: sectionPlane.axis,
+      position: sectionPlane.position,
+      enabled: sectionPlane.enabled,
+    });
+  }, [sectionPlane]);
 
   // Multi-model: create mapping from modelId to modelIndex
   const modelIdToIndex = useMemo(() => {

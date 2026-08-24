@@ -846,11 +846,21 @@ function showPickInfo(eid) {
   if (!info) return;
   const el = document.getElementById('pick-info');
   el.style.display = 'block';
-  el.innerHTML =
-    '<div class="label">Entity #' + eid + '</div>' +
-    '<div class="value">' + info.ifcType + '</div>' +
-    '<div class="label">Triangles</div>' +
-    '<div class="value">' + Math.floor(info.indexCount / 3).toLocaleString() + '</div>';
+  // Build with textContent, not innerHTML. info.ifcType is safe today -- it
+  // comes from the WASM parser's IfcType::name(), a closed set of generated
+  // "Ifc..." literals -- so this is not fixing a reachable escape. It removes
+  // the file's last interpolation site that would depend on that staying true.
+  el.textContent = '';
+  const row = (cls, text) => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.textContent = text;
+    return d;
+  };
+  el.appendChild(row('label', 'Entity #' + eid));
+  el.appendChild(row('value', info.ifcType));
+  el.appendChild(row('label', 'Triangles'));
+  el.appendChild(row('value', Math.floor(info.indexCount / 3).toLocaleString()));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1117,7 +1127,7 @@ function handleCommand(cmd) {
           const batch = meshes.map(m => ({
             expressId: m.expressId + idOffset,
             ifcType: m.ifcType || 'Created',
-            positions: m.positions,
+            positions: foldOrigin(m.positions, m.origin),
             normals: m.normals,
             indices: m.indices,
             color: [m.color[0], m.color[1], m.color[2], m.color[3] ?? 1],
@@ -1299,6 +1309,28 @@ function connectSSE() {
 // Same callback contract: onBatch(meshes, { percent }) and onComplete().
 // meshes are MeshDataJs objects (.expressId/.ifcType/.positions/.normals/
 // .indices/.color), identical to what the old async API yielded.
+
+// wasm stores each mesh's positions relative to its own per-element local
+// frame, not absolute world coordinates -- world position = origin + position
+// (see MeshDataJs.origin; local-frame storage defaults ON for wasm so f32
+// vertices stay precise at building/georef scale). origin is [0,0,0] when
+// positions are already absolute, so this is a no-op in that case (#2261:
+// this fold was missing entirely, collapsing every element toward its own
+// AABB centre near the shared (0,0,0) origin).
+function foldOrigin(positions, origin) {
+  if (!origin || (origin[0] === 0 && origin[1] === 0 && origin[2] === 0)) {
+    return positions;
+  }
+  const ox = origin[0], oy = origin[1], oz = origin[2];
+  const out = new Float32Array(positions.length);
+  for (let i = 0; i < positions.length; i += 3) {
+    out[i] = positions[i] + ox;
+    out[i + 1] = positions[i + 1] + oy;
+    out[i + 2] = positions[i + 2] + oz;
+  }
+  return out;
+}
+
 async function parseMeshesViaPrePass(api, content, opts) {
   opts = opts || {};
   const batchSize = opts.batchSize || 50;
@@ -1388,7 +1420,12 @@ async function loadModel() {
           const batch = meshes.map(m => ({
             expressId: m.expressId,
             ifcType: m.ifcType || 'Unknown',
-            positions: m.positions,
+            // positions are stored in each mesh's own local frame -- world
+            // position = m.origin + positions[i] (see MeshDataJs.origin).
+            // wasm defaults local-frame storage ON, so skipping this fold
+            // collapses every element toward its own AABB centre, i.e. most
+            // elements render near the shared (0,0,0) origin (#2261).
+            positions: foldOrigin(m.positions, m.origin),
             normals: m.normals,
             indices: m.indices,
             color: [m.color[0], m.color[1], m.color[2], m.color[3] ?? 1],

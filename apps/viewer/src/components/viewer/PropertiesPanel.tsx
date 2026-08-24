@@ -36,12 +36,17 @@ import { useIfc } from '@/hooks/useIfc';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { IfcQuery } from '@ifc-lite/query';
 import { MutablePropertyView } from '@ifc-lite/mutations';
-import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
+import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeQuantitiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
 import type { NewEntity } from '@ifc-lite/mutations';
 import { EntityFlags, RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
 import type { EntityRef, FederatedModel } from '@/store/types';
+import { ZoneVolumeBreakdown } from './ZoneVolumeBreakdown';
+import type { ZoneSet } from '@/lib/zones';
+import { withInheritedTypeQuantities } from '@/lib/zones/inherited-quantities';
 
 import { CoordVal, CoordRow } from './properties/CoordinateDisplay';
+import { renderToWorldViewer, viewerToIfcAxes } from './tools/measure-modes/coordinates';
+import { useRenderFrameOffsets } from '@/hooks/useRenderFrameOffsets';
 import { PropertySetCard } from './properties/PropertySetCard';
 import { QuantitySetCard } from './properties/QuantitySetCard';
 import { ModelMetadataPanel } from './properties/ModelMetadataPanel';
@@ -412,8 +417,15 @@ export function PropertiesPanel() {
   // To reverse back to world coordinates (Y-up):
   //   world_yup = scene_local + originShift + wasmRtcOffset_converted_to_yup
   //
-  // For multi-model: all models are aligned to the first model's RTC frame,
-  // so we always use the first model's wasmRtcOffset for reconstruction.
+  // For multi-model: all models are aligned to the first model's RTC frame, so
+  // BOTH offsets must come from that one model. This panel used to take
+  // `wasmRtcOffset` from the anchor and `originShift` from the SELECTED model,
+  // which mixes two frames and shifts the reported world centre by their
+  // difference. `useRenderFrameOffsets` is the one resolver — the same one the
+  // measure tool's picked-point readout uses — so the two cannot disagree about
+  // the frame any more than they can about which axis is up.
+  const renderFrame = useRenderFrameOffsets();
+
   const entityCoordinates = useMemo(() => {
     if (!selectedEntity) return null;
 
@@ -452,28 +464,6 @@ export function PropertiesPanel() {
     if (!found) return null;
 
     const coordInfo = geoResult.coordinateInfo;
-    const shift = coordInfo?.originShift ?? { x: 0, y: 0, z: 0 };
-
-    // Get the reference WASM RTC offset for world coordinate reconstruction.
-    // For multi-model: all models are aligned to the first model's RTC frame,
-    // so we must use the first model's wasmRtcOffset (not the current model's).
-    // For single/legacy: use the geometry result's own offset.
-    let wasmRtcIfc = coordInfo?.wasmRtcOffset;
-    if (models.size > 1) {
-      let earliest = Infinity;
-      for (const [, m] of models) {
-        if (m.loadedAt < earliest) {
-          earliest = m.loadedAt;
-          wasmRtcIfc = m.geometryResult?.coordinateInfo?.wasmRtcOffset;
-        }
-      }
-    }
-
-    // Convert WASM RTC offset from IFC Z-up to viewer Y-up:
-    //   viewer X = IFC X, viewer Y = IFC Z, viewer Z = -IFC Y
-    const wasmRtcYup = wasmRtcIfc
-      ? { x: wasmRtcIfc.x, y: wasmRtcIfc.z, z: -wasmRtcIfc.y }
-      : { x: 0, y: 0, z: 0 };
 
     // Local (scene) center - what the renderer uses (Y-up, shifted)
     const localCenter = {
@@ -482,28 +472,20 @@ export function PropertiesPanel() {
       z: (minZ + maxZ) / 2,
     };
 
-    // World center (Y-up) = scene_local + originShift + wasmRtcOffset_yup
-    const worldCenterYup = {
-      x: localCenter.x + shift.x + wasmRtcYup.x,
-      y: localCenter.y + shift.y + wasmRtcYup.y,
-      z: localCenter.z + shift.z + wasmRtcYup.z,
-    };
-
-    // Convert world Y-up to IFC Z-up for display:
-    //   IFC X = viewer X, IFC Y = -viewer Z, IFC Z = viewer Y
-    const worldCenterZup = {
-      x: worldCenterYup.x,
-      y: -worldCenterYup.z,
-      z: worldCenterYup.y,
-    };
+    // World center (Y-up) = scene_local + originShift + wasmRtcOffset_yup, and
+    // then IFC Z-up for display. Both transforms live in the measure tool's
+    // `coordinates` module so this panel and the picked-point readout can no
+    // longer disagree about which axis is up or which sign a northing takes.
+    const worldCenterYup = renderToWorldViewer(localCenter, renderFrame);
+    const worldCenterZup = viewerToIfcAxes(worldCenterYup);
 
     return {
       local: { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ }, center: localCenter },
       worldYup: { center: worldCenterYup },
       worldZup: { center: worldCenterZup },
-      hasLargeCoordinates: (coordInfo?.hasLargeCoordinates ?? false) || !!wasmRtcIfc,
+      hasLargeCoordinates: (coordInfo?.hasLargeCoordinates ?? false) || !!renderFrame.wasmRtcOffsetIfc,
     };
-  }, [selectedEntity, model, geometryResult, models]);
+  }, [selectedEntity, model, geometryResult, models, renderFrame]);
 
   // Get entity node - must be computed before early return to maintain hook order
   // IMPORTANT: Use selectedEntity.expressId (original ID) for IfcDataStore lookups
@@ -669,6 +651,30 @@ export function PropertiesPanel() {
     return entityNode.quantities();
   }, [entityNode, selectedEntity, mutationViews, mutationVersion]);
 
+  /**
+   * The occurrence's quantity sets followed by those it INHERITS from its
+   * `IfcTypeObject` (#1745/#1755), for the zone volume breakdown (#2508).
+   *
+   * Appended rather than merged in place, because `declaredVolumeBases` keeps
+   * the FIRST value it sees per basis: the occurrence therefore still wins for
+   * any basis it declares, and the type only fills a basis the occurrence is
+   * silent on. Without this, a door whose `NetVolume` lives only on its type —
+   * the common case for catalogue-driven exports — showed a mesh basis alone
+   * and looked like a file that declares nothing.
+   *
+   * Both parse paths are served: the on-demand extractor walks STEP source and
+   * returns `null` when there is none, which is every server-parsed store, so
+   * that path reads the prebuilt table keyed by the TYPE's express id — the
+   * same split `lib/lists/adapter.ts` makes.
+   */
+  const quantitiesWithInheritedType = useMemo(() => withInheritedTypeQuantities(
+    quantities,
+    (model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null,
+    selectedEntity?.expressId,
+    RelationshipType.DefinesByType,
+    (store, id) => extractTypeQuantitiesOnDemand(store as IfcDataStore, id)?.quantities as QuantitySet[] | undefined,
+  ), [quantities, selectedEntity, model, ifcDataStore]);
+
   // Build attributes array for display - must be before early return to maintain hook order
   // Uses schema-aware extraction to show ALL string/enum attributes for the entity type.
   // Merges mutated attributes (from bSDD) into the base attribute list.
@@ -790,12 +796,50 @@ export function PropertiesPanel() {
   // IfcSpatialZone in an IfcZone — e.g. one dwelling, house number or fire
   // compartment). Members are hidden-by-default spatial elements, so flip their
   // visibility toggles on first or the isolated set would render nothing (#1075).
+  //
+  // A member can also be geometry-LESS: an IfcElementAssembly (or an IfcStair /
+  // IfcRoof used as a container) carries no mesh of its own, its geometry hangs
+  // off the IfcRelAggregates parts. The renderer matches `isolatedEntities`
+  // against mesh ids directly, so isolating such a member's bare id contributes
+  // nothing renderable and a group made of assemblies blanked the view -- the
+  // same class #2531 fixed for framing and the class trees, and #2660 fixed for
+  // the advanced filter's "Isolate in 3D". Resolve through the same Viewport
+  // channel those use (`cameraCallbacks.resolveHighlightIds`, backed by
+  // `expandToGeometryBearingIds`).
   const handleIsolateGroupMembers = useCallback((groupId: number) => {
     const dataStore = (model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null;
     if (!dataStore || !selectedEntity) return;
     const members = extractGroupMembersOnDemand(dataStore, groupId);
     if (members.length === 0) return;
     const globalIds = members.map((m) => toGlobalIdFromModels(models, selectedEntity.modelId, m.id));
+    // The members' own ids are ADDED to what the resolver returns, never
+    // REPLACED by it -- the one place this departs from #2660, which isolates
+    // the resolved set alone. The resolver reads the type-visibility-FILTERED
+    // mesh list (Viewport gets ViewportContainer's `filteredGeometry`), and
+    // this handler exists for zones of hidden-by-default IfcSpaces (#1075):
+    // those members resolve to nothing until the toggles below flip, so
+    // replacing would drop exactly the ids the feature is about. Keeping them
+    // costs nothing -- `isolatedEntities` is a whitelist the renderer matches
+    // mesh ids against, and an id with no mesh simply never matches.
+    //
+    // Both store setters take the Set of this array, so the resolver handing
+    // back a member id it passed through is a harmless duplicate rather than a
+    // second entry. Members ride LAST because `selectedEntityId` is the
+    // ARRAY's final element (selectionSlice.ts): the primary selection stays a
+    // member of the group the user clicked instead of an arbitrary aggregated
+    // part -- the #1133 convention SearchModal.text's commit and
+    // HierarchyPanel's group isolate already follow.
+    //
+    // Residual gap, documented rather than pretended closed: an assembly
+    // member whose parts are THEMSELVES hidden types resolves to nothing and
+    // still contributes no geometry, because the toggles below only flip for
+    // the classes present among the DIRECT members. Closing it properly wants
+    // a resolver that sees UNFILTERED geometry, which is Viewport plumbing
+    // shared with frameSelection and the Search tab.
+    const isolationIds = [
+      ...(cameraCallbacks.resolveHighlightIds?.(globalIds) ?? []),
+      ...globalIds,
+    ];
     // Only turn a hidden class toggle on when the zone actually contains members
     // of that class — otherwise clearing isolation later would surface unrelated
     // spaces/zones the user had deliberately hidden (PR #1094 review).
@@ -805,8 +849,8 @@ export function PropertiesPanel() {
     if (!typeVisibility.spatialZones && members.some((m) => m.type === 'IfcSpatialZone')) {
       toggleTypeVisibility('spatialZones');
     }
-    isolateEntities(globalIds);
-    setSelectedEntityIds(globalIds);
+    isolateEntities(isolationIds);
+    setSelectedEntityIds(isolationIds);
     if (cameraCallbacks.frameSelection) {
       window.setTimeout(() => cameraCallbacks.frameSelection?.(), 50);
     }
@@ -1020,7 +1064,7 @@ export function PropertiesPanel() {
     // display NAME, which is "unique-by-convention but not enforced" (see
     // `ZoneSet.name`), so two same-named sets would collide as React keys
     // (CodeRabbit review of PR #1869).
-    const rows: Array<{ setId: string; label: string; value: string }> = [];
+    const rows: Array<{ setId: string; label: string; value: string; straddles: boolean; zoneSet: ZoneSet }> = [];
     for (const zs of zoneSets) {
       const assignment = record?.[zs.id];
       if (!assignment) continue;
@@ -1028,9 +1072,12 @@ export function PropertiesPanel() {
         const touched = assignment.touchedZoneIds
           .map((zoneId) => zs.zones.find((z) => z.id === zoneId)?.name)
           .filter((n): n is string => !!n);
-        rows.push({ setId: zs.id, label: zs.name, value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles' });
+        rows.push({
+          setId: zs.id, label: zs.name, straddles: true, zoneSet: zs,
+          value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles',
+        });
       } else if (assignment.zoneName) {
-        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName });
+        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName, straddles: false, zoneSet: zs });
       }
     }
     return rows.length > 0 ? rows : null;
@@ -1148,6 +1195,7 @@ export function PropertiesPanel() {
   const renderedInheritedTypeProperties = inheritedTypeProperties;
   const renderedMergedProperties = mergedProperties;
   const renderedQuantities = quantities;
+  const renderedQuantitiesWithInheritedType = quantitiesWithInheritedType;
   const renderedAttributes = attributes;
   const renderedClassifications = classifications;
   const renderedMaterialInfos = materialInfos;
@@ -1577,9 +1625,23 @@ export function PropertiesPanel() {
           <CollapsibleContent>
             <div className="divide-y border-t">
               {zoneMembership.map((item) => (
-                <div key={item.setId} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
-                  <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
-                  <span className="font-medium font-mono truncate" title={item.value}>{item.value}</span>
+                <div key={item.setId}>
+                  <div className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
+                    <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
+                    <span className="font-medium font-mono truncate" title={item.value}>{item.value}</span>
+                  </div>
+                  {/* Only a straddler has anything to apportion (#2508): an
+                      element wholly inside one zone contributes its whole
+                      volume to that zone and needs no clip to say so. */}
+                  {item.straddles && selectedEntityId !== null && (
+                    <ZoneVolumeBreakdown
+                      zoneSet={item.zoneSet}
+                      globalId={selectedEntityId}
+                      quantitySets={renderedQuantitiesWithInheritedType}
+                      projectUnits={renderedProjectUnits}
+                      unitDisplayOverrides={unitDisplayOverrides}
+                    />
+                  )}
                 </div>
               ))}
             </div>

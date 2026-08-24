@@ -13,6 +13,7 @@ import type { EntityTable } from '@ifc-lite/data';
 import { PropertyValueType } from '@ifc-lite/data';
 import type { MutablePropertyView } from './mutable-property-view.js';
 import type { Mutation, PropertyValue } from './types.js';
+import { checkMutationGuard, type MutationGuard } from './mutation-guard.js';
 
 /**
  * A parsed CSV row
@@ -114,15 +115,19 @@ export class CsvConnector {
   private entities: EntityTable;
   private mutationView: MutablePropertyView;
   private strings: { get(idx: number): string } | null;
+  /** See mutation-guard.ts: consulted once by `generateMutations`, opt-in. */
+  private canEdit: MutationGuard | undefined;
 
   constructor(
     entities: EntityTable,
     mutationView: MutablePropertyView,
-    strings?: { get(idx: number): string } | null
+    strings?: { get(idx: number): string } | null,
+    canEdit?: MutationGuard
   ) {
     this.entities = entities;
     this.mutationView = mutationView;
     this.strings = strings || null;
+    this.canEdit = canEdit;
   }
 
   /**
@@ -248,6 +253,7 @@ export class CsvConnector {
    * Generate mutations from matched data
    */
   generateMutations(matches: MatchResult[], mapping: DataMapping): Mutation[] {
+    checkMutationGuard(this.canEdit);
     const mutations: Mutation[] = [];
 
     for (const match of matches) {
@@ -486,6 +492,9 @@ export class CsvConnector {
         try {
           return JSON.parse(value);
         } catch {
+          // Legitimately silent: two accepted CSV encodings for a list value,
+          // JSON first then semicolon-separated. A non-JSON cell is the normal
+          // second form, not a failure.
           return value.split(';').map((s) => s.trim());
         }
 

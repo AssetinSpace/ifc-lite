@@ -10,6 +10,7 @@
  * entities to include, and delegates to the appropriate exporter.
  */
 
+import { escapeCsvCell } from '@ifc-lite/export';
 import type { BimBackend, EntityRef, EntityData, PropertySetData, QuantitySetData } from '../types.js';
 
 export interface ExportCsvOptions {
@@ -31,6 +32,13 @@ export interface ExportStepOptions {
 
 export interface ExportHbjsonOptions {
   /** Honeybee model identifier / display name (defaults to the model name). */
+  name?: string;
+  /** When set, also trigger a download with this filename. */
+  filename?: string;
+}
+
+export interface ExportDfjsonOptions {
+  /** Dragonfly model identifier / display name (defaults to the model name). */
   name?: string;
   /** When set, also trigger a download with this filename. */
   filename?: string;
@@ -214,33 +222,43 @@ export class ExportNamespace {
   }
 
   /**
+   * Export the model as a Dragonfly DFJSON energy model — each `IfcSpace` becomes an
+   * extruded `Room2D` (floor polygon + floor-to-ceiling height) grouped into stories. This
+   * is the simpler Ladybug Tools target for mostly-vertical-wall models. Loads via
+   * `dragonfly.model.Model.from_dfjson`.
+   *
+   * Requires a geometry-capable backend (the CLI and browser carry the wasm engine); the
+   * data-only SDK never meshes, so this throws on a backend that does not provide it.
+   */
+  async dfjson(options: ExportDfjsonOptions = {}): Promise<string> {
+    if (!this.backend.export.dfjson) {
+      throw new Error('DFJSON export requires a geometry-capable backend; the active backend does not provide it.');
+    }
+    const content = await this.backend.export.dfjson(options.name);
+    if (options.filename) {
+      this.backend.export.download(content, options.filename, 'application/json');
+    }
+    return content;
+  }
+
+  /**
    * Trigger a browser file download with raw content.
    */
   download(content: string, filename: string, mimeType?: string): void {
     this.backend.export.download(content, filename, mimeType ?? 'text/plain');
   }
 
+  /**
+   * RFC 4180 quoting + the CWE-1236 formula-injection guard, delegated to
+   * `@ifc-lite/export`'s single escaper.
+   *
+   * This method used to carry the repo's reference copy of the guard (#1944).
+   * It was the best of nine, but still its own: its invisible class was
+   * `\p{Zs}`, which leaves U+2028 LINE SEPARATOR and U+2029 PARAGRAPH
+   * SEPARATOR usable as hiding places for a trigger. The shared escaper uses
+   * `\p{Z}`, covering `Zl`/`Zp` too.
+   */
   private escapeCsv(value: string, sep: string): string {
-    // CSV/formula-injection guard (CWE-1236): prefix a leading spreadsheet
-    // formula trigger so Excel/Sheets treat the cell as text, not a formula.
-    //
-    // The trigger is looked for past any leading INVISIBLE characters. A BOM,
-    // zero-width space, left-to-right mark or non-breaking space in front of
-    // `=` does not stop a spreadsheet reading the cell as a formula, but it
-    // does stop an anchored regex matching, so `\uFEFF=HYPERLINK(...)`, a BOM then `=`, used to
-    // sail through. IFC text properties are attacker-controllable and can
-    // carry any of them.
-    //
-    // `\p{Cf}` (format) and `\p{Zs}` (space separator) deliberately, NOT `\s`:
-    // `\s` would swallow a leading tab, and tab is itself a trigger, so
-    // "\thello" would stop being guarded.
-    let str = value;
-    if (/^[\p{Cf}\p{Zs}]*[=+\-@\t\r]/u.test(str)) {
-      str = `'${str}`;
-    }
-    if (str.includes(sep) || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
+    return escapeCsvCell(value, { delimiter: sep });
   }
 }
