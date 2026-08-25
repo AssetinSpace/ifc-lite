@@ -211,7 +211,7 @@
    428 packages/drawing-2d/src/edge-extractor.ts
    565 packages/drawing-2d/src/gpu-section-cutter.ts
    470 packages/drawing-2d/src/graphic-overrides/presets.ts
-   561 packages/drawing-2d/src/graphic-overrides/rule-engine.ts
+   523 packages/drawing-2d/src/graphic-overrides/rule-engine.ts
    431 packages/drawing-2d/src/hatch-generator.ts
    572 packages/drawing-2d/src/index.ts
    436 packages/drawing-2d/src/line-merger.ts
@@ -270,12 +270,12 @@
    573 packages/mutations/src/csv-connector.ts
   2121 packages/mutations/src/mutable-property-view.ts
    422 packages/oauth-pkce/src/token-manager.ts
-  1237 packages/parser/src/columnar-parser.ts
+  1211 packages/parser/src/columnar-parser.ts
    480 packages/parser/src/compact-entity-index.ts
    530 packages/parser/src/data-store-transport.ts
    564 packages/parser/src/georef-extractor.ts
    827 packages/parser/src/material-resolver.ts
-  1037 packages/parser/src/on-demand-extractors.ts
+  1014 packages/parser/src/on-demand-extractors.ts
    523 packages/parser/src/project-units.ts
    594 packages/parser/src/schedule-extractor.ts
    494 packages/parser/src/source-bytes.ts
