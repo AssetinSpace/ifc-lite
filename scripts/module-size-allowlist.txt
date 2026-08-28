@@ -95,7 +95,7 @@
    970 apps/viewer/src/components/viewer/useGeometryStreaming.ts
    946 apps/viewer/src/components/viewer/useMouseControls.ts
    782 apps/viewer/src/components/viewer/ViewerLayout.tsx
-  1840 apps/viewer/src/components/viewer/Viewport.tsx
+  1843 apps/viewer/src/components/viewer/Viewport.tsx
   1539 apps/viewer/src/components/viewer/ViewportContainer.tsx
    511 apps/viewer/src/components/viewer/ZonesPanel.tsx
    862 apps/viewer/src/hooks/ids/idsExportService.ts
@@ -145,7 +145,7 @@
    561 apps/viewer/src/services/ifc-cache.ts
    581 apps/viewer/src/store/basketVisibleSet.ts
    485 apps/viewer/src/store/constants.ts
-   575 apps/viewer/src/store/index.ts
+   581 apps/viewer/src/store/index.ts
    404 apps/viewer/src/store/slices/addElementMeshes.ts
    452 apps/viewer/src/store/slices/chatSlice.ts
    994 apps/viewer/src/store/slices/clashSlice.ts
@@ -163,7 +163,7 @@
    571 apps/viewer/src/store/slices/sheetSlice.ts
    414 apps/viewer/src/store/slices/uiSlice.ts
    485 apps/viewer/src/store/slices/visibilitySlice.ts
-   689 apps/viewer/src/store/types.ts
+   696 apps/viewer/src/store/types.ts
    662 apps/viewer/src/utils/serverDataModel.ts
    422 apps/viewer/src/utils/spatialHierarchy.ts
    573 apps/viewer/src/utils/viewportUtils.ts
@@ -291,9 +291,9 @@
   1033 packages/provenance/src/merge-model.ts
    609 packages/provenance/src/node-hash.ts
    535 packages/query/src/duckdb-integration.ts
-   561 packages/renderer/src/camera-controls.ts
-   657 packages/renderer/src/camera.ts
-  3752 packages/renderer/src/index.ts
+   583 packages/renderer/src/camera-controls.ts
+   662 packages/renderer/src/camera.ts
+  3753 packages/renderer/src/index.ts
    780 packages/renderer/src/picker.ts
    952 packages/renderer/src/pipeline.ts
    477 packages/renderer/src/pointcloud/point-cloud-renderer.ts
