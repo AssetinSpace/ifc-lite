@@ -162,6 +162,8 @@ export class StepTokenizer {
         }
 
         if (!hasDigits) continue;
+        // Overflow/collision: see `readRefId` in columnar-parser-attributes.ts.
+        if (!Number.isSafeInteger(expressId)) continue;
 
         // Skip whitespace (inline)
         while (pos < len) {
@@ -302,6 +304,7 @@ export class StepTokenizer {
     }
 
     if (digits === 0) return null;
+    if (!Number.isSafeInteger(id)) return null; // same overflow/collision as scanEntitiesFast
     this.position = pos;
     return id;
   }

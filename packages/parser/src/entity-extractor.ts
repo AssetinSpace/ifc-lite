@@ -74,7 +74,13 @@ export class EntityExtractor {
       const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\(([\s\S]*)\)/);
       if (!match) return null;
 
+      // `\d+` guarantees this is not NaN, but not that it is a safe integer:
+      // ids lose precision past 2^53 (~16 digits), long before 400 digits
+      // would overflow to Infinity. An entity keyed by a value another id also
+      // accumulates to would collide with it in the entity map, so refuse the
+      // record.
       const expressId = parseInt(match[1], 10);
+      if (!Number.isSafeInteger(expressId)) return null;
       const type = match[2];
       const paramsText = match[3];
 
@@ -252,7 +258,14 @@ export class EntityExtractor {
     // Reference: #123
     if (value.startsWith('#')) {
       const id = parseInt(value.substring(1), 10);
-      return isNaN(id) ? null : id;
+      // Number.isSafeInteger, not !isNaN or Number.isFinite: a reference with
+      // enough digits to overflow the double range
+      // (`parseInt('1'.repeat(400), 10)` is `Infinity`) passes an isNaN guard,
+      // and an Infinity express id resolves to nothing — but two references
+      // that merely exceed 2^53 (~16 digits) accumulate to the SAME value and
+      // would resolve to the SAME (wrong) entity, which `isFinite` alone does
+      // not catch. Treat both as the dangling reference they are.
+      return Number.isSafeInteger(id) ? id : null;
     }
 
     // String: 'text'
@@ -263,13 +276,39 @@ export class EntityExtractor {
       return decodeIfcString(raw);
     }
 
-    // Number
+    // Number.
+    //
+    // Number.isFinite, not !isNaN: a STEP real whose exponent overflows the
+    // IEEE-754 double range (`1.0E400`) parses to `Infinity`, and
+    // `isNaN(Infinity)` is `false`, so the old guard admitted it. From the
+    // property table a non-finite number reaches every writer, where
+    // `JSON.stringify(Infinity)` is `null` — the file loses the value with no
+    // diagnostic anywhere along the way.
+    //
+    // Falling through preserves the literal as the raw token (the branch
+    // below), which is what this function already does for every other token
+    // it cannot represent as a number. That keeps the data the file actually
+    // contained — a reader can still see `1.0E400`. Rejecting the attribute
+    // outright would drop data the file did contain; clamping would invent a
+    // value.
+    //
+    // This is NOT by itself enough to say "nothing is silently dropped".
+    // Preserving the string only helps consumers whose value type admits a
+    // string — the property table's `PropertyValue` union does. A consumer
+    // whose field is typed `number` sees the preserved string fail its
+    // `typeof x === 'number'` test and falls back to whatever default it has,
+    // which is how `quantity-collect` and `georef-extractor` turned an
+    // unreadable value into a plausible `0`. Absence is detectable; a zero
+    // easting is a coordinate. Both now refuse and warn instead of
+    // substituting — see `isOverflowingNumericLiteral` in
+    // `attribute-helpers.ts` and its two call sites. Any NEW `number`-typed
+    // consumer of this function's output owes the same decision.
     const num = parseFloat(value);
-    if (!isNaN(num)) {
+    if (Number.isFinite(num)) {
       return num;
     }
 
-    // Enumeration or other identifier
+    // Enumeration, non-finite numeric literal, or other identifier: the raw token.
     return value;
   }
 }
