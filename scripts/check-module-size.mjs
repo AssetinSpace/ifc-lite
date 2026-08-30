@@ -200,7 +200,7 @@ const SOURCE_RE = /\.(ts|tsx|mts|cts)$/;
  * moves if anything else touched the allowlist first.
  */
 const ALLOWLIST_DIGESTS = {
-  'apps/viewer': '2930216234144357007',
+  'apps/viewer': '5259857359528176291',
   'apps/viewer-embed': '12728483381622404308',
   'packages/bcf': '10369893299996048894',
   'packages/cache': '14926850005686407910',
@@ -230,7 +230,7 @@ const ALLOWLIST_DIGESTS = {
   'packages/pointcloud': '9060606210189352091',
   'packages/provenance': '17691750269289291288',
   'packages/query': '10617410983412679617',
-  'packages/renderer': '5830827647468430253',
+  'packages/renderer': '11784806359104102641',
   'packages/sandbox': '7650074321748792699',
   'packages/sdk': '885187935350689181',
   'packages/server-client': '7638729328149367977',
