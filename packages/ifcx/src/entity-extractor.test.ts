@@ -108,4 +108,51 @@ describe('extractEntities', () => {
     assert.strictEqual(entities.getName(wallId), 'Wall-A');
     assert.strictEqual(entities.getDescription(wallId), 'Exterior load-bearing wall');
   });
+
+  it('does not fabricate ObjectType from the IFC class code', () => {
+    // objectType used to be filled with the entity's own class code, so
+    // every IFCX-sourced wall reported ObjectType 'IfcWall' — a
+    // plausible-looking value no source attribute backs, indistinguishable
+    // from an authored one to every consumer that reads it (CSV/Parquet
+    // export, the query engine's ObjectType column, IDS's `getObjectType`,
+    // the lens summary line). With no ObjectType on the node the field must
+    // stay '', the STEP parser's own default (`addEntityBatch` in
+    // packages/parser/src/columnar-parser.ts).
+    const wall = createNode('wall');
+    wall.attributes.set(ATTR.CLASS, ifcClass('IfcWall'));
+    wall.attributes.set('bsi::ifc::prop::Name', 'Wall-01');
+
+    const strings = new StringTable();
+    const { entities, pathToId } = extractEntities(new Map([[wall.path, wall]]), strings);
+
+    const wallId = pathToId.get(wall.path);
+    assert.ok(wallId !== undefined);
+    // Control: Name is a real attribute on this node and DOES round-trip,
+    // isolating the failure to objectType.
+    assert.strictEqual(entities.getName(wallId), 'Wall-01');
+    assert.strictEqual(entities.getObjectType(wallId), '');
+  });
+
+  it('reads back bsi::ifc::prop::ObjectType when the source carries it', () => {
+    // buildingSMART's v5a `prop` schema defines no ObjectType, but ifc-lite's
+    // own collab seed writes the key: apps/viewer/src/lib/collab/step-seed.ts
+    // emits `bsi::ifc::prop::ObjectType` for every STEP entity that has one,
+    // and that snapshot comes back through `extractEntities`
+    // (`snapshotToIfcx` → `parseIfcxViewerModel`). This node is the shape
+    // step-seed.ts produces for a typed wall. The expected value matches
+    // neither the class code nor '', so it separates reading the attribute
+    // from both the old fabrication and a blanket ''.
+    const wall = createNode('wall');
+    wall.attributes.set(ATTR.CLASS, ifcClass('IfcWall'));
+    wall.attributes.set('bsi::ifc::prop::Name', 'Wall-01');
+    wall.attributes.set('bsi::ifc::prop::ObjectType', 'Basic Wall:Generic 200mm');
+
+    const strings = new StringTable();
+    const { entities, pathToId } = extractEntities(new Map([[wall.path, wall]]), strings);
+
+    const wallId = pathToId.get(wall.path);
+    assert.ok(wallId !== undefined);
+    assert.strictEqual(entities.getName(wallId), 'Wall-01');
+    assert.strictEqual(entities.getObjectType(wallId), 'Basic Wall:Generic 200mm');
+  });
 });

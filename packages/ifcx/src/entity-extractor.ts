@@ -96,6 +96,16 @@ export function extractEntities(
     // Check if this is a type definition
     const isType = typeCode.toUpperCase().endsWith('TYPE');
 
+    // Extract objectType the same way. It used to be filled with `typeCode`,
+    // which fabricated an ObjectType for every IFCX-sourced entity: every
+    // wall reported ObjectType 'IfcWall', indistinguishable from an authored
+    // value to every consumer that reads it (CSV/Parquet export, the query
+    // engine's ObjectType column, IDS's `getObjectType`, the lens summary
+    // line). Absent now means '', the same default the STEP parser uses for
+    // an entity with no ObjectType (`addEntityBatch` in
+    // packages/parser/src/columnar-parser.ts).
+    const objectType = extractObjectType(node);
+
     // Add entity to builder
     builder.add(
       expressId,
@@ -103,7 +113,7 @@ export function extractEntities(
       node.path, // Use path as GlobalId
       name,
       description,
-      typeCode, // objectType
+      objectType,
       hasGeometry,
       isType
     );
@@ -152,4 +162,22 @@ function extractName(node: ComposedNode, incomingEdgeNames: string[]): string | 
 function extractDescription(node: ComposedNode): string {
   const description = node.attributes.get('bsi::ifc::prop::Description');
   return typeof description === 'string' ? description : '';
+}
+
+/**
+ * Extract entity ObjectType from node attributes.
+ *
+ * buildingSMART's official v5a `prop` schema
+ * (packages/export/src/__fixtures__/schemas/prop@v5a.ifcx) defines
+ * Name/Description/UsageType/TypeName but no ObjectType, so a third-party
+ * IFCX archive usually carries nothing here. ifc-lite's own collab seed does
+ * write the key — apps/viewer/src/lib/collab/step-seed.ts emits
+ * `bsi::ifc::prop::ObjectType` for every STEP entity that has one — and that
+ * snapshot is read back through `extractEntities` (`snapshotToIfcx` →
+ * `parseIfcxViewerModel`), so reading the key is what carries ObjectType
+ * across a collab round trip instead of dropping it.
+ */
+function extractObjectType(node: ComposedNode): string {
+  const objectType = node.attributes.get('bsi::ifc::prop::ObjectType');
+  return typeof objectType === 'string' ? objectType : '';
 }
