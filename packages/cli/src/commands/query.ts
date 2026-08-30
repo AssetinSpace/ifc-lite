@@ -535,8 +535,11 @@ export async function queryCommand(args: string[]): Promise<void> {
 
   // Validated, not parseInt'd -- the backend descriptor only honours the
   // limit under a `> 0` check, so a NaN --limit returned every match.
+  // Both flags need both guards: !groupBy because the --where/--storey
+  // siblings never slice before grouping, and !aggQuantity (#3510) because
+  // an aggregation must run over the whole filtered set.
   if (rowLimit !== undefined && !groupBy && !aggQuantity) q = q.limit(rowLimit);
-  if (offset && !aggQuantity) q = q.offset(offset);
+  if (offset && !groupBy && !aggQuantity) q = q.offset(offset);
 
   // B11: Validate --group-by key
   if (groupBy) {
