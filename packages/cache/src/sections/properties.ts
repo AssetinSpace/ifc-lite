@@ -11,6 +11,28 @@ import { comparePropertyValues, PropertyValueType } from '@ifc-lite/data';
 import { BufferWriter, BufferReader } from '../utils/buffer-utils.js';
 
 /**
+ * List-value parse failures are per-property on a cache-rehydration path, so
+ * the warning is latched: a corrupt cache would otherwise emit one line per
+ * row.
+ */
+let listParseWarningShown = false;
+
+/** @internal test seam — reset the once-per-process list-parse warning latch. */
+export function __resetListParseWarningLatch(): void {
+  listParseWarningShown = false;
+}
+
+function warnListParseFailureOnce(listStr: string, err: unknown): void {
+  if (listParseWarningShown) return;
+  listParseWarningShown = true;
+  console.warn(
+    `[cache] cached property list value is not valid JSON; reporting an empty ` +
+      `list (further occurrences suppressed). value=${JSON.stringify(listStr.slice(0, 120))}`,
+    err,
+  );
+}
+
+/**
  * Write PropertyTable to buffer
  * Format:
  *   - count: uint32
@@ -66,9 +88,9 @@ export function readProperties(reader: BufferReader, strings: StringTable): Prop
   const valueBool = reader.readUint8Array(count);
   const unitId = reader.readInt32Array(count);
 
-  const entityIndex = readIndex(reader);
-  const psetIndex = readIndex(reader);
-  const propIndex = readIndex(reader);
+  const entityIndex = readIndex(reader, count, 'entityIndex');
+  const psetIndex = readIndex(reader, count, 'psetIndex');
+  const propIndex = readIndex(reader, count, 'propIndex');
 
   const getPropertyValue = (idx: number): PropertyValue => {
     const type = propType[idx];
@@ -92,13 +114,23 @@ export function readProperties(reader: BufferReader, strings: StringTable): Prop
       case PropertyValueType.Logical:
         const boolVal = valueBool[idx];
         return boolVal === 255 ? null : boolVal === 1;
-      case PropertyValueType.List:
-        const listStr = strings.get(valueString[idx]);
+      case PropertyValueType.List: {
+        // Mirrors the string branch above (and @ifc-lite/data's
+        // `getPropertyValue`): the NULL sentinel -1 wraps to 4294967295 and
+        // `strings.get` answers '' for it, so without this guard a NULL list
+        // property was rehydrated from cache as `[]` — a real empty list —
+        // with the silent catch hiding the difference.
+        const li = valueString[idx];
+        if (!(li >= 0 && li < strings.count)) return null;
+        const listStr = strings.get(li);
+        if (listStr === '') return null;
         try {
           return JSON.parse(listStr);
-        } catch {
+        } catch (err) {
+          warnListParseFailureOnce(listStr, err);
           return [];
         }
+      }
       default:
         return null;
     }
@@ -199,7 +231,18 @@ function writeIndex(writer: BufferWriter, index: Map<number, number[]>): void {
   }
 }
 
-function readIndex(reader: BufferReader): Map<number, number[]> {
+/**
+ * Read a row-index table (entityIndex/psetIndex/propIndex): key -> row
+ * indices into the parallel column arrays. Each row index MUST be < rowCount
+ * — the column arrays (entityId, psetName, propType, valueString, ...) are
+ * fixed-size `Uint32Array`/`Float64Array`s, so an out-of-range read returns
+ * `undefined` instead of throwing (`arr[idx]` on a typed array never throws).
+ * A corrupt cache with an inflated row index would otherwise flow `undefined`
+ * names and types into `getForEntity` results silently instead of failing the
+ * cache load. Same defect shape, and same fix, as `entity-index.ts`'s
+ * `typeIndex` bounds check.
+ */
+function readIndex(reader: BufferReader, rowCount: number, name: string): Map<number, number[]> {
   const size = reader.readUint32();
   const index = new Map<number, number[]>();
   for (let i = 0; i < size; i++) {
@@ -207,7 +250,14 @@ function readIndex(reader: BufferReader): Map<number, number[]> {
     const valueCount = reader.readUint32();
     const values: number[] = [];
     for (let j = 0; j < valueCount; j++) {
-      values.push(reader.readUint32());
+      const rowIndex = reader.readUint32();
+      if (rowIndex >= rowCount) {
+        throw new Error(
+          `Corrupt cache PropertyTable ${name}: row index ${rowIndex} for key ${key} ` +
+            `exceeds row count ${rowCount}`,
+        );
+      }
+      values.push(rowIndex);
     }
     index.set(key, values);
   }

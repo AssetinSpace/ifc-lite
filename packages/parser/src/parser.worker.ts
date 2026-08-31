@@ -27,6 +27,7 @@ import {
   type DataStoreTransport,
   type ParserMemorySnapshot,
 } from './data-store-transport.js';
+import { takeWasmPanicStash } from './wasm-panic-forward.js';
 
 /** Input message: pass the SAB-backed source bytes and an opaque request id. */
 export interface ParserWorkerInputMessage {
@@ -52,6 +53,13 @@ export interface ParserWorkerEntityIndexMessage {
   ids: Uint32Array;
   starts: Uint32Array;
   lengths: Uint32Array;
+  /**
+   * Records the pre-pass refused for an express id above the u32 storage
+   * bound (#3395). Absent from `ids` by construction, so the count has to be
+   * handed over with the columns or the parse reports a clean load that is
+   * quietly short. Optional: an older host sends the three columns only.
+   */
+  oversizedIdCount?: number;
 }
 
 /** Progress update from the worker. */
@@ -87,6 +95,12 @@ export interface ParserWorkerErrorMessage {
   type: 'error';
   id: string;
   message: string;
+  /** This worker realm's wasm panic-location stash (#2527 follow-up), forwarded
+   *  so the main thread can re-plant it on ITS global for the existing
+   *  `attachWasmPanicLocation` gate. Location only, never the panic message.
+   *  Absent when there was no stash. See `wasm-panic-forward.ts`. */
+  wasmPanicLocation?: string;
+  wasmPanicAt?: number;
 }
 
 export type ParserWorkerOutputMessage =
@@ -156,6 +170,7 @@ let pendingEntityIndex: {
   ids: Uint32Array;
   starts: Uint32Array;
   lengths: Uint32Array;
+  oversizedIdCount?: number;
 } | null = null;
 let entityIndexWaiter: ((value: NonNullable<typeof pendingEntityIndex>) => void) | null = null;
 
@@ -203,6 +218,7 @@ self.onmessage = async (event: MessageEvent<ParserInbound>) => {
       ids: data.ids,
       starts: data.starts,
       lengths: data.lengths,
+      oversizedIdCount: data.oversizedIdCount,
     };
     if (entityIndexWaiter) {
       const resolve = entityIndexWaiter;
@@ -317,10 +333,15 @@ self.onmessage = async (event: MessageEvent<ParserInbound>) => {
     };
     postOutput({ type: 'complete', id, payload, memory }, transfers);
   } catch (err) {
+    // #2527 follow-up: forward this realm's panic-location stash (set by the
+    // Rust panic hook if this failure was a wasm trap) so the main thread can
+    // re-plant it on ITS global for `attachWasmPanicLocation`.
+    const panic = takeWasmPanicStash(self);
     postOutput({
       type: 'error',
       id,
       message: err instanceof Error ? err.message : String(err),
+      ...(panic ? { wasmPanicLocation: panic.location, wasmPanicAt: panic.at } : {}),
     });
   }
 };

@@ -14,6 +14,7 @@
 //! Typical additional compression: 3-5x over basic Parquet format.
 
 use crate::services::axis::{zup_to_yup, zup_to_yup_f64};
+use crate::services::parquet_schema::{instance_schema, ABSENT_SOURCE_ID};
 use crate::types::MeshData;
 use arrow::array::{Float32Array, Float64Array, Int32Array, StringArray, UInt32Array, UInt8Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -28,6 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::sync::Arc;
 
+use super::parquet::check_u32_len;
 use super::ParquetError;
 
 /// Vertex multiplier for integer quantization.
@@ -140,6 +142,10 @@ pub fn serialize_to_parquet_optimized(
     let mut instance_origin_y: Vec<f64> = Vec::with_capacity(meshes.len());
     let mut instance_origin_z: Vec<f64> = Vec::with_capacity(meshes.len());
     let mut instance_geometry_class: Vec<u8> = Vec::with_capacity(meshes.len());
+    // PER INSTANCE, not per template (#3215): the dedup key is vertex data, so
+    // two instances sharing a template can come from different source items.
+    let mut instance_geometry_item_ids: Vec<u32> = Vec::with_capacity(meshes.len());
+    let mut instance_material_ids: Vec<u32> = Vec::with_capacity(meshes.len());
 
     for mesh in meshes {
         // Compute geometry hash for deduplication
@@ -177,6 +183,8 @@ pub fn serialize_to_parquet_optimized(
         instance_origin_y.push(origin_yup[1]);
         instance_origin_z.push(origin_yup[2]);
         instance_geometry_class.push(mesh.geometry_class);
+        instance_geometry_item_ids.push(mesh.geometry_item_id.unwrap_or(ABSENT_SOURCE_ID));
+        instance_material_ids.push(mesh.material_id.unwrap_or(ABSENT_SOURCE_ID));
     }
 
     // Phase 2: Build vertex and index buffers from unique meshes
@@ -278,16 +286,7 @@ pub fn serialize_to_parquet_optimized(
     // Phase 3: Create Parquet tables
 
     // Instance table schema
-    let instance_schema = Arc::new(Schema::new(vec![
-        Field::new("entity_id", DataType::UInt32, false),
-        Field::new("ifc_type", DataType::Utf8, false),
-        Field::new("mesh_index", DataType::UInt32, false),
-        Field::new("material_index", DataType::UInt32, false),
-        Field::new("origin_x", DataType::Float64, false),
-        Field::new("origin_y", DataType::Float64, false),
-        Field::new("origin_z", DataType::Float64, false),
-        Field::new("geometry_class", DataType::UInt8, false),
-    ]));
+    let instance_schema = instance_schema();
 
     let instance_batch = RecordBatch::try_new(
         instance_schema,
@@ -300,6 +299,8 @@ pub fn serialize_to_parquet_optimized(
             Arc::new(Float64Array::from(instance_origin_y)),
             Arc::new(Float64Array::from(instance_origin_z)),
             Arc::new(UInt8Array::from(instance_geometry_class)),
+            Arc::new(UInt32Array::from(instance_geometry_item_ids)),
+            Arc::new(UInt32Array::from(instance_material_ids)),
         ],
     )?;
 
@@ -395,37 +396,87 @@ pub fn serialize_to_parquet_optimized(
         RecordBatch::try_new(index_schema, vec![Arc::new(UInt32Array::from(indices))])?;
 
     // Phase 4: Write to binary format
-    // Header: [version:u8][flags:u8][instance_len:u32][mesh_len:u32][material_len:u32][vertex_len:u32][index_len:u32]
-    // Then: [instance_parquet][mesh_parquet][material_parquet][vertex_parquet][index_parquet]
-    let mut output = Vec::new();
+    let instance_parquet = write_parquet_buffer(&instance_batch)?;
+    let mesh_parquet = write_parquet_buffer(&mesh_batch)?;
+    let material_parquet = write_parquet_buffer(&material_batch)?;
+    let vertex_parquet = write_parquet_buffer(&vertex_batch)?;
+    let index_parquet = write_parquet_buffer(&index_batch)?;
+
+    assemble_optimized_output(
+        include_normals,
+        &instance_parquet,
+        &mesh_parquet,
+        &material_parquet,
+        &vertex_parquet,
+        &index_parquet,
+    )
+}
+
+/// Validate the five optimized-writer section lengths against the u32 wire
+/// limit. Takes plain lengths, not byte slices, so a >4 GiB test case is just
+/// the number `u32::MAX as usize + 1` — no multi-gigabyte buffer needed.
+fn check_optimized_section_lengths(
+    instance_len: usize, mesh_len: usize, material_len: usize, vertex_len: usize, index_len: usize,
+) -> Result<(), ParquetError> {
+    let sections = [
+        ("instance", instance_len), ("mesh", mesh_len), ("material", material_len),
+        ("vertex", vertex_len), ("index", index_len),
+    ];
+    for (name, len) in sections {
+        check_u32_len(name, len)?;
+    }
+    Ok(())
+}
+
+/// Header: `[version:u8][flags:u8][instance_len:u32][mesh_len:u32][material_len:u32][vertex_len:u32][index_len:u32]`
+/// Then: `[instance_parquet][mesh_parquet][material_parquet][vertex_parquet][index_parquet]`
+///
+/// Each section length is a wire-format u32: fail loud via
+/// `check_optimized_section_lengths` instead of silently truncating a >4 GiB
+/// section into a corrupt length prefix that disagrees with the bytes
+/// appended below. Mirrors the guard `parquet::frame_sections`/
+/// `frame_combined_sections` apply to the non-optimized writer's sections.
+fn assemble_optimized_output(
+    include_normals: bool,
+    instance_parquet: &[u8],
+    mesh_parquet: &[u8],
+    material_parquet: &[u8],
+    vertex_parquet: &[u8],
+    index_parquet: &[u8],
+) -> Result<Bytes, ParquetError> {
+    check_optimized_section_lengths(
+        instance_parquet.len(),
+        mesh_parquet.len(),
+        material_parquet.len(),
+        vertex_parquet.len(),
+        index_parquet.len(),
+    )?;
+
+    let mut output = Vec::with_capacity(
+        2 + 20
+            + instance_parquet.len()
+            + mesh_parquet.len()
+            + material_parquet.len()
+            + vertex_parquet.len()
+            + index_parquet.len(),
+    );
 
     // Version 2 = optimized format
     output.push(2u8);
     // Flags: bit 0 = has_normals
     output.push(if include_normals { 1u8 } else { 0u8 });
 
-    // Write tables
-    let instance_parquet = write_parquet_buffer(&instance_batch)?;
     output.extend_from_slice(&(instance_parquet.len() as u32).to_le_bytes());
-
-    let mesh_parquet = write_parquet_buffer(&mesh_batch)?;
     output.extend_from_slice(&(mesh_parquet.len() as u32).to_le_bytes());
-
-    let material_parquet = write_parquet_buffer(&material_batch)?;
     output.extend_from_slice(&(material_parquet.len() as u32).to_le_bytes());
-
-    let vertex_parquet = write_parquet_buffer(&vertex_batch)?;
     output.extend_from_slice(&(vertex_parquet.len() as u32).to_le_bytes());
-
-    let index_parquet = write_parquet_buffer(&index_batch)?;
     output.extend_from_slice(&(index_parquet.len() as u32).to_le_bytes());
 
-    // Append all parquet data
-    output.extend_from_slice(&instance_parquet);
-    output.extend_from_slice(&mesh_parquet);
-    output.extend_from_slice(&material_parquet);
-    output.extend_from_slice(&vertex_parquet);
-    output.extend_from_slice(&index_parquet);
+    output.extend_from_slice(instance_parquet);
+    output.extend_from_slice(mesh_parquet);
+    output.extend_from_slice(material_parquet);
+    output.extend_from_slice(vertex_parquet);
+    output.extend_from_slice(index_parquet);
 
     Ok(Bytes::from(output))
 }

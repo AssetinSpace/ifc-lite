@@ -15,6 +15,7 @@ type ParsedGlb = {
 };
 
 export function parseGLB(glb: Uint8Array): ParsedGlb {
+  if (glb.byteLength < 12) throw new Error('GLB file too small for header');
   const dv = new DataView(glb.buffer, glb.byteOffset, glb.byteLength);
   const magic = dv.getUint32(0, true);
   if (magic !== 0x46546c67) throw new Error('Invalid GLB magic');
@@ -26,10 +27,26 @@ export function parseGLB(glb: Uint8Array): ParsedGlb {
   let offset = 12;
   let json: any = null;
   let bin: Uint8Array | null = null;
-  while (offset + 8 <= glb.byteLength) {
+  // Bound the walk by the DECLARED (and above, validated <= glb.byteLength)
+  // `totalLen`, not the raw buffer length. Using `glb.byteLength` here let a
+  // buffer with bytes appended after a legitimate GLB's end (e.g. a phantom
+  // chunk with the BIN magic) get parsed as additional real chunks — the
+  // last BIN/JSON chunk found wins, so an attacker-appended trailing chunk
+  // silently REPLACED the genuine bin/json. The walk now stops at `totalLen`,
+  // so such a trailing chunk is ignored rather than adopted; the file itself
+  // is not rejected. Each chunk is also checked against `totalLen` so a chunkLen
+  // that overruns the declared length throws instead of `subarray` silently
+  // clamping to a truncated view (mirrors the guard in the sibling GLB
+  // reader, `@ifc-lite/cache`'s `glb.ts`).
+  while (offset + 8 <= totalLen) {
     const chunkLen = dv.getUint32(offset, true);
     const chunkType = dv.getUint32(offset + 4, true);
     offset += 8;
+    if (offset + chunkLen > totalLen) {
+      throw new Error(
+        `GLB chunk extends beyond declared length: offset=${offset} chunkLen=${chunkLen} totalLen=${totalLen}`,
+      );
+    }
     const chunk = glb.subarray(offset, offset + chunkLen);
     offset += chunkLen;
     if (chunkType === 0x4e4f534a) {
@@ -130,6 +147,18 @@ export function parseGLBToMeshData(glb: Uint8Array): MeshData[] {
     const bv = bufferViews[acc.bufferView];
     const byteOffset = (bv.byteOffset || 0) + (acc.byteOffset || 0);
     const count = Number(acc.count || 0);
+    // `Number(acc.count || 0)` only catches a MISSING count (falsy ->
+    // defaults to 0); a present-but-non-numeric count (e.g. a corrupted
+    // JSON chunk with `"count":"abc"`) survives `|| 0` and becomes NaN
+    // here. `byteLen` then propagates NaN, and `NaN > bin.byteLength` below
+    // is `false` -- the exact same "bare comparison is bypassed by NaN"
+    // shape as the sibling `@ifc-lite/cache` GLB reader. Without this
+    // check, `bin.subarray(offset, NaN)` silently returns an EMPTY view and
+    // this accessor decodes as a mesh with zero vertices/indices instead of
+    // throwing.
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error(`GLB accessor has an invalid count: ${acc.count}`);
+    }
     const comps = typeComponents(String(acc.type));
     const cSize = componentTypeSize(Number(acc.componentType));
     const byteLen = count * comps * cSize;

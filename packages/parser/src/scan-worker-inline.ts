@@ -10,12 +10,23 @@
  * avoid bundler/import issues with Web Workers.
  */
 
+import { MAX_EXPRESS_ID } from './express-id.js';
+
 export interface EntityRefWorkerResult {
   expressId: number;
   type: string;
   byteOffset: number;
   byteLength: number;
   lineNumber: number;
+}
+
+/** What one worker scan produced: the records it accepted, and how many it
+ *  refused for an out-of-contract express id (#3395). The second half is not
+ *  decoration — a guard that acts without reporting turns a corrupted index
+ *  into a silently short one, which reads exactly like success. */
+export interface EntityScanWorkerResult {
+  refs: EntityRefWorkerResult[];
+  oversizedIdCount: number;
 }
 
 /**
@@ -35,7 +46,14 @@ self.onmessage = function(e) {
 
   // Pre-allocate result array (estimate ~13,500 entities per MB)
   var estimatedCount = Math.max((len / 1024 / 1024) * 13500, 1000) | 0;
-  // Pack results into typed arrays for fast transfer
+  // Pack results into typed arrays for fast transfer. Uint32Array for the ids:
+  // that is the express-id storage contract every consumer of this scan holds
+  // to (CompactEntityIndex, the entity/property/quantity tables, the wasm
+  // boundary, Rust's ColumnarIndex), so the guard below refuses anything wider
+  // rather than carrying it one buffer further and truncating downstream
+  // (#3395). The worker runs from a Blob URL and cannot import at runtime, so
+  // the bound below is interpolated from express-id.ts when this template is
+  // evaluated -- one home for the number, not a copy that can drift.
   var ids = new Uint32Array(estimatedCount);
   var offsets = new Uint32Array(estimatedCount);
   var lengths = new Uint32Array(estimatedCount);
@@ -43,6 +61,8 @@ self.onmessage = function(e) {
   // Type names stored separately (strings)
   var types = new Array(estimatedCount);
   var count = 0;
+  // Records refused by the express-id bound, reported back to the caller.
+  var oversizedIds = 0;
 
   // Type name cache (IFC files have ~776 unique types across millions of entities)
   var typeCache = new Map();
@@ -98,6 +118,21 @@ self.onmessage = function(e) {
       // Check for '='
       if (pos >= len || buf[pos] !== 0x3D) continue;
       pos++;
+
+      // Express-id bound, identical to StepTokenizer.scanEntitiesFast -- this
+      // worker is that scan's twin and must reject the same records, and count
+      // the same ones, or which scan path ran decides both whether an id
+      // collides with another and what the user is told was dropped. The
+      // single '>' subsumes a safe-integer check: a digit run accumulated as a
+      // double is non-negative and integral, and every value past 2^32 --
+      // including one past 2^53, where two distinct ids collide onto one
+      // double -- fails it. Tested only after '=' has matched, because that is
+      // the DECLARATION shape Rust's EntityScanner validates before refusing:
+      // the 'continue' below resumes inside the refused record's argument
+      // list, so an oversized '#ref' in there arrives here too and would be
+      // counted as a second dropped record. Count the refusal; a record that
+      // vanishes without a trace is the same defect wearing a different hat.
+      if (expressId > ${MAX_EXPRESS_ID}) { oversizedIds++; continue; }
 
       // Skip whitespace
       while (pos < len) {
@@ -192,6 +227,41 @@ self.onmessage = function(e) {
     } else if (ch === 0x0A) {
       line++;
       pos++;
+    } else if (ch === 0x27) { // quote
+      // Consume a string literal whole. HEADER records carry no '#', so this
+      // loop walks them byte by byte, and a '/*' inside a description would
+      // otherwise open a comment that never closes and take DATA with it.
+      var sp = pos + 1;
+      while (sp < len) {
+        if (buf[sp] === 0x27) {
+          if (sp + 1 < len && buf[sp + 1] === 0x27) { sp += 2; continue; }
+          sp++;
+          break;
+        }
+        if (buf[sp] === 0x0A) { line++; }
+        sp++;
+      }
+      pos = sp;
+    } else if (ch === 0x2F && pos + 1 < len && buf[pos + 1] === 0x2A) {
+      // Skip a /* */ region. A record that is commented out is still a
+      // well-formed #id = TYPE(...), so every check above accepts it and only
+      // skipping the region rejects it. Kept byte-identical to
+      // step-lexing.ts, which this cannot import: the worker source is a
+      // string, so the third copy of this loop has to carry its own copy of
+      // the rule. Comments do not nest, per ISO 10303-21.
+      var cp = pos + 2;
+      var closed = false;
+      while (cp + 1 < len) {
+        if (buf[cp] === 0x2A && buf[cp + 1] === 0x2F) { closed = true; break; }
+        if (buf[cp] === 0x0A) { line++; }
+        cp++;
+      }
+      if (!closed) {
+        // Unterminated: everything to EOF is commented out.
+        pos = len;
+        break;
+      }
+      pos = cp + 2;
     } else {
       pos++;
     }
@@ -210,6 +280,7 @@ self.onmessage = function(e) {
     lines: trimmedLines.buffer,
     types: types.slice(0, count),
     count: count,
+    oversizedIds: oversizedIds,
   }, [
     trimmedIds.buffer,
     trimmedOffsets.buffer,
@@ -236,13 +307,27 @@ function getWorkerBlobUrl(): string {
  */
 export function scanEntitiesInWorker(
   buffer: ArrayBuffer | SharedArrayBuffer,
-): Promise<EntityRefWorkerResult[]> {
+): Promise<EntityScanWorkerResult> {
   return new Promise((resolve, reject) => {
+    // Declared outside the try so the catch block below can still reach it:
+    // `new Worker(...)` can succeed and a later step in this same try (e.g.
+    // `postMessage` on an already-detached buffer, or under memory pressure
+    // while cloning a large one) can still throw. A `worker` scoped to the
+    // try block would be unreachable from `catch`, leaking the spawned
+    // worker — construct-then-fail with no handle to dispose it.
+    let worker: Worker | undefined;
     try {
-      const worker = new Worker(getWorkerBlobUrl());
+      worker = new Worker(getWorkerBlobUrl());
+      // TS loses the `worker` narrowing inside these closures (a captured
+      // `let` is re-widened to `Worker | undefined` at the point the
+      // callback body reads it), even though it is definitely assigned by
+      // the time either callback can run. Alias to a const so the handlers
+      // reference a known-`Worker` binding instead of asserting past the
+      // checker.
+      const activeWorker = worker;
 
-      worker.onmessage = (e: MessageEvent) => {
-        const { ids, offsets, lengths, lines, types, count } = e.data;
+      activeWorker.onmessage = (e: MessageEvent) => {
+        const { ids, offsets, lengths, lines, types, count, oversizedIds } = e.data;
         const idArr = new Uint32Array(ids);
         const offsetArr = new Uint32Array(offsets);
         const lengthArr = new Uint32Array(lengths);
@@ -259,19 +344,20 @@ export function scanEntitiesInWorker(
           };
         }
 
-        worker.terminate();
-        resolve(refs);
+        activeWorker.terminate();
+        resolve({ refs, oversizedIdCount: oversizedIds });
       };
 
-      worker.onerror = (e) => {
-        worker.terminate();
+      activeWorker.onerror = (e) => {
+        activeWorker.terminate();
         reject(new Error(`Scan worker error: ${e.message}`));
       };
 
       // Send buffer copy to worker (structured clone — browser copies efficiently).
       // Do NOT transfer: caller needs the original buffer for columnar parsing.
-      worker.postMessage(buffer);
+      activeWorker.postMessage(buffer);
     } catch (err) {
+      worker?.terminate();
       reject(err);
     }
   });

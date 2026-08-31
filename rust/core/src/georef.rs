@@ -28,38 +28,6 @@ fn pset_value_string(prop: &DecodedEntity) -> Option<String> {
     }
 }
 
-/// Map an IFC unit label (e.g. "MILLIMETRE", "FOOT") to its metre scale.
-/// Mirrors the TS parser's `inferMapUnitScaleFromLabel` and the viewer's
-/// `inferMapUnitScale` so an ePSet_ProjectedCRS.MapUnit yields the same scale
-/// the native IfcProjectedCRS path resolves from the unit entity. Returns
-/// `None` for an absent/unknown unit (the ePSet convention then defers to the
-/// project length unit downstream).
-fn infer_map_unit_scale(label: &str) -> Option<f64> {
-    let n = label.to_uppercase();
-    if n.contains("US") && (n.contains("SURVEY") || n.contains("FTUS")) {
-        return Some(0.3048006096);
-    }
-    if n.contains("FOOT") || n.contains("FEET") {
-        return Some(0.3048);
-    }
-    if n.contains("MILLI") {
-        return Some(0.001);
-    }
-    if n.contains("CENTI") {
-        return Some(0.01);
-    }
-    if n.contains("DECI") {
-        return Some(0.1);
-    }
-    if n.contains("KILO") {
-        return Some(1000.0);
-    }
-    if n.contains("METRE") || n.contains("METER") {
-        return Some(1.0);
-    }
-    None
-}
-
 /// Where the georeferencing data was authored in the file.
 ///
 /// Single discriminator shared (string-for-string) with the TS parser's
@@ -260,6 +228,45 @@ impl GeoReference {
 /// Extract georeferencing from IFC content
 pub struct GeoRefExtractor;
 
+/// Resolve an `IfcConversionBasedUnit`'s `ConversionFactor` to metres.
+///
+/// `IFCMEASUREWITHUNIT: [0] ValueComponent, [1] UnitComponent` — the value is
+/// expressed IN the unit component, so a prefixed SI component multiplies it
+/// (0.3048 expressed in millimetres is not 0.3048 metres). Twin of
+/// `resolveMeasureWithUnit` in packages/parser/src/georef-extractor.ts.
+fn resolve_measure_with_unit(
+    decoder: &mut EntityDecoder,
+    conversion_unit: &DecodedEntity,
+) -> Option<f64> {
+    let measure_ref = conversion_unit.get_ref(3)?;
+    let measure = decoder.decode_by_id(measure_ref).ok()?;
+
+    let value_attr = measure.get(0)?;
+    let value = value_attr
+        .as_float()
+        .or_else(|| value_attr.as_int().map(|v| v as f64))?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+
+    let mut component_scale = 1.0_f64;
+    if let Some(component_ref) = measure.get_ref(1) {
+        if let Ok(component) = decoder.decode_by_id(component_ref) {
+            if component.ifc_type == IfcType::IfcSIUnit {
+                if let Some(prefix_attr) = component.get(2) {
+                    if !prefix_attr.is_null() {
+                        if let Some(prefix) = prefix_attr.as_enum() {
+                            component_scale = crate::units::get_si_prefix_multiplier(prefix);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(value * component_scale)
+}
+
 impl GeoRefExtractor {
     /// Extract georeferencing from decoder
     ///
@@ -387,33 +394,71 @@ impl GeoRefExtractor {
         if let Some(zone) = entity.get_string(5) {
             georef.map_zone = Some(zone.to_string());
         }
-        // Index 6: MapUnit (IfcNamedUnit ref). Mirrors the TS parser: when a
-        // MapUnit IS authored, default to METRE/1.0 and refine from the
-        // IFCSIUNIT prefix — a millimetre-based conversion must scale by
-        // 0.001 on the server exactly like in the browser. When absent, the
-        // project length unit applies (spec default) and both stay `None`.
+        // Index 6: MapUnit (IfcNamedUnit ref). Mirrors the TS parser
+        // (packages/parser/src/georef-extractor.ts): when a MapUnit IS
+        // authored, default to METRE/1.0 and refine from the unit entity — a
+        // millimetre-based or foot-based conversion must scale the same way on
+        // the server as in the browser. When absent, the project length unit
+        // applies (spec default) and both stay `None`.
+        //
+        // IfcNamedUnit is IfcSIUnit OR IfcConversionBasedUnit, and attribute 2
+        // means something different in each: `Prefix` on the first, `Name` on
+        // the second. Reading slot 2 as a prefix unconditionally meant a
+        // foot-based MapUnit — the exact form ifc-lite's own exporter writes
+        // (packages/export/src/step-georeferencing.ts) — matched no prefix and
+        // fell through to METRE at scale 1, a silent 3.28x error on every
+        // coordinate.
         if let Some(unit_ref) = entity.get_ref(6) {
             let mut unit_name = "METRE".to_string();
             let mut unit_scale = 1.0_f64;
             if let Ok(unit_entity) = decoder.decode_by_id(unit_ref) {
-                if unit_entity.ifc_type == IfcType::IfcSIUnit {
-                    // IFCSIUNIT: [0] Dimensions, [1] UnitType, [2] Prefix, [3] Name
-                    if let Some(prefix_attr) = unit_entity.get(2) {
-                        if !prefix_attr.is_null() {
-                            if let Some(prefix) = prefix_attr.as_enum() {
-                                let multiplier = crate::units::get_si_prefix_multiplier(prefix);
-                                if (multiplier - 1.0).abs() > f64::EPSILON {
-                                    unit_scale = multiplier;
-                                    let prefix_upper = prefix.to_ascii_uppercase();
-                                    unit_name = if prefix_upper == "MILLI" {
-                                        "MILLIMETRE".to_string()
-                                    } else {
-                                        format!("{prefix_upper}METRE")
-                                    };
+                match unit_entity.ifc_type {
+                    IfcType::IfcSIUnit => {
+                        // IFCSIUNIT: [0] Dimensions, [1] UnitType, [2] Prefix, [3] Name
+                        if let Some(prefix_attr) = unit_entity.get(2) {
+                            if !prefix_attr.is_null() {
+                                if let Some(prefix) = prefix_attr.as_enum() {
+                                    let multiplier =
+                                        crate::units::get_si_prefix_multiplier(prefix);
+                                    if (multiplier - 1.0).abs() > f64::EPSILON {
+                                        unit_scale = multiplier;
+                                        let prefix_upper = prefix.to_ascii_uppercase();
+                                        unit_name = if prefix_upper == "MILLI" {
+                                            "MILLIMETRE".to_string()
+                                        } else {
+                                            format!("{prefix_upper}METRE")
+                                        };
+                                    }
                                 }
                             }
                         }
                     }
+                    IfcType::IfcConversionBasedUnit => {
+                        // IFCCONVERSIONBASEDUNIT: [0] Dimensions, [1] UnitType,
+                        // [2] Name, [3] ConversionFactor (IfcMeasureWithUnit)
+                        let name = unit_entity
+                            .get(2)
+                            .and_then(|attr| attr.as_string())
+                            .map(|n| n.trim_matches('\'').trim().to_ascii_uppercase());
+                        // The name table first (it carries the exact defined
+                        // ratios, e.g. the US survey foot's 1200/3937), then
+                        // the file's own declared factor for an unknown name.
+                        let scale = name
+                            .as_deref()
+                            .and_then(crate::units::get_conversion_based_unit_factor)
+                            .or_else(|| {
+                                resolve_measure_with_unit(decoder, &unit_entity)
+                            });
+                        if let Some(scale) = scale {
+                            if scale.is_finite() && scale > 0.0 {
+                                unit_scale = scale;
+                                if let Some(name) = name {
+                                    unit_name = name;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             georef.map_unit = Some(unit_name);
@@ -580,7 +625,7 @@ impl GeoRefExtractor {
                     // Parity with the native IfcProjectedCRS path: derive the
                     // metre scale from the unit label so consumers don't default
                     // explicit non-metre ePSet offsets to metres.
-                    georef.map_unit_scale = value.as_deref().and_then(infer_map_unit_scale);
+                    georef.map_unit_scale = value.as_deref().and_then(crate::unit_labels::infer_map_unit_scale);
                     georef.map_unit = value;
                 }
                 _ => {}
@@ -709,85 +754,5 @@ impl RtcOffset {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_georef_local_to_map() {
-        let mut georef = GeoReference::new();
-        georef.eastings = 500000.0;
-        georef.northings = 5000000.0;
-        georef.orthogonal_height = 100.0;
-
-        let (e, n, h) = georef.local_to_map(10.0, 20.0, 5.0);
-        assert!((e - 500010.0).abs() < 1e-10);
-        assert!((n - 5000020.0).abs() < 1e-10);
-        assert!((h - 105.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_georef_map_to_local() {
-        let mut georef = GeoReference::new();
-        georef.eastings = 500000.0;
-        georef.northings = 5000000.0;
-        georef.orthogonal_height = 100.0;
-
-        let (x, y, z) = georef.map_to_local(500010.0, 5000020.0, 105.0);
-        assert!((x - 10.0).abs() < 1e-10);
-        assert!((y - 20.0).abs() < 1e-10);
-        assert!((z - 5.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_georef_with_rotation() {
-        let mut georef = GeoReference::new();
-        georef.eastings = 0.0;
-        georef.northings = 0.0;
-        // 90 degree rotation
-        georef.x_axis_abscissa = 0.0;
-        georef.x_axis_ordinate = 1.0;
-
-        let (e, n, _) = georef.local_to_map(10.0, 0.0, 0.0);
-        // After 90 degree rotation: (10, 0) -> (0, 10)
-        assert!(e.abs() < 1e-10);
-        assert!((n - 10.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_rtc_offset() {
-        let positions = vec![
-            500000.0f32,
-            5000000.0,
-            0.0,
-            500010.0,
-            5000010.0,
-            10.0,
-            500020.0,
-            5000020.0,
-            20.0,
-        ];
-
-        let offset = RtcOffset::from_positions(&positions);
-        assert!(offset.is_significant());
-        assert!((offset.x - 500010.0).abs() < 1.0);
-        assert!((offset.y - 5000010.0).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_rtc_apply() {
-        let mut positions = vec![500000.0f32, 5000000.0, 0.0, 500010.0, 5000010.0, 10.0];
-
-        let offset = RtcOffset {
-            x: 500000.0,
-            y: 5000000.0,
-            z: 0.0,
-        };
-
-        offset.apply(&mut positions);
-
-        assert!((positions[0] - 0.0).abs() < 1e-5);
-        assert!((positions[1] - 0.0).abs() < 1e-5);
-        assert!((positions[3] - 10.0).abs() < 1e-5);
-        assert!((positions[4] - 10.0).abs() < 1e-5);
-    }
-}
+#[path = "georef_tests.rs"]
+mod georef_tests;

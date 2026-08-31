@@ -51,6 +51,21 @@ describe('matchConstraint — simpleValue', () => {
     expect(matchConstraint(sv('42'), '42.0000005')).toBe(true); // within tolerance
   });
 
+  it('scales the numeric tolerance with the magnitude of the IDS value', () => {
+    // Every other numeric fixture here has |value| <= 42 and a delta of 5e-7,
+    // so a FLAT 1e-6 passes all of them and the relative term
+    // `1e-6 * (1 + |castValue|)` in numericEpsilon is unexercised. At 1e6 the
+    // two differ by six orders of magnitude: relative gives ~1.0, flat gives
+    // 1e-6. This is the real case — a length in millimetres round-tripped
+    // through text loses more than 1e-6 absolute.
+    expect(matchConstraint(sv('1000000'), 1000000.5)).toBe(true);
+    // ...and the tolerance must stay a tolerance: still bounded, not open.
+    expect(matchConstraint(sv('1000000'), 1000002)).toBe(false);
+    // The scaling is relative, so a small value keeps a small window: 0.5 is
+    // nowhere near 1, even though 0.5 was accepted as slack at 1e6 above.
+    expect(matchConstraint(sv('1'), 1.5)).toBe(false);
+  });
+
   it('matches boolean true (strict lowercase per IDS spec)', () => {
     expect(matchConstraint(sv('true'), true)).toBe(true);
     // Numeric `1` / `0` are NOT valid boolean literals per IDS 1.0.
@@ -322,6 +337,83 @@ describe('matchConstraint — bounds', () => {
   it('no bounds specified accepts any number', () => {
     expect(matchConstraint(bounds({}), 999)).toBe(true);
     expect(matchConstraint(bounds({}), -999)).toBe(true);
+  });
+});
+
+// ============================================================================
+// matchConstraint — bounds (string-length facets: xs:length / xs:minLength /
+// xs:maxLength)
+// ============================================================================
+
+describe('matchConstraint — bounds (length facets)', () => {
+  const bounds = (
+    opts: Partial<IDSBoundsConstraint>
+  ): IDSBoundsConstraint => ({
+    type: 'bounds',
+    ...opts,
+  });
+
+  describe('length (exact)', () => {
+    const c = bounds({ length: 4 });
+
+    it('passes when the string length exactly matches', () => {
+      expect(matchConstraint(c, 'abcd')).toBe(true);
+    });
+
+    it('fails when the string is one character shorter', () => {
+      expect(matchConstraint(c, 'abc')).toBe(false);
+    });
+
+    it('fails when the string is one character longer', () => {
+      expect(matchConstraint(c, 'abcde')).toBe(false);
+    });
+  });
+
+  describe('minLength', () => {
+    const c = bounds({ minLength: 3 });
+
+    it('passes exactly at the boundary', () => {
+      expect(matchConstraint(c, 'abc')).toBe(true);
+    });
+
+    it('fails one character below the boundary', () => {
+      expect(matchConstraint(c, 'ab')).toBe(false);
+    });
+
+    it('passes above the boundary', () => {
+      expect(matchConstraint(c, 'abcd')).toBe(true);
+    });
+  });
+
+  describe('maxLength', () => {
+    const c = bounds({ maxLength: 5 });
+
+    it('passes exactly at the boundary', () => {
+      expect(matchConstraint(c, 'abcde')).toBe(true);
+    });
+
+    it('fails one character above the boundary', () => {
+      expect(matchConstraint(c, 'abcdef')).toBe(false);
+    });
+
+    it('passes below the boundary', () => {
+      expect(matchConstraint(c, 'abcd')).toBe(true);
+    });
+  });
+
+  it('minLength and maxLength combined form a range', () => {
+    const c = bounds({ minLength: 2, maxLength: 3 });
+    expect(matchConstraint(c, 'a')).toBe(false);
+    expect(matchConstraint(c, 'ab')).toBe(true);
+    expect(matchConstraint(c, 'abc')).toBe(true);
+    expect(matchConstraint(c, 'abcd')).toBe(false);
+  });
+
+  it('length is evaluated against the string form of a numeric value', () => {
+    // actualValue may arrive as a number (e.g. a numeric IFC attribute);
+    // the length facets still operate on its textual representation.
+    expect(matchConstraint(bounds({ length: 3 }), 123)).toBe(true);
+    expect(matchConstraint(bounds({ length: 3 }), 12)).toBe(false);
   });
 });
 

@@ -1,5 +1,49 @@
 # @ifc-lite/pointcloud
 
+## 0.7.1
+
+### Patch Changes
+
+- [#3010](https://github.com/LTplus-AG/ifc-lite/pull/3010) [`20264d8`](https://github.com/LTplus-AG/ifc-lite/commit/20264d8b1ee82169a02f9dc588decc45fb8fdc00) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a decode-worker resource leak: `handleOpen` registered a newly-opened `StreamingPointSource` into the worker's `sources` map before reporting `{ kind: 'opened', sourceId }` back to the main thread. If that report failed to post, the client never learned the source's id and could therefore never send `close`/`abort` for it, leaking the source (its file reader / native buffers) for the life of the worker. The worker now reports success first and only registers the source once that succeeds, releasing it itself if reporting fails.
+
+## 0.7.0
+
+### Minor Changes
+
+- [#2623](https://github.com/LTplus-AG/ifc-lite/pull/2623) [`2bd854d`](https://github.com/LTplus-AG/ifc-lite/commit/2bd854de15965b0fee684ef6fda90f2984d3e6f0) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Extend [#1804](https://github.com/LTplus-AG/ifc-lite/issues/1804)'s LAS/LAZ `originOffset` precision fix to the other four point-cloud formats: `decodeE57Packet`/`decodeE57Scan`/`decodeE57`/`applyPoseInPlace`, `decodePcd`, `decodePly`, and `decodeAsciiPoints`/`decodeAsciiPointsFromText` all gain an optional `originOffset` (native X/Y/Z), subtracted in f64 before narrowing to f32, matching `decodeLasPoints`'s existing parameter shape. Their streaming sources (`E57StreamingSource`, `PcdStreamingSource`, `PlyStreamingSource`, `AsciiPointsStreamingSource`) thread it through the same way LAS/LAZ already did.
+
+  A georeferenced E57 scan or a PTS/XYZ export at survey/state-plane magnitude (~1e6 m) previously quantised to ~0.12 m of per-point noise on decode — worse at higher magnitudes — before any alignment math ever saw the coordinates. E57 scans with a `<pose>` compose the offset onto the pose's translation (post-rotation) rather than the pre-rotation local cartesian, so an origin shift never gets rotated along with the points.
+
+  All new parameters are optional and additive — omitting them reproduces prior behaviour byte-for-byte.
+
+  `decodePly` is now exported from the package root alongside `decodePcd`/`decodeAsciiPoints`/`decodeE57Scan`, matching the other three format decoders — it was the one omission from that set.
+
+  **Adversarial review fix**: the viewer's `computePointCloudAlignment()` (`apps/viewer/src/hooks/ingest/pointCloudAlignment.ts`) previously derived its decode-time offset in the model's `IfcProjectedCRS.MapUnit` unconditionally — correct for LAS/LAZ, which stores coordinates natively in that unit, but wrong for every format this change threads the offset to: E57 cartesian coordinates are metres by spec (ASTM E2807) regardless of MapUnit, and PCD/PLY/PTS/XYZ have no unit convention of their own. Removing the LAS/LAZ-only alignment gate (this PR) fed the same MapUnit-native offset into all five decoders unchanged, so a scan point exactly at the conversion origin under a non-metre MapUnit (e.g. feet) decoded thousands of kilometres off. `computePointCloudAlignment` now takes a `sourceUnit: 'mapUnit' | 'metre'` parameter that the viewer passes per format (`'mapUnit'` for LAS/LAZ, `'metre'` for E57/PCD/PLY/PTS/XYZ — metres is the explicit, documented assumption for the formats with no convention of their own, not a silent default); it derives both the offset and the aligned matrix's linear scale factor consistently for whichever unit was requested. LAS/LAZ behaviour is unchanged.
+
+## 0.6.1
+
+### Patch Changes
+
+- [#2325](https://github.com/LTplus-AG/ifc-lite/pull/2325) [`bf44de2`](https://github.com/LTplus-AG/ifc-lite/commit/bf44de2d8d023f22e2f4010a0c7832543221909e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `LasStreamingSource` silently emitting fabricated zero-valued points instead of erroring when a LAS file's header declares more points than the body actually backs (truncated download, corrupt/lying producer) and downsampling (`stride > 1`) is active.
+
+  The strided-read branch of `next()` always allocated its scratch buffer at the full requested size and copied into it via `subarray`/`set`; `subarray` silently saturates instead of throwing when the source slab is short, so the missing tail landed as zero bytes rather than raising an error, and those zero-derived points were reported as real decoded data. The `stride === 1` branch was already safe because it hands the (possibly short) slab straight to `decodeLasPoints`, whose own length check catches it. The strided branch now checks the read slab's length against what the requested strided window needs and throws a clear "file truncated?" error instead of fabricating points.
+
+## 0.6.0
+
+### Minor Changes
+
+- [#2113](https://github.com/LTplus-AG/ifc-lite/pull/2113) [`a25dd32`](https://github.com/LTplus-AG/ifc-lite/commit/a25dd32a78626a0ed697a21ed2c4963641bb7b89) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `probeLazPerfWasmLoad()`, an internal E2E test hook that exercises the real laz-perf wasm loader (the Vite `?url` asset fetch plus the `Module.wasmBinary` hand-off to emscripten) without needing a `.laz` fixture. No other test drove this path for real: every existing test substitutes the loader via `setLazPerfLoaderForTesting()`, so a broken `?url` resolution or a broken `wasmBinary` hand-off stayed invisible until a real browser tried to open a LAZ file ([#2097](https://github.com/LTplus-AG/ifc-lite/issues/2097)). Used by `apps/viewer`'s `laz-probe.html` (E2E-only, not linked from the app UI) and asserted by `tests/e2e/laz-wasm.e2e.spec.ts` against a real production build.
+
+### Patch Changes
+
+- [#2086](https://github.com/LTplus-AG/ifc-lite/pull/2086) [`9d9c804`](https://github.com/LTplus-AG/ifc-lite/commit/9d9c8049075c9d8692a483ef1fa75325e822c15a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Retry the `laz-perf` wasm load after a transient failure instead of poisoning every future `.laz` open.
+
+  `LazStreamingSource.open()` shares one lazily-instantiated wasm module across every source, memoised in a module-level `modulePromise`. That promise was assigned once and never cleared, so a rejection was cached exactly like a success: a single failed wasm fetch — a 404 from a misconfigured asset path, an offline blip, a 5xx from the CDN — left every subsequent LAZ open replaying the same rejected promise for the lifetime of the page. The user re-dropped the file and got the identical error, with no fetch ever attempted again; only a reload recovered.
+
+  The memo now lives in a small `memoizeAsync` helper that drops the cached promise when the load rejects, so the next `open()` retries. A fulfilled module is still cached forever, and concurrent opens still collapse onto a single in-flight load — dropping several `.laz` files at once instantiates the wasm once, as before. This matches the remedy already applied to `@ifc-lite/query`'s `DuckDBIntegration.init()`, which clears its cached `initPromise` on failure for the same reason.
+
+  There is deliberately no backoff: retries here are driven by a user re-opening a file, not by a polling loop, and a batch of simultaneous opens already shares one attempt.
+
 ## 0.5.0
 
 ### Minor Changes

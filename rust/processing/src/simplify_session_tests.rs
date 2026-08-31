@@ -7,7 +7,9 @@
 //! `module_size_ratchet` budget; `_tests.rs` files are exempt from that
 //! ratchet (see `module_size_ratchet.rs`'s `is_exempt`).
 
-use crate::simplify_math::zup_to_yup;
+use crate::simplify_math::{
+    conjugate_yup_to_zup, invert_affine_row_major, matmul_row_major, zup_to_yup,
+};
 use crate::simplify_session::*;
 
 /// Indexed 12-tri box between min/max, IFC Z-up frame, zero normals.
@@ -117,17 +119,25 @@ fn yup_frame_round_trips_and_restores_winding() {
         tri.swap(1, 2);
     }
     let normals_y = vec![0.0; positions_y.len()];
+    // A non-zero per-mesh origin with three distinct components, so the
+    // `yup_to_zup(rec.origin)` swap is observable: with `origin: [0; 3]`
+    // (or any origin whose components coincide) dropping the swap moves
+    // nothing, and `let origin = rec.origin;` passes unnoticed.
+    let origin_z = [1.0, 2.0, 3.0];
+    let origin_y = zup_to_yup(origin_z);
     let rec = SimplifyRecordInput {
         positions: &positions_y,
         normals: &normals_y,
         indices: &indices_y,
-        origin: [0.0; 3],
+        origin: origin_y,
         // Identity conjugates to identity.
         local_to_world: Some(IDENTITY),
     };
     let out = simplify_element(&[rec], 5, [0.0; 3], 1.0, true).unwrap();
 
-    // IFC-local output must be back in Z-up: extents match the Z-up box.
+    // IFC-local output must be back in Z-up: the Z-up box [0,2]x[0,3]x[0,4]
+    // offset by the Z-up origin (1,2,3) => [1,3]x[2,5]x[3,7]. Skipping the
+    // origin swap would place it at [1,3]x[3,6]x[2,6] instead.
     let (mut lmin, mut lmax) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
     for c in out.local_positions.chunks_exact(3) {
         for k in 0..3 {
@@ -135,12 +145,25 @@ fn yup_frame_round_trips_and_restores_winding() {
             lmax[k] = lmax[k].max(c[k]);
         }
     }
-    assert!((lmax[0] - 2.0).abs() < 1e-6);
-    assert!((lmax[1] - 3.0).abs() < 1e-6);
-    assert!((lmax[2] - 4.0).abs() < 1e-6);
+    let expect_lmin = [1.0, 2.0, 3.0];
+    let expect_lmax = [3.0, 5.0, 7.0];
+    for k in 0..3 {
+        assert!(
+            (lmin[k] - expect_lmin[k]).abs() < 1e-6,
+            "local min axis {k}: {} != {}",
+            lmin[k],
+            expect_lmin[k]
+        );
+        assert!(
+            (lmax[k] - expect_lmax[k]).abs() < 1e-6,
+            "local max axis {k}: {} != {}",
+            lmax[k],
+            expect_lmax[k]
+        );
+    }
 
-    // Render output stays in the caller's Y-up frame: the Z-up box
-    // [0,2]x[0,3]x[0,4] swaps to x[0,2], y[0,4], z[-3,0]; positions are
+    // Render output stays in the caller's Y-up frame: the Z-up world box
+    // [1,3]x[2,5]x[3,7] swaps to x[1,3], y[3,7], z[-5,-2]; positions are
     // relative to render_origin, so reconstruct world = origin + p.
     let (mut rmin, mut rmax) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
     for c in out.render_positions.chunks_exact(3) {
@@ -150,10 +173,90 @@ fn yup_frame_round_trips_and_restores_winding() {
             rmax[k] = rmax[k].max(w);
         }
     }
-    assert!((rmax[0] - 2.0).abs() < 1e-5);
-    assert!((rmax[1] - 4.0).abs() < 1e-5);
-    assert!((rmin[2] - -3.0).abs() < 1e-5);
-    assert!(rmax[2].abs() < 1e-5);
+    let expect_rmin = [1.0, 3.0, -5.0];
+    let expect_rmax = [3.0, 7.0, -2.0];
+    for k in 0..3 {
+        assert!(
+            (rmin[k] - expect_rmin[k]).abs() < 1e-5,
+            "render min axis {k}: {} != {}",
+            rmin[k],
+            expect_rmin[k]
+        );
+        assert!(
+            (rmax[k] - expect_rmax[k]).abs() < 1e-5,
+            "render max axis {k}: {} != {}",
+            rmax[k],
+            expect_rmax[k]
+        );
+    }
+}
+
+#[test]
+fn conjugate_yup_to_zup_recovers_a_non_identity_matrix() {
+    // `yup_frame_round_trips_and_restores_winding` only exercises
+    // `conjugate_yup_to_zup` through the identity matrix, where
+    // `S * I * S^T == S^T * I * S == I` for any orthogonal `S` — so a
+    // mutation swapping the multiplication order (`S * M' * S^T` instead
+    // of the documented `S^T * M' * S`) is invisible there. Pin it with a
+    // translation whose x/y/z are distinct, so the two orders diverge.
+    let m = [
+        1.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0, 20.0, 0.0, 0.0, 1.0, 30.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    // Forward boundary conjugation `M' = S * M * S^T`
+    // (`zero_copy::mesh::swap_zup_to_yup_mat4`'s convention), built from
+    // the same S/S^T this module documents in `conjugate_yup_to_zup`.
+    #[rustfmt::skip]
+    let s: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, -1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    #[rustfmt::skip]
+    let st: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    let m_prime = matmul_row_major(&matmul_row_major(&s, &m), &st);
+    let recovered = conjugate_yup_to_zup(&m_prime);
+    for (i, (a, b)) in recovered.iter().zip(m.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-9, "index {i}: {recovered:?} != {m:?}");
+    }
+}
+
+#[test]
+fn invert_affine_row_major_inverts_a_rotated_placement() {
+    // Every existing `local_to_world` fixture in this file uses an identity
+    // (diagonal) linear block, so the cofactor cross terms in
+    // `invert_affine_row_major`'s determinant (e.g. `a[3] * a[7] - a[4] *
+    // a[6]`) are always `0 * 0`, and a sign flip there is invisible —
+    // worse, even a pure axis-aligned 90-degree rotation keeps one row a
+    // unit vector and re-zeroes the same cross term. Use a fully generic
+    // invertible linear block (every entry nonzero and distinct) so the
+    // determinant's cofactor expansion is actually exercised, and check
+    // the round trip `M * M^-1 == I` directly rather than re-deriving the
+    // expected inverse by hand.
+    #[rustfmt::skip]
+    let m: [f64; 16] = [
+        2.0, 1.0, 3.0, 5.0,
+        4.0, 5.0, 1.0, 7.0,
+        2.0, 3.0, 6.0, 9.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    let inv = invert_affine_row_major(&m).expect("rotation matrix is non-singular");
+    let round_trip = matmul_row_major(&m, &inv);
+    #[rustfmt::skip]
+    let identity: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    for (i, (a, b)) in round_trip.iter().zip(identity.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-9, "index {i}: {round_trip:?} != identity");
+    }
 }
 
 #[test]

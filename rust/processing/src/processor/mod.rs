@@ -23,13 +23,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 mod color_layer;
-mod instancing;
+pub(crate) mod instancing;
 mod jobs;
 mod opening_filter;
 mod properties;
 mod quick_metadata;
 mod site_local;
 
+pub use quick_metadata::is_quick_spatial_type_ci;
 pub use site_local::convert_mesh_to_site_local;
 
 use jobs::{build_color_updates_for_jobs, process_entity_job};
@@ -42,8 +43,7 @@ use opening_filter::apply_opening_filter;
 use properties::resolve_space_zone_properties_lazy;
 use quick_metadata::{
     build_quick_spatial_tree_node, extract_name_from_args, extract_storey_elevation_from_args,
-    is_quick_spatial_type_ci, parse_step_arguments, parse_step_ref, parse_step_ref_list,
-    QuickSpatialNodeEntry,
+    parse_step_arguments, parse_step_ref, parse_step_ref_list, QuickSpatialNodeEntry,
 };
 use site_local::{
     translation_is_nonidentity, MODEL_RTC_MESH_COORDINATE_SPACE, RAW_IFC_MESH_COORDINATE_SPACE,
@@ -737,6 +737,34 @@ pub fn process_geometry_streaming_filtered_with_options(
                 space_zone_properties: None,
                 representation_map_id: None,
             });
+        } else if ifc_lite_core::is_representationless_spatial_container_by_name(type_name)
+            && ifc_lite_core::nth_attribute_is_present(&content[start..end], 6)
+        {
+            // #1910: `has_geometry_by_name` excludes spatial containers like
+            // `IfcBuilding` because in virtually every real file they are
+            // pure hierarchy nodes with a null Representation. A DGM/terrain
+            // export that attaches its `IfcShellBasedSurfaceModel` directly
+            // to `IfcBuilding` (no `IfcBuildingElement` children at all) is
+            // the exceptional counter-example: its geometry must still be
+            // scheduled for meshing, or the file loads with correct metadata
+            // but renders nothing. Deliberately skips the
+            // `quick_element_summaries` insert above — the spatial tree
+            // already carries this entity as a node (`spatial_nodes`), so an
+            // extra "element" summary row would duplicate it in the UI tree.
+            let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+            entity_jobs.push(EntityJob {
+                id,
+                ifc_type,
+                start,
+                end,
+                product_definition_shape_id: None,
+                element_color: crate::style::default_color_for_type(ifc_type).to_array(),
+                global_id: None,
+                name: None,
+                presentation_layer: None,
+                space_zone_properties: None,
+                representation_map_id: None,
+            });
         }
         // #957: collect type-product geometry (IfcXxxType carrying its own
         // RepresentationMaps) and every IfcMappedItem's MappingSource, so after
@@ -770,9 +798,7 @@ pub fn process_geometry_streaming_filtered_with_options(
             if let Some(type_id) = args.get(5).and_then(|token| parse_step_ref(token)) {
                 instantiated_type_ids.insert(type_id);
             }
-        } else if (type_name.ends_with("TYPE") || type_name.ends_with("STYLE"))
-            && IfcType::from_str(type_name).is_subtype_of(IfcType::IfcTypeProduct)
-        {
+        } else if let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) {
             let args = parse_step_arguments(&content[start..end]);
             // IfcTypeProduct.RepresentationMaps is attribute index 6.
             let rep_map_ids = args
@@ -780,16 +806,16 @@ pub fn process_geometry_streaming_filtered_with_options(
                 .map(|token| parse_step_ref_list(token))
                 .unwrap_or_default();
             if !rep_map_ids.is_empty() {
-                type_product_geometry.push((
-                    id,
-                    start,
-                    end,
-                    IfcType::from_str(type_name),
-                    rep_map_ids,
-                ));
+                type_product_geometry.push((id, start, end, type_ty, rep_map_ids));
             }
         }
     }
+
+    // The scan just refused every record whose instance name is wider than
+    // `u32` (#3395). This is the native/server load's only whole-file walk, so
+    // those records are simply not in the result — say so rather than returning
+    // a model that is short by a count nobody read.
+    ifc_lite_core::report_oversized_ids(scanner.skipped_oversized_ids());
 
     // #957: synthesize render jobs for orphan type-product geometry — a
     // RepresentationMap on an IfcXxxType that no IfcMappedItem instantiates.
@@ -1601,7 +1627,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                 is_geo_referenced: has_rtc_offset,
             },
             length_unit_scale: Some(unit_scale),
-            georeferencing: crate::extract_georeferencing(content),
+            georeferencing: crate::extract_georeferencing_with_index(content, &entity_index_arc),
         },
         stats: ProcessingStats {
             total_meshes,
@@ -1629,5 +1655,5 @@ pub fn process_geometry_streaming_filtered_with_options(
 // `crate::style::default_color_for_type` (issue #913). Do not reintroduce a
 // per-module table here — see `tests/styling_parity.rs` for the guard.
 //
-// `find_geometry_item_color_follows_mapped_item` lives in `crate::element::tests`,
-// next to the resolver it pins.
+// `find_geometry_item_color_follows_mapped_item` lives in `crate::element::tests`;
+// the resolver it pins moved to `element/element_color.rs`.

@@ -26,10 +26,12 @@ import {
   type DataStoreTransport,
   type ParserMemorySnapshot,
 } from './data-store-transport.js';
+import { contiguousSourceBytes } from './source-bytes.js';
 import type {
   ParserWorkerInputMessage,
   ParserWorkerOutputMessage,
 } from './parser.worker.js';
+import { restashWasmPanicLocation } from './wasm-panic-forward.js';
 
 export interface WorkerParserOptions extends ParseOptions {
   /** Override the worker URL. Default: bundler-resolved `parser.worker.ts`. */
@@ -57,6 +59,7 @@ export class WorkerParser {
     ids: Uint32Array;
     starts: Uint32Array;
     lengths: Uint32Array;
+    oversizedIdCount?: number;
   } | null = null;
 
   /**
@@ -106,9 +109,16 @@ export class WorkerParser {
       }
       this.worker = worker;
 
-      // Reusable receiver-side view of the shared bytes. Both the partial
-      // and final store on the main thread alias the same SAB.
-      const sourceView = new Uint8Array(source);
+      // ONE accessor, shared by the partial store and the final one. Both
+      // alias the same SAB, so this is not merely tidy: `contentKey` is
+      // memoised per accessor instance, and the viewer's overlay hooks read it
+      // off whichever store is active. Building an accessor per `fromTransport`
+      // call would hash the whole file once for the partial store and again for
+      // the final one -- two full walks of a 342 MB source on the main thread,
+      // on exactly the models #2183 is about. The previous code got one hash by
+      // memoising on the shared Uint8Array; sharing the accessor is the same
+      // guarantee without the side table.
+      const sourceBytes = contiguousSourceBytes(new Uint8Array(source));
 
       const settle = (cleanup: () => void) => {
         worker.onmessage = null;
@@ -133,7 +143,7 @@ export class WorkerParser {
           case 'partial-store': {
             if (!options.onSpatialReady) return;
             try {
-              const partial = fromTransport(msg.payload as DataStoreTransport, sourceView);
+              const partial = fromTransport(msg.payload as DataStoreTransport, sourceBytes);
               options.onSpatialReady(partial);
             } catch (err) {
               // Don't fail the whole parse on partial deserialization
@@ -145,7 +155,7 @@ export class WorkerParser {
 
           case 'complete': {
             try {
-              const dataStore = fromTransport(msg.payload as DataStoreTransport, sourceView);
+              const dataStore = fromTransport(msg.payload as DataStoreTransport, sourceBytes);
               options.onMemorySnapshot?.(msg.memory);
               settle(() => {
                 worker.terminate();
@@ -163,6 +173,12 @@ export class WorkerParser {
           }
 
           case 'error':
+            // #2527 follow-up: re-plant the worker realm's panic-location
+            // stash (if this error was a wasm trap) on THIS realm's global,
+            // before the rejection below propagates, so
+            // `attachWasmPanicLocation` in analytics-scrub.ts sees it
+            // exactly as it would a main-thread trap.
+            restashWasmPanicLocation(globalThis, msg.wasmPanicLocation, msg.wasmPanicAt, msg.message);
             settle(() => {
               worker.terminate();
               this.worker = null;
@@ -200,6 +216,7 @@ export class WorkerParser {
             ids: queued.ids,
             starts: queued.starts,
             lengths: queued.lengths,
+            oversizedIdCount: queued.oversizedIdCount,
           });
         } catch (err) {
           console.warn('[WorkerParser] queued setEntityIndex failed:', err);
@@ -214,7 +231,21 @@ export class WorkerParser {
         deferPropertyAtomIndex: options.deferPropertyAtomIndex,
         waitForEntityIndex: options.waitForEntityIndex,
       };
-      worker.postMessage(input);
+      try {
+        worker.postMessage(input);
+      } catch (err) {
+        // postMessage can itself throw (e.g. a DataCloneError from structured
+        // clone). It's called after the worker is spawned, assigned to
+        // `this.worker`, and its handlers attached, so without this catch the
+        // Promise executor's synchronous throw auto-rejects the returned
+        // promise while nothing ever calls settle() — the worker thread is
+        // left running (and `this.worker` left pointing at it) forever.
+        settle(() => {
+          worker.terminate();
+          this.worker = null;
+        });
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -223,10 +254,20 @@ export class WorkerParser {
    * geometry pre-pass). May be called before or after `parseColumnar` —
    * if before, the payload is queued and posted as soon as the worker is
    * spawned. The parser worker uses the index to skip its WASM scan.
+   *
+   * `oversizedIdCount` is how many records the pre-pass refused for an express
+   * id above the u32 bound (#3395). Pass it: the columns cannot carry a record
+   * that was refused, so a caller that drops the number leaves the parse
+   * reporting a clean load that is short by exactly that many entities.
    */
-  setEntityIndex(ids: Uint32Array, starts: Uint32Array, lengths: Uint32Array): void {
+  setEntityIndex(
+    ids: Uint32Array,
+    starts: Uint32Array,
+    lengths: Uint32Array,
+    oversizedIdCount?: number,
+  ): void {
     if (!this.worker) {
-      this.queuedEntityIndex = { ids, starts, lengths };
+      this.queuedEntityIndex = { ids, starts, lengths, oversizedIdCount };
       return;
     }
     try {
@@ -235,6 +276,7 @@ export class WorkerParser {
         ids,
         starts,
         lengths,
+        oversizedIdCount,
       });
     } catch (err) {
       console.warn('[WorkerParser] setEntityIndex postMessage failed:', err);

@@ -487,6 +487,74 @@ definitions and georeferencing offsets are left untouched. Length attributes
 specific to IFC4X3 (alignment / linear referencing) may not be rescaled — a
 `stats.warnings` advisory flags this.
 
+### Anonymized Isolated Export
+
+Some parsing or geometry bugs only reproduce on a client's actual model, which
+cannot be shared for debugging. The anonymized isolated export picks the
+offending object(s), expands the selection to the context a reproduction
+needs (host wall, openings/fillers, the storey/building/site/project chain,
+type objects, materials, aggregate parents/children), and exports **only**
+that subset with every project-identifying signal removed — while keeping
+the geometry-relevant local transformations (placement rotations,
+non-orthogonal cuts) so the bug still reproduces:
+
+```typescript
+import { collectRelatedEntities, exportAnonymizedSubset } from '@ifc-lite/export';
+
+// Seed selection: e.g. the window an offending model fails to parse around.
+const seeds = new Set([312]); // expressId(s) of the seed entity/entities
+
+// Expand by relationship context: host, openings/fillers, type, materials,
+// and the spatial containment chain up to IfcProject (all on by default).
+const related = collectRelatedEntities(store, seeds);
+
+// Export exactly that subset, anonymized.
+const result = exportAnonymizedSubset(store, related.all);
+await saveFile('anonymized.ifc', result.content);
+
+// Old GlobalId -> regenerated GlobalId, kept OUT of the exported file itself.
+console.log(result.guidMap.size, result.stats.warnings);
+```
+
+`RelatedEntityOptions` toggles which relationship kinds `collectRelatedEntities`
+expands (`IfcRelVoidsElement`, `IfcRelFillsElement`, `IfcRelAggregates`,
+`IfcRelNests`, `IfcRelDefinesByType`, `IfcRelAssociatesMaterial`,
+`IfcRelContainedInSpatialStructure`, `IfcRelDefinesByProperties`, and a
+bounded `IfcRelConnectsPathElementsDepth`) and how far; `IfcProject` is
+always included regardless of any toggle. `AnonymizeOptions` toggles what
+`exportAnonymizedSubset` scrubs — every field defaults to the
+maximally-scrubbed direction, so the call above with no options is the
+intended common case:
+
+| Kept by default | Removed/replaced by default |
+|---|---|
+| `PredefinedType`, enum-valued attributes | `Name`/`LongName`/`Description`/`Tag` on `IfcRoot` → `<IfcType>-<n>` pseudonym (`pseudonymizeNames`) |
+| Materials, representation, styles (their geometry/colour values) | `ObjectType`, `IfcTypeObject.ApplicableOccurrence`, `IfcElementType.ElementType`, `IfcProject.Phase`, and quoted `Name`/`LongName`/`Description`/`ProfileName`/`LayerSetName`/`Category` on non-`IfcRoot` entities — surface styles, materials, layers, profiles, colours (`pseudonymizeAllNames`) |
+| Units, geometric contexts, `RepresentationIdentifier` (`Body`, `Axis`) | `GlobalId` (regenerated; old→new in `result.guidMap`, never in the file) |
+| `preprocessor_version` (ifc-lite) | `IfcPropertySet`/`IfcElementQuantity` (unless `keepPropertySets`) |
+| `IfcApplication.ApplicationFullName` / `ApplicationIdentifier` | Root placement translation (rotation/`Axis`/`RefDirection` kept) |
+| Only the storeys/buildings the selection actually sits in (siblings are not pulled in) | `IfcMapConversion*`/`IfcProjectedCRS`, `IfcSite`/`IfcBuilding` address & georeferencing fields |
+| | `IfcPerson`/`IfcOrganization` fields, `IfcOwnerHistory` dates (`CreationDate` → 0, `LastModifiedDate` → `$`), `IfcApplication.Version`, STEP header author/organization/authorization/`originating_system` (`scrubOwnerHistory`) |
+| | `IfcMonetaryUnit.Currency` → USD (`neutralizeCurrency`) |
+
+The authoring tool's *name* is kept by decision (it is debugging signal) but
+its version/build string is not — vendors embed the licence region there
+(`26.0.0 NOR FULL`). Property/quantity *names* are kept whenever
+`keepPropertySets` is on; property/quantity *values* are never scrubbed,
+whether the pset is kept or dropped — a kept pset carries them exactly as
+authored, and a dropped one takes its values out of the file with it. The
+tool name and a kept pset's values are the residual leak surface; review a
+file before sharing it externally, and never name the download after the
+source model.
+
+The `IfcPropertySet`/`IfcElementQuantity` drop holds for `includedIds`
+regardless of how it was built — `collectRelatedEntities`'s
+`IfcRelDefinesByProperties` walk, or an id set assembled by hand — not only
+the CLI's `--keep-psets` and the viewer's "Property sets" toggle, which
+couple the same option to their own selection step. A dropped id is reported
+in `result.stats.droppedPropertySetIds`. The CLI equivalent is
+`ifc-lite anonymize` (see the [CLI guide](cli.md)).
+
 ## IFC5 (IFCX) Export
 
 Export a parsed model as an IFC5 IFCX document (JSON with USD-style composition):
@@ -506,12 +574,38 @@ await saveFile('model.ifcx', result.content);  // string; result.stats has count
 
 A Rust-side variant is also available as `GeometryProcessor.exportIfcx(bytes, onlyKnownProperties?, pretty?)`.
 
+## OpenUSD (.usda) Export
+
+Export a model as a real **OpenUSD ASCII** (`.usda`) stage — distinct from IFCX, which is
+USD-*flavored JSON*. The stage is Z-up (`upAxis = "Z"`, `metersPerUnit = 1`) and mirrors the
+IFC spatial hierarchy as `Xform` prims, with `UsdGeomMesh` geometry, `UsdPreviewSurface`
+materials, and IFC metadata (`ifc:class`, `ifc:GlobalId`, property/quantity sets) as custom
+attributes. It opens in usdview, Blender, and Omniverse.
+
+```bash
+# whole-model export (entity filters do not apply to USD)
+ifc-lite export model.ifc --format usd --out model.usda
+```
+
+One-call from the Rust-backed processor: `GeometryProcessor.exportUsd(bytes)` returns the
+`.usda` bytes (`null` before `init()`). The MCP tool is `export_usd` (`{ model_id?, file_path }`).
+Geometry that lives outside the spatial tree (opening elements, type-product meshes) is placed
+under a synthetic `Unassigned` prim rather than dropped, and each mesh carries its placement as a
+`double3 xformOp:translate` so georeferenced models keep full precision. The layer's
+`customLayerData` records the `generator` and a deterministic `sourceFingerprint` of the input
+bytes (a lineage anchor), and opening/space elements are tagged `purpose = "guide"` so they don't
+occlude the default render. Repeated mapped geometry (façade panels, MEP fittings, racks) is
+authored once as a referenced `class Mesh` prototype under `/World/Prototypes` and each occurrence
+references it with a per-occurrence transform — a file-size win that keeps every occurrence a
+distinct, queryable prim.
+
 ## Other Formats via GeometryProcessor
 
 The Rust exporter crate backs several more one-call formats on `GeometryProcessor`:
 
 | Method | Output |
 |--------|--------|
+| `exportUsd(bytes)` | OpenUSD ASCII (`.usda`) stage of the whole model |
 | `exportObj(bytes, includeNormals?, hidden?, isolated?)` | Wavefront OBJ of the render geometry |
 | `exportJson(bytes, pretty?, includeProperties?, includeQuantities?)` | Plain JSON entity dump |
 | `exportStep(bytes, schema?, included?, mutationsJson?)` | STEP/IFC re-export (Rust path) |
