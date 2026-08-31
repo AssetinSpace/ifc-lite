@@ -84,7 +84,7 @@ function generateEntityInterfaces(schema: ExpressSchema): string {
     code += '\n\n';
   }
 
-  return code;
+  return `${code.trimEnd()}\n`;
 }
 
 /**
