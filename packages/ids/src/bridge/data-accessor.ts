@@ -56,8 +56,9 @@ const PARTOF_REL_MAP: Record<PartOfRelation, readonly RelationshipType[]> = {
 /**
  * Bridge an `IfcDataStore` (produced by `@ifc-lite/parser`) into the
  * abstract `IFCDataAccessor` the IDS validator consumes. The single
- * canonical translation — viewer, MCP server, and the corpus-parity
- * harness all use this rather than re-implementing the projection.
+ * canonical translation: viewer, MCP server, and the buildingSMART corpus
+ * harness (`src/__corpus__/corpus.test.ts`) all use this rather than
+ * re-implementing the projection.
  *
  * Mirrors upstream `IfcOpenShell/ifctester` semantics: classification
  * sub-reference walking, IfcExternalReferenceRelationship for
@@ -173,6 +174,24 @@ export function createDataAccessor(store: IfcDataStore): IFCDataAccessor {
       );
     },
 
+    getSchemaVersion(): string | undefined {
+      return store.schemaVersion;
+    },
+
+    getTypeEntityType(expressId: number): string | undefined {
+      const typeIds =
+        store.relationships?.getRelated?.(
+          expressId,
+          RelationshipType.DefinesByType,
+          'inverse'
+        ) || [];
+      for (const typeId of typeIds) {
+        const t = accessor.getEntityType(typeId);
+        if (t) return t;
+      }
+      return undefined;
+    },
+
     getEntitiesByType(typeName: string): number[] {
       const ids = store.entityIndex?.byType?.get(typeName.toUpperCase());
       return ids ? Array.from(ids) : [];
@@ -253,7 +272,15 @@ export function createDataAccessor(store: IfcDataStore): IFCDataAccessor {
             out.push({
               expressId: parentId,
               entityType: accessor.getEntityType(parentId) || 'Unknown',
-              predefinedType: accessor.getObjectType(parentId),
+              // Raw enum token first (BEAM, USERDEFINED, …) — NOT
+              // getObjectType. getObjectType collapses USERDEFINED to the
+              // accompanying user-defined name, which loses the literal
+              // "USERDEFINED" token a spec may legitimately ask for (the
+              // same case entity-facet.ts's rawType branch accepts for a
+              // direct entity check). The user-defined name is carried
+              // separately in `objectType` as a fallback for partof-facet.
+              predefinedType: accessor.getPredefinedTypeRaw?.(parentId),
+              objectType: accessor.getObjectType(parentId),
             });
             queue.push(parentId);
           }

@@ -144,6 +144,29 @@ pub(crate) async fn extract_file(
 /// one candidate rather than silently guessing which model to load, and bounds
 /// the decompressed size (zip-bomb guard) against the same `max_bytes` ceiling
 /// the raw/gzip paths use.
+/// Whether an archive entry is a macOS AppleDouble sidecar rather than content.
+///
+/// Compressing in macOS Finder writes `__MACOSX/._<name>` beside each entry,
+/// carrying resource forks and extended attributes. It keeps the original
+/// extension, so `__MACOSX/._model.ifc` counted as a second model and every
+/// Mac-made archive was rejected as ambiguous (#2812, reported from
+/// production).
+///
+/// The test is the BASENAME, not the directory. `._` is what makes a file a
+/// sidecar; `__MACOSX/` is merely where macOS puts them, so matching on it is
+/// redundant (every entry inside is already `._`-prefixed) and wrong for a user
+/// whose archive genuinely contains a folder of that name. The basename form
+/// also covers a sidecar left beside its original by a rezip that flattens the
+/// directory away.
+///
+/// Mirrors `APPLE_DOUBLE_RE` in `packages/parser/src/ifczip.ts`. The two must
+/// agree, or an archive the browser accepts is rejected by the server.
+fn is_apple_double(name: &str) -> bool {
+    name.rsplit('/')
+        .next()
+        .is_some_and(|base| base.starts_with("._"))
+}
+
 fn unwrap_ifczip(
     bytes: &[u8],
     max_bytes: usize,
@@ -165,7 +188,7 @@ fn unwrap_ifczip(
         }
         let name = entry.name();
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".ifc") || lower.ends_with(".ifcxml") {
+        if (lower.ends_with(".ifc") || lower.ends_with(".ifcxml")) && !is_apple_double(name) {
             candidates.push((i, name.to_string()));
         }
     }
@@ -231,3 +254,127 @@ mod extract_file_tests;
 
 #[cfg(test)]
 mod ifczip_tests;
+
+#[cfg(test)]
+mod parquet_tests;
+
+#[cfg(test)]
+mod json_tests;
+
+#[cfg(test)]
+mod fetch_tests;
+
+#[cfg(test)]
+mod cache_keys_symbolic_tests;
+
+#[cfg(test)]
+mod resolved_tessellation_quality_tests {
+    use super::*;
+    use crate::error::ApiError;
+
+    /// Omitting the query parameter must resolve to the documented default
+    /// (`Medium`, byte-identical to pre-enum behavior) — not silently to some
+    /// other level. Coverage gap found via mutation testing: swapping this arm
+    /// to `TessellationQuality::Highest` survived the full `ifc-lite-server`
+    /// suite (83/83 passed) with zero test hitting this code path.
+    #[test]
+    fn none_resolves_to_medium_default() {
+        let query = ParseQuery {
+            tessellation_quality: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            query.resolved_tessellation_quality().unwrap(),
+            TessellationQuality::Medium
+        );
+    }
+
+    /// Every documented label round-trips through `resolved_tessellation_quality`,
+    /// case-insensitively.
+    #[test]
+    fn every_documented_label_parses() {
+        let cases = [
+            ("lowest", TessellationQuality::Lowest),
+            ("Low", TessellationQuality::Low),
+            ("MEDIUM", TessellationQuality::Medium),
+            ("high", TessellationQuality::High),
+            ("Highest", TessellationQuality::Highest),
+        ];
+        for (label, expected) in cases {
+            let query = ParseQuery {
+                tessellation_quality: Some(label.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                query.resolved_tessellation_quality().unwrap(),
+                expected,
+                "label {label:?} should resolve to {expected:?}"
+            );
+        }
+    }
+
+    /// An unknown level must be rejected as a client error (`400 BadRequest`),
+    /// not swallowed or reported as a server-side `Internal` error — the two
+    /// map to different HTTP statuses and log at different severities.
+    /// Coverage gap found via mutation testing: replacing `ApiError::BadRequest`
+    /// with `ApiError::Internal` on this arm survived the full suite (83/83
+    /// passed) — no test asserted the error path at all, let alone which variant.
+    #[test]
+    fn unknown_label_is_bad_request_not_internal() {
+        let query = ParseQuery {
+            tessellation_quality: Some("ultra".to_string()),
+            ..Default::default()
+        };
+        let err = query.resolved_tessellation_quality().unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("ultra"),
+                    "error message should name the rejected value, got: {msg}"
+                );
+            }
+            other => panic!("expected ApiError::BadRequest, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod apple_double_tests {
+    use super::is_apple_double;
+
+    // macOS Finder writes `__MACOSX/._<name>` beside each entry when
+    // compressing, keeping the original extension - so it matched the .ifc
+    // filter and every Mac-made archive was rejected as containing two models
+    // (#2812).
+    #[test]
+    fn recognises_the_macosx_directory_sidecar() {
+        assert!(is_apple_double("__MACOSX/._model.ifc"));
+        assert!(is_apple_double("project/__MACOSX/._model.ifc"));
+    }
+
+    // Several unzip/rezip round trips drop the directory but keep the sidecar
+    // next to its original, so the prefix alone is not enough.
+    #[test]
+    fn recognises_a_bare_sidecar_beside_its_original() {
+        assert!(is_apple_double("._model.ifc"));
+        assert!(is_apple_double("project/._model.ifc"));
+    }
+
+    // The ambiguity error exists for a reason: skipping sidecars must not skip
+    // a real second model, including one in a folder or one whose name merely
+    // contains the marker.
+    #[test]
+    fn leaves_genuine_models_alone() {
+        assert!(!is_apple_double("model.ifc"));
+        assert!(!is_apple_double("project/model.ifc"));
+        assert!(!is_apple_double("nested/b.ifc"));
+        // A file NAMED after the marker is still content.
+        assert!(!is_apple_double("__MACOSX_backup.ifc"));
+        // ...and so is a real model inside a folder called `__MACOSX`. The
+        // sidecar test is the basename; matching the directory would drop it.
+        assert!(!is_apple_double("__MACOSX/model.ifc"));
+        // ...and `._` INSIDE a name is not a sidecar prefix: only a basename
+        // that STARTS with it is.
+        assert!(!is_apple_double("v1._final.ifc"));
+    }
+}

@@ -117,6 +117,15 @@ export function createCachedAccessor(accessor: IFCDataAccessor): IFCDataAccessor
       accessor.getAncestors!(id, rel as PartOfRelation)
     ) as IFCDataAccessor['getAncestors'];
   }
+  if (accessor.getSchemaVersion) {
+    // Model-wide, not per-entity — compute once and hand back the
+    // same value forever for this accessor's lifetime.
+    const schemaVersion = accessor.getSchemaVersion();
+    cached.getSchemaVersion = () => schemaVersion;
+  }
+  if (accessor.getTypeEntityType) {
+    cached.getTypeEntityType = memoById((id) => accessor.getTypeEntityType!(id));
+  }
 
   return cached;
 }
@@ -549,6 +558,13 @@ function checkRequirement(
           'CLASSIFICATION_MISSING',
           'MATERIAL_MISSING',
           'PARTOF_RELATION_MISSING',
+          // The nested predefinedType sub-constraint on an entity /
+          // partOf facet is itself an "attribute" of the target entity —
+          // when it's wholly unset (no PredefinedType, no fallback
+          // ObjectType/parent predefinedType at all) that's the same
+          // "wholly absent" shape as ATTRIBUTE_MISSING, not "bad data".
+          'PREDEFINED_TYPE_MISSING',
+          'PARTOF_PREDEFINED_TYPE_MISSING',
         ]);
         if (
           facetResult.failure?.type &&

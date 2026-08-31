@@ -21,8 +21,9 @@
  *   (a,b,c)            → JS array, recursively
  */
 
+import { decodeStepStringLiteral } from '@ifc-lite/encoding';
 import type { IfcAttributeValue } from '@ifc-lite/mutations';
-import { safeUtf8Decode } from '@ifc-lite/data';
+import { asSourceBytes, type IfcSourceBytes } from '@ifc-lite/parser';
 
 /**
  * Tokenize the inside of a STEP entity body (`,`-separated arguments)
@@ -82,15 +83,15 @@ function splitTopLevelArgs(text: string): string[] {
  * into JS numbers).
  */
 export function extractRawStepTokens(
-  buffer: Uint8Array,
+  buffer: Uint8Array | IfcSourceBytes,
   byteOffset: number,
   byteLength: number,
 ): string[] | null {
   if (byteLength <= 0) return null;
-  // safeUtf8Decode handles SAB-backed source buffers (the parser
-  // keeps `dataStore.source` SAB-backed for zero-copy worker sharing,
-  // and Firefox/Chrome reject `TextDecoder.decode()` on SAB views).
-  const text = safeUtf8Decode(buffer, byteOffset, byteOffset + byteLength);
+  // `decodeUtf8` handles SAB-backed source buffers (the parser keeps
+  // `dataStore.source` SAB-backed for zero-copy worker sharing, and
+  // Firefox/Chrome reject `TextDecoder.decode()` on SAB views).
+  const text = asSourceBytes(buffer).decodeUtf8(byteOffset, byteOffset + byteLength);
   // Match #N=TYPE( ... ) — the trailing `;` is optional in case the
   // ref slice doesn't include it.
   const match = text.match(/^#\d+\s*=\s*[A-Z0-9_]+\(([\s\S]*)\)\s*;?\s*$/i);
@@ -123,7 +124,10 @@ export function serializeStepToken(value: IfcAttributeValue): string {
     if (trimmed === '$' || trimmed === '*') return trimmed;
     if (/^#\d+$/.test(trimmed)) return trimmed;
     if (/^\.[A-Z0-9_]+\.$/i.test(trimmed)) return trimmed.toUpperCase();
-    return `'${value.replace(/'/g, "''")}'`;
+    // Backslash must double before the quote does — same order as
+    // `escapeStepString` in @ifc-lite/export — or a value containing both
+    // (e.g. `C:\O'Brien`) mis-escapes.
+    return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
   }
   if (Array.isArray(value)) {
     return `(${value.map(serializeStepToken).join(',')})`;
@@ -178,9 +182,16 @@ export function parseRawStepInput(input: string): { value: IfcAttributeValue } |
   }
 
   // Quoted string: strip the wrapping quotes — `serializeStepValue`
-  // re-adds them on export.
+  // re-adds them on export. The inner text goes through the repo's one
+  // STEP literal decoder rather than a local `''` -> `'` replace: it
+  // undoes BOTH lexical doublings (`''` and `\\`) plus the backslash
+  // directives, so it is the exact inverse of the `escapeStepString`
+  // order `serializeStepToken` mirrors above. A hand-rolled quote-only
+  // inverse silently doubled every backslash again on each save
+  // (1 -> 2 -> 4 per open-and-Enter round) and read an on-disk
+  // `\X2\00FC\X0\` back as literal escape text instead of `ü`.
   if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
-    return { value: trimmed.slice(1, -1).replace(/''/g, "'") };
+    return { value: decodeStepStringLiteral(trimmed.slice(1, -1)) };
   }
 
   // Lists / typed values: refuse for now. The pen icon is hidden for

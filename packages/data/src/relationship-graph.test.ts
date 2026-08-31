@@ -46,6 +46,45 @@ describe('RelationshipGraph', () => {
     expect(rels[0].type).toBe(RelationshipType.ContainsElements);
     expect(rels[0].typeName).toBe('IfcRelContainedInSpatialStructure');
   });
+
+  // The suite above only ever exercises one `RelationshipType` -> IFC entity
+  // name mapping (ContainsElements), so a swap between two other entries in
+  // the internal `RelationshipTypeToString` lookup table (e.g. AssignsToGroup
+  // <-> AssignsToProduct, which are adjacent numeric values 60/61) is
+  // invisible to every existing test. This pins every type -> name pair so
+  // such a swap fails here.
+  it('maps every RelationshipType to its correct IFC entity name', () => {
+    const expected: Record<RelationshipType, string> = {
+      [RelationshipType.ContainsElements]: 'IfcRelContainedInSpatialStructure',
+      [RelationshipType.Aggregates]: 'IfcRelAggregates',
+      [RelationshipType.DefinesByProperties]: 'IfcRelDefinesByProperties',
+      [RelationshipType.DefinesByType]: 'IfcRelDefinesByType',
+      [RelationshipType.AssociatesMaterial]: 'IfcRelAssociatesMaterial',
+      [RelationshipType.AssociatesClassification]: 'IfcRelAssociatesClassification',
+      [RelationshipType.AssociatesDocument]: 'IfcRelAssociatesDocument',
+      [RelationshipType.VoidsElement]: 'IfcRelVoidsElement',
+      [RelationshipType.FillsElement]: 'IfcRelFillsElement',
+      [RelationshipType.ConnectsPathElements]: 'IfcRelConnectsPathElements',
+      [RelationshipType.ConnectsElements]: 'IfcRelConnectsElements',
+      [RelationshipType.ConnectsPortToElement]: 'IfcRelConnectsPortToElement',
+      [RelationshipType.ConnectsPorts]: 'IfcRelConnectsPorts',
+      [RelationshipType.SpaceBoundary]: 'IfcRelSpaceBoundary',
+      [RelationshipType.AssignsToGroup]: 'IfcRelAssignsToGroup',
+      [RelationshipType.AssignsToProduct]: 'IfcRelAssignsToProduct',
+      [RelationshipType.ReferencedInSpatialStructure]: 'IfcRelReferencedInSpatialStructure',
+    };
+
+    let relId = 1000;
+    for (const [typeStr, typeName] of Object.entries(expected)) {
+      const type = Number(typeStr) as RelationshipType;
+      const builder = new RelationshipGraphBuilder();
+      builder.addEdge(1, 2, type, relId++);
+      const g = builder.build();
+      const rels = g.getRelationshipsBetween(1, 2);
+      expect(rels).toHaveLength(1);
+      expect(rels[0].typeName).toBe(typeName);
+    }
+  });
 });
 
 describe('relationshipGraphToColumns / relationshipGraphFromColumns round-trip', () => {
@@ -82,5 +121,113 @@ describe('relationshipGraphToColumns / relationshipGraphFromColumns round-trip',
     expect(rebuilt.getRelated(1, RelationshipType.Aggregates, 'forward')).toEqual([]);
     expect(rebuilt.hasRelationship(1, 2)).toBe(false);
     expect(rebuilt.forward.edgeTargets.length).toBe(0);
+  });
+});
+
+describe('buildCSR determinism and edge presence', () => {
+  // The sample fixture above adds edges in already-ascending source order
+  // (100, 200, 200, 400, 400), which makes the `uniqueKeys.sort()` in
+  // buildCSR an identity — and every assertion in it calls `.sort()` on the
+  // result, so CSR ordering could not be observed either way. These build
+  // the graph in DESCENDING key order and read the raw CSR columns.
+  function descendingGraph() {
+    const builder = new RelationshipGraphBuilder();
+    builder.addEdge(400, 41, RelationshipType.Aggregates, 1);
+    builder.addEdge(200, 21, RelationshipType.Aggregates, 2);
+    builder.addEdge(300, 31, RelationshipType.Aggregates, 3);
+    builder.addEdge(200, 22, RelationshipType.Aggregates, 4);
+    builder.addEdge(100, 11, RelationshipType.Aggregates, 5);
+    return builder.build();
+  }
+
+  it('lays edges out in ascending key order regardless of insertion order', () => {
+    const g = descendingGraph();
+    // Offsets must be assigned by ascending key, not by first-seen order.
+    expect([...g.forward.offsets.entries()].sort((a, b) => a[0] - b[0])).toEqual([
+      [100, 0],
+      [200, 1],
+      [300, 3],
+      [400, 4],
+    ]);
+    // ... and the scattered edge column follows that layout.
+    expect([...g.forward.edgeTargets]).toEqual([11, 21, 22, 31, 41]);
+  });
+
+  it('produces byte-identical CSR columns for two different insertion orders', () => {
+    const ascending = new RelationshipGraphBuilder();
+    ascending.addEdge(100, 11, RelationshipType.Aggregates, 5);
+    ascending.addEdge(200, 21, RelationshipType.Aggregates, 2);
+    ascending.addEdge(200, 22, RelationshipType.Aggregates, 4);
+    ascending.addEdge(300, 31, RelationshipType.Aggregates, 3);
+    ascending.addEdge(400, 41, RelationshipType.Aggregates, 1);
+    const a = ascending.build();
+    const d = descendingGraph();
+    expect([...d.forward.edgeTargets]).toEqual([...a.forward.edgeTargets]);
+    expect([...d.forward.edgeRelIds]).toEqual([...a.forward.edgeRelIds]);
+    expect([...d.forward.offsets.entries()].sort((x, y) => x[0] - y[0])).toEqual(
+      [...a.forward.offsets.entries()].sort((x, y) => x[0] - y[0]),
+    );
+  });
+
+  // `edgeRelIds` is the express id of the IfcRel* entity, and NOTHING pinned
+  // it to a value: the round-trip test compares the column against another
+  // build of the same data (self-consistent either way), and the metadata test
+  // asserts only `type`/`typeName`. Scattering `keys[i]` (the SOURCE entity id)
+  // into `edgeRelIds` instead of `relIds[i]` passed the whole suite. These ids
+  // are deliberately disjoint from every source and target id in the fixture,
+  // so no substitution can look correct.
+  it('scatters the relationship express id, not the source or target id', () => {
+    const builder = new RelationshipGraphBuilder();
+    builder.addEdge(400, 41, RelationshipType.Aggregates, 7001);
+    builder.addEdge(200, 21, RelationshipType.Aggregates, 7002);
+    builder.addEdge(200, 22, RelationshipType.ContainsElements, 7003);
+    const g = builder.build();
+
+    expect(g.forward.getEdges(200)).toEqual([
+      { target: 21, type: RelationshipType.Aggregates, relationshipId: 7002 },
+      { target: 22, type: RelationshipType.ContainsElements, relationshipId: 7003 },
+    ]);
+    expect(g.forward.getEdges(400)).toEqual([
+      { target: 41, type: RelationshipType.Aggregates, relationshipId: 7001 },
+    ]);
+    // The inverse half carries the same relationship ids, keyed by target.
+    expect(g.inverse.getEdges(21)).toEqual([
+      { target: 200, type: RelationshipType.Aggregates, relationshipId: 7002 },
+    ]);
+    expect(g.getRelationshipsBetween(200, 22)).toEqual([
+      {
+        relationshipId: 7003,
+        type: RelationshipType.ContainsElements,
+        typeName: 'IfcRelContainedInSpatialStructure',
+      },
+    ]);
+  });
+
+  it('records the per-key edge count', () => {
+    const g = descendingGraph();
+    expect(g.forward.counts.get(200)).toBe(2);
+    expect(g.forward.counts.get(100)).toBe(1);
+    expect(g.forward.counts.get(999)).toBeUndefined();
+  });
+
+  it('hasAnyEdges distinguishes entities with edges from those without', () => {
+    const g = buildSampleGraph();
+    expect(g.forward.hasAnyEdges(200)).toBe(true); // storey has children
+    expect(g.forward.hasAnyEdges(301)).toBe(false); // leaf wall: no forward edges
+    expect(g.inverse.hasAnyEdges(301)).toBe(true); // ... but it has parents
+    expect(g.forward.hasAnyEdges(999)).toBe(false); // unknown entity
+  });
+
+  it('hasAnyEdges is false for every entity in an empty graph', () => {
+    const empty = new RelationshipGraphBuilder().build();
+    expect(empty.forward.hasAnyEdges(1)).toBe(false);
+    expect(empty.inverse.hasAnyEdges(1)).toBe(false);
+  });
+
+  it('getTargets returns just the target ids, filtered by type', () => {
+    const g = buildSampleGraph();
+    expect(g.forward.getTargets(200, RelationshipType.ContainsElements).sort()).toEqual([301, 302]);
+    expect(g.forward.getTargets(200, RelationshipType.Aggregates)).toEqual([]);
+    expect(g.forward.getTargets(200).sort()).toEqual([301, 302]);
   });
 });

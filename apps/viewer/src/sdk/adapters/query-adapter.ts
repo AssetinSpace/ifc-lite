@@ -17,8 +17,8 @@ import type {
   QueryBackendMethods,
 } from '@ifc-lite/sdk';
 import type { StoreApi } from './types.js';
-import { EntityNode } from '@ifc-lite/query';
-import { RelationshipType, IfcTypeEnum, IfcTypeEnumFromString } from '@ifc-lite/data';
+import { EntityNode, findPropertyInSets } from '@ifc-lite/query';
+import { IfcTypeEnum, IfcTypeEnumFromString } from '@ifc-lite/data';
 import { getModelForRef, getAllModelEntries } from './model-compat.js';
 import {
   extractAllEntityAttributes,
@@ -27,56 +27,11 @@ import {
   extractTypePropertiesOnDemand,
   extractDocumentsOnDemand,
   extractRelationshipsOnDemand,
+  expandTypes,
+  QUERY_REL_TYPE_MAP,
 } from '@ifc-lite/parser';
 import { applyAttributeMutationsToEntityData, mergeAttributeMutations } from './mutation-view.js';
 import { evaluateFilterRules } from '../../lib/search/filter-evaluate.js';
-
-/** Map IFC relationship entity names to internal RelationshipType enum.
- * Keys use proper IFC schema names (e.g. IfcRelAggregates, not "Aggregates"). */
-const REL_TYPE_MAP: Record<string, RelationshipType> = {
-  IfcRelContainedInSpatialStructure: RelationshipType.ContainsElements,
-  IfcRelAggregates: RelationshipType.Aggregates,
-  IfcRelDefinesByType: RelationshipType.DefinesByType,
-  IfcRelVoidsElement: RelationshipType.VoidsElement,
-  IfcRelFillsElement: RelationshipType.FillsElement,
-};
-
-/**
- * IFC4 subtype map — maps parent types to their StandardCase/ElementedCase subtypes.
- * In IFC4, many element types have *StandardCase subtypes that the parser stores
- * as the full type name. This map lets byType('IfcWall') also find IfcWallStandardCase.
- *
- * Keys and values are UPPERCASE because entityIndex.byType uses UPPERCASE keys
- * (raw STEP type names, e.g. IFCWALLSTANDARDCASE).
- */
-const IFC_SUBTYPES: Record<string, string[]> = {
-  IFCWALL: ['IFCWALLSTANDARDCASE', 'IFCWALLELEMENTEDCASE'],
-  IFCBEAM: ['IFCBEAMSTANDARDCASE'],
-  IFCCOLUMN: ['IFCCOLUMNSTANDARDCASE'],
-  IFCDOOR: ['IFCDOORSTANDARDCASE'],
-  IFCWINDOW: ['IFCWINDOWSTANDARDCASE'],
-  IFCSLAB: ['IFCSLABSTANDARDCASE', 'IFCSLABELEMENTEDCASE'],
-  IFCMEMBER: ['IFCMEMBERSTANDARDCASE'],
-  IFCPLATE: ['IFCPLATESTANDARDCASE'],
-  IFCOPENINGELEMENT: ['IFCOPENINGSTANDARDCASE'],
-};
-
-/**
- * Expand a type list to include known IFC subtypes.
- * Converts PascalCase input (e.g. 'IfcWall') to UPPERCASE for entityIndex lookup.
- */
-function expandTypes(types: string[]): string[] {
-  const result: string[] = [];
-  for (const type of types) {
-    const upper = type.toUpperCase();
-    result.push(upper);
-    const subtypes = IFC_SUBTYPES[upper];
-    if (subtypes) {
-      for (const sub of subtypes) result.push(sub);
-    }
-  }
-  return result;
-}
 
 /**
  * Check if a type name represents a product/spatial entity.
@@ -287,9 +242,7 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
       for (const filter of descriptor.filters) {
         filtered = filtered.filter(entity => {
           const props = getCachedProps(entity.ref);
-          const pset = props.find(p => p.name === filter.psetName);
-          if (!pset) return false;
-          const prop = pset.properties.find(p => p.name === filter.propName);
+          const prop = findPropertyInSets(props, filter.psetName, filter.propName);
           if (!prop) return false;
           if (filter.operator === 'exists') return true;
 
@@ -373,7 +326,7 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
       const state = store.getState();
       const model = getModelForRef(state, ref.modelId);
       if (!model?.ifcDataStore) return [];
-      const relEnum = REL_TYPE_MAP[relType];
+      const relEnum = QUERY_REL_TYPE_MAP[relType];
       if (relEnum === undefined) return [];
       const targets = model.ifcDataStore.relationships.getRelated(ref.expressId, relEnum, direction);
       return targets.map((expressId: number) => ({ modelId: ref.modelId, expressId }));

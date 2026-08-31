@@ -3,8 +3,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, it, expect } from 'vitest';
-import { collectReferencedEntityIds, getVisibleEntityIds } from './reference-collector.js';
-import type { IfcDataStore } from '@ifc-lite/parser';
+import {
+  PRODUCT_TYPES,
+  collectReferencedEntityIds,
+  getVisibleEntityIds,
+} from './reference-collector.js';
+import { EMPTY_SOURCE_BYTES, type IfcDataStore } from '@ifc-lite/parser';
+import type { EffectiveEntityIndex } from './effective-index.js';
+import {
+  ENTITIES_IFC2X3,
+  ENTITIES_IFC4,
+  ENTITIES_IFC4X3,
+  type IfcEntityInfo,
+} from '@ifc-lite/data';
 
 /**
  * Helper: encode a set of STEP entity lines into a source buffer + entity index.
@@ -248,6 +259,44 @@ describe('collectReferencedEntityIds', () => {
     expect(closure.has(11)).toBe(true);  // point (reached via placement)
     expect(closure.has(2)).toBe(false);  // hidden wall (excluded)
   });
+
+  // CodeRabbit finding on #2637: `relationshipRefGroupsFromSourceLine` (via
+  // `extractRelationshipRefGroupsIndexed`) only walks ONE level of
+  // parenthesised nesting. A DOUBLY-nested list of entity refs — a real IFC
+  // shape, e.g. `IfcBSplineSurfaceWithKnots.ControlPointsList: LIST OF LIST
+  // OF IfcCartesianPoint` — has each inner `(#N,#N)` group fail the bare
+  // `#(\d+)` match, so the whole attribute is discarded as "contains a
+  // non-ref item" and every ref inside it is lost. This only bites a
+  // source-backed entity with a queued mutation elsewhere on the SAME record
+  // (`hasSourceMutation` gates the parse-instead-of-byte-scan path) — an
+  // unmutated entity still takes the plain `extractRefsFromBytes` scan below,
+  // which has no such blind spot.
+  it('does not drop refs inside a doubly-nested list attribute on a mutated entity', () => {
+    const { source, entityIndex: base } = buildTestData([
+      [1, 'IFCBSPLINESURFACEWITHKNOTS', '#1=IFCBSPLINESURFACEWITHKNOTS(3,3,((#10,#11),(#12,#13)),.UNSPECIFIED.,$,$,$);'],
+      [10, 'IFCCARTESIANPOINT', '#10=IFCCARTESIANPOINT((0.,0.,0.));'],
+      [11, 'IFCCARTESIANPOINT', '#11=IFCCARTESIANPOINT((1.,0.,0.));'],
+      [12, 'IFCCARTESIANPOINT', '#12=IFCCARTESIANPOINT((0.,1.,0.));'],
+      [13, 'IFCCARTESIANPOINT', '#13=IFCCARTESIANPOINT((1.,1.,0.));'],
+    ]);
+    // Mark #1 as carrying a queued mutation on SOME other attribute (the
+    // gate cares only that a mutation is queued for the id, not which
+    // attribute) so the closure takes the parse-based path instead of the
+    // plain byte scan.
+    const entityIndex = {
+      get: (id: number) => base.get(id),
+      has: (id: number) => base.has(id),
+      hasSourceMutation: (id: number) => id === 1,
+    };
+
+    const closure = collectReferencedEntityIds(new Set([1]), source, entityIndex);
+
+    expect(closure.has(1)).toBe(true);
+    expect(closure.has(10)).toBe(true);
+    expect(closure.has(11)).toBe(true);
+    expect(closure.has(12)).toBe(true);
+    expect(closure.has(13)).toBe(true);
+  });
 });
 
 describe('getVisibleEntityIds', () => {
@@ -407,5 +456,257 @@ describe('getVisibleEntityIds', () => {
     expect(roots.has(17)).toBe(false);
     expect(roots.has(18)).toBe(false);
     expect(roots.has(19)).toBe(false);
+  });
+});
+
+/**
+ * A source-less store (server-parsed, synthetic, GLB, point cloud) can still
+ * carry overlay-authored `IfcRelVoidsElement` records, and those serve their
+ * ends from the creation payload rather than from bytes.
+ *
+ * The guard in front of the byte scan used to be `if (!source) return`, which
+ * never fired -- even a zero-length `Uint8Array` is truthy. Rewriting it as an
+ * early `byteLength === 0` return during the accessor migration (#2339) would
+ * have silently skipped the authored branch too, dropping opening-exclusion
+ * propagation for exactly those stores. Pin the behaviour so it cannot narrow
+ * again.
+ */
+describe('propagateOpeningExclusions without a source (#2339)', () => {
+  const WALL = 10;
+  const OPENING = 20;
+  const REL = 30;
+
+  function sourcelessStore(): IfcDataStore {
+    return {
+      source: EMPTY_SOURCE_BYTES,
+      entityIndex: {
+        byId: new Map([
+          [WALL, { type: 'IFCWALL', byteOffset: 0, byteLength: 0 }],
+          [OPENING, { type: 'IFCOPENINGELEMENT', byteOffset: 0, byteLength: 0 }],
+          [REL, { type: 'IFCRELVOIDSELEMENT', byteOffset: 0, byteLength: 0 }],
+        ]),
+        byType: new Map([
+          ['IFCWALL', [WALL]],
+          ['IFCOPENINGELEMENT', [OPENING]],
+          ['IFCRELVOIDSELEMENT', [REL]],
+        ]),
+      },
+    } as unknown as IfcDataStore;
+  }
+
+  /** Minimal overlay index that authors the relation's two ends. */
+  function overlayIndex(store: IfcDataStore): EffectiveEntityIndex {
+    const byId = store.entityIndex.byId;
+    return {
+      byType: store.entityIndex.byType,
+      get: (id: number) => byId.get(id),
+      effectiveType: (_id: number, type: string) => type.toUpperCase(),
+      refsOf: (id: number) => (id === REL ? [WALL, OPENING] : undefined),
+      [Symbol.iterator]: () => byId[Symbol.iterator](),
+    } as unknown as EffectiveEntityIndex;
+  }
+
+  it('still excludes an opening whose wall is hidden', () => {
+    const store = sourcelessStore();
+    const { hiddenProductIds } = getVisibleEntityIds(
+      store,
+      new Set([WALL]),
+      null,
+      overlayIndex(store),
+    );
+    expect(hiddenProductIds.has(WALL)).toBe(true);
+    // The propagation under test: it can only come from the authored refs,
+    // because there are no bytes to scan.
+    expect(hiddenProductIds.has(OPENING)).toBe(true);
+  });
+
+  it('skips a bytes-only relation without abandoning a later authored one', () => {
+    // `continue`, not `break`. OverlayIndex.byType shallow-copies the source
+    // buckets and APPENDS created ids, so a byte-scan relation is iterated
+    // before an authored one. With `break` the authored relation is never
+    // reached and its opening silently stays in the export. Without a second
+    // relation in this order the two spellings are indistinguishable.
+    const WALL2 = 11;
+    const OPENING2 = 21;
+    const REL_BYTES = 31;   // no authored refs -> takes the byte branch
+    const REL_AUTHORED = 32;
+
+    const byId = new Map([
+      [WALL2, { type: 'IFCWALL', byteOffset: 0, byteLength: 0 }],
+      [OPENING2, { type: 'IFCOPENINGELEMENT', byteOffset: 0, byteLength: 0 }],
+      [REL_BYTES, { type: 'IFCRELVOIDSELEMENT', byteOffset: 0, byteLength: 0 }],
+      [REL_AUTHORED, { type: 'IFCRELVOIDSELEMENT', byteOffset: -1, byteLength: 0 }],
+    ]);
+    const store = {
+      source: EMPTY_SOURCE_BYTES,
+      entityIndex: {
+        byId,
+        byType: new Map([
+          ['IFCWALL', [WALL2]],
+          ['IFCOPENINGELEMENT', [OPENING2]],
+          // Byte-scan relation FIRST, mirroring the real append order.
+          ['IFCRELVOIDSELEMENT', [REL_BYTES, REL_AUTHORED]],
+        ]),
+      },
+    } as unknown as IfcDataStore;
+
+    const index = {
+      byType: store.entityIndex.byType,
+      get: (id: number) => byId.get(id),
+      effectiveType: (_id: number, type: string) => type.toUpperCase(),
+      refsOf: (id: number) => (id === REL_AUTHORED ? [WALL2, OPENING2] : undefined),
+      [Symbol.iterator]: () => byId[Symbol.iterator](),
+    } as unknown as EffectiveEntityIndex;
+
+    const { hiddenProductIds } = getVisibleEntityIds(store, new Set([WALL2]), null, index);
+    expect(hiddenProductIds.has(OPENING2)).toBe(true);
+  });
+
+  it('leaves the opening visible when its wall is visible', () => {
+    // Control: proves the assertion above is driven by the wall's hidden state
+    // and not by the opening being unconditionally excluded.
+    const store = sourcelessStore();
+    const { hiddenProductIds } = getVisibleEntityIds(store, new Set(), null, overlayIndex(store));
+    expect(hiddenProductIds.has(OPENING)).toBe(false);
+  });
+});
+
+/**
+ * The product-type classification must agree with the bundled IFC schema
+ * tables, in BOTH directions:
+ *   - every concrete IfcProduct subtype the schema declares is classified as a
+ *     product root (otherwise a visible-only export silently drops it);
+ *   - every name the classifier treats as a product really is an IfcProduct
+ *     subtype in some schema (otherwise the classifier over-roots).
+ *
+ * The expectation is derived from `@ifc-lite/data`'s generated entity tables,
+ * never from a hand-copied list — a hand copy would drift with the table it is
+ * meant to check.
+ */
+describe('product-type classification vs the generated IFC schema', () => {
+  function mockStore(entries: Array<[number, string]>): IfcDataStore {
+    const byId = new Map<number, { expressId: number; type: string; byteOffset: number; byteLength: number; lineNumber: number }>();
+    const byType = new Map<string, number[]>();
+    for (const [id, type] of entries) {
+      byId.set(id, { expressId: id, type, byteOffset: 0, byteLength: 0, lineNumber: 0 });
+      const upper = type.toUpperCase();
+      if (!byType.has(upper)) byType.set(upper, []);
+      byType.get(upper)!.push(id);
+    }
+    return { entityIndex: { byId, byType }, source: new Uint8Array(0) } as unknown as IfcDataStore;
+  }
+
+  /** Concrete (instantiable) IfcProduct subtypes declared by one schema table. */
+  function concreteProducts(table: readonly IfcEntityInfo[]): string[] {
+    const parent = new Map(table.map(e => [e.name, e.parent]));
+    const isProduct = (name: string): boolean => {
+      let cursor: string | null | undefined = name;
+      for (let guard = 0; cursor && guard < 64; guard++) {
+        if (cursor === 'IfcProduct') return true;
+        cursor = parent.get(cursor);
+      }
+      return false;
+    };
+    return table.filter(e => !e.abstract && e.name !== 'IfcProduct' && isProduct(e.name)).map(e => e.name);
+  }
+
+  const SCHEMA_TABLES: Array<[string, readonly IfcEntityInfo[]]> = [
+    ['IFC2X3', ENTITIES_IFC2X3],
+    ['IFC4', ENTITIES_IFC4],
+    ['IFC4X3', ENTITIES_IFC4X3],
+  ];
+
+  /**
+   * Anti-vacuity: named entities that must appear in the derived enumeration.
+   * A count floor would go green on benign growth and stay silent on exactly
+   * the schema whose types went missing, so the guard names them instead.
+   * The IFC2X3-only entries are the ones the hand-written table omitted.
+   */
+  const REQUIRED_IN_ENUMERATION: Record<string, string[]> = {
+    IFC2X3: [
+      'IfcElectricDistributionPoint',
+      'IfcElectricalElement',
+      'IfcEquipmentElement',
+      'IfcChamferEdgeFeature',
+      'IfcRoundedEdgeFeature',
+      'IfcStructuralLinearActionVarying',
+      'IfcStructuralPlanarActionVarying',
+      'IfcWall',
+    ],
+    IFC4: ['IfcWall', 'IfcFurniture', 'IfcShadingDevice'],
+    IFC4X3: ['IfcWall', 'IfcKerb', 'IfcSign'],
+  };
+
+  for (const [version, table] of SCHEMA_TABLES) {
+    it(`enumerates the ${version} products it is about to assert on`, () => {
+      const products = new Set(concreteProducts(table));
+      for (const required of REQUIRED_IN_ENUMERATION[version]) {
+        expect(products.has(required), `${required} missing from the ${version} enumeration`).toBe(true);
+      }
+    });
+
+    it(`roots every concrete ${version} IfcProduct subtype when nothing is hidden`, () => {
+      const products = concreteProducts(table);
+      const entries: Array<[number, string]> = products.map((name, i) => [i + 100, name.toUpperCase()]);
+      const store = mockStore(entries);
+      const { roots } = getVisibleEntityIds(store, new Set(), null);
+
+      const dropped = entries.filter(([id]) => !roots.has(id)).map(([, type]) => type);
+      expect(dropped, `${version} products dropped from a visible-only export`).toEqual([]);
+    });
+  }
+
+  it('classifies nothing the schema does not declare as an IfcProduct subtype', () => {
+    const declared = new Set<string>();
+    for (const [, table] of SCHEMA_TABLES) {
+      const parent = new Map(table.map(e => [e.name, e.parent]));
+      for (const entity of table) {
+        let cursor: string | null | undefined = parent.get(entity.name);
+        for (let guard = 0; cursor && guard < 64; guard++) {
+          if (cursor === 'IfcProduct') {
+            declared.add(entity.name.toUpperCase());
+            break;
+          }
+          cursor = parent.get(cursor);
+        }
+      }
+    }
+
+    expect(declared.size, 'schema enumeration is empty — the diff below would be vacuous').toBeGreaterThan(0);
+    const strays = [...PRODUCT_TYPES].filter(name => !declared.has(name));
+    expect(strays, 'classified as products but not IfcProduct subtypes in any bundled schema').toEqual([]);
+  });
+
+  it('does not root non-product entities (control)', () => {
+    const controls: Array<[number, string]> = [
+      [1, 'IFCCARTESIANPOINT'],
+      [2, 'IFCPROPERTYSET'],
+      [3, 'IFCPROPERTYSINGLEVALUE'],
+      [4, 'IFCMATERIAL'],
+      [5, 'IFCWALLTYPE'],
+      [6, 'IFCLOCALPLACEMENT'],
+      [7, 'IFCSHAPEREPRESENTATION'],
+    ];
+    const { roots } = getVisibleEntityIds(mockStore(controls), new Set(), null);
+    const rooted = controls.filter(([id]) => roots.has(id)).map(([, type]) => type);
+    expect(rooted, 'non-product entities must be reached through the closure, not rooted').toEqual([]);
+  });
+
+  it('drops an IFC2X3 electrical element only when it is actually hidden', () => {
+    const store = mockStore([
+      [1, 'IFCPROJECT'],
+      [2, 'IFCBUILDINGSTOREY'],
+      [3, 'IFCELECTRICDISTRIBUTIONPOINT'],
+      [4, 'IFCELECTRICALELEMENT'],
+    ]);
+
+    const visible = getVisibleEntityIds(store, new Set(), null);
+    expect(visible.roots.has(3)).toBe(true);
+    expect(visible.roots.has(4)).toBe(true);
+
+    const hidden = getVisibleEntityIds(store, new Set([3]), null);
+    expect(hidden.roots.has(3)).toBe(false);
+    expect(hidden.hiddenProductIds.has(3)).toBe(true);
+    expect(hidden.roots.has(4)).toBe(true);
   });
 });

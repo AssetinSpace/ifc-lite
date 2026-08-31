@@ -2,7 +2,8 @@
 //! IFC **schema conversion** for STEP export (Phase 2 P2). Ports
 //! `packages/export/src/schema-converter.ts`: entity-type renames between
 //! IFC2X3 / IFC4 / IFC4X3 / IFC5 (with multi-step chaining), IFC2X3 attribute-count
-//! trimming on downgrade, and a proxy fallback for types with no target representation.
+//! trimming on downgrade, padding of the attributes a newer target schema appended
+//! (`schema_pad`), and a proxy fallback for types with no target representation.
 
 /// Canonicalize a FILE_SCHEMA label to one of the four families we convert between.
 fn canon(s: &str) -> &'static str {
@@ -213,6 +214,18 @@ pub fn convert_step_line(line: &str, from: &str, to: &str, express_id: u32) -> S
     let new_type = convert_entity_type(&entity_type, cfrom, cto);
 
     if should_skip_entity(&new_type, cto) {
+        // The proxy carries a MINTED GlobalId, not the source entity's, and the
+        // authored identity is therefore lost on a downgrade. That is
+        // deliberate on the TypeScript twin (`convertStepLine` in
+        // `packages/export/src/schema-converter.ts`), which documents the
+        // counter-example and pins it in `merged-exporter.test.ts`: two
+        // federated models can legitimately carry the SAME alignment GlobalId,
+        // and copying the source id would unify two distinct alignments into
+        // one. The two implementations do not agree on WHAT to mint — this one
+        // derives from the express id, the TypeScript one from the whole source
+        // line — so the same model downgraded by each yields different proxy
+        // ids. Left as found; changing either is a decision for the maintainer,
+        // not a side effect of a round-trip test.
         return format!(
             "{prefix}IFCPROXY('{}',$,'{}',$,$,$,$,.NOTDEFINED.,$);",
             placeholder_guid(express_id),
@@ -220,7 +233,7 @@ pub fn convert_step_line(line: &str, from: &str, to: &str, express_id: u32) -> S
         );
     }
 
-    let final_attrs = if cto == "IFC2X3" {
+    let mut final_attrs = if cto == "IFC2X3" {
         match ifc2x3_attr_count(&new_type) {
             Some(max) => trim_attributes(attrs, max),
             None => attrs.to_string(),
@@ -228,6 +241,24 @@ pub fn convert_step_line(line: &str, from: &str, to: &str, express_id: u32) -> S
     } else {
         attrs.to_string()
     };
+
+    // Pad the trailing optional attributes a newer target schema APPENDED
+    // (#1416). Keyed on the ORIGINAL type, because the source schema is what
+    // decides how many attributes the line already has; the table's target
+    // count already accounts for the rename. Only types whose source
+    // attribute NAME list is a strict prefix of the target's are in it, so
+    // this can never shift a value into a reordered slot -- see
+    // `schema_pad`. An attribute-less line is left alone rather than
+    // fabricated from nothing, matching the TypeScript twin's
+    // `currentCount > 0` guard.
+    if let Some(target_count) = crate::schema_pad::padded_attr_count(cfrom, cto, &entity_type) {
+        let current = crate::schema_pad::count_top_level_attributes(&final_attrs);
+        if current > 0 && current < target_count {
+            for _ in current..target_count {
+                final_attrs.push_str(",$");
+            }
+        }
+    }
 
     format!("{prefix}{new_type}({final_attrs});")
 }
@@ -238,52 +269,5 @@ pub fn needs_conversion(from: &str, to: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entity_type_renames() {
-        assert_eq!(convert_entity_type("IFCBURNERTYPE", "IFC4", "IFC2X3"), "IFCGASTERMINALTYPE");
-        assert_eq!(convert_entity_type("IFCCHIMNEY", "IFC4", "IFC2X3"), "IFCBUILDINGELEMENTPROXY");
-        assert_eq!(convert_entity_type("IFCWALL", "IFC2X3", "IFC4"), "IFCWALL"); // unchanged
-        // chained 4X3 → 2X3 (via 4): IfcFacility → IfcBuilding
-        assert_eq!(convert_entity_type("IFCFACILITY", "IFC4X3", "IFC2X3"), "IFCBUILDING");
-    }
-
-    #[test]
-    fn downgrade_trims_attributes() {
-        // IfcWall in IFC4 has 9 attrs (trailing PredefinedType); IFC2X3 keeps 8.
-        let line = "#5=IFCWALL('guid',$,'W1',$,$,#6,#7,'tag',.STANDARD.);";
-        let out = convert_step_line(line, "IFC4", "IFC2X3", 5);
-        assert!(out.starts_with("#5=IFCWALL("), "type kept");
-        assert!(!out.contains(".STANDARD."), "9th attr (PredefinedType) trimmed");
-        // 8 top-level attrs remain → 7 commas.
-        let inner = &out["#5=IFCWALL(".len()..out.len() - 2];
-        assert_eq!(inner.split(',').count(), 8, "trimmed to 8 attrs");
-    }
-
-    #[test]
-    fn nested_attrs_not_split_when_trimming() {
-        // Commas inside a nested list must not count as top-level separators.
-        let line = "#9=IFCWALL('g',$,$,$,$,(#1,#2,#3),#7,'t',.STANDARD.);";
-        let out = convert_step_line(line, "IFC4", "IFC2X3", 9);
-        assert!(out.contains("(#1,#2,#3)"), "nested list preserved intact");
-        assert!(!out.contains(".STANDARD."), "trailing attr trimmed");
-    }
-
-    #[test]
-    fn alignment_becomes_proxy_on_downgrade() {
-        let line = "#3=IFCALIGNMENTHORIZONTAL('g',$,$,$,$,#4);";
-        let out = convert_step_line(line, "IFC4X3", "IFC4", 3);
-        assert!(out.starts_with("#3=IFCPROXY("), "alignment → proxy");
-        assert!(out.contains("'IFCALIGNMENTHORIZONTAL'"), "original type recorded as name");
-    }
-
-    #[test]
-    fn no_conversion_is_identity() {
-        let line = "#1=IFCWALL('g',$,$);";
-        assert_eq!(convert_step_line(line, "IFC4", "IFC4", 1), line);
-        assert!(!needs_conversion("IFC4", "IFC4"));
-        assert!(needs_conversion("IFC2X3", "IFC4"));
-    }
-}
+#[path = "schema_convert_tests.rs"]
+mod tests;
