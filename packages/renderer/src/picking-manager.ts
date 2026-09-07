@@ -8,6 +8,7 @@
  */
 
 import { Camera } from './camera.js';
+import { isEntityVisible } from './entity-visibility.js';
 import { Scene } from './scene.js';
 import { Picker, type PointPickSizing } from './picker.js';
 import type { MeshData } from '@ifc-lite/geometry';
@@ -101,8 +102,7 @@ export class PickingManager {
         const requiredPieceCounts = new Map<string, number>();
         const visibleExpressIds: number[] = [];
         for (const expressId of expressIds) {
-            if (options?.hiddenIds?.has(expressId)) continue;
-            if (options?.isolatedIds !== null && options?.isolatedIds !== undefined && !options.isolatedIds.has(expressId)) continue;
+            if (!isEntityVisible(expressId, options?.hiddenIds, options?.isolatedIds)) continue;
             visibleExpressIds.push(expressId);
 
             const pieces = this.scene.getMeshDataPieces(expressId);
@@ -190,23 +190,30 @@ export class PickingManager {
             const ray = this.camera.unprojectToRay(scaledX, scaledY, this.canvas.width, this.canvas.height);
             const hit = this.scene.raycast(ray.origin, ray.direction, options?.hiddenIds, options?.isolatedIds, clip);
             if (!hit) return null;
-            // CPU raycasting returns expressId and modelIndex
+            // The CPU fallback is the COMMON path — anything over
+            // MAX_PICK_MESH_CREATION lands here — so it must report the picked
+            // item, not just its product. Carrying expressId/modelIndex only is
+            // how a pick silently degrades to product-level on a big model
+            // while looking identical to a genuine "no item here" (#2985).
+            //
+            // NOT full parity with the GPU path: `worldXYZ` is still omitted,
+            // as it was before #2985. `Scene.raycast` returns the hit distance
+            // and the world point is rayOrigin + t*rayDir, so it is computable
+            // here, but filling it in is a behaviour change (HoverTooltip shows
+            // a world coordinate only when the key is set, so today it is blank
+            // above the pick-mesh budget) and belongs to its own issue.
             return {
                 expressId: hit.expressId,
                 modelIndex: hit.modelIndex,
+                ...(hit.geometryItemId !== undefined ? { geometryItemId: hit.geometryItemId } : {}),
             };
         }
 
         let meshes = this.scene.getMeshes();
 
-        // Apply visibility filtering to meshes before picking
-        // This ensures users can only select elements that are actually visible
-        if (options?.hiddenIds && options.hiddenIds.size > 0) {
-            meshes = meshes.filter(mesh => !options.hiddenIds!.has(mesh.expressId));
-        }
-        if (options?.isolatedIds !== null && options?.isolatedIds !== undefined) {
-            meshes = meshes.filter(mesh => options.isolatedIds!.has(mesh.expressId));
-        }
+        // Apply visibility filtering to meshes before picking, with the same
+        // rule the draw paths use — users can only select what they can see.
+        meshes = meshes.filter(mesh => isEntityVisible(mesh.expressId, options?.hiddenIds, options?.isolatedIds));
 
         const viewProj = this.camera.getViewProjMatrix().m;
         const pointSnap = this.pointPickProvider?.() ?? null;
@@ -334,12 +341,7 @@ export class PickingManager {
         }
 
         let meshes = this.scene.getMeshes();
-        if (options?.hiddenIds && options.hiddenIds.size > 0) {
-            meshes = meshes.filter((m) => !options.hiddenIds!.has(m.expressId));
-        }
-        if (options?.isolatedIds !== null && options?.isolatedIds !== undefined) {
-            meshes = meshes.filter((m) => options.isolatedIds!.has(m.expressId));
-        }
+        meshes = meshes.filter((m) => isEntityVisible(m.expressId, options?.hiddenIds, options?.isolatedIds));
         const viewProj = this.camera.getViewProjMatrix().m;
         const pointSnap = this.pointPickProvider?.() ?? null;
         return this.picker.pickRect(

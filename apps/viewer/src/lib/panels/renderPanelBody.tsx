@@ -27,17 +27,26 @@ import { GanttPanel } from '@/components/viewer/schedule/GanttPanel';
 import { ListPanel } from '@/components/viewer/lists/ListPanel';
 import { RoomPanel } from '@/components/viewer/RoomPanel';
 import { ZonesPanel } from '@/components/viewer/ZonesPanel';
+import { LoadReportPanel } from '@/components/viewer/LoadReportPanel';
 // Lazy: the Layers panel pulls in @ifc-lite/merge (engine + blake3); a
 // dynamic chunk keeps it out of the initial bundle until first opened.
 const LayersPanel = lazy(() =>
   import('@/components/viewer/layers/LayersPanel').then((m) => ({ default: m.LayersPanel })),
 );
+<<<<<<< HEAD
 // Eager on purpose: pdf.js stays out of the initial bundle regardless (the
 // rasterizer dynamic-imports pdfjs-dist on first use), and a lazy() chunk
 // here produced a rolldown chunk-order cycle that broke react-dom's CJS
 // interop at startup ("require_react_dom is not a function", blank app).
 import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
 import { DocumentsPanel } from '@/components/documents/DocumentsPanel';
+=======
+// Lazy: the Sources panel (cloud-source browser + provider plumbing) is only
+// needed once a user opens it — keep it out of the first-paint bundle.
+const SourcesPanel = lazy(() =>
+  import('@/components/sources/SourcesPanel').then((m) => ({ default: m.SourcesPanel })),
+);
+>>>>>>> upstream/main
 
 /**
  * Render the body for a workspace panel. `onClose` is the host's "close this
@@ -61,6 +70,7 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
     case 'lists': return <ListPanel onClose={onClose} />;
     case 'collab': return <RoomPanel onClose={onClose} />;
     case 'zones': return <ZonesPanel onClose={onClose} />;
+    case 'loadReport': return <LoadReportPanel onClose={onClose} />;
     case 'layers': return (
       <ChunkErrorBoundary label="Layers panel">
         <Suspense fallback={null}>
@@ -68,7 +78,15 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
         </Suspense>
       </ChunkErrorBoundary>
     );
+<<<<<<< HEAD
     case 'drawing-underlay': return <DrawingUnderlayPanel onClose={onClose} />;
     case 'documents': return <DocumentsPanel onClose={onClose} />;
+=======
+    case 'sources': return (
+      <Suspense fallback={null}>
+        <SourcesPanel onClose={onClose} />
+      </Suspense>
+    );
+>>>>>>> upstream/main
   }
 }

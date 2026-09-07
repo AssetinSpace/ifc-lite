@@ -26,8 +26,10 @@ import {
   type PropertyRule,
   type QuantityRule,
   type ClassificationRule,
+  type StoreyRule,
 } from './filter-rules.js';
 import { lensMaterialNames } from '../lens-material-names.js';
+import { parsePropertyValue } from '@ifc-lite/encoding';
 
 // ── Pset / Qto matching ──────────────────────────────────────────────────────
 
@@ -47,8 +49,13 @@ export function flattenPsets(
         setName: set.name,
         propertyName: p.name,
         // Stringify everything — `valueOpMatches` re-parses numeric ops
-        // from this representation. Booleans render as "true"/"false"
-        // which matches the chip UI's lowercased input convention.
+        // from this representation. Booleans render as "True"/"False" —
+        // the SAME capitalised display string the property table and the
+        // list engine (`@ifc-lite/encoding`'s `parsePropertyValue`) show —
+        // so a value picked from a chip/dropdown suggestion always matches
+        // what the user sees rendered elsewhere. `valueOpMatches`'s eq/ne
+        // are case-insensitive, so this doesn't change matching outcomes
+        // for either the search chips or free-typed "true"/"false".
         value: stringifyValue(p.value),
       });
     }
@@ -70,7 +77,11 @@ export function flattenQtys(
 
 export function stringifyValue(value: unknown): string {
   if (value === null || value === undefined) return '';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  // Match `parsePropertyValue`'s boolean rendering ("True"/"False") — the
+  // SAME function the property table and the list engine's display use —
+  // so discovered dropdown suggestions equal what's actually shown/matched
+  // elsewhere (#IsExternal true/false mismatch report).
+  if (typeof value === 'boolean') return parsePropertyValue(value).displayValue;
   if (typeof value === 'number') return String(value);
   return String(value);
 }
@@ -111,6 +122,39 @@ export function defaultStoreyName(store: IfcDataStore, expressId: number): strin
   const storeyId = hierarchy.elementToStorey.get(expressId);
   if (!storeyId) return '';
   return store.entities.getName(storeyId);
+}
+
+/** Does `expressId` (in `modelId`) sit in a storey ref'd by `rule.refs`?
+ *  `IfcBuildingStorey.Name` isn't unique, so once a `StoreyRule` carries
+ *  an exact (modelId, expressId) ref (mirrored from a HierarchyPanel
+ *  click), matching bypasses Name entirely. */
+export function storeyMatchesRefs(store: IfcDataStore, expressId: number, modelId: string, rule: StoreyRule): boolean {
+  const storeyId = store.spatialHierarchy?.elementToStorey.get(expressId);
+  return storeyId != null && !!rule.refs?.some((r) => r.modelId === modelId && r.expressId === storeyId);
+}
+
+/** Index-prefilter twin of {@link storeyMatchesRefs}/Name matching: the
+ *  bucket of elements a `storey op:'in'` rule narrows to for `modelId`. */
+export function unionByStorey(store: IfcDataStore, rule: StoreyRule, modelId: string | undefined): number[] | null {
+  const hierarchy = store.spatialHierarchy;
+  if (!hierarchy) return null;
+  const out: number[] = [];
+  if (rule.refs) {
+    for (const ref of rule.refs) {
+      if (ref.modelId !== modelId) continue;
+      const elements = hierarchy.byStorey.get(ref.expressId);
+      if (elements) for (const id of elements) out.push(id);
+    }
+    return out.length > 0 ? out : null;
+  }
+  const wanted = new Set(rule.values.map((n) => n.toLowerCase()));
+  for (const storeyId of hierarchy.byStorey.keys()) {
+    const name = store.entities.getName(storeyId);
+    if (!wanted.has(name.toLowerCase())) continue;
+    const elements = hierarchy.byStorey.get(storeyId);
+    if (elements) for (const id of elements) out.push(id);
+  }
+  return out.length > 0 ? out : null;
 }
 
 // ── Material / classification / elevation resolution ─────────────────────────

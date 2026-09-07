@@ -40,20 +40,19 @@ import { useBCF } from '@/hooks/useBCF';
 import { BCFTopicList } from './bcf/BCFTopicList';
 import { BCFTopicDetail } from './bcf/BCFTopicDetail';
 import { BCFCreateTopicForm } from './bcf/BCFCreateTopicForm';
+import { BCFServerControl } from './bcf/BCFServerControl';
 import { openGenericFileDialog } from '@/services/file-dialog';
 import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
 
 // ============================================================================
 // Main BCF Panel Component
 // ============================================================================
-
 interface BCFPanelProps {
   onClose: () => void;
 }
 
 export function BCFPanel({ onClose }: BCFPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
-
   // Store state
   const bcfProject = useViewerStore((s) => s.bcfProject);
   const setBcfProject = useViewerStore((s) => s.setBcfProject);
@@ -406,7 +405,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             onClick={() => { void handleImportClick(); }}
             title="Import BCF"
           >
-            <Upload className="h-4 w-4" />
+            <Download className="h-4 w-4" />
           </Button>
           <Button
             variant="ghost"
@@ -417,8 +416,9 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             title="Export BCF"
             {...tourAnchor(TOUR_ANCHORS.bcfExport)}
           >
-            <Download className="h-4 w-4" />
+            <Upload className="h-4 w-4" />
           </Button>
+          <BCFServerControl />
           <Button
             variant={bcfOverlayVisible ? 'secondary' : 'ghost'}
             size="icon"

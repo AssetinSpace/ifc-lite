@@ -33,7 +33,6 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { cn } from '@/lib/utils';
 import { runTier0Scan, type SearchResult, type ScanModel } from '@/lib/search/tier0-scan';
 import { queryTier1Indexes, type Tier1Index } from '@/lib/search/tier1-index';
-import { useSearchIndex } from '@/hooks/useSearchIndex';
 import {
   loadRecentSearches,
   pushRecentSearch,
@@ -85,6 +84,7 @@ export function SearchInline() {
     models,
     setSelectedEntity,
     setSelectedEntityId,
+    setSelectedEntityIds,
     toggleEntitySelection,
     cameraCallbacks,
   } = useViewerStore(
@@ -108,13 +108,11 @@ export function SearchInline() {
       models: s.models,
       setSelectedEntity: s.setSelectedEntity,
       setSelectedEntityId: s.setSelectedEntityId,
+      setSelectedEntityIds: s.setSelectedEntityIds,
       toggleEntitySelection: s.toggleEntitySelection,
       cameraCallbacks: s.cameraCallbacks,
     })),
   );
-
-  // Kick off lazy Tier-1 index builds for any loaded model.
-  useSearchIndex();
 
   // Recents list — loaded on mount, refreshed after each Enter commit.
   const [recents, setRecents] = useState<string[]>(() => loadRecentSearches());
@@ -232,6 +230,8 @@ export function SearchInline() {
         return;
       }
 
+      // Clear multi-selection first (setSelectedEntityIds([]) resets selectedEntityId)
+      setSelectedEntityIds([]);
       setSelectedEntityId(globalId);
       setSelectedEntity(ref);
       if (cameraCallbacks.frameSelection) {
@@ -247,6 +247,7 @@ export function SearchInline() {
       models,
       setSelectedEntity,
       setSelectedEntityId,
+      setSelectedEntityIds,
       toggleEntitySelection,
     ],
   );

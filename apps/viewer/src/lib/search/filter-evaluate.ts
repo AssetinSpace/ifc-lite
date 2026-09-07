@@ -37,11 +37,15 @@
 import {
   extractPropertiesOnDemand,
   extractQuantitiesOnDemand,
+  extractTypePropertiesOnDemand,
   extractAllMaterialsOnDemand,
   extractClassificationsOnDemand,
+  mergeInheritedPropertySets,
   type IfcDataStore,
   type ClassificationInfo,
 } from '@ifc-lite/parser';
+
+import { RelationshipType } from '@ifc-lite/data';
 
 import {
   combineRuleResults,
@@ -52,6 +56,11 @@ import {
   type Combinator,
   type FilterRule,
 } from './filter-rules.js';
+import {
+  isNumericArrayLike,
+  materialiseNumericIterable,
+  toNumericIterable,
+} from './filter-iteration.js';
 
 import {
   flattenPsets,
@@ -60,6 +69,8 @@ import {
   matchPropertyRule,
   matchQuantityRule,
   defaultStoreyName,
+  storeyMatchesRefs,
+  unionByStorey,
   materialNamesOf,
   matchClassificationRule,
   elevationOf,
@@ -90,6 +101,8 @@ export interface EvaluateOptions {
   storeyNameOf?: (expressId: number) => string;
   /** Optional predefined-type resolver. Falls back to "" when omitted. */
   predefinedTypeOf?: (expressId: number) => string;
+  /** Stable identity used by persisted model rules; defaults to `modelId`. */
+  modelFilterIdentity?: string;
 }
 
 const DEFAULT_LIMIT = 5_000;
@@ -114,18 +127,21 @@ export function evaluateFilterRules(
 
   const limit = options.limit ?? DEFAULT_LIMIT;
   const orderedRules = orderRulesByCost(rules);
-  const iterIds = toIterable(
-    selectIterationSource(store, rules, combinator, options.candidateExpressIds),
+  const iterIds = toNumericIterable(
+    selectIterationSource(store, rules, combinator, options.candidateExpressIds, modelId),
   );
   const out: FilteredElement[] = [];
   const ctx: EvalContext = {
     store,
+    modelId,
+    modelFilterIdentity: options.modelFilterIdentity ?? modelId,
     table: store.entities,
     options,
     hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
     hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
     hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
     hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
+    typePsetCache: new Map(),
   };
 
   for (const expressId of iterIds) {
@@ -138,18 +154,6 @@ export function evaluateFilterRules(
     out.push(buildResult(modelId, ctx, expressId));
   }
   return out;
-}
-
-/** Coerce ArrayLike-or-Iterable into an Iterable so the sync entry can
- *  use `for…of`. The federated entry takes the array fast-path
- *  separately. */
-function toIterable(source: ArrayLike<number> | Iterable<number>): Iterable<number> {
-  if (Symbol.iterator in Object(source)) return source as Iterable<number>;
-  // ArrayLike fallback — wrap as a generator so the for…of loop works.
-  return (function* () {
-    const arr = source as ArrayLike<number>;
-    for (let i = 0; i < arr.length; i++) yield arr[i];
-  })();
 }
 
 // ── Async federated entry — production UI path ──────────────────────────────
@@ -178,7 +182,7 @@ export interface FederatedEvaluateOptions extends Omit<EvaluateOptions, 'candida
  * sorted result list. Async chunked + cancellable + progress-reporting.
  */
 export async function evaluateFilterRulesFederated(
-  models: ReadonlyArray<{ id: string; store: IfcDataStore | null }>,
+  models: ReadonlyArray<{ id: string; filterIdentity?: string; store: IfcDataStore | null }>,
   rules: readonly FilterRule[],
   combinator: Combinator,
   options: FederatedEvaluateOptions = {},
@@ -195,6 +199,7 @@ export async function evaluateFilterRulesFederated(
   // progress callback can render a single bar across the federation.
   interface Plan {
     modelId: string;
+    modelFilterIdentity: string;
     store: IfcDataStore;
     iter: ArrayLike<number> | Iterable<number>;
     total: number;
@@ -204,15 +209,32 @@ export async function evaluateFilterRulesFederated(
   let totalKnown = true;
   for (const m of models) {
     if (!m.store) continue;
+    const modelFilterIdentity = m.filterIdentity ?? m.id;
+    if (
+      combinator === 'AND'
+      && orderedRules.some((rule) => {
+        if (rule.kind !== 'model') return false;
+        const matchesModel = setOpMatches(rule.op, modelFilterIdentity, rule.values);
+        return !matchesModel;
+      })
+    ) {
+      continue;
+    }
     const candidates = options.candidateExpressIdsByModel?.get(m.id);
-    const source = candidates ?? selectIterationSource(m.store, rules, combinator, undefined);
-    const arr = materialiseIterable(source);
+    const source = candidates ?? selectIterationSource(m.store, rules, combinator, undefined, m.id);
+    const arr = materialiseNumericIterable(source);
     if (arr === null) {
       totalKnown = false;
     } else {
       grandTotal += arr.length;
     }
-    plans.push({ modelId: m.id, store: m.store, iter: arr ?? source, total: arr ? arr.length : -1 });
+    plans.push({
+      modelId: m.id,
+      modelFilterIdentity,
+      store: m.store,
+      iter: arr ?? source,
+      total: arr ? arr.length : -1,
+    });
   }
 
   let scanned = 0;
@@ -224,18 +246,21 @@ export async function evaluateFilterRulesFederated(
 
     const ctx: EvalContext = {
       store: plan.store,
+      modelId: plan.modelId,
+      modelFilterIdentity: plan.modelFilterIdentity,
       table: plan.store.entities,
       options,
       hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
       hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
       hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
       hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
+      typePsetCache: new Map(),
     };
 
     // Walk the per-model iter in chunkSize-sized strides, yielding the
     // event loop between chunks. ArrayLike fast-path uses index access;
     // the fallback path drains an iterator into chunks.
-    if (Array.isArray(plan.iter) || isArrayLike(plan.iter)) {
+    if (Array.isArray(plan.iter) || isNumericArrayLike(plan.iter)) {
       const arr = plan.iter as ArrayLike<number>;
       for (let i = 0; i < arr.length && out.length < limit; i += chunkSize) {
         if (signal?.aborted) throwAbort(signal);
@@ -289,6 +314,7 @@ export function selectIterationSource(
   rules: readonly FilterRule[],
   combinator: Combinator,
   candidateExpressIds: Iterable<number> | undefined,
+  modelId?: string,
 ): ArrayLike<number> | Iterable<number> {
   // Caller-supplied narrowing wins (Tier-1 candidates).
   if (candidateExpressIds !== undefined) return candidateExpressIds;
@@ -309,7 +335,7 @@ export function selectIterationSource(
       const bucket = unionByType(store, rule.values);
       if (bucket && (best === null || bucket.length < best.length)) best = bucket;
     } else if (rule.kind === 'storey' && rule.op === 'in' && rule.values.length > 0) {
-      const bucket = unionByStorey(store, rule.values);
+      const bucket = unionByStorey(store, rule, modelId);
       if (bucket && (best === null || bucket.length < best.length)) best = bucket;
     }
   }
@@ -330,23 +356,6 @@ function unionByType(store: IfcDataStore, names: readonly string[]): number[] | 
   return out.length > 0 ? out : null;
 }
 
-function unionByStorey(store: IfcDataStore, storeyNames: readonly string[]): number[] | null {
-  const hierarchy = store.spatialHierarchy;
-  if (!hierarchy) return null;
-  const wanted = new Set(storeyNames.map((n) => n.toLowerCase()));
-  const out: number[] = [];
-  // byStorey keys are storey expressIds; their name comes from the
-  // entity table. Models rarely have more than ~20 storeys, so this
-  // pass is essentially free.
-  for (const storeyId of hierarchy.byStorey.keys()) {
-    const name = store.entities.getName(storeyId);
-    if (!wanted.has(name.toLowerCase())) continue;
-    const elements = hierarchy.byStorey.get(storeyId);
-    if (elements) for (const id of elements) out.push(id);
-  }
-  return out.length > 0 ? out : null;
-}
-
 // ── Cheap-first rule ordering ────────────────────────────────────────────────
 
 /**
@@ -356,6 +365,8 @@ function unionByStorey(store: IfcDataStore, storeyNames: readonly string[]): num
  * expensive parse for entities that already fail/pass.
  */
 const RULE_COST: Record<FilterRule['kind'], number> = {
+  // Constant-time comparison against the entity's owning model.
+  model:          0,
   // Column-only — single TypedArray read.
   ifcType:        0,
   // Pre-built reverse-map lookup.
@@ -387,14 +398,30 @@ export function orderRulesByCost(rules: readonly FilterRule[]): FilterRule[] {
 
 // ── Per-entity inner loop ────────────────────────────────────────────────────
 
+/** Type-level pset rows in the same shape `extractPropertiesOnDemand` /
+ *  `extractTypePropertiesOnDemand` return — what `flattenPsets` /
+ *  `mergeInheritedPropertySets` expect. */
+type TypePsetList = ReturnType<typeof extractPropertiesOnDemand>;
+
 interface EvalContext {
   store: IfcDataStore;
+  /** Scopes a `StoreyRule.refs` exact match to this store's own model. */
+  modelId: string;
+  /** Stable source identity compared by `ModelRule`. */
+  modelFilterIdentity: string;
   table: IfcDataStore['entities'];
   options: EvaluateOptions;
   hasPropertyRule: boolean;
   hasQuantityRule: boolean;
   hasMaterialRule: boolean;
   hasClassificationRule: boolean;
+  /** Per-TYPE pset cache, keyed by the type's expressId and shared across
+   *  every entity evaluated against this store (one `EvalContext` per
+   *  model/plan). Many instances share one `IfcWallType` etc., so this
+   *  turns what would be N source-buffer parses (one per instance) into
+   *  one parse per distinct type — see the AGENTS.md §2 large-loop
+   *  warning this module already guards against for instance psets. */
+  typePsetCache: Map<number, TypePsetList>;
 }
 
 function evaluateOneEntity(
@@ -412,7 +439,17 @@ function evaluateOneEntity(
   let matCache: string[] | null = null;
   let classCache: readonly ClassificationInfo[] | null = null;
   const psetsFor = (): PsetRows => {
-    if (!psetCache) psetCache = flattenPsets(extractPropertiesOnDemand(ctx.store, expressId));
+    if (!psetCache) {
+      const ownSets = extractPropertiesOnDemand(ctx.store, expressId);
+      const typeSets = getInheritedTypePsets(ctx, expressId);
+      // IFC inheritance is per-PROPERTY, not per-set, and the occurrence's
+      // own value wins on a name collision — same rule the IDS bridge
+      // already applies (`mergeInheritedPropertySets`, packages/parser).
+      // A type-only pset (nothing on the instance) is appended as-is, so
+      // `isSet`/`isNotSet` now also see properties that exist ONLY on the
+      // type — a deliberate presence-semantics change (was instance-only).
+      psetCache = flattenPsets(mergeInheritedPropertySets(ownSets, typeSets));
+    }
     return psetCache;
   };
   const qtysFor = (): QtyRows => {
@@ -454,6 +491,41 @@ function evaluateOneEntity(
   return combineRuleResults(combinator, ruleResults);
 }
 
+/**
+ * Resolve `expressId`'s TYPE-level property sets (e.g. `IfcWallType`'s
+ * `Pset_WallCommon`) via `IfcRelDefinesByType`, caching the parse per
+ * TYPE (`ctx.typePsetCache`) rather than per instance. Many occurrences
+ * share one type, so this is O(distinct types) source-buffer parses per
+ * filter run, not O(entities) — see the AGENTS.md §2 warning this module
+ * already guards for instance psets.
+ *
+ * Mirrors `packages/ids/src/bridge/properties.ts`'s `inheritedPropertySets`
+ * / `typePropertySetsFromTable` split: `extractTypePropertiesOnDemand` only
+ * resolves from the source buffer, so on a server-parsed store (no
+ * `source`, e.g. after collab/session load) it always returns null — the
+ * type's psets there are keyed under the type's own expressId in the
+ * pre-built `PropertyTable` (`store.properties.getForEntity(typeId)`,
+ * issue #1787's server-path fallback).
+ */
+function getInheritedTypePsets(ctx: EvalContext, expressId: number): TypePsetList {
+  if (!ctx.store.relationships) return [];
+  const typeIds = ctx.store.relationships.getRelated(expressId, RelationshipType.DefinesByType, 'inverse');
+  if (typeIds.length === 0) return [];
+  const typeId = typeIds[0];
+
+  const cached = ctx.typePsetCache.get(typeId);
+  if (cached !== undefined) return cached;
+
+  let resolved: TypePsetList;
+  if (ctx.store.source && ctx.store.source.length > 0) {
+    resolved = extractTypePropertiesOnDemand(ctx.store, expressId)?.properties ?? [];
+  } else {
+    resolved = (ctx.store.properties?.getForEntity?.(typeId) ?? []) as unknown as TypePsetList;
+  }
+  ctx.typePsetCache.set(typeId, resolved);
+  return resolved;
+}
+
 function evaluateRule(
   rule: FilterRule,
   ctx: EvalContext,
@@ -464,7 +536,15 @@ function evaluateRule(
   classFor: (() => readonly ClassificationInfo[]) | null,
 ): boolean {
   switch (rule.kind) {
+    case 'model': {
+      return setOpMatches(rule.op, ctx.modelFilterIdentity, rule.values);
+    }
     case 'storey': {
+      // Exact-identity mode (refs present): Name isn't unique.
+      if (rule.refs) {
+        const isMatch = storeyMatchesRefs(ctx.store, expressId, ctx.modelId, rule);
+        return rule.op === 'in' ? isMatch : !isMatch;
+      }
       const storeyName = ctx.options.storeyNameOf?.(expressId)
         ?? defaultStoreyName(ctx.store, expressId);
       return setOpMatches(rule.op, storeyName, rule.values);
@@ -527,28 +607,6 @@ function buildResult(modelId: string, ctx: EvalContext, expressId: number): Filt
  *  entry report a `total` rather than streaming with `total = -1`. */
 function iterateAllExpressIds(store: IfcDataStore): ArrayLike<number> {
   return store.entities.expressId;
-}
-
-function isArrayLike(value: unknown): value is ArrayLike<number> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { length?: unknown }).length === 'number'
-  );
-}
-
-/** Try to materialise an iterable into an array so the federated loop
- *  can chunk-iterate by index (faster + provides a `total` for progress).
- *  Returns null when the source is unknown-size and we'd rather stream. */
-function materialiseIterable(
-  source: ArrayLike<number> | Iterable<number>,
-): ArrayLike<number> | null {
-  if (Array.isArray(source)) return source;
-  if (isArrayLike(source)) return source;
-  if (source instanceof Set) return Array.from(source);
-  // Generators / unknown-size iterables: keep streaming. The federated
-  // loop falls back to the iterator branch with a buffered chunk count.
-  return null;
 }
 
 function throwAbort(signal: AbortSignal): never {

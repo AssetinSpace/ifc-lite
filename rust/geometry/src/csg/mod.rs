@@ -14,7 +14,11 @@ use smallvec::SmallVec;
 use std::cell::RefCell;
 
 mod consolidate;
+mod degenerate_check;
 mod normals;
+mod plane_eps;
+mod topology_diagnostic;
+mod union;
 
 pub use normals::calculate_normals;
 pub(crate) use consolidate::tri_is_needle;
@@ -184,7 +188,11 @@ fn record_csg_op(op: u8, a_tris: usize, b_tris: usize) {
 
 /// CSG Clipping Processor
 pub struct ClippingProcessor {
-    /// Epsilon for floating point comparisons
+    /// Floor for [`Self::clip_mesh`]'s projected classification epsilon (and
+    /// the whole tolerance [`Self::clip_triangle`] still uses). Raw `f64`,
+    /// never rescaled by `unit_scale`, so its unit is the caller's: file units
+    /// on the `processors/boolean` path, METRES on `router/layers`. See
+    /// [`plane_eps`] for the frames, the sizing and the KNOWN LIMITATION.
     pub epsilon: f64,
     /// Boolean / CSG failures recorded since the last `take_failures()`.
     /// Interior-mutable so the existing `&self` API stays unchanged.
@@ -237,137 +245,7 @@ impl ClippingProcessor {
     /// Clip a triangle against a plane
     /// Returns triangles that are in front of the plane
     pub fn clip_triangle(&self, triangle: &Triangle, plane: &Plane) -> ClipResult {
-        // Calculate signed distances for all vertices
-        let d0 = plane.signed_distance(&triangle.v0);
-        let d1 = plane.signed_distance(&triangle.v1);
-        let d2 = plane.signed_distance(&triangle.v2);
-
-        // Edge intersection parameter, clamped to the segment. Vertices are
-        // classified front/back with an epsilon band (`d >= -epsilon`), so a
-        // "front" vertex can sit slightly behind the plane (d in [-epsilon, 0)).
-        // Feeding that raw distance into `d_front / (d_front - d_back)` yields a
-        // t outside [0, 1] — and when the plane is nearly coincident with a host
-        // face the denominator collapses, extrapolating the cut vertex far off
-        // the edge (issue #1155: a clipped column flew ~97 m). Clamping keeps the
-        // intersection on the edge; the near-zero guard avoids a NaN from a
-        // degenerate (in-plane) edge.
-        let edge_t = |d_front: f64, d_back: f64| -> f64 {
-            let denom = d_front - d_back;
-            if denom.abs() < 1.0e-12 {
-                0.0
-            } else {
-                (d_front / denom).clamp(0.0, 1.0)
-            }
-        };
-
-        // Count vertices in front of plane
-        let mut front_count = 0;
-        if d0 >= -self.epsilon {
-            front_count += 1;
-        }
-        if d1 >= -self.epsilon {
-            front_count += 1;
-        }
-        if d2 >= -self.epsilon {
-            front_count += 1;
-        }
-
-        match front_count {
-            // All vertices behind - discard triangle
-            0 => ClipResult::AllBehind,
-
-            // All vertices in front - keep triangle
-            3 => ClipResult::AllFront(triangle.clone()),
-
-            // One vertex in front - create 1 smaller triangle
-            1 => {
-                let (front, back1, back2) = if d0 >= -self.epsilon {
-                    (triangle.v0, triangle.v1, triangle.v2)
-                } else if d1 >= -self.epsilon {
-                    (triangle.v1, triangle.v2, triangle.v0)
-                } else {
-                    (triangle.v2, triangle.v0, triangle.v1)
-                };
-
-                // Interpolate to find intersection points
-                let d_front = if d0 >= -self.epsilon {
-                    d0
-                } else if d1 >= -self.epsilon {
-                    d1
-                } else {
-                    d2
-                };
-                let d_back1 = if d0 >= -self.epsilon {
-                    d1
-                } else if d1 >= -self.epsilon {
-                    d2
-                } else {
-                    d0
-                };
-                let d_back2 = if d0 >= -self.epsilon {
-                    d2
-                } else if d1 >= -self.epsilon {
-                    d0
-                } else {
-                    d1
-                };
-
-                let t1 = edge_t(d_front, d_back1);
-                let t2 = edge_t(d_front, d_back2);
-
-                let p1 = front + (back1 - front) * t1;
-                let p2 = front + (back2 - front) * t2;
-
-                ClipResult::Split(smallvec::smallvec![Triangle::new(front, p1, p2)])
-            }
-
-            // Two vertices in front - create 2 triangles
-            2 => {
-                let (front1, front2, back) = if d0 < -self.epsilon {
-                    (triangle.v1, triangle.v2, triangle.v0)
-                } else if d1 < -self.epsilon {
-                    (triangle.v2, triangle.v0, triangle.v1)
-                } else {
-                    (triangle.v0, triangle.v1, triangle.v2)
-                };
-
-                // Interpolate to find intersection points
-                let d_back = if d0 < -self.epsilon {
-                    d0
-                } else if d1 < -self.epsilon {
-                    d1
-                } else {
-                    d2
-                };
-                let d_front1 = if d0 < -self.epsilon {
-                    d1
-                } else if d1 < -self.epsilon {
-                    d2
-                } else {
-                    d0
-                };
-                let d_front2 = if d0 < -self.epsilon {
-                    d2
-                } else if d1 < -self.epsilon {
-                    d0
-                } else {
-                    d1
-                };
-
-                let t1 = edge_t(d_front1, d_back);
-                let t2 = edge_t(d_front2, d_back);
-
-                let p1 = front1 + (back - front1) * t1;
-                let p2 = front2 + (back - front2) * t2;
-
-                ClipResult::Split(smallvec::smallvec![
-                    Triangle::new(front1, front2, p1),
-                    Triangle::new(front2, p2, p1),
-                ])
-            }
-
-            _ => unreachable!(),
-        }
+        plane_eps::clip_triangle_with_epsilon(triangle, plane, self.epsilon)
     }
 
     /// Check if two meshes' bounding boxes overlap
@@ -404,7 +282,12 @@ impl ClippingProcessor {
     /// On any failure path the host is returned un-cut and a [`BoolFailure`]
     /// record is appended to the processor's failure log (drainable via
     /// [`Self::take_failures`]). An empty host returns an empty mesh without
-    /// recording a failure (it's a fast path, not a fallback).
+    /// recording a failure (it's a fast path, not a fallback). The accept path
+    /// also runs `record_topology_tear` (#3440 step 1): diagnostic only, never
+    /// gates, in every build. `topology_gate_reject` (#3440 step 2) runs the
+    /// same closure predicate but, ONLY when the crate is built with the
+    /// `csg_topology_gate` feature (off by default; no downstream crate turns
+    /// it on), rejects a torn result the same way `KernelOutputInvalid` does.
     pub fn subtract_mesh(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> Result<Mesh> {
         record_csg_op(0, host_mesh.triangle_count(), opening_mesh.triangle_count());
         if host_mesh.is_empty() {
@@ -454,7 +337,10 @@ impl ClippingProcessor {
             self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
             return Ok(host_mesh.clone());
         }
-        Ok(result)
+        if self.accept_gates_reject(BoolOp::Difference, &result) {
+            return Ok(host_mesh.clone());
+        }
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
     }
 
     /// Subtract a GROUP of pairwise-disjoint opening cutters from the host in
@@ -527,36 +413,12 @@ impl ClippingProcessor {
                 self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
                 return Ok(host_mesh.clone());
             }
+            if self.accept_gates_reject(BoolOp::Difference, &next) {
+                return Ok(host_mesh.clone());
+            }
             result = next;
         }
-        Ok(result)
-    }
-
-    /// Union two meshes together using CSG boolean operations on the
-    /// pure-Rust exact kernel.
-    ///
-    /// Empty operands are handled silently — they have a unique correct answer.
-    pub fn union_mesh(&self, mesh_a: &Mesh, mesh_b: &Mesh) -> Result<Mesh> {
-        record_csg_op(1, mesh_a.triangle_count(), mesh_b.triangle_count());
-        if mesh_a.is_empty() {
-            return Ok(mesh_b.clone());
-        }
-        if mesh_b.is_empty() {
-            return Ok(mesh_a.clone());
-        }
-
-        // Pure-Rust exact kernel. On an empty/invalid kernel result
-        // fall back to a plain merge (overlap not removed) + record the failure,
-        // preserving the legacy never-Err contract.
-        let raw_u = crate::kernel::mesh_bridge::union(mesh_a, mesh_b);
-        let result = Self::consolidate_coplanar(raw_u);
-        if result.is_empty() || !self.validate_mesh(&result) {
-            self.record_failure(BoolOp::Union, BoolFailureReason::KernelOutputInvalid);
-            let mut merged = mesh_a.clone();
-            merged.merge(mesh_b);
-            return Ok(merged);
-        }
-        Ok(result)
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
     }
 
     /// Intersect two meshes using CSG boolean operations on the pure-Rust
@@ -578,103 +440,10 @@ impl ClippingProcessor {
             self.record_failure(BoolOp::Intersection, BoolFailureReason::KernelOutputInvalid);
             return Ok(Mesh::new());
         }
-        Ok(result)
-    }
-
-    /// Union multiple meshes together
-    ///
-    /// Convenience method that sequentially unions all non-empty meshes.
-    /// Skips empty meshes to avoid unnecessary CSG operations.
-    pub fn union_meshes(&self, meshes: &[Mesh]) -> Result<Mesh> {
-        if meshes.is_empty() {
+        if self.accept_gates_reject(BoolOp::Intersection, &result) {
             return Ok(Mesh::new());
         }
-
-        if meshes.len() == 1 {
-            return Ok(meshes[0].clone());
-        }
-
-        // Start with first non-empty mesh
-        let mut result = Mesh::new();
-        let mut found_first = false;
-
-        for mesh in meshes {
-            if mesh.is_empty() {
-                continue;
-            }
-
-            if !found_first {
-                result = mesh.clone();
-                found_first = true;
-                continue;
-            }
-
-            result = self.union_mesh(&result, mesh)?;
-        }
-
-        Ok(result)
-    }
-
-    /// Heuristic: does this look like a botched CSG difference?
-    ///
-    /// Kernel-neutral check used by the boolean processor (e.g. the
-    /// polygonal-bounded half-space clip) to fall back to a robust
-    /// unbounded plane clip when a difference result looks collapsed
-    /// relative to its host. Historically this caught a Linux-specific
-    /// Manifold pathology where a wall body clipped by an
-    /// `IfcPolygonalBoundedHalfSpace` prism collapsed to a near-empty
-    /// result (1 triangle from a 12-triangle host box).
-    ///
-    /// Rules:
-    ///  * An empty result is a legit outcome (cutter contains host) —
-    ///    NOT degenerate.
-    ///  * A closed-volume result needs at least 4 triangles. Anything
-    ///    below that is structurally broken.
-    ///  * For hosts with >= 12 triangles (typical IFC solid input), the
-    ///    output should retain at least 25 % of the host's triangle
-    ///    count when the cutter is partial.
-    pub(crate) fn difference_result_looks_degenerate(host: &Mesh, result: &Mesh) -> bool {
-        let result_tris = result.indices.len() / 3;
-        if result_tris == 0 {
-            return false;
-        }
-        if result_tris < 4 {
-            return true;
-        }
-        let host_tris = host.indices.len() / 3;
-        if host_tris >= 12 && result_tris * 4 < host_tris {
-            return true;
-        }
-
-        // "Wrong piece" check: a difference result MUST be a subset of the
-        // host volume, so the result's bounding box has to sit inside the
-        // host's. When a malformed cutter (typical: IfcFacetedBrep with
-        // inward-pointing face normals) inverts the kernel's
-        // inside/outside test, Manifold returns the CUTTER mesh instead —
-        // which lives partially or wholly outside the host bbox. House.ifc
-        // wall #3448 (a 7 m extrusion clipped by a gable-shaped brep)
-        // rendered as the gable triangle alone before this guard.
-        let (host_min, host_max) = host.bounds();
-        let (res_min, res_max) = result.bounds();
-        // 1 % of the host's edge **per axis** — using a single tolerance
-        // derived from the longest dimension lets thin walls/plates pass
-        // a wrong-piece check on Y/Z that they shouldn't (CodeRabbit
-        // review on PR #861). With per-axis slack, a 5 m × 0.4 m × 7 m
-        // wall gets ±5 cm tolerance on X, ±4 mm on Y, ±7 cm on Z — so a
-        // result that pokes >4 mm past the wall's thickness face is
-        // correctly flagged even though it's well within 1 % of the X
-        // span.
-        let slack = (host_max - host_min).abs() * 0.01;
-        if res_min.x + slack.x < host_min.x
-            || res_min.y + slack.y < host_min.y
-            || res_min.z + slack.z < host_min.z
-            || res_max.x > host_max.x + slack.x
-            || res_max.y > host_max.y + slack.y
-            || res_max.z > host_max.z + slack.z
-        {
-            return true;
-        }
-        false
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Intersection, m))
     }
 
     /// Validate mesh for common issues
@@ -683,12 +452,10 @@ impl ClippingProcessor {
         if mesh.positions.iter().any(|v| !v.is_finite()) {
             return false;
         }
-
         // Check for NaN/Inf in normals
         if mesh.normals.iter().any(|v| !v.is_finite()) {
             return false;
         }
-
         // Check for valid triangle indices
         let vertex_count = mesh.vertex_count();
         for idx in &mesh.indices {
@@ -700,10 +467,18 @@ impl ClippingProcessor {
         true
     }
 
-    /// Clip an entire mesh against a plane
+    /// Clip an entire mesh against a plane.
+    ///
+    /// The classification epsilon is per-axis f32 rounding noise projected
+    /// onto `plane`'s own normal and floored at [`Self::epsilon`]; see
+    /// [`plane_eps`] for why it must scale with coordinate magnitude, why the
+    /// magnitude is tracked per axis rather than maxed over all three, and why
+    /// `near_band_from_extent` is deliberately not reused.
     pub fn clip_mesh(&self, mesh: &Mesh, plane: &Plane) -> Result<Mesh> {
         record_csg_op(3, mesh.triangle_count(), 0);
         let mut result = Mesh::new();
+
+        let eps = plane_eps::PlaneEps::new(mesh, self.epsilon).for_normal(&plane.normal);
 
         // Process each triangle
         let vert_count = mesh.positions.len() / 3;
@@ -740,7 +515,7 @@ impl ClippingProcessor {
             let triangle = Triangle::new(v0, v1, v2);
 
             // Clip triangle
-            match self.clip_triangle(&triangle, plane) {
+            match plane_eps::clip_triangle_with_epsilon(&triangle, plane, eps) {
                 ClipResult::AllFront(tri) => {
                     // Keep original triangle
                     add_triangle_to_mesh(&mut result, &tri);

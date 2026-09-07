@@ -30,12 +30,17 @@ import {
   Table2,
   ListTree,
   Users,
+  Cloud,
   Layers as LayersIcon,
   Box,
+<<<<<<< HEAD
   // >>> AIM-FORK: icons for the fork-only panels below (D-072, D-075)
   Map as MapIcon,
   Files,
   // <<< AIM-FORK
+=======
+  FileWarning,
+>>>>>>> upstream/main
   type LucideIcon,
 } from 'lucide-react';
 
@@ -53,16 +58,21 @@ export type WorkspacePanelId =
   | 'lens'
   | 'clash'
   | 'extensions'
+  | 'sources'
   | 'script'
   | 'gantt'
   | 'lists'
   | 'collab'
   | 'layers'
   | 'zones'
+<<<<<<< HEAD
   // >>> AIM-FORK: fork-only panels (D-072 underlays, D-075 documents)
   | 'drawing-underlay'
   | 'documents';
   // <<< AIM-FORK
+=======
+  | 'loadReport';
+>>>>>>> upstream/main
 
 /** Activity-bar clustering — a divider is drawn whenever the group changes. */
 export type PanelGroup = 'navigate' | 'inspect' | 'review' | 'author' | 'work';
@@ -108,6 +118,9 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Alt+1..0 mapping stays intact (no Alt shortcut). The activity bar hides it
   // while the collab feature flag is off (see ActivityBar).
   { id: 'collab', title: 'Collaboration room', short: 'Room', Icon: Users, group: 'review', region: 'side' },
+  // Cloud sources (CDE integrations). APPENDED — no Alt shortcut. Always on
+  // the rail; providers that failed to register are reported inside the panel.
+  { id: 'sources', title: 'Cloud sources', short: 'Sources', Icon: Cloud, group: 'inspect', region: 'side' },
   // IFCX layer stack + per-layer diff (#1717). APPENDED so the frozen
   // Alt+1..0 mapping stays intact (no Alt shortcut). The activity bar only
   // surfaces it while a federated layer stack is loaded.
@@ -115,6 +128,7 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Location zones (construction sections / takt areas, #1810). APPENDED so
   // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
   { id: 'zones', title: 'Location zones', short: 'Zones', Icon: Box, group: 'review', region: 'side' },
+<<<<<<< HEAD
   // >>> AIM-FORK: fork-only panels, kept last so upstream keeps appending above us.
   // Georeferenced PDF drawing underlays (D-072 in the AIM repo). APPENDED so
   // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
@@ -123,6 +137,12 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // tabs in the center document pane. APPENDED — frozen Alt mapping untouched.
   { id: 'documents', title: 'Documents', short: 'Docs', Icon: Files, group: 'navigate', region: 'side' },
   // <<< AIM-FORK
+=======
+  // Flag-free like 'zones' above (#1869 precedent) — no dedicated
+  // `loadReportPanelVisible` boolean; `openWorkspacePanel`'s generic
+  // non-SIDEBAR_PANEL_FLAGS branch adopts it directly (issue #3927).
+  { id: 'loadReport', title: 'Load report', short: 'Load report', Icon: FileWarning, group: 'review', region: 'side' },
+>>>>>>> upstream/main
 ];
 
 /** The bottom-strip panel ids, mapped to their store visibility flag + setter

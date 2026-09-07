@@ -190,6 +190,15 @@ fn extracts_type_relationship_and_resolves_typed_property_values() {
         })
     };
     assert!(type_link(210), "TYPEHASPROPERTYSETS #210->#200 missing");
+    // Synthetic edges: no IfcRel entity produced them, so `rel_id` is 0 rather
+    // than a borrowed id (issue #3860).
+    assert!(
+        dm.relationships
+            .iter()
+            .filter(|r| r.rel_type == "TYPEHASPROPERTYSETS")
+            .all(|r| r.rel_id == 0),
+        "synthetic type-set edges must not claim an IfcRel express id"
+    );
     assert!(
         type_link(220),
         "TYPEHASPROPERTYSETS #220->#200 missing (qset)"
@@ -404,4 +413,517 @@ fn drops_voids_and_fills_rows_with_missing_or_list_refs() {
         "malformed voids/fills rows must be dropped, got: {:?}",
         dm.relationships
     );
+}
+
+/// Full Project -> Site -> Building -> Storey -> Space spatial chain (via
+/// IFCRELAGGREGATES), with one element contained directly at EACH of the four
+/// levels (via IFCRELCONTAINEDINSPATIALSTRUCTURE): a furnishing element in the
+/// site, a door in the building, a wall in the storey, a chair in the space.
+/// This pins `build_spatial_hierarchy`'s parent/level/path bookkeeping and the
+/// four-way element_to_{site,building,storey,space} bucketing — none of which
+/// was previously exercised end-to-end (only storey elevation was tested).
+const SPATIAL_CHAIN_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'MyProject',$,$,$,$,$,$);
+#2=IFCSITE('Site0000000000000000001',$,'MySite',$,$,$,$,$,$,$,$,$,$,$);
+#3=IFCBUILDING('Bldg0000000000000000001',$,'MyBuilding',$,$,$,$,$,$,$,$,$);
+#4=IFCBUILDINGSTOREY('Stor0000000000000000001',$,'MyStorey',$,$,$,$,$,$,$);
+#5=IFCSPACE('Spac0000000000000000001',$,'MySpace',$,$,$,$,$,$,$);
+#10=IFCFURNISHINGELEMENT('Furn0000000000000000001',$,'SiteFurniture',$,$,$,$,$);
+#11=IFCDOOR('Door0000000000000000001',$,'BuildingDoor',$,$,$,$,$,$,$,$,$);
+#12=IFCWALL('Wall0000000000000000001',$,'StoreyWall',$,$,$,$,$,$);
+#13=IFCFURNISHINGELEMENT('Chai0000000000000000001',$,'SpaceChair',$,$,$,$,$);
+#100=IFCRELAGGREGATES('Agg00000000000000000001',$,$,$,#1,(#2));
+#101=IFCRELAGGREGATES('Agg00000000000000000002',$,$,$,#2,(#3));
+#102=IFCRELAGGREGATES('Agg00000000000000000003',$,$,$,#3,(#4));
+#103=IFCRELAGGREGATES('Agg00000000000000000004',$,$,$,#4,(#5));
+#110=IFCRELCONTAINEDINSPATIALSTRUCTURE('Con00000000000000000001',$,$,$,(#10),#2);
+#111=IFCRELCONTAINEDINSPATIALSTRUCTURE('Con00000000000000000002',$,$,$,(#11),#3);
+#112=IFCRELCONTAINEDINSPATIALSTRUCTURE('Con00000000000000000003',$,$,$,(#12),#4);
+#113=IFCRELCONTAINEDINSPATIALSTRUCTURE('Con00000000000000000004',$,$,$,(#13),#5);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn builds_spatial_hierarchy_with_correct_parent_level_and_path() {
+    let dm = extract_data_model(SPATIAL_CHAIN_IFC);
+    let sh = &dm.spatial_hierarchy;
+
+    assert_eq!(sh.project_id, 1, "project id must be #1");
+    let node = |id: u32| sh.nodes.iter().find(|n| n.entity_id == id).unwrap();
+
+    let project = node(1);
+    assert_eq!(project.parent_id, 0);
+    assert_eq!(project.level, 0);
+    assert_eq!(project.path, "MyProject");
+    assert_eq!(project.children_ids, vec![2]);
+
+    let site = node(2);
+    assert_eq!(site.parent_id, 1);
+    assert_eq!(site.level, 1);
+    assert_eq!(site.path, "MyProject/MySite");
+    assert_eq!(site.children_ids, vec![3]);
+
+    let building = node(3);
+    assert_eq!(building.parent_id, 2);
+    assert_eq!(building.level, 2);
+    assert_eq!(building.path, "MyProject/MySite/MyBuilding");
+
+    let storey = node(4);
+    assert_eq!(storey.parent_id, 3);
+    assert_eq!(storey.level, 3);
+    assert_eq!(storey.path, "MyProject/MySite/MyBuilding/MyStorey");
+
+    let space = node(5);
+    assert_eq!(space.parent_id, 4);
+    assert_eq!(space.level, 4);
+    assert_eq!(space.path, "MyProject/MySite/MyBuilding/MyStorey/MySpace");
+}
+
+/// Exercises the two DocumentAssociation paths never covered by
+/// `extracts_classification_material_and_document_associations` (which only
+/// hits a fully-populated `IfcDocumentReference` with no `ReferencedDocument`):
+/// (1) `IfcRelAssociatesDocument` pointing straight at an
+/// `IfcDocumentInformation` (attribute layout Identification/Name/Description/
+/// Location — description and location are NOT in attribute order, the exact
+/// index-swap trap), and (2) an `IfcDocumentReference` with some fields blank
+/// backfilled from its `ReferencedDocument`, where already-set reference
+/// fields (Identification, Location) must NOT be overwritten by the info's
+/// values, even though the info carries different values at those slots.
+const DOCUMENT_PATHS_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#28=IFCWALL('Wall00000000000000001',$,'W1',$,$,$,$,$,$);
+#29=IFCCOLUMN('Col0000000000000000001',$,'C1',$,$,$,$,$,$);
+/* (1) Direct IfcDocumentInformation reference. */
+#50=IFCDOCUMENTINFORMATION('INFO-ID','InfoName','InfoDesc','http://info.example',$,$,$,$,$,$,$,$,$);
+#51=IFCRELASSOCIATESDOCUMENT('Doc0000000000000000002',$,$,$,(#28),#50);
+/* (2) IfcDocumentReference with Name/Description blank, Identification and
+   Location already set — backfill must fill Name/Description ONLY, from the
+   correct info slots (1 and 2), and must leave Identification/Location alone
+   even though the info has different values at slots 0 and 3. */
+#60=IFCDOCUMENTREFERENCE('http://ref.example','REF-ID',$,$,#61);
+#61=IFCDOCUMENTINFORMATION('OTHER-ID','BackfilledName','BackfilledDesc','http://other.example',$,$,$,$,$,$,$,$,$);
+#62=IFCRELASSOCIATESDOCUMENT('Doc0000000000000000003',$,$,$,(#29),#60);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn resolves_document_information_directly_at_its_own_attribute_layout() {
+    let dm = extract_data_model(DOCUMENT_PATHS_IFC);
+    let d = dm
+        .documents
+        .iter()
+        .find(|d| d.element_id == 28)
+        .expect("wall document association");
+    assert_eq!(d.identification.as_deref(), Some("INFO-ID"));
+    assert_eq!(d.name.as_deref(), Some("InfoName"));
+    assert_eq!(d.description.as_deref(), Some("InfoDesc"));
+    assert_eq!(d.location.as_deref(), Some("http://info.example"));
+}
+
+#[test]
+fn backfills_only_missing_document_reference_fields_from_referenced_document() {
+    let dm = extract_data_model(DOCUMENT_PATHS_IFC);
+    let d = dm
+        .documents
+        .iter()
+        .find(|d| d.element_id == 29)
+        .expect("column document association");
+    // Already-set on the reference: must survive untouched, not be
+    // overwritten by the referenced info's (different) values.
+    assert_eq!(d.identification.as_deref(), Some("REF-ID"));
+    assert_eq!(d.location.as_deref(), Some("http://ref.example"));
+    // Blank on the reference: must be backfilled from the CORRECT info slots.
+    assert_eq!(d.name.as_deref(), Some("BackfilledName"));
+    assert_eq!(d.description.as_deref(), Some("BackfilledDesc"));
+}
+
+/// One quantity of EACH `IfcPhysicalQuantity` subtype the extractor supports,
+/// on a single Qto. Only `IFCQUANTITYLENGTH` was previously exercised (via
+/// `Qto_WallBaseQuantities.Width` in `TYPE_PARITY_IFC`) — the other match
+/// arms in `extract_quantity_value`'s `quantity_type` mapping had no
+/// coverage, so e.g. "area" and "volume" could be silently swapped.
+/// `IFCQUANTITYNUMBER` was worse than swapped: unrecognised, so `#3266`'s
+/// subtype was dropped from the quantity set entirely. It is IFC4X3-only,
+/// hence this fixture's schema header.
+const ALL_QUANTITY_KINDS_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4X3'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#10=IFCWALL('Wall00000000000000001',$,'W1',$,$,$,$,$,$);
+#20=IFCELEMENTQUANTITY('Qset00000000000000001',$,'Qto_All',$,$,(#21,#22,#23,#24,#25,#26,#27));
+#21=IFCQUANTITYLENGTH('QLen',$,$,111.);
+#22=IFCQUANTITYAREA('QArea',$,$,222.);
+#23=IFCQUANTITYVOLUME('QVol',$,$,333.);
+#24=IFCQUANTITYCOUNT('QCount',$,$,444.);
+#25=IFCQUANTITYWEIGHT('QWeight',$,$,555.);
+#26=IFCQUANTITYTIME('QTime',$,$,666.);
+#27=IFCQUANTITYNUMBER('QNumber',$,$,777.);
+#30=IFCRELDEFINESBYPROPERTIES('Rdbp0000000000000001',$,$,$,(#10),#20);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn maps_every_physical_quantity_subtype_to_its_own_quantity_type_string() {
+    let dm = extract_data_model(ALL_QUANTITY_KINDS_IFC);
+    let qset = dm
+        .quantity_sets
+        .iter()
+        .find(|q| q.qset_id == 20)
+        .expect("Qto_All extracted");
+    let q = |name: &str| {
+        qset.quantities
+            .iter()
+            .find(|q| q.quantity_name == name)
+            .unwrap_or_else(|| panic!("quantity {name} missing: {:?}", qset.quantities))
+    };
+    assert_eq!(q("QLen").quantity_type, "length");
+    assert_eq!(q("QLen").quantity_value, 111.0);
+    assert_eq!(q("QArea").quantity_type, "area");
+    assert_eq!(q("QArea").quantity_value, 222.0);
+    assert_eq!(q("QVol").quantity_type, "volume");
+    assert_eq!(q("QVol").quantity_value, 333.0);
+    assert_eq!(q("QCount").quantity_type, "count");
+    assert_eq!(q("QCount").quantity_value, 444.0);
+    assert_eq!(q("QWeight").quantity_type, "weight");
+    assert_eq!(q("QWeight").quantity_value, 555.0);
+    assert_eq!(q("QTime").quantity_type, "time");
+    assert_eq!(q("QTime").quantity_value, 666.0);
+    assert_eq!(q("QNumber").quantity_type, "number");
+    assert_eq!(q("QNumber").quantity_value, 777.0);
+}
+
+/// A wall associated DIRECTLY with an `IfcMaterial` (no layer set / usage
+/// indirection) — the `"IFCMATERIAL" =>` arm of `resolve_material`, whose
+/// `category` field (attribute 2) was previously not asserted anywhere: a
+/// mutation dropping it to `None` passed the full suite.
+const DIRECT_MATERIAL_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#28=IFCWALL('Wall00000000000000001',$,'W1',$,$,$,$,$,$);
+#80=IFCMATERIAL('Brick',$,'Masonry');
+#81=IFCRELASSOCIATESMATERIAL('Mat0000000000000000004',$,$,$,(#28),#80);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn resolves_a_direct_material_association_including_its_category() {
+    let dm = extract_data_model(DIRECT_MATERIAL_IFC);
+    let m = dm
+        .materials
+        .iter()
+        .find(|m| m.element_id == 28)
+        .expect("direct material association");
+    assert_eq!(m.material_name, "Brick");
+    assert_eq!(m.category.as_deref(), Some("Masonry"));
+    assert_eq!(m.set_name, None);
+    assert_eq!(m.thickness, None);
+}
+
+/// A TWO-level `IfcClassificationReference` chain (leaf -> intermediate ref ->
+/// `IfcClassification`) — `resolve_classification`'s `ReferencedSource` walk
+/// loop was only ever exercised at depth 1 (leaf ref pointing straight at the
+/// classification); a mutation that stops walking after the first hop still
+/// passed the full suite, silently losing `system_name` on any multi-level
+/// classification tree (issue #900 covers only the flat case).
+const NESTED_CLASSIFICATION_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#28=IFCWALL('Wall00000000000000001',$,'W1',$,$,$,$,$,$);
+#40=IFCCLASSIFICATION('Uniclass 2015','2',$,'Uniclass 2015',$,$,$);
+#41=IFCCLASSIFICATIONREFERENCE('loc-parent','PARENT','Parent Group',#40,$,$);
+#42=IFCCLASSIFICATIONREFERENCE('loc-leaf','LEAF','Leaf Item',#41,$,$);
+#43=IFCRELASSOCIATESCLASSIFICATION('Cls0000000000000000002',$,$,$,(#28),#42);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn walks_referenced_source_through_multiple_classification_reference_levels() {
+    let dm = extract_data_model(NESTED_CLASSIFICATION_IFC);
+    let c = dm
+        .classifications
+        .iter()
+        .find(|c| c.element_id == 28)
+        .expect("nested classification association");
+    // The leaf reference's own fields.
+    assert_eq!(c.identification.as_deref(), Some("LEAF"));
+    assert_eq!(c.name.as_deref(), Some("Leaf Item"));
+    assert_eq!(c.location.as_deref(), Some("loc-leaf"));
+    // system_name resolved by walking THROUGH the intermediate reference (#41)
+    // to the owning IfcClassification (#40) two hops away.
+    assert_eq!(c.system_name.as_deref(), Some("Uniclass 2015"));
+}
+
+#[test]
+fn buckets_contained_elements_by_the_correct_spatial_container_kind() {
+    let dm = extract_data_model(SPATIAL_CHAIN_IFC);
+    let sh = &dm.spatial_hierarchy;
+
+    // Each element must land in EXACTLY its own container's bucket, not any
+    // of the other three (the swapped/wrong-bucket mutation this pins).
+    assert_eq!(sh.element_to_site, vec![(10, 2)], "site bucket");
+    assert_eq!(sh.element_to_building, vec![(11, 3)], "building bucket");
+    assert_eq!(sh.element_to_storey, vec![(12, 4)], "storey bucket");
+    assert_eq!(sh.element_to_space, vec![(13, 5)], "space bucket");
+
+    assert_eq!(sh.element_to_site.len(), 1);
+    assert_eq!(sh.element_to_building.len(), 1);
+    assert_eq!(sh.element_to_storey.len(), 1);
+    assert_eq!(sh.element_to_space.len(), 1);
+}
+
+/// Every relationship row must carry the express id of the `IfcRel*` entity it
+/// came from (issue #3860). Without it the viewer's server path fed the
+/// relationship graph id 0 and a Parquet/DuckDB export wrote `RelId = 0` on
+/// every row, so a server-loaded model and a locally parsed one disagreed on
+/// the same relationship. The three association rels here have distinct express
+/// ids (#35 / #42 / #51) that are also distinct from their relating and related
+/// ids, so neither a constant nor a copy of a neighbouring column passes.
+#[test]
+fn relationships_carry_the_ifcrel_express_id() {
+    let dm = extract_data_model(ASSOCIATIONS_IFC);
+    let rel_id_of = |ty: &str, relating: u32, related: u32| -> u32 {
+        dm.relationships
+            .iter()
+            .find(|r| {
+                r.rel_type.eq_ignore_ascii_case(ty)
+                    && r.relating_id == relating
+                    && r.related_id == related
+            })
+            .unwrap_or_else(|| panic!("{ty} ({relating} -> {related}) missing"))
+            .rel_id
+    };
+    assert_eq!(rel_id_of("IFCRELASSOCIATESMATERIAL", 34, 28), 35);
+    assert_eq!(rel_id_of("IFCRELASSOCIATESCLASSIFICATION", 41, 28), 42);
+    assert_eq!(rel_id_of("IFCRELASSOCIATESDOCUMENT", 50, 28), 51);
+}
+
+/// The single-ref voids/fills path builds its `Relationship` in a separate arm
+/// from the list path, so it can lose `rel_id` on its own.
+#[test]
+fn voids_and_fills_carry_the_ifcrel_express_id() {
+    let dm = extract_data_model(VOID_FILL_IFC);
+    let rel_id_of = |ty: &str| -> u32 {
+        dm.relationships
+            .iter()
+            .find(|r| r.rel_type.eq_ignore_ascii_case(ty))
+            .unwrap_or_else(|| panic!("{ty} missing"))
+            .rel_id
+    };
+    assert_eq!(rel_id_of("IFCRELVOIDSELEMENT"), 40);
+    assert_eq!(rel_id_of("IFCRELFILLSELEMENT"), 50);
+}
+
+/// Fixture for issue #3964: a `IfcSystem` grouping a wall via
+/// `IfcRelAssignsToGroup`, an `IfcZone` grouping the same wall via
+/// `IfcRelAssignsToGroupByFactor` (adds a proportional Factor, e.g. zone
+/// occupancy share, but shares the same RelatedObjects/RelatingGroup
+/// membership semantics as its supertype), a door decomposed into a panel via
+/// `IfcRelNests` (a decomposition edge some IFC4 exporters use instead of
+/// `IfcRelAggregates`, e.g. feature/fastener nesting), and two walls joined
+/// end-to-end via `IfcRelConnectsPathElements` (the "connected walls" edge the
+/// Properties panel reads via `extractRelationshipsOnDemand`). None of these
+/// four types were extracted before this fix.
+const NEW_REL_TYPES_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0$ScRe4drECQ4DMSqUjd6d',$,'P',$,$,$,$,$,$);
+#10=IFCWALL('Wall00000000000000001',$,'W1',$,$,$,$,$,$);
+#11=IFCWALL('Wall00000000000000002',$,'W2',$,$,$,$,$,$);
+#20=IFCSYSTEM('Sys0000000000000000001',$,'HVAC-1',$,$);
+#21=IFCRELASSIGNSTOGROUP('Grp0000000000000000001',$,$,$,(#10),$,#20);
+#25=IFCZONE('Zon0000000000000000001',$,'Zone-A',$,$);
+#26=IFCRELASSIGNSTOGROUPBYFACTOR('Grf0000000000000000001',$,$,$,(#10),$,#25,0.5);
+#30=IFCDOOR('Doo0000000000000000001',$,'D1',$,$,$,$,$,$);
+#31=IFCDOOR('Doo0000000000000000002',$,'D2',$,$,$,$,$,$);
+#32=IFCRELNESTS('Nst0000000000000000001',$,$,$,#30,(#31));
+#40=IFCRELCONNECTSPATHELEMENTS('Con0000000000000000001',$,$,$,$,#10,#11,$,$,.ATEND.,.ATSTART.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn extracts_assigns_to_group_relationship_orientation() {
+    let dm = extract_data_model(NEW_REL_TYPES_IFC);
+    // RelatingGroup=#20 (IfcSystem), RelatedObjects=(#10) (the wall).
+    assert!(
+        dm.relationships.iter().any(|r| {
+            r.rel_type.eq_ignore_ascii_case("IFCRELASSIGNSTOGROUP")
+                && r.relating_id == 20
+                && r.related_id == 10
+        }),
+        "IFCRELASSIGNSTOGROUP (system -> wall) missing or misoriented: {:?}",
+        dm.relationships
+    );
+}
+
+#[test]
+fn extracts_assigns_to_group_by_factor_relationship_orientation() {
+    let dm = extract_data_model(NEW_REL_TYPES_IFC);
+    // RelatingGroup=#25 (IfcZone), RelatedObjects=(#10) (the wall).
+    assert!(
+        dm.relationships.iter().any(|r| {
+            r.rel_type.eq_ignore_ascii_case("IFCRELASSIGNSTOGROUPBYFACTOR")
+                && r.relating_id == 25
+                && r.related_id == 10
+        }),
+        "IFCRELASSIGNSTOGROUPBYFACTOR (zone -> wall) missing or misoriented: {:?}",
+        dm.relationships
+    );
+}
+
+#[test]
+fn extracts_nests_relationship_orientation() {
+    let dm = extract_data_model(NEW_REL_TYPES_IFC);
+    // RelatingObject=#30 (door), RelatedObjects=(#31) (the nested panel).
+    assert!(
+        dm.relationships.iter().any(|r| {
+            r.rel_type.eq_ignore_ascii_case("IFCRELNESTS")
+                && r.relating_id == 30
+                && r.related_id == 31
+        }),
+        "IFCRELNESTS (door -> panel) missing or misoriented: {:?}",
+        dm.relationships
+    );
+}
+
+#[test]
+fn extracts_connects_path_elements_relationship_orientation() {
+    let dm = extract_data_model(NEW_REL_TYPES_IFC);
+    // RelatingElement=#10 (wall 1), RelatedElement=#11 (wall 2).
+    assert!(
+        dm.relationships.iter().any(|r| {
+            r.rel_type.eq_ignore_ascii_case("IFCRELCONNECTSPATHELEMENTS")
+                && r.relating_id == 10
+                && r.related_id == 11
+        }),
+        "IFCRELCONNECTSPATHELEMENTS (wall -> wall) missing or misoriented: {:?}",
+        dm.relationships
+    );
+}
+
+/// Control: a fixture with none of the four new types must extract exactly as
+/// before — none of them should ever appear for a model that never wrote
+/// them, so a future change to the new-type match arms can't silently start
+/// matching an unrelated type.
+#[test]
+fn fixture_without_new_types_is_unaffected() {
+    let dm = extract_data_model(ASSOCIATIONS_IFC);
+    assert!(
+        !dm.relationships.iter().any(|r| {
+            matches!(
+                r.rel_type.to_uppercase().as_str(),
+                "IFCRELASSIGNSTOGROUP"
+                    | "IFCRELASSIGNSTOGROUPBYFACTOR"
+                    | "IFCRELNESTS"
+                    | "IFCRELCONNECTSPATHELEMENTS"
+            )
+        }),
+        "fixture has none of the new types, but one was extracted: {:?}",
+        dm.relationships
+    );
+}
+
+/// #3949: `IfcClassification`'s attribute order is `Source(0), Edition(1),
+/// EditionDate(2), Name(3), ...` — nothing like `IfcRoot`'s
+/// `GlobalId(0), OwnerHistory(1), Name(2)`. Reading it at the hardcoded
+/// `IfcRoot` positions makes `global_id` the classification's `Source` string
+/// and `name` its `EditionDate`.
+const CLASSIFICATION_METADATA_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#90=IFCCLASSIFICATION('Src90','Ed90','2024-01-01','RealName90',$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn ifcclassification_metadata_reads_name_by_schema_position_not_ifcroot_position() {
+    let dm = extract_data_model(CLASSIFICATION_METADATA_IFC);
+    let e = dm
+        .entities
+        .iter()
+        .find(|e| e.entity_id == 90)
+        .expect("classification entity #90 missing");
+    assert_eq!(e.type_name, "IFCCLASSIFICATION");
+    // `IfcClassification` has no `GlobalId` attribute at all.
+    assert_eq!(
+        e.global_id, None,
+        "IfcClassification does not declare GlobalId; must not read Source as a GUID"
+    );
+    assert_eq!(
+        e.name.as_deref(),
+        Some("RealName90"),
+        "name must be IfcClassification's own Name attribute (index 3), not EditionDate (index 2)"
+    );
+}
+
+/// Control: a genuine `IfcRoot` subtype (`IfcWall`) must keep extracting
+/// `global_id`/`name` at exactly the same positions as before this fix —
+/// `IfcRoot` subtypes are the overwhelming majority of real-model content.
+#[test]
+fn ifcwall_metadata_still_reads_globalid_and_name_at_ifcroot_positions() {
+    let dm = extract_data_model(ASSOCIATIONS_IFC);
+    let e = dm
+        .entities
+        .iter()
+        .find(|e| e.entity_id == 28)
+        .expect("wall entity #28 missing");
+    assert_eq!(e.global_id.as_deref(), Some("Wall00000000000000001"));
+    assert_eq!(e.name.as_deref(), Some("W1"));
+}
+
+/// Control: a type absent from the schema registry falls back to the same
+/// `IfcElement`-layout positions the WASM path uses for unknown types
+/// (Description 3, ObjectType 4, Tag 7) — extended here to GlobalId 0 / Name 2,
+/// matching the pre-fix hardcoded behaviour for the unknown-type case.
+const UNKNOWN_TYPE_METADATA_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#95=IFCTOTALLYMADEUPVENDORTYPE('Guid95',$,'Name95','Desc95','ObjType95',$,$,'Tag95');
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn unknown_type_metadata_falls_back_to_ifcelement_layout_positions() {
+    let dm = extract_data_model(UNKNOWN_TYPE_METADATA_IFC);
+    let e = dm
+        .entities
+        .iter()
+        .find(|e| e.entity_id == 95)
+        .expect("unknown-type entity #95 missing");
+    assert_eq!(e.global_id.as_deref(), Some("Guid95"));
+    assert_eq!(e.name.as_deref(), Some("Name95"));
+    assert_eq!(e.description.as_deref(), Some("Desc95"));
+    assert_eq!(e.object_type.as_deref(), Some("ObjType95"));
+    assert_eq!(e.tag.as_deref(), Some("Tag95"));
 }
