@@ -9,6 +9,7 @@
 
 use crate::generated::IfcType;
 use crate::parser::Token;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Geometry representation categories (internal use only)
@@ -58,11 +59,31 @@ impl AttributeValue {
         match token {
             Token::EntityRef(id) => AttributeValue::EntityRef(*id),
             Token::String(s) => {
-                // Decode STEP escapes (\X2\, \X4\, \X\, \S\, \P\) so every
-                // consumer of a string attribute sees native UTF-8, matching
-                // the TS decodeIfcString. No-escape strings stay zero-cost.
+                // Un-double the `''` quote escape, THEN decode the backslash
+                // escapes (\X2\, \X4\, \X\, \S\, \P\) — the same order the TS
+                // parser uses (columnar-parser-attributes.ts). The tokenizer
+                // hands over the raw inner bytes with `''` intact, and
+                // `decode_ifc_string` deliberately never touches quotes, so
+                // without this step every consumer of a string attribute saw
+                // `O''Brien` (#2323).
+                //
+                // The order is load-bearing, not cosmetic: decoding first would
+                // let two SEPARATE escaped apostrophes (`\X\27\X\27`) decode to
+                // `''` and then collapse into one, losing a character.
+                //
+                // This is the single funnel every Rust consumer of
+                // `AttributeValue::String` goes through. `quick_metadata.rs`
+                // un-doubles on its own raw-byte path, which never builds a
+                // Token, so nothing double-collapses.
                 let raw = String::from_utf8_lossy(s);
-                AttributeValue::String(crate::step_encoding::decode_ifc_string(&raw).into_owned())
+                let undoubled = if raw.contains("''") {
+                    Cow::Owned(raw.replace("''", "'"))
+                } else {
+                    raw
+                };
+                AttributeValue::String(
+                    crate::step_encoding::decode_ifc_string(&undoubled).into_owned(),
+                )
             }
             Token::Integer(i) => AttributeValue::Integer(*i),
             Token::Float(f) => AttributeValue::Float(*f),
@@ -73,8 +94,15 @@ impl AttributeValue {
             Token::TypedValue(type_name, args) => {
                 // For typed values like IFCPARAMETERVALUE(0.), extract the inner value
                 // Store as a list with the type name first, followed by args
+                //
+                // The name is a STEP keyword, so its case is not significant
+                // (ISO 10303-21). Fold it to the EXPRESS spelling here, once, so
+                // every consumer can match uppercase literals and every exporter
+                // emits the canonical name (#4707). Still one allocation: an
+                // uppercase name is borrowed until `into_owned`.
+                let name = String::from_utf8_lossy(type_name);
                 let mut values = vec![AttributeValue::String(
-                    String::from_utf8_lossy(type_name).into_owned(),
+                    crate::schema_helpers::normalise_uppercase(&name).into_owned(),
                 )];
                 values.extend(args.iter().map(Self::from_token));
                 AttributeValue::List(values)
@@ -302,6 +330,17 @@ impl DecodedEntity {
     pub fn get_list(&self, index: usize) -> Option<&[AttributeValue]> {
         self.get(index).and_then(|v| v.as_list())
     }
+
+    /// Get entity references from a list attribute. A bare reference is a
+    /// tolerated one-element list; non-reference list members are skipped.
+    pub fn get_refs(&self, index: usize) -> Option<Vec<u32>> {
+        let attr = self.get(index)?;
+        let refs = match attr.as_list() {
+            Some(list) => list.iter().filter_map(AttributeValue::as_entity_ref).collect(),
+            None => vec![attr.as_entity_ref()?],
+        };
+        (!refs.is_empty()).then_some(refs)
+    }
 }
 
 /// IFC schema metadata for dynamic processing
@@ -410,56 +449,6 @@ impl IfcSchema {
     /// Check if type is a profile
     pub fn is_profile_type(&self, ifc_type: &IfcType) -> bool {
         self.profile_types.contains_key(ifc_type)
-    }
-
-    /// Check if type has geometry
-    pub fn has_geometry(&self, ifc_type: &IfcType) -> bool {
-        // Building elements, furnishing, etc.
-        let name = ifc_type.name();
-        (matches!(
-            ifc_type,
-            IfcType::IfcWall
-                | IfcType::IfcWallStandardCase
-                | IfcType::IfcSlab
-                | IfcType::IfcBeam
-                | IfcType::IfcColumn
-                | IfcType::IfcRoof
-                | IfcType::IfcStair
-                | IfcType::IfcRamp
-                | IfcType::IfcRailing
-                | IfcType::IfcPlate
-                | IfcType::IfcMember
-                | IfcType::IfcFooting
-                | IfcType::IfcPile
-                | IfcType::IfcCovering
-                | IfcType::IfcCurtainWall
-                | IfcType::IfcDoor
-                | IfcType::IfcWindow
-                | IfcType::IfcChimney
-                | IfcType::IfcShadingDevice
-                | IfcType::IfcBuildingElementProxy
-                | IfcType::IfcBuildingElementPart
-        ) || name.contains("Reinforc"))
-            || matches!(
-                ifc_type,
-                IfcType::IfcFurnishingElement
-                | IfcType::IfcFurniture
-                | IfcType::IfcDuctSegment
-                | IfcType::IfcPipeSegment
-                | IfcType::IfcCableSegment
-                | IfcType::IfcProduct // Base type for all products
-                | IfcType::IfcDistributionElement
-                | IfcType::IfcFlowSegment
-                | IfcType::IfcFlowFitting
-                | IfcType::IfcFlowTerminal
-            )
-            // Spatial elements with geometry (for visibility toggling)
-            || matches!(
-                ifc_type,
-                IfcType::IfcSpace
-                | IfcType::IfcOpeningElement
-                | IfcType::IfcSite
-            )
     }
 }
 

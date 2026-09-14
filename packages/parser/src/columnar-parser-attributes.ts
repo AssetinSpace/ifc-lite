@@ -11,6 +11,8 @@
 
 import type { EntityRef } from './types.js';
 import { decodeIfcString } from '@ifc-lite/encoding';
+import { isIndexableExpressId } from './express-id.js';
+import { opensComment, skipComment, skipTrivia } from './step-lexing.js';
 
 /**
  * Find the byte range of a quoted string at a specific attribute position in STEP entity bytes.
@@ -58,8 +60,12 @@ export function findQuotedAttrRange(
 
     // Skip whitespace — including \n/\r: STEP records may wrap attributes
     // across source lines, so a quoted attr can start on a new line
-    // (schependomlaan storey/covering-type names).
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // (schependomlaan storey/covering-type names). Form feed (0x0C) and
+    // vertical tab (0x0B) are included too, kept in sync with isSpaceByte
+    // in step-lexing.ts (#3733): without them, a GlobalId/Name preceded by
+    // either byte silently fails to match here and this function returns
+    // null, the same drop shape the entity scanners had.
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
 
     // Check for quoted string
     if (pos >= end || buffer[pos] !== 0x27 /* ' */) return null;
@@ -80,7 +86,59 @@ export function findQuotedAttrRange(
 }
 
 /**
+ * True unless the attribute at `attrIndex` is the IFC "not present" token
+ * `$`. False (not true) when the record's attribute list is too short to
+ * reach `attrIndex` at all, matching how `entity.get(N).is_some_and(|a|
+ * !a.is_null())` reads a missing attribute on the Rust export side
+ * (`rust/export/src/model.rs`) — an absent slot means "no value", not
+ * "assume present".
+ *
+ * Used for `Representation` (index 6) on `IfcProduct` descendants: GlobalId,
+ * OwnerHistory, Name, Description, ObjectType, ObjectPlacement,
+ * Representation — `IfcProduct` is the last ancestor in the chain to declare
+ * an attribute before this one, so every subtype (`IfcElement`, `IfcWall`,
+ * `IfcBuildingElementProxy`, `IfcSpatialElement`, …) inherits `Representation`
+ * at this exact position; subtypes only append attributes after it. Callers
+ * are responsible for only calling this on an `IfcProduct` descendant.
+ *
+ * ISO 10303-21 allows a `/* ... *\/` comment anywhere whitespace is legal,
+ * including between attributes and right before the target value — a
+ * comma inside an earlier comment must not count as a delimiter either, or
+ * the scan lands on the wrong slot entirely. Both `skipCommas` (below) and
+ * the final approach to `attrIndex` use `step-lexing.ts`'s comment-aware
+ * `skipTrivia`/`opensComment`/`skipComment` — the same helpers the
+ * tokenizer uses — rather than a second, partial comment lexer: a raw
+ * six-byte whitespace test here previously read `,/* omitted *\/$,` as
+ * landing ON the `/` and reported the attribute present (#4725 review).
+ */
+export function hasAttrValueAt(
+    buffer: Uint8Array,
+    entityStart: number,
+    entityLen: number,
+    attrIndex: number,
+): boolean {
+    const end = entityStart + entityLen;
+    let pos = entityStart;
+    while (pos < end && buffer[pos] !== 0x28 /* ( */) pos++;
+    if (pos >= end) return false;
+    pos++; // skip '('
+    pos = skipCommas(buffer, pos, end, attrIndex);
+    const trivia = skipTrivia(buffer, pos, end);
+    pos = trivia.next;
+    if (trivia.stop || pos >= end) return false;
+    return buffer[pos] !== 0x24 /* $ */;
+}
+
+/**
  * Skip N commas at depth 0 in STEP bytes.
+ *
+ * Comment-aware: a `/* ... *\/` comment is legal wherever whitespace is
+ * legal in a record's attribute list, so a comma or quote INSIDE one must
+ * not be read as a delimiter or a string opener. Comments are skipped
+ * whole via `step-lexing.ts`'s `opensComment`/`skipComment` (the same
+ * comment scanner the tokenizer uses) before the comma/paren/quote checks
+ * run, so `(...,#165,/* a, b *\/$,...)` still lands the `$` at the slot
+ * right after `#165`, not one early from the comma inside the comment.
  */
 export function skipCommas(buffer: Uint8Array, start: number, end: number, count: number): number {
     let pos = start;
@@ -89,14 +147,21 @@ export function skipCommas(buffer: Uint8Array, start: number, end: number, count
     let inString = false;
     while (pos < end && remaining > 0) {
         const ch = buffer[pos];
-        if (ch === 0x27) {
-            if (inString && pos + 1 < end && buffer[pos + 1] === 0x27) { pos += 2; continue; }
-            inString = !inString;
-        } else if (!inString) {
-            if (ch === 0x28) depth++;
-            else if (ch === 0x29) depth--;
-            else if (ch === 0x2C && depth === 0) remaining--;
+        if (inString) {
+            if (ch === 0x27 && pos + 1 < end && buffer[pos + 1] === 0x27) { pos += 2; continue; }
+            if (ch === 0x27) inString = false;
+            pos++;
+            continue;
         }
+        if (ch === 0x27) { inString = true; pos++; continue; }
+        if (opensComment(buffer, pos, end)) {
+            const next = skipComment(buffer, pos, end);
+            pos = next < 0 ? end : next;
+            continue;
+        }
+        if (ch === 0x28) depth++;
+        else if (ch === 0x29) depth--;
+        else if (ch === 0x2C && depth === 0) remaining--;
         pos++;
     }
     return pos;
@@ -104,7 +169,10 @@ export function skipCommas(buffer: Uint8Array, start: number, end: number, count
 
 /** Read a #ID entity reference as a number. Returns -1 if not an entity ref. */
 export function readRefId(buffer: Uint8Array, pos: number, end: number): [number, number] {
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // Kept in sync with isSpaceByte in step-lexing.ts (#3733): form feed
+    // (0x0C) and vertical tab (0x0B) are legal separators too, or a ref
+    // preceded by either silently reads as "no reference here" (-1).
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
     if (pos < end && buffer[pos] === 0x23) {
         pos++;
         let num = 0;
@@ -112,6 +180,26 @@ export function readRefId(buffer: Uint8Array, pos: number, end: number): [number
             num = num * 10 + (buffer[pos] - 0x30);
             pos++;
         }
+        // `num * 10 + digit` overflows to Infinity only past ~309 digits, but
+        // it stops meaning anything long before that: doubles lose integer
+        // precision past 2^53 (~16 digits), so `#100000000000000001` and
+        // `#100000000000000002` accumulate to the SAME value, and the 32-bit
+        // express-id columns below truncate anything above 2^32 so that
+        // `#4294967297` lands on `#1`. `isIndexableExpressId` is the single
+        // home for that bound (express-id.ts, #3395).
+        // Guarding at each accumulator (here, and both `StepTokenizer` scans,
+        // and the inline scan worker) rather than only when the entity is
+        // extracted: this is the byte-level path that builds the
+        // property/relationship indexes, so an unguarded overflow here keyed a
+        // pset under a record the entity index had already refused —
+        // `extractPropertiesOnDemand(store, Infinity)` returned a real pset for
+        // an entity whose own GlobalId and Name were unreadable.
+        //
+        // `-1` is this function's existing "no reference here" sentinel and
+        // every caller already tests it (`if (relating < 0) return null`,
+        // `if (id >= 0) ids.push(id)`). `pos` is still returned advanced past
+        // the digits so scanning continues from the right place.
+        if (!isIndexableExpressId(num)) return [-1, pos];
         return [num, pos];
     }
     return [-1, pos];
@@ -119,13 +207,14 @@ export function readRefId(buffer: Uint8Array, pos: number, end: number): [number
 
 /** Read a list of entity refs (#id1,#id2,...) or a single #id. Returns [ids, newPos]. */
 export function readRefList(buffer: Uint8Array, pos: number, end: number): [number[], number] {
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // Kept in sync with isSpaceByte in step-lexing.ts (#3733).
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
     const ids: number[] = [];
 
     if (pos < end && buffer[pos] === 0x28) {
         pos++;
         while (pos < end && buffer[pos] !== 0x29) {
-            while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x2C)) pos++;
+            while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B || buffer[pos] === 0x2C)) pos++;
             if (pos < end && buffer[pos] === 0x23) {
                 const [id, np] = readRefId(buffer, pos, end);
                 if (id >= 0) ids.push(id);

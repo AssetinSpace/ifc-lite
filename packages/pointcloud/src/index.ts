@@ -11,7 +11,7 @@
  * Phase 2: streaming `.laz` (laz-perf in the worker).
  */
 
-export type { DecodedPointChunk, PointCloudBBox } from './types.js';
+export type { DecodedPointChunk, PointCloudBBox, PointNormalState } from './types.js';
 
 // Inline / IFCx decoders (Phase 0)
 export { decodePcd } from './formats/pcd.js';
@@ -43,7 +43,7 @@ export type {
   DownsampleHint,
 } from './streaming/types.js';
 export { LasStreamingSource } from './streaming/las-source.js';
-export { LazStreamingSource } from './streaming/laz-source.js';
+export { LazStreamingSource, probeLazPerfWasmLoad } from './streaming/laz-source.js';
 export { PlyStreamingSource } from './streaming/ply-source.js';
 export { PcdStreamingSource } from './streaming/pcd-source.js';
 export { E57StreamingSource } from './streaming/e57-source.js';
@@ -55,7 +55,7 @@ export {
   type AsciiPointsFormat,
   type AsciiPointsLayout,
 } from './formats/ascii-points.js';
-export { parsePlyHeader } from './formats/ply.js';
+export { parsePlyHeader, decodePly } from './formats/ply.js';
 export {
   parseE57FileHeader,
   parseE57Xml,

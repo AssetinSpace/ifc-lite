@@ -1,16 +1,19 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { prepareAppearanceSerialization } from '../../lib/appearance/serialization.js';
+import { packagePortableIfc, portableIfcDownload } from '../../lib/export/portable-ifc.js';
 
 import type { StoreApi } from './types.js';
 import type { EntityRef, EntityData, PropertySetData, QuantitySetData, ExportBackendMethods } from '@ifc-lite/sdk';
-import { EntityNode } from '@ifc-lite/query';
-import { StepExporter, type StepExportOptions } from '@ifc-lite/export';
-import { getModelForRef, LEGACY_MODEL_ID } from './model-compat.js';
+import { EntityNode, findPropertyInSets, findQuantityInSets } from '@ifc-lite/query';
+import { escapeCsvCell, StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { getDefaultModelId, getModelForRef } from './model-compat.js';
 import { applyAttributeMutationsToEntityData, getMutationViewForModel } from './mutation-view.js';
 import { serializeScheduleToStep, type ScheduleExtraction, type IfcDataStore } from '@ifc-lite/parser';
 import { spliceScheduleIntoExport } from './export-schedule-splice.js';
-import { downloadFile } from '../../lib/export/download.js';
+import { downloadFile, sanitizeFilename, buildExportFilename } from '../../lib/export/download.js';
+import { resolveExportVisibility } from '../../store/exportVisibility.js';
 
 /** Options for CSV export */
 interface CsvOptions {
@@ -82,42 +85,40 @@ function normalizeRefs(raw: unknown[]): EntityRef[] {
   });
 }
 
+/**
+ * Resolve `sdk.export.ifc()` visibility filters. "Full model" means coverage, not size: `selectedExpressIds` is
+ * the whole model only when size === `entityCount` and `hasEntity` confirms every id exists -- cardinality alone
+ * let nonexistent ids pass as "full", silently exporting the whole model (reproduced live). Short of that it
+ * isolates to `selectedExpressIds`; a verified full model instead routes through `resolveExportVisibility()`
+ * (ExportDialog/GLBExportDialog's resolver) so `classFilter`/`selectedStoreys`/`typeVisibility` apply too (#4328).
+ * `null` is no ref list at all (#4738) and takes that same full-model branch: nothing was filtered out. */
 export function resolveVisibilityFilterSets(
   state: StoreApi['getState'] extends () => infer T ? T : never,
   modelId: string,
-  selectedExpressIds: Set<number>,
+  selectedExpressIds: Set<number> | null,
   entityCount: number,
+  hasEntity: (expressId: number) => boolean,
 ): { visibleOnly: boolean; hiddenEntityIds: Set<number>; isolatedEntityIds: Set<number> | null } {
-  const shouldLimitToSelection = selectedExpressIds.size < entityCount;
-  const isLegacyModel = state.models.size === 0 && (modelId === LEGACY_MODEL_ID || modelId === 'legacy');
-  const modelHidden = state.hiddenEntitiesByModel.get(modelId) ?? (isLegacyModel ? state.hiddenEntities : undefined);
-  const modelIsolated = state.isolatedEntitiesByModel.get(modelId) ?? (isLegacyModel ? state.isolatedEntities : null);
+  if (selectedExpressIds !== null && (selectedExpressIds.size !== entityCount || ![...selectedExpressIds].every(hasEntity))) {
+    return { visibleOnly: true, hiddenEntityIds: new Set<number>(), isolatedEntityIds: selectedExpressIds };
+  }
 
+  const visibility = resolveExportVisibility(state, modelId);
   return {
-    visibleOnly: shouldLimitToSelection,
-    hiddenEntityIds: shouldLimitToSelection
-      ? new Set<number>()
-      : new Set<number>(modelHidden ?? []),
-    isolatedEntityIds: shouldLimitToSelection
-      ? selectedExpressIds
-      : modelIsolated,
+    visibleOnly: false,
+    hiddenEntityIds: visibility.hiddenLocalIds,
+    isolatedEntityIds: visibility.isolatedLocalIds,
   };
 }
 
 /**
- * Escape a CSV cell value — wrap in quotes if it contains the separator,
- * double-quotes, or newlines.
+ * RFC 4180 quoting + the CWE-1236 formula-injection guard, delegated to
+ * `@ifc-lite/export`'s single escaper. The copy that used to live here tested
+ * the trigger anchored at offset 0, so a BOM/ZWSP/LRM/NBSP/U+2028 in front of
+ * `=` walked past it.
  */
 function escapeCsv(value: string, sep: string): string {
-  // Neutralize spreadsheet formula injection (CWE-1236): a leading
-  // =, +, -, @, TAB or CR makes a cell execute as a formula in Excel/
-  // LibreOffice/Sheets. IFC values are attacker-controllable, so prefix
-  // such cells with an apostrophe.
-  if (/^[=+\-@\t\r]/.test(value)) value = `'${value}`;
-  if (value.includes(sep) || value.includes('"') || value.includes('\n') || value.includes('\r')) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
+  return escapeCsvCell(value, { delimiter: sep });
 }
 
 /**
@@ -209,19 +210,13 @@ export function createExportAdapter(store: StoreApi): ExportBackendMethods {
 
       // Try property sets first
       const psets = getProps();
-      const pset = psets.find(p => p.name === setName);
-      if (pset) {
-        const prop = pset.properties.find(p => p.name === valueName);
-        if (prop?.value != null) return String(prop.value);
-      }
+      const prop = findPropertyInSets(psets, setName, valueName);
+      if (prop?.value != null) return String(prop.value);
 
       // Fall back to quantity sets
       const qsets = getQties();
-      const qset = qsets.find(q => q.name === setName);
-      if (qset) {
-        const qty = qset.quantities.find(q => q.name === valueName);
-        if (qty?.value != null) return String(qty.value);
-      }
+      const qty = findQuantityInSets(qsets, setName, valueName);
+      if (qty?.value != null) return String(qty.value);
 
       return '';
     }
@@ -318,50 +313,48 @@ export function createExportAdapter(store: StoreApi): ExportBackendMethods {
 
     ifc(rawRefs: unknown, rawOptions: unknown) {
       const candidateOptions = rawOptions ?? {};
-      if (!isEntityRefArray(rawRefs)) {
+      // No ref list is "no isolation filter" (#4738): the active model whole, the same
+      // export refs covering it produce. An EMPTY list matched nothing and never arrives.
+      if (rawRefs != null && !isEntityRefArray(rawRefs)) {
         throw new Error('export.ifc: first argument must be an array of entity references');
       }
       if (!isIfcExportOptions(candidateOptions)) {
         throw new Error('export.ifc: second argument must be { schema?: IFC2X3|IFC4|IFC4X3, filename?: string, includeMutations?: boolean, visibleOnly?: boolean }');
       }
-
-      const refs = normalizeRefs(rawRefs);
-      if (refs.length === 0) {
+      const refs = rawRefs == null ? null : normalizeRefs(rawRefs);
+      if (refs?.length === 0) {
         throw new Error('export.ifc: expected at least one entity reference');
       }
-
-      const modelIds = new Set(refs.map(ref => ref.modelId));
-      if (modelIds.size !== 1) {
+      if (refs && new Set(refs.map(ref => ref.modelId)).size !== 1) {
         throw new Error('export.ifc: all entity references must belong to the same model');
       }
-
-      const modelId = refs[0].modelId;
       const state = store.getState();
+      const modelId = refs ? refs[0].modelId : getDefaultModelId(state);
+      if (!modelId) throw new Error('export.ifc: no model is loaded');
       const model = getModelForRef(state, modelId);
       if (!model?.ifcDataStore) {
         throw new Error(`export.ifc: model '${modelId}' is not loaded`);
       }
-
-      if (model.ifcDataStore.schemaVersion === 'IFC5') {
+      const dataStore = model.ifcDataStore;
+      if (dataStore.schemaVersion === 'IFC5') {
         throw new Error('export.ifc: IFC5 export is not supported by STEP exporter, use IFC2X3/IFC4/IFC4X3 models');
       }
 
       const options = candidateOptions;
-      const selectedExpressIds = new Set(refs.map(ref => ref.expressId));
+      const selectedExpressIds = refs ? new Set(refs.map(ref => ref.expressId)) : null;
       const visibilityFilters = resolveVisibilityFilterSets(
-        state,
-        modelId,
-        selectedExpressIds,
-        model.ifcDataStore.entityCount,
+        state, modelId, selectedExpressIds, dataStore.entityCount,
+        (expressId) => dataStore.entityIndex.byId.has(expressId),
       );
       const visibleOnly = options.visibleOnly === true || visibilityFilters.visibleOnly;
       const hiddenEntityIds = visibleOnly ? visibilityFilters.hiddenEntityIds : new Set<number>();
       const isolatedEntityIds = visibleOnly ? visibilityFilters.isolatedEntityIds : null;
 
-      const exporter = new StepExporter(
-        model.ifcDataStore,
+      const serialized = prepareAppearanceSerialization(
+        modelId, model.ifcDataStore,
         options.includeMutations === false ? undefined : getMutationViewForModel(store, modelId) ?? undefined,
       );
+      const exporter = new StepExporter(model.ifcDataStore, serialized.view);
       // Include georeferencing mutations if present
       const georefMutations = options.includeMutations !== false
         ? state.georefMutations?.get(modelId) ?? undefined
@@ -391,11 +384,28 @@ export function createExportAdapter(store: StoreApi): ExportBackendMethods {
         scheduleIsEdited: state.scheduleIsEdited === true,
         scheduleSourceModelId: state.scheduleSourceModelId ?? null,
       });
-      return spliced.content;
+      return packagePortableIfc(modelId, spliced.content, serialized.resources).content;
     },
 
     download(content: string | Uint8Array, filename: string, mimeType?: string) {
-      triggerDownload(content, filename, mimeType ?? 'text/plain');
+      // `filename` is API input (scripts pass arbitrary strings) — sanitize at
+      // this single chokepoint so every SDK download path honors the repo's
+      // filename contract, keeping a real extension intact.
+      //
+      // Split the extension off, then hand both halves to `buildExportFilename`
+      // rather than sanitizing them here: it is the canonical builder, and it
+      // caps the extension at EXTENSION_MAX_LENGTH and budgets the stem so the
+      // whole result fits. A local `[^\w]+` pass instead would silently rewrite
+      // legitimate extensions (`report.energy-json` -> `report.energyjson`,
+      // and anything non-ASCII outright) and skip the length budgeting.
+      const dot = filename.lastIndexOf('.');
+      const stem = dot > 0 ? filename.slice(0, dot) : filename;
+      const ext = dot > 0 ? filename.slice(dot + 1) : '';
+      const safe = ext
+        ? buildExportFilename(stem, ext)
+        : sanitizeFilename(filename, { fallback: 'export' });
+      const portable = portableIfcDownload(content, safe, mimeType ?? 'text/plain');
+      triggerDownload(content, portable.filename, portable.mime);
       return undefined;
     },
   };

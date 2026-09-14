@@ -30,7 +30,10 @@ import {
   expressIdToGlobalId as expressIdToGlobalIdLookup,
 } from './bcfIdLookup';
 import { fromGlobalIdFromModels } from '@/store/globalId';
+import { resolvePresentationIds } from '@/lib/presentation/resolvePresentationIds';
 import { deriveHeaderFiles } from './bcfHeaderFiles';
+import { toast } from '@/components/ui/toast';
+import { captureVisibility, describeVisibilityNotice } from './bcf/visibility-capture';
 
 // ============================================================================
 // Types
@@ -103,6 +106,25 @@ export function setGlobalRendererRef(ref: React.RefObject<Renderer | null>): voi
  */
 export function getGlobalRenderer(): Renderer | null {
   return globalRendererRef?.current ?? null;
+}
+
+/**
+ * Get the live viewport canvas (for anything outside the viewport tree that
+ * needs its CSS layout size, e.g. the to-scale PDF export deriving the scale
+ * the viewport is currently displaying at, #2042).
+ *
+ * Read `clientHeight`/`clientWidth`, never `width`/`height`. The attributes are
+ * the BACKING STORE size, which is conventionally `css * devicePixelRatio`, and
+ * reading them for a physical-size derivation is wrong by exactly that ratio on
+ * a Retina display. Today this particular canvas happens to be sized straight
+ * from `getBoundingClientRect()` with no DPR factor (`packages/renderer`), so
+ * the two coincide - which is precisely why the rule is written as a rule: the
+ * day the renderer starts scaling its backing store, a caller that reached for
+ * `width` silently starts reporting a scale that is off by the ratio, and
+ * nothing about the resulting PDF looks wrong.
+ */
+export function getGlobalCanvas(): HTMLCanvasElement | null {
+  return globalCanvasRef?.current ?? null;
 }
 
 /**
@@ -239,6 +261,11 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
     const target = camera.getTarget();
     const up = camera.getUp();
     const fov = camera.getFOV();
+    // BCF 3.0 requires <AspectRatio> on every camera and `@ifc-lite/bcf`
+    // refuses to invent one, so a viewpoint captured without it makes the
+    // WHOLE export throw -- what a user hit after importing another tool's
+    // 3.0 archive (readBCF keeps its version) and adding a topic (#3612).
+    const aspectRatio = camera.getAspect();
 
     return {
       position,
@@ -246,6 +273,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       up, // Use actual camera up vector
       fov,
       isOrthographic: false,
+      aspectRatio,
     };
   }, [getRenderer]);
 
@@ -272,6 +300,16 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
     [models, ifcDataStore]
   );
 
+  /** A registered model whose metadata has not hydrated yet cannot name its entities YET (#4529). */
+  const isEntityPending = useCallback(
+    (globalId: number): boolean => {
+      const resolved = fromGlobalIdFromModels(models, globalId);
+      const model = resolved && resolved.modelId !== 'legacy' ? models.get(resolved.modelId) : undefined;
+      return !!model && !model.ifcDataStore && model.loadState !== 'error';
+    },
+    [models]
+  );
+
   /**
    * Convert IFC GlobalId string to expressId (with model offset for federation)
    * Returns { expressId, modelId } or null if not found
@@ -293,19 +331,25 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         includeHidden = true,
       } = opts;
 
-      const cameraState = getCameraState();
-      if (!cameraState) {
-        console.warn('[useBCF] Cannot create viewpoint: no camera state');
-        return null;
-      }
-
-      // Get snapshot if requested
+      // Snapshot FIRST, camera after: the PNG and the camera's `aspectRatio`
+      // describe one frame, so they must come from one drawing buffer.
+      // `captureSnapshot` awaits `queue.onSubmittedWorkDone()` before
+      // `toDataURL`, and the render loop resizes the canvas and calls
+      // `camera.setAspect` inside that wait (`renderer/src/index.ts`, the
+      // `dimensionsChanged` branch). Reading the camera after closes the
+      // window: an `await` resumes in a microtask, a rAF render is a task.
       let snapshot: string | undefined;
       if (includeSnapshot) {
         const captured = await captureSnapshot();
         if (captured) {
           snapshot = captured;
         }
+      }
+
+      const cameraState = getCameraState();
+      if (!cameraState) {
+        console.warn('[useBCF] Cannot create viewpoint: no camera state');
+        return null;
       }
 
       // Convert section plane state
@@ -339,27 +383,21 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
           })()
         : undefined;
 
-      // Get visibility GUIDs - either hidden (normal mode) or visible (isolation mode)
+      // Visibility GUIDs — the isolate allowlist or the hide-list, whichever the
+      // viewer is in; what could not be named is reported to the author.
+      // Pure decision in hooks/bcf/visibility-capture.ts (#4509, #4529).
       let hiddenGuids: string[] | undefined;
       let visibleGuids: string[] | undefined;
-
       if (includeHidden) {
-        if (isolatedEntities !== null && isolatedEntities.size > 0) {
-          // Isolation mode: capture visible entities (defaultVisibility=false)
-          const guids: string[] = [];
-          for (const id of isolatedEntities) {
-            const guid = expressIdToGlobalId(id);
-            if (guid) guids.push(guid);
-          }
-          visibleGuids = guids.length > 0 ? guids : undefined;
-        } else if (hiddenEntities.size > 0) {
-          // Normal mode: capture hidden entities (defaultVisibility=true)
-          const guids: string[] = [];
-          for (const id of hiddenEntities) {
-            const guid = expressIdToGlobalId(id);
-            if (guid) guids.push(guid);
-          }
-          hiddenGuids = guids.length > 0 ? guids : undefined;
+        const capture = captureVisibility(isolatedEntities, hiddenEntities, expressIdToGlobalId, isEntityPending);
+        ({ visibleGuids, hiddenGuids } = capture);
+        if (capture.notice) {
+          const { unnameable, total, kind, omitted, pending, ids } = capture.notice;
+          console.warn(
+            `[useBCF] ${unnameable} of ${total} ${kind} entities have no resolvable IFC GlobalId${pending ? ' (model metadata still loading)' : ''}; ${omitted ? 'omitting the viewpoint visibility component' : 'recording the rest'}. Global ids: ${ids.join(', ')}`,
+          );
+          const message = describeVisibilityNotice(capture.notice);
+          if (message) toast.info(message);
         }
       }
 
@@ -539,23 +577,44 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         clearEntitySelection();
       }
 
-      // Apply visibility from BCF components
-      // Either isolation mode (visibleGuids with defaultVisibility=false)
-      // or normal mode (hiddenGuids with defaultVisibility=true)
-      if (state.visibleGuids.length > 0) {
+      // Apply visibility from BCF components: isolation mode (visibleGuids
+      // with defaultVisibility=false) or normal (hiddenGuids, default true).
+      // `state.visibleGuids` is meaningfully nullable (`extractViewpointState`,
+      // packages/bcf/src/viewpoint.ts): `null` means the viewpoint carries no
+      // isolation channel, while a non-null array -- EMPTY included -- means
+      // isolation WAS active when the viewpoint was captured, down to
+      // "matched nothing". A `.length > 0` check here would read a captured
+      // empty viewport (a real, spec-valid `DefaultVisibility="false"` with
+      // no exceptions) as "no isolation" and fall into the `hiddenGuids`
+      // branch below, restoring an unfiltered view instead of an empty one --
+      // the read-side mirror of the same collapse fixed on the write side
+      // above and in `createViewpoint`'s `hasVisible`.
+      if (state.visibleGuids !== null) {
         // Isolation mode: only specified entities are visible
         const isolatedExpressIds = new Set<number>();
         for (const guid of state.visibleGuids) {
           const result = globalIdToExpressId(guid);
-          if (result) {
-            isolatedExpressIds.add(result.expressId);
-          }
+          if (result) isolatedExpressIds.add(result.expressId);
         }
 
-        if (isolatedExpressIds.size > 0) {
-          setIsolatedEntities(isolatedExpressIds);
-        } else {
+        if (state.visibleGuids.length > 0 && isolatedExpressIds.size === 0) {
+          // THIRD state. The viewpoint names elements, and NONE of them is in
+          // the model currently loaded -- the ordinary case for a BCF file
+          // authored against a different (or differently versioned) model.
+          // That is not "isolation matched nothing": the isolation could not
+          // be evaluated here at all. Applying it as an empty isolate would
+          // hide every element of a model the viewpoint never spoke about,
+          // which is indistinguishable from a broken viewer. Leave the
+          // isolation channel off and say why, so the camera and selection
+          // the viewpoint DOES carry still land on a visible model.
           setIsolatedEntities(null);
+          toast.info(
+            "Viewpoint visibility not applied: none of its elements are in the loaded model."
+          );
+        } else {
+          // #3338: a viewpoint guid may name a geometry-less assembly whose parts carry the mesh.
+          const resolver = useViewerStore.getState().cameraCallbacks.resolveHighlightIds;
+          setIsolatedEntities(new Set(resolvePresentationIds(resolver, [...isolatedExpressIds])));
         }
       } else if (state.hiddenGuids.length > 0) {
         // Normal mode: specified entities are hidden

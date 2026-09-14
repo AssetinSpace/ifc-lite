@@ -7,7 +7,12 @@
  */
 
 export * from './types.js';
-export { MutablePropertyView, type PropertyExtractor, type QuantityExtractor } from './mutable-property-view.js';
+export {
+  MutablePropertyView,
+  type PropertyExtractor,
+  type QuantityExtractor,
+  type AttributeExtractor,
+} from './mutable-property-view.js';
 export {
   StoreEditor,
   OVERLAY_BYTE_OFFSET,
@@ -15,6 +20,7 @@ export {
   type EntityTypeNormalizer,
 } from './store-editor.js';
 export { ChangeSetManager } from './change-set.js';
+export { MutationGuardError, type MutationGuard } from './mutation-guard.js';
 export {
   BulkQueryEngine,
   type SelectionCriteria,
@@ -44,3 +50,5 @@ export {
   type DerivedIdentityEntry,
   type EntityIdentityResolver,
 } from './change-set-to-ops.js';
+
+export type { EntityOperation, EntityOperationEffect, EntityPreparationOptions, PreparedEntityOperations } from './cooperative-operation-types.js';

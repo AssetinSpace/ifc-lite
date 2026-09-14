@@ -5,8 +5,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
-import { PickingManager, type PointPickProvider } from './picking-manager.ts';
-import type { PointPickNode } from './point-picker.ts';
+import { PickingManager, type PointPickProvider } from './picking-manager.js';
+import type { PointPickNode } from './point-picker.js';
 
 describe('PickingManager', () => {
   it('uses raycast when geometry data was released after finalize', async () => {
@@ -155,6 +155,7 @@ describe('PickingManager', () => {
 
     function harness(overrides: {
       released?: boolean;
+      texturedOnly?: boolean;
       existingMeshes?: Array<{ expressId: number }>;
       pieces?: (id: number) => Array<{ expressId: number }> | undefined;
       pointNodes?: PointPickNode[] | null;
@@ -176,7 +177,8 @@ describe('PickingManager', () => {
 
       const scene = {
         getMeshes: () => createdMeshes,
-        getBatchedMeshes: () => [{ expressIds: [WALL] }],
+        getBatchedMeshes: () => overrides.texturedOnly ? [] : [{ expressIds: [WALL] }],
+        getTexturedMeshes: () => overrides.texturedOnly ? [{ expressId: WALL }, { expressId: SLAB }] : [],
         isGeometryDataReleased: () => overrides.released ?? false,
         getAllMeshDataExpressIds: () => [WALL, SLAB],
         getMeshDataPieces:
@@ -242,6 +244,18 @@ describe('PickingManager', () => {
       };
     }
 
+    it('hydrates textured-only captured objects without a colour batch (#4228)', async () => {
+      const h = harness({ texturedOnly: true, pieces: id => [{ expressId: id }, { expressId: id }] });
+      const hits = await h.manager.pickRect(0, 0, 100, 100);
+      assert.deepStrictEqual(h.createdMeshes.map(mesh => mesh.expressId), [WALL, WALL, SLAB, SLAB]);
+      assert.deepStrictEqual(h.pickerRectMeshes, h.createdMeshes, 'all hydrated pieces must reach the GPU picker');
+      assert.equal(h.selectRectCalls, 0, 'textured-only small models must avoid the CPU fallback');
+      assert.deepStrictEqual(hits, new Set([WALL, SLAB]));
+      // A second pick must reuse the hydrated pieces rather than duplicating them.
+      await h.manager.pickRect(0, 0, 100, 100);
+      assert.equal(h.createdMeshes.length, 4);
+    });
+
     it('hydrates batched pieces so the rect pass can see them', async () => {
       const h = harness();
 
@@ -258,6 +272,27 @@ describe('PickingManager', () => {
         'expected both batched pieces to be hydrated for the rect pass',
       );
       assert.equal(h.selectRectCalls, 0, 'small model should use the GPU path, not the CPU fallback');
+    });
+
+    // The `existingMeshes` harness knob above was declared but never exercised
+    // by any test in this file, so the "assume existing pieces correspond to
+    // the first N pieces in stable order" dedup (picking-manager.ts, the
+    // `ordinal < baselineExisting` skip) had no coverage: a multi-piece entity
+    // that was already partially hydrated (e.g. from an earlier pick()) would
+    // silently re-create pieces it already had, duplicating GPU mesh buffers.
+    it('does not re-hydrate a piece that already exists for a multi-piece entity', async () => {
+      const wallPieces = [{ expressId: WALL }, { expressId: WALL }];
+      const h = harness({
+        existingMeshes: [{ expressId: WALL }],
+        pieces: (id) => (id === WALL ? wallPieces : undefined),
+      });
+
+      await h.manager.pickRect(0, 0, 100, 100);
+
+      assert.equal(
+        h.createdMeshes.length, 2,
+        'the already-existing piece must not be re-created; only the missing second piece should be hydrated',
+      );
     });
 
     it('falls back to Scene.selectRect once geometry data is released', async () => {
@@ -282,6 +317,30 @@ describe('PickingManager', () => {
       assert.deepStrictEqual(result, new Set([WALL, SLAB]));
       assert.equal(h.selectRectCalls, 1, 'over-budget hydration must take the CPU path');
       assert.equal(h.createdMeshes.length, 0, 'must not hydrate when over budget');
+    });
+
+    // Pins the exact MAX_PICK_MESH_CREATION (500) boundary: `toCreate > 500`
+    // must stay a strict inequality, not `>=`. A budget of exactly 500 pieces
+    // is still affordable and must hydrate on the GPU path, not fall back.
+    it('hydrates on the GPU path at exactly the pick-mesh budget (500)', async () => {
+      const exactlyBudget = Array.from({ length: 500 }, () => ({ expressId: WALL }));
+      // Only WALL needs pieces here; SLAB contributes nothing so toCreate === 500 exactly.
+      const h = harness({ pieces: (id) => (id === WALL ? exactlyBudget : undefined) });
+
+      await h.manager.pickRect(0, 0, 100, 100);
+
+      assert.equal(h.selectRectCalls, 0, 'exactly-500 must stay under budget and use the GPU path');
+      assert.equal(h.createdMeshes.length, 500, 'all 500 pieces must be hydrated');
+    });
+
+    it('falls back to Scene.selectRect one piece past the pick-mesh budget (501)', async () => {
+      const overBudget = Array.from({ length: 501 }, () => ({ expressId: WALL }));
+      const h = harness({ pieces: (id) => (id === WALL ? overBudget : undefined) });
+
+      await h.manager.pickRect(0, 0, 100, 100);
+
+      assert.equal(h.selectRectCalls, 1, '501 pieces must exceed the budget and take the CPU path');
+      assert.equal(h.createdMeshes.length, 0, 'must not hydrate when one piece over budget');
     });
 
     it('honours isolation when falling back to the CPU path', async () => {

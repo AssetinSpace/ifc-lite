@@ -37,21 +37,43 @@
 import {
   extractPropertiesOnDemand,
   extractQuantitiesOnDemand,
+  extractTypePropertiesOnDemand,
   extractAllMaterialsOnDemand,
   extractClassificationsOnDemand,
+  extractAllEntityAttributes,
+  mergeInheritedPropertySets,
   type IfcDataStore,
   type ClassificationInfo,
 } from '@ifc-lite/parser';
 
+import { RelationshipType } from '@ifc-lite/data';
+
 import {
   combineRuleResults,
-  setOpMatches,
-  stringOpMatches,
-  matchStringAnyNone,
-  numericOpMatches,
   type Combinator,
   type FilterRule,
 } from './filter-rules.js';
+import {
+  setOpMatches,
+  globalIdOpMatches,
+  stringOpMatches,
+  matchStringAnyNone,
+  numericOpMatches,
+} from './filter-ops.js';
+import {
+  isNumericArrayLike,
+  materialiseNumericIterable,
+  toNumericIterable,
+} from './filter-iteration.js';
+import { selectIterationSource, orderRulesByCost } from './filter-iteration-source.js';
+import { throwAbort, yieldToEventLoop } from './filter-evaluate-yield.js';
+import {
+  modelPrunedUnderAnd,
+  modelScopedRuleMatches,
+  isModelScopedRule,
+  NO_MODEL_TAGS,
+  type ModelScope,
+} from './filter-evaluate-model-tag.js';
 
 import {
   flattenPsets,
@@ -59,10 +81,13 @@ import {
   stringifyValue,
   matchPropertyRule,
   matchQuantityRule,
+  matchAttributeRule,
   defaultStoreyName,
+  storeyMatchesRefs,
   materialNamesOf,
   matchClassificationRule,
   elevationOf,
+  type AttrRows,
   type PsetRows,
   type QtyRows,
 } from './filter-match.js';
@@ -90,6 +115,14 @@ export interface EvaluateOptions {
   storeyNameOf?: (expressId: number) => string;
   /** Optional predefined-type resolver. Falls back to "" when omitted. */
   predefinedTypeOf?: (expressId: number) => string;
+  /** Stable identity used by persisted model rules; defaults to `modelId`. */
+  modelFilterIdentity?: string;
+  /** This model's tag ids (`modelTag` rules, #4215); absent = untagged. */
+  modelTagIds?: ReadonlySet<string>;
+  /** Every tag id that exists. A `modelTag` rule naming any other id is
+   *  UNRESOLVED and matches nothing — absent means "no tags exist", so every
+   *  rule naming a tag is unresolved, never silently broad. */
+  definedModelTagIds?: ReadonlySet<string>;
 }
 
 const DEFAULT_LIMIT = 5_000;
@@ -114,18 +147,26 @@ export function evaluateFilterRules(
 
   const limit = options.limit ?? DEFAULT_LIMIT;
   const orderedRules = orderRulesByCost(rules);
-  const iterIds = toIterable(
-    selectIterationSource(store, rules, combinator, options.candidateExpressIds),
+  const iterIds = toNumericIterable(
+    selectIterationSource(store, rules, combinator, options.candidateExpressIds, modelId),
   );
   const out: FilteredElement[] = [];
   const ctx: EvalContext = {
     store,
+    modelId,
+    scope: {
+      filterIdentity: options.modelFilterIdentity ?? modelId,
+      tagIds: options.modelTagIds,
+      definedModelTagIds: options.definedModelTagIds ?? NO_MODEL_TAGS,
+    },
     table: store.entities,
     options,
     hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
     hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
     hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
     hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
+    hasAttributeRule: orderedRules.some((r) => r.kind === 'attribute'),
+    typePsetCache: new Map(),
   };
 
   for (const expressId of iterIds) {
@@ -138,18 +179,6 @@ export function evaluateFilterRules(
     out.push(buildResult(modelId, ctx, expressId));
   }
   return out;
-}
-
-/** Coerce ArrayLike-or-Iterable into an Iterable so the sync entry can
- *  use `for…of`. The federated entry takes the array fast-path
- *  separately. */
-function toIterable(source: ArrayLike<number> | Iterable<number>): Iterable<number> {
-  if (Symbol.iterator in Object(source)) return source as Iterable<number>;
-  // ArrayLike fallback — wrap as a generator so the for…of loop works.
-  return (function* () {
-    const arr = source as ArrayLike<number>;
-    for (let i = 0; i < arr.length; i++) yield arr[i];
-  })();
 }
 
 // ── Async federated entry — production UI path ──────────────────────────────
@@ -177,8 +206,18 @@ export interface FederatedEvaluateOptions extends Omit<EvaluateOptions, 'candida
  * Evaluate `rules` across multiple federated models, producing a single
  * sorted result list. Async chunked + cancellable + progress-reporting.
  */
+/** One federated model as the evaluator sees it. `tagIds` is the model's tag
+ *  set at call time — a SNAPSHOT: re-tagging while a run is in flight does not
+ *  change what the run matches (the clash resolver relies on this, #4215). */
+export interface EvaluatorModel {
+  id: string;
+  filterIdentity?: string;
+  tagIds?: ReadonlySet<string>;
+  store: IfcDataStore | null;
+}
+
 export async function evaluateFilterRulesFederated(
-  models: ReadonlyArray<{ id: string; store: IfcDataStore | null }>,
+  models: ReadonlyArray<EvaluatorModel>,
   rules: readonly FilterRule[],
   combinator: Combinator,
   options: FederatedEvaluateOptions = {},
@@ -193,8 +232,10 @@ export async function evaluateFilterRulesFederated(
 
   // Pre-compute per-model iteration plans + a global total so the
   // progress callback can render a single bar across the federation.
+  const definedModelTagIds = options.definedModelTagIds ?? NO_MODEL_TAGS;
   interface Plan {
     modelId: string;
+    scope: ModelScope;
     store: IfcDataStore;
     iter: ArrayLike<number> | Iterable<number>;
     total: number;
@@ -204,15 +245,25 @@ export async function evaluateFilterRulesFederated(
   let totalKnown = true;
   for (const m of models) {
     if (!m.store) continue;
+    const scope: ModelScope = { filterIdentity: m.filterIdentity ?? m.id, tagIds: m.tagIds, definedModelTagIds };
+    // Whole-model prune, AND only: under OR a model failing its model-scoped
+    // rules still contributes entities the other rules admit (#4215).
+    if (combinator === 'AND' && modelPrunedUnderAnd(orderedRules, scope)) continue;
     const candidates = options.candidateExpressIdsByModel?.get(m.id);
-    const source = candidates ?? selectIterationSource(m.store, rules, combinator, undefined);
-    const arr = materialiseIterable(source);
+    const source = candidates ?? selectIterationSource(m.store, rules, combinator, undefined, m.id);
+    const arr = materialiseNumericIterable(source);
     if (arr === null) {
       totalKnown = false;
     } else {
       grandTotal += arr.length;
     }
-    plans.push({ modelId: m.id, store: m.store, iter: arr ?? source, total: arr ? arr.length : -1 });
+    plans.push({
+      modelId: m.id,
+      scope,
+      store: m.store,
+      iter: arr ?? source,
+      total: arr ? arr.length : -1,
+    });
   }
 
   let scanned = 0;
@@ -224,18 +275,22 @@ export async function evaluateFilterRulesFederated(
 
     const ctx: EvalContext = {
       store: plan.store,
+      modelId: plan.modelId,
+      scope: plan.scope,
       table: plan.store.entities,
       options,
       hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
       hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
       hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
       hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
+      hasAttributeRule: orderedRules.some((r) => r.kind === 'attribute'),
+      typePsetCache: new Map(),
     };
 
     // Walk the per-model iter in chunkSize-sized strides, yielding the
     // event loop between chunks. ArrayLike fast-path uses index access;
     // the fallback path drains an iterator into chunks.
-    if (Array.isArray(plan.iter) || isArrayLike(plan.iter)) {
+    if (Array.isArray(plan.iter) || isNumericArrayLike(plan.iter)) {
       const arr = plan.iter as ArrayLike<number>;
       for (let i = 0; i < arr.length && out.length < limit; i += chunkSize) {
         if (signal?.aborted) throwAbort(signal);
@@ -276,125 +331,33 @@ export async function evaluateFilterRulesFederated(
   return out;
 }
 
-// ── Iteration source: index prefilter (AND + op:in) ──────────────────────────
-
-/**
- * Decide which expressIds the evaluator walks. Public for testability —
- * consumers should only depend on the results returned, not on the
- * iteration count, but a benchmark / regression test may want to assert
- * the prefilter actually narrows.
- */
-export function selectIterationSource(
-  store: IfcDataStore,
-  rules: readonly FilterRule[],
-  combinator: Combinator,
-  candidateExpressIds: Iterable<number> | undefined,
-): ArrayLike<number> | Iterable<number> {
-  // Caller-supplied narrowing wins (Tier-1 candidates).
-  if (candidateExpressIds !== undefined) return candidateExpressIds;
-
-  // Prefilter only applies under AND. OR rules are unioned; you can't
-  // shrink the candidate set from a single OR clause without losing
-  // results from the other clauses.
-  if (combinator !== 'AND') return iterateAllExpressIds(store);
-
-  // Try to find the smallest narrowing source. Multiple op:in rules in
-  // the same query can each suggest a candidate bucket; we pick the
-  // smallest one (the per-entity loop re-checks every rule, so any one
-  // valid bucket is correctness-safe — fewer rows = less work).
-  let best: number[] | null = null;
-
-  for (const rule of rules) {
-    if (rule.kind === 'ifcType' && rule.op === 'in' && rule.values.length > 0) {
-      const bucket = unionByType(store, rule.values);
-      if (bucket && (best === null || bucket.length < best.length)) best = bucket;
-    } else if (rule.kind === 'storey' && rule.op === 'in' && rule.values.length > 0) {
-      const bucket = unionByStorey(store, rule.values);
-      if (bucket && (best === null || bucket.length < best.length)) best = bucket;
-    }
-  }
-
-  return best ?? iterateAllExpressIds(store);
-}
-
-function unionByType(store: IfcDataStore, names: readonly string[]): number[] | null {
-  const byType = store.entityIndex.byType;
-  if (!byType || byType.size === 0) return null;
-  // STEP type names are stored UPPERCASE; rule values arrive in canonical
-  // PascalCase ("IfcWall") so we uppercase here at the boundary.
-  const out: number[] = [];
-  for (const name of names) {
-    const bucket = byType.get(name.toUpperCase());
-    if (bucket) for (const id of bucket) out.push(id);
-  }
-  return out.length > 0 ? out : null;
-}
-
-function unionByStorey(store: IfcDataStore, storeyNames: readonly string[]): number[] | null {
-  const hierarchy = store.spatialHierarchy;
-  if (!hierarchy) return null;
-  const wanted = new Set(storeyNames.map((n) => n.toLowerCase()));
-  const out: number[] = [];
-  // byStorey keys are storey expressIds; their name comes from the
-  // entity table. Models rarely have more than ~20 storeys, so this
-  // pass is essentially free.
-  for (const storeyId of hierarchy.byStorey.keys()) {
-    const name = store.entities.getName(storeyId);
-    if (!wanted.has(name.toLowerCase())) continue;
-    const elements = hierarchy.byStorey.get(storeyId);
-    if (elements) for (const id of elements) out.push(id);
-  }
-  return out.length > 0 ? out : null;
-}
-
-// ── Cheap-first rule ordering ────────────────────────────────────────────────
-
-/**
- * AGENTS.md §2: never call `extractPropertiesOnDemand` in a large loop.
- * We can't avoid it entirely for `property`/`quantity` rules, but we can
- * make sure cheap rules check first so AND/OR short-circuit skips the
- * expensive parse for entities that already fail/pass.
- */
-const RULE_COST: Record<FilterRule['kind'], number> = {
-  // Column-only — single TypedArray read.
-  ifcType:        0,
-  // Pre-built reverse-map lookup.
-  storey:         1,
-  // Pre-built reverse-map lookup (elementToStorey → storeyElevations).
-  elevation:      1,
-  // String-table indirection.
-  name:           2,
-  // Source-buffer parse (resolveEntityPredefinedType re-reads the entity's
-  // attributes) - same cost class as a pset parse, so order it after the
-  // cheap column checks that can short-circuit it. (#1462)
-  predefinedType: 10,
-  // Source-buffer parse (the AGENTS.md §2 hot path).
-  property:       10,
-  quantity:       10,
-  // Relationship-graph walk + on-demand resolve — as costly as a pset parse.
-  material:       10,
-  classification: 10,
-};
-
-export function orderRulesByCost(rules: readonly FilterRule[]): FilterRule[] {
-  // Stable sort — equal-cost rules retain their authored order so the
-  // user's intent is visible in debug logs / SQL preview.
-  return rules
-    .map((r, i) => ({ r, i, cost: RULE_COST[r.kind] }))
-    .sort((a, b) => a.cost - b.cost || a.i - b.i)
-    .map((x) => x.r);
-}
-
 // ── Per-entity inner loop ────────────────────────────────────────────────────
+
+/** Type-level pset rows in the same shape `extractPropertiesOnDemand` /
+ *  `extractTypePropertiesOnDemand` return — what `flattenPsets` /
+ *  `mergeInheritedPropertySets` expect. */
+type TypePsetList = ReturnType<typeof extractPropertiesOnDemand>;
 
 interface EvalContext {
   store: IfcDataStore;
+  /** Scopes a `StoreyRule.refs` exact match to this store's own model. */
+  modelId: string;
+  /** What the model-scoped rules (`model`, `modelTag`) read. */
+  scope: ModelScope;
   table: IfcDataStore['entities'];
   options: EvaluateOptions;
   hasPropertyRule: boolean;
   hasQuantityRule: boolean;
   hasMaterialRule: boolean;
   hasClassificationRule: boolean;
+  hasAttributeRule: boolean;
+  /** Per-TYPE pset cache, keyed by the type's expressId and shared across
+   *  every entity evaluated against this store (one `EvalContext` per
+   *  model/plan). Many instances share one `IfcWallType` etc., so this
+   *  turns what would be N source-buffer parses (one per instance) into
+   *  one parse per distinct type — see the AGENTS.md §2 large-loop
+   *  warning this module already guards against for instance psets. */
+  typePsetCache: Map<number, TypePsetList>;
 }
 
 function evaluateOneEntity(
@@ -411,8 +374,19 @@ function evaluateOneEntity(
   let qtyCache: QtyRows | null = null;
   let matCache: string[] | null = null;
   let classCache: readonly ClassificationInfo[] | null = null;
+  let attrCache: AttrRows | null = null;
   const psetsFor = (): PsetRows => {
-    if (!psetCache) psetCache = flattenPsets(extractPropertiesOnDemand(ctx.store, expressId));
+    if (!psetCache) {
+      const ownSets = extractPropertiesOnDemand(ctx.store, expressId);
+      const typeSets = getInheritedTypePsets(ctx, expressId);
+      // IFC inheritance is per-PROPERTY, not per-set, and the occurrence's
+      // own value wins on a name collision — same rule the IDS bridge
+      // already applies (`mergeInheritedPropertySets`, packages/parser).
+      // A type-only pset (nothing on the instance) is appended as-is, so
+      // `isSet`/`isNotSet` now also see properties that exist ONLY on the
+      // type — a deliberate presence-semantics change (was instance-only).
+      psetCache = flattenPsets(mergeInheritedPropertySets(ownSets, typeSets));
+    }
     return psetCache;
   };
   const qtysFor = (): QtyRows => {
@@ -435,6 +409,10 @@ function evaluateOneEntity(
     if (!classCache) classCache = extractClassificationsOnDemand(ctx.store, expressId);
     return classCache;
   };
+  const attrsFor = (): AttrRows => {
+    if (!attrCache) attrCache = extractAllEntityAttributes(ctx.store, expressId);
+    return attrCache;
+  };
 
   const ruleResults: boolean[] = [];
   for (const rule of orderedRules) {
@@ -446,12 +424,48 @@ function evaluateOneEntity(
       ctx.hasQuantityRule ? qtysFor : null,
       ctx.hasMaterialRule ? matNamesFor : null,
       ctx.hasClassificationRule ? classFor : null,
+      ctx.hasAttributeRule ? attrsFor : null,
     );
     ruleResults.push(result);
     if (combinator === 'AND' && !result) return false;
     if (combinator === 'OR' && result) return true;
   }
   return combineRuleResults(combinator, ruleResults);
+}
+
+/**
+ * Resolve `expressId`'s TYPE-level property sets (e.g. `IfcWallType`'s
+ * `Pset_WallCommon`) via `IfcRelDefinesByType`, caching the parse per
+ * TYPE (`ctx.typePsetCache`) rather than per instance. Many occurrences
+ * share one type, so this is O(distinct types) source-buffer parses per
+ * filter run, not O(entities) — see the AGENTS.md §2 warning this module
+ * already guards for instance psets.
+ *
+ * Mirrors `packages/ids/src/bridge/properties.ts`'s `inheritedPropertySets`
+ * / `typePropertySetsFromTable` split: `extractTypePropertiesOnDemand` only
+ * resolves from the source buffer, so on a server-parsed store (no
+ * `source`, e.g. after collab/session load) it always returns null — the
+ * type's psets there are keyed under the type's own expressId in the
+ * pre-built `PropertyTable` (`store.properties.getForEntity(typeId)`,
+ * issue #1787's server-path fallback).
+ */
+function getInheritedTypePsets(ctx: EvalContext, expressId: number): TypePsetList {
+  if (!ctx.store.relationships) return [];
+  const typeIds = ctx.store.relationships.getRelated(expressId, RelationshipType.DefinesByType, 'inverse');
+  if (typeIds.length === 0) return [];
+  const typeId = typeIds[0];
+
+  const cached = ctx.typePsetCache.get(typeId);
+  if (cached !== undefined) return cached;
+
+  let resolved: TypePsetList;
+  if (ctx.store.source && ctx.store.source.length > 0) {
+    resolved = extractTypePropertiesOnDemand(ctx.store, expressId)?.properties ?? [];
+  } else {
+    resolved = (ctx.store.properties?.getForEntity?.(typeId) ?? []) as unknown as TypePsetList;
+  }
+  ctx.typePsetCache.set(typeId, resolved);
+  return resolved;
 }
 
 function evaluateRule(
@@ -462,9 +476,16 @@ function evaluateRule(
   qtysFor: (() => QtyRows) | null,
   matNamesFor: (() => string[]) | null,
   classFor: (() => readonly ClassificationInfo[]) | null,
+  attrsFor: (() => AttrRows) | null,
 ): boolean {
+  if (isModelScopedRule(rule)) return modelScopedRuleMatches(rule, ctx.scope);
   switch (rule.kind) {
     case 'storey': {
+      // Exact-identity mode (refs present): Name isn't unique.
+      if (rule.refs) {
+        const isMatch = storeyMatchesRefs(ctx.store, expressId, ctx.modelId, rule);
+        return rule.op === 'in' ? isMatch : !isMatch;
+      }
       const storeyName = ctx.options.storeyNameOf?.(expressId)
         ?? defaultStoreyName(ctx.store, expressId);
       return setOpMatches(rule.op, storeyName, rule.values);
@@ -483,7 +504,14 @@ function evaluateRule(
       return setOpMatches(rule.op, pt, rule.values);
     }
     case 'name': {
-      return stringOpMatches(rule.op, ctx.table.getName(expressId), rule.value);
+      return stringOpMatches(rule.op, ctx.table.getName(expressId), rule.value, rule.valueKind);
+    }
+    case 'globalId': {
+      return globalIdOpMatches(rule.op, ctx.table.getGlobalId(expressId), rule.values);
+    }
+    case 'attribute': {
+      if (!attrsFor) return false;
+      return matchAttributeRule(rule, attrsFor());
     }
     case 'property': {
       if (!psetsFor) return false;
@@ -495,7 +523,7 @@ function evaluateRule(
     }
     case 'material': {
       if (!matNamesFor) return false;
-      return matchStringAnyNone(rule.op, matNamesFor(), rule.value);
+      return matchStringAnyNone(rule.op, matNamesFor(), rule.value, rule.valueKind);
     }
     case 'classification': {
       if (!classFor) return false;
@@ -506,7 +534,26 @@ function evaluateRule(
       if (elev === null) return false;
       return numericOpMatches(rule.op, elev, rule.value);
     }
+    case 'type': {
+      const typeName = relatingTypeNameOf(ctx, expressId);
+      if (typeName === null) return false;
+      return stringOpMatches(rule.op, typeName, rule.value, rule.valueKind);
+    }
   }
+}
+
+/**
+ * The Name of `expressId`'s RELATING TYPE via `IfcRelDefinesByType` — the
+ * `type=` selector dimension (#4094), distinct from `ctx.table.getTypeName`
+ * (the element's own IFC class). `null` when the element carries no such
+ * relation, which a `type=` rule must never match (an absent relation is
+ * not the same as a type with an empty Name).
+ */
+function relatingTypeNameOf(ctx: EvalContext, expressId: number): string | null {
+  if (!ctx.store.relationships) return null;
+  const typeIds = ctx.store.relationships.getRelated(expressId, RelationshipType.DefinesByType, 'inverse');
+  if (typeIds.length === 0) return null;
+  return ctx.table.getName(typeIds[0]);
 }
 
 function buildResult(modelId: string, ctx: EvalContext, expressId: number): FilteredElement {
@@ -519,71 +566,6 @@ function buildResult(modelId: string, ctx: EvalContext, expressId: number): Filt
   };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Return the raw expressId column as the iteration source. The
- *  per-entity loops already skip empty rows (`if (!expressId) continue`)
- *  so the typed-array shape is correctness-safe AND lets the federated
- *  entry report a `total` rather than streaming with `total = -1`. */
-function iterateAllExpressIds(store: IfcDataStore): ArrayLike<number> {
-  return store.entities.expressId;
-}
-
-function isArrayLike(value: unknown): value is ArrayLike<number> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { length?: unknown }).length === 'number'
-  );
-}
-
-/** Try to materialise an iterable into an array so the federated loop
- *  can chunk-iterate by index (faster + provides a `total` for progress).
- *  Returns null when the source is unknown-size and we'd rather stream. */
-function materialiseIterable(
-  source: ArrayLike<number> | Iterable<number>,
-): ArrayLike<number> | null {
-  if (Array.isArray(source)) return source;
-  if (isArrayLike(source)) return source;
-  if (source instanceof Set) return Array.from(source);
-  // Generators / unknown-size iterables: keep streaming. The federated
-  // loop falls back to the iterator branch with a buffered chunk count.
-  return null;
-}
-
-function throwAbort(signal: AbortSignal): never {
-  // Match the shape DOM throws on AbortController.signal.aborted reads —
-  // callers can `instanceof DOMException && err.name === 'AbortError'`.
-  throw new DOMException(
-    signal.reason instanceof Error ? signal.reason.message : 'evaluateFilterRules aborted',
-    'AbortError',
-  );
-}
-
-/** Yield control to the event loop. Mirrors `tier1-index.ts` so we
- *  don't pin the Node test runner — `scheduler.yield` (browsers /
- *  Node 22+) and `setImmediate` (Node fallback) are preferred over
- *  the MessageChannel trick because the latter requires explicit
- *  port closure to release the loop reference. */
-function yieldToEventLoop(): Promise<void> {
-  const maybeScheduler = (globalThis as typeof globalThis & {
-    scheduler?: { yield?: () => Promise<void> };
-  }).scheduler;
-  if (typeof maybeScheduler?.yield === 'function') return maybeScheduler.yield();
-  if (typeof setImmediate === 'function') {
-    return new Promise<void>((resolve) => { setImmediate(() => resolve()); });
-  }
-  return new Promise<void>((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => {
-      channel.port1.close();
-      channel.port2.close();
-      resolve();
-    };
-    channel.port2.postMessage(null);
-  });
-}
-
 // ── Exposed for tests ────────────────────────────────────────────────────────
 
 export const __internal = {
@@ -592,6 +574,7 @@ export const __internal = {
   stringifyValue,
   matchPropertyRule,
   matchQuantityRule,
+  matchAttributeRule,
   materialNamesOf,
   matchClassificationRule,
   elevationOf,

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 export { default as AddFile } from '~icons/viewer/add-file';
+export { default as CloudSources } from '~icons/viewer/cloud-sources';
 export { default as Loading } from '~icons/viewer/loading';
 export { default as OpenFile } from '~icons/viewer/open-file';
 export { default as Refresh } from '~icons/viewer/refresh';
@@ -13,6 +14,8 @@ export { default as FileJson } from '~icons/viewer/file-json';
 export { default as FileGlb } from '~icons/viewer/file-glb';
 export { default as FileKmz } from '~icons/viewer/file-kmz';
 export { default as FileHbjson } from '~icons/viewer/file-hbjson';
+export { default as FileUsd } from '~icons/viewer/file-usd';
+export { default as FilePdf } from '~icons/viewer/file-pdf';
 export { default as Annotate } from '~icons/viewer/annotate';
 export { default as Measure } from '~icons/viewer/measure';
 export { default as Section } from '~icons/viewer/section';
@@ -46,6 +49,8 @@ export { default as Check } from '~icons/viewer/check';
 export { default as Script } from '~icons/viewer/script';
 export { default as Coloring } from '~icons/viewer/coloring';
 export { default as Schedule } from '~icons/viewer/schedule';
+export { default as Chart } from '~icons/viewer/chart';
+export { default as Document } from '~icons/viewer/document';
 export { default as Extension } from '~icons/viewer/extension';
 export { default as SpaceSketch } from '~icons/viewer/space-sketch';
 export { default as AddElement } from '~icons/viewer/add-element';
@@ -67,3 +72,11 @@ export { default as Class } from '~icons/viewer/class';
 export { default as Type } from '~icons/viewer/type';
 export { default as Group } from '~icons/viewer/group';
 export { default as Material } from '~icons/viewer/material';
+export { default as Reposition } from '~icons/viewer/reposition';
+export { default as Zones } from '~icons/viewer/zones';
+export { default as LoadReport } from '~icons/viewer/load-report';
+export { default as Appearance } from '~icons/viewer/appearance';
+export { default as World } from '~icons/viewer/world';
+export { default as Move } from '~icons/viewer/move';
+export { default as FollowWork } from '~icons/viewer/follow-work';
+export { default as ClassicBar } from '~icons/viewer/classic-bar';

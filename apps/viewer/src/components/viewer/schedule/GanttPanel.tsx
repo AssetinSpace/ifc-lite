@@ -11,12 +11,13 @@
  * highlight. The 4D animator runs completely uninterrupted either way.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { extractScheduleOnDemand } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
 import { resolveScheduleSourceModelId } from '@/store/slices/schedule-edit-helpers';
 import { useIfc } from '@/hooks/useIfc';
+import { Button } from '@/components/ui/button';
 import { GanttToolbar } from './GanttToolbar';
 import { GanttTaskTree } from './GanttTaskTree';
 import { GanttTimeline } from './GanttTimeline';
@@ -25,8 +26,8 @@ import { GenerateScheduleDialog } from './GenerateScheduleDialog';
 import { flattenTaskTree } from './schedule-utils';
 import { canGenerateScheduleFrom, resolveActiveDataStore } from './generate-schedule';
 import { useConstructionSequence } from './useConstructionSequence';
+import { useScheduleFileImport } from './useScheduleFileImport';
 import { useGanttSelection3DHighlight } from './useGanttSelection3DHighlight';
-import { useOverlayCompositor } from './useOverlayCompositor';
 
 interface GanttPanelProps {
   onClose?: () => void;
@@ -46,6 +47,7 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
   const {
     scheduleData,
     scheduleRange,
+    scheduleIsEdited,
     activeWorkScheduleId,
     expandedTaskGlobalIds,
     hoveredTaskGlobalId,
@@ -60,6 +62,7 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
   } = useViewerStore(useShallow(s => ({
     scheduleData: s.scheduleData,
     scheduleRange: s.scheduleRange,
+    scheduleIsEdited: s.scheduleIsEdited,
     activeWorkScheduleId: s.activeWorkScheduleId,
     expandedTaskGlobalIds: s.expandedTaskGlobalIds,
     hoveredTaskGlobalId: s.hoveredTaskGlobalId,
@@ -120,15 +123,11 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeStore]);
 
-  // Single compositor — reads the overlay-layer registry and writes the
-  // composite into the renderer's legacy hiddenEntities / pendingColorUpdates
-  // channels. Must be mounted BEFORE any layer owner in the render tree so
-  // its first reconcile can observe their initial contributions.
-  useOverlayCompositor();
-
   // Drive the 3D viewport's hidden-entity set from the playback clock.
-  // Registers the 'animation' overlay layer; the compositor above does
-  // the actual write.
+  // Registers the 'animation' overlay layer; the single compositor mounted
+  // by `ViewerLayout` (`useOverlayCompositor`) does the actual write, so a
+  // layer registered by any panel — docked, floating or popped out — is
+  // composited by exactly one writer.
   useConstructionSequence();
 
   // Highlight the current Gantt selection's products in 3D. Selection-only
@@ -149,6 +148,17 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
   // palette / hotkeys can open it without going through this component.
   const generateOpen = useViewerStore(s => s.generateScheduleDialogOpen);
   const setGenerateOpen = useViewerStore(s => s.setGenerateScheduleDialogOpen);
+
+  // Import from an external MSPDI/CSV file — same commit path as "Generate
+  // schedule" (`commitGeneratedSchedule`), just fed by a parsed file instead
+  // of the spatial hierarchy. Extracted into useScheduleFileImport (AGENTS.md
+  // module-size split) — see apps/viewer/src/components/viewer/schedule/import/.
+  const { importFileInputRef, pendingImport, handleImportFileChange, confirmPendingImport, cancelPendingImport } =
+    useScheduleFileImport(models, activeModelId);
+  const onImportFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => handleImportFileChange(e, scheduleData, scheduleIsEdited),
+    [handleImportFileChange, scheduleData, scheduleIsEdited],
+  );
   const canGenerate = useMemo(() => {
     // Geometry-only models (no spatial hierarchy) can still generate via
     // the Height strategy, so surface the button whenever EITHER a
@@ -223,13 +233,43 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
       tabIndex={-1}
       onKeyDown={onPanelKeyDown}
     >
+      <input
+        ref={importFileInputRef}
+        type="file"
+        accept=".xml,.csv,.txt"
+        className="hidden"
+        onChange={onImportFileChange}
+      />
+
       <GanttToolbar
         onClose={onClose}
         onOpenGenerate={() => setGenerateOpen(true)}
+        onOpenImport={() => importFileInputRef.current?.click()}
         canGenerate={canGenerate}
       />
 
       <GenerateScheduleDialog open={generateOpen} onOpenChange={setGenerateOpen} />
+
+      {pendingImport && (
+        <div
+          // The banner appears asynchronously after the file read completes,
+          // with focus still on the toolbar button that opened the picker —
+          // without this, a screen reader user gets no notice a destructive
+          // confirmation is waiting. Same pattern as ChunkErrorBoundary.
+          role="alert"
+          className="px-3 py-2 bg-destructive/5 border-b flex items-center gap-2 text-xs"
+        >
+          <span className="text-muted-foreground">
+            Importing &quot;{pendingImport.fileName}&quot; will replace the current schedule and its undo history.
+          </span>
+          <Button variant="destructive" size="sm" onClick={confirmPendingImport} className="h-5 px-2 text-xs">
+            Replace
+          </Button>
+          <Button variant="ghost" size="sm" onClick={cancelPendingImport} className="h-5 px-2 text-xs">
+            Cancel
+          </Button>
+        </div>
+      )}
 
       {showEmpty ? (
         <GanttEmptyState
@@ -238,6 +278,7 @@ export function GanttPanel({ onClose }: GanttPanelProps) {
           canGenerate={canGenerate}
           extractionError={extractionError}
           onGenerate={() => setGenerateOpen(true)}
+          onImport={() => importFileInputRef.current?.click()}
           onClose={onClose}
         />
       ) : (

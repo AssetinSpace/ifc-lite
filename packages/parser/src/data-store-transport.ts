@@ -3,20 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Worker-boundary transport for `IfcDataStore`.
- *
- * `IfcDataStore` carries closures (`entities.getName`, `relationships.getRelated`,
- * `spatialHierarchy.getPath`, …) that the structured-clone algorithm strips
- * silently. This module separates the clone-safe column data from the
- * closures: `toTransport` returns a POJO + transferable list to ship across
- * a `postMessage` boundary; `fromTransport` reconstructs a live `IfcDataStore`
- * with closures rebuilt on the receiving thread.
- *
- * The `source` buffer is intentionally NOT included in the transferable list
- * because both the parser worker and the geometry workers read from the same
- * `SharedArrayBuffer` upstream of the parser. Callers are responsible for
- * keeping a `Uint8Array` view of that SAB on the main thread and supplying
- * it to `fromTransport`.
+ * Worker transport splits clone-safe columns from live store accessors.
+ * toTransport serializes columns; fromTransport rebuilds their closures.
+ * Source bytes stay in the shared buffer, supplied separately by the receiver.
  */
 
 import {
@@ -42,59 +31,23 @@ import {
   relationshipGraphFromColumns,
   relationshipGraphToColumns,
   findStoreyByElevation,
+  spatialLookups,
 } from '@ifc-lite/data';
 
 import { CompactEntityIndex } from './compact-entity-index.js';
+import {
+  type CompactEntityIndexColumns,
+  compactEntityIndexFromColumns,
+  compactEntityIndexToColumns,
+} from './compact-entity-index-transport.js';
 import type { EntityRef } from './types.js';
+import { asSourceBytes, type IfcSourceBytes } from './source-bytes.js';
 import type { IfcDataStore, EntityByIdIndex } from './columnar-parser.js';
 import { attachDataStoreAccessors } from './data-store-accessors.js';
+import type { GeoreferenceInfo } from './georef-extractor.js';
+import { oncePerStore } from './on-demand-cache.js';
 
-// ────────────────────────────────────────────────────────────────────────────
-// CompactEntityIndex transport
-// ────────────────────────────────────────────────────────────────────────────
-
-/**
- * Plain-data column representation of a `CompactEntityIndex`. Holds the
- * five backing arrays plus the deduplicated type-string list. All four
- * typed arrays are transferable.
- */
-export interface CompactEntityIndexColumns {
-  expressIds: Uint32Array;
-  byteOffsets: Uint32Array;
-  byteLengths: Uint32Array;
-  typeIndices: Uint16Array;
-  typeStrings: string[];
-}
-
-function compactEntityIndexToColumns(index: CompactEntityIndex): CompactEntityIndexColumns {
-  // CompactEntityIndex stores its arrays as private fields; access them
-  // through the prototype's documented columns. We rely on the public
-  // constructor's parameter order to define this contract.
-  const internal = index as unknown as {
-    expressIds: Uint32Array;
-    byteOffsets: Uint32Array;
-    byteLengths: Uint32Array;
-    typeIndices: Uint16Array;
-    typeStrings: string[];
-  };
-  return {
-    expressIds: internal.expressIds,
-    byteOffsets: internal.byteOffsets,
-    byteLengths: internal.byteLengths,
-    typeIndices: internal.typeIndices,
-    typeStrings: internal.typeStrings.slice(),
-  };
-}
-
-function compactEntityIndexFromColumns(columns: CompactEntityIndexColumns): CompactEntityIndex {
-  return new CompactEntityIndex(
-    columns.expressIds,
-    columns.byteOffsets,
-    columns.byteLengths,
-    columns.typeIndices,
-    columns.typeStrings,
-  );
-}
+export type { CompactEntityIndexColumns };
 
 // ────────────────────────────────────────────────────────────────────────────
 // SpatialHierarchy transport
@@ -124,6 +77,8 @@ export interface SpatialHierarchyColumns {
   storeyHeights: Array<[number, number]>;
   elementToStorey: Array<[number, number]>;
   elementToContainer?: Array<[number, number]>;
+  ambiguousStorey?: number[]; // #4311
+  reachableSpatialNodes?: number[]; // #4314
 }
 
 function serializeSpatialNode(node: SpatialNode): SerializedSpatialNode {
@@ -163,6 +118,8 @@ export function spatialHierarchyToColumns(hierarchy: SpatialHierarchy): SpatialH
     elementToContainer: hierarchy.elementToContainer
       ? [...hierarchy.elementToContainer.entries()]
       : undefined,
+    ambiguousStorey: hierarchy.ambiguousStorey ? [...hierarchy.ambiguousStorey] : undefined, // #4311
+    reachableSpatialNodes: hierarchy.reachableSpatialNodes ? [...hierarchy.reachableSpatialNodes] : undefined, // #4314
   };
 }
 
@@ -178,16 +135,8 @@ export function spatialHierarchyFromColumns(columns: SpatialHierarchyColumns): S
   const elementToContainer = columns.elementToContainer
     ? new Map<number, number>(columns.elementToContainer)
     : undefined;
-
-  // elementToSpace is the inverse of bySpace and is what `getContainingSpace`
-  // queries. Only this direction is shipped over the wire because it is
-  // O(unique-spaces) and trivially derivable from `bySpace`.
-  const elementToSpace = new Map<number, number>();
-  for (const [spaceId, elementIds] of bySpace) {
-    for (const elementId of elementIds) {
-      elementToSpace.set(elementId, spaceId);
-    }
-  }
+  const ambiguousStorey = columns.ambiguousStorey ? new Set<number>(columns.ambiguousStorey) : undefined; // #4311
+  const reachableSpatialNodes = columns.reachableSpatialNodes ? new Set<number>(columns.reachableSpatialNodes) : undefined; // #4314
 
   return {
     project,
@@ -199,6 +148,8 @@ export function spatialHierarchyFromColumns(columns: SpatialHierarchyColumns): S
     storeyHeights,
     elementToStorey,
     elementToContainer,
+    ambiguousStorey, // #4311
+    reachableSpatialNodes, // #4314
 
     getStoreyElements(storeyId: number): number[] {
       return byStorey.get(storeyId) ?? [];
@@ -210,23 +161,7 @@ export function spatialHierarchyFromColumns(columns: SpatialHierarchyColumns): S
       // worker boundary.
       return findStoreyByElevation(storeyElevations, z);
     },
-    getContainingSpace(elementId: number): number | null {
-      return elementToSpace.get(elementId) ?? null;
-    },
-    getPath(elementId: number): SpatialNode[] {
-      const path: SpatialNode[] = [];
-      const walk = (node: SpatialNode): boolean => {
-        path.push(node);
-        if (node.elements.includes(elementId)) return true;
-        for (const child of node.children) {
-          if (walk(child)) return true;
-        }
-        path.pop();
-        return false;
-      };
-      walk(project);
-      return path;
-    },
+    ...spatialLookups(project, bySpace, elementToContainer),
   };
 }
 
@@ -252,6 +187,9 @@ export interface ParserMemorySnapshot {
 // ────────────────────────────────────────────────────────────────────────────
 
 export interface DataStoreTransport {
+  /** Worker-prepared render data (#3983); absent on older transports. */
+  sourceContentKey?: string | null;
+  georeferencing?: GeoreferenceInfo | null;
   fileSize: number;
   schemaVersion: IfcDataStore['schemaVersion'];
   sourceHeader?: IfcDataStore['sourceHeader'];
@@ -351,6 +289,7 @@ export function collectTransferables(payload: DataStoreTransport): Transferable[
   for (const arr of [
     payload.quantities.entityId,
     payload.quantities.qsetName,
+    payload.quantities.qsetGlobalId,
     payload.quantities.quantityName,
     payload.quantities.quantityType,
     payload.quantities.value,
@@ -358,11 +297,10 @@ export function collectTransferables(payload: DataStoreTransport): Transferable[
     payload.quantities.formula,
   ]) push(arr.buffer);
 
-  // RelationshipGraphColumns
+  // RelationshipGraphColumns. shadowed* (#3782) are absent unless an edge
+  // collapsed more than one IfcRel* instance.
   for (const half of [payload.relationships.forward, payload.relationships.inverse]) {
-    push(half.edgeTargets.buffer);
-    push(half.edgeTypes.buffer);
-    push(half.edgeRelIds.buffer);
+    for (const arr of [half.edgeTargets, half.edgeTypes, half.edgeRelIds, half.shadowedEdgeIndex, half.shadowedGroupOffsets, half.shadowedRelIds]) if (arr) push(arr.buffer);
   }
 
   // De-duplicate: a typed array sliced from another aliases the same
@@ -394,9 +332,12 @@ function sumBytes(payload: DataStoreTransport): number {
  * thread both view the same upstream `SharedArrayBuffer`. Callers must
  * reattach `source` on the receiving side when calling `fromTransport`.
  */
-export function toTransport(store: IfcDataStore): DataStoreTransportEnvelope {
+export function toTransport(
+  store: IfcDataStore,
+  indexOverride?: DataStoreTransport['entityIndex'],
+): DataStoreTransportEnvelope {
   const byTypeEntries: Array<[string, number[]]> = [];
-  for (const [key, value] of store.entityIndex.byType) {
+  for (const [key, value] of indexOverride ? [] : store.entityIndex.byType) {
     byTypeEntries.push([key, [...value]]);
   }
 
@@ -413,7 +354,7 @@ export function toTransport(store: IfcDataStore): DataStoreTransportEnvelope {
     parseTime: store.parseTime,
     lengthUnitScale: store.lengthUnitScale,
 
-    entityIndex: {
+    entityIndex: indexOverride ?? {
       byId: compactEntityIndexToColumns(compactById),
       byType: byTypeEntries,
     },
@@ -456,7 +397,11 @@ export function toTransport(store: IfcDataStore): DataStoreTransportEnvelope {
  * `DataStoreTransport` payload and the `source` buffer view that lives on
  * the receiving thread.
  */
-export function fromTransport(payload: DataStoreTransport, source: Uint8Array): IfcDataStore {
+export function fromTransport(
+  payload: DataStoreTransport,
+  source: Uint8Array | IfcSourceBytes,
+  byTypeOverride?: Map<string, number[]>,
+): IfcDataStore {
   const strings: DataStringTable = StringTable.fromArray(payload.strings);
   const entities = entityTableFromColumns(payload.entities, strings);
   const properties = propertyTableFromColumns(payload.properties, strings);
@@ -464,7 +409,7 @@ export function fromTransport(payload: DataStoreTransport, source: Uint8Array): 
   const relationships = relationshipGraphFromColumns(payload.relationships);
 
   const byIdIndex = compactEntityIndexFromColumns(payload.entityIndex.byId);
-  const byType = new Map<string, number[]>(
+  const byType = byTypeOverride ?? new Map<string, number[]>(
     payload.entityIndex.byType.map(([k, v]) => [k, [...v]]),
   );
   const deferredEntityIndex = payload.deferredEntityIndex
@@ -483,7 +428,7 @@ export function fromTransport(payload: DataStoreTransport, source: Uint8Array): 
   const onDemandQuantityMap = new Map(payload.onDemandQuantityMap.map(([k, v]) => [k, [...v]]));
   // Lazy accessors are wired by the shared helper so the fresh-parse, transport,
   // and cache-restore paths can never drift (see data-store-accessors.ts).
-  return attachDataStoreAccessors({
+  const store = attachDataStoreAccessors({
     fileSize: payload.fileSize,
     schemaVersion: payload.schemaVersion,
     sourceHeader: payload.sourceHeader,
@@ -491,7 +436,7 @@ export function fromTransport(payload: DataStoreTransport, source: Uint8Array): 
     parseTime: payload.parseTime,
     lengthUnitScale: payload.lengthUnitScale,
 
-    source,
+    source: asSourceBytes(source),
     entityIndex,
     deferredEntityIndex: deferredEntityIndex as unknown as EntityByIdIndex | undefined,
 
@@ -508,6 +453,10 @@ export function fromTransport(payload: DataStoreTransport, source: Uint8Array): 
     onDemandMaterialMap: new Map(payload.onDemandMaterialMap),
     onDemandDocumentMap: new Map(payload.onDemandDocumentMap.map(([k, v]) => [k, [...v]])),
   });
+  if (payload.georeferencing !== undefined) {
+    oncePerStore(store, 'georef', () => payload.georeferencing);
+  }
+  return store;
 }
 
 /**

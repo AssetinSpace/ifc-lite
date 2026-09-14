@@ -12,6 +12,22 @@ use crate::api::IfcAPI;
 use js_sys::Function;
 use wasm_bindgen::prelude::*;
 
+/// One `[r, g, b, a]` per id. `finalizePrepassStyles` reads four floats per id
+/// from both style column pairs, and under wasm `panic=abort` a read past the
+/// end traps the instance, so any other length is refused before either pair
+/// is read (#4614).
+pub(super) fn check_rgba_columns(what: &str, ids: &[u32], colors: &[f32]) -> Result<(), String> {
+    if colors.len().is_multiple_of(4) && colors.len() / 4 == ids.len() {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} style columns disagree: {} ids need {} colour floats, got {}",
+        ids.len(),
+        ids.len() as u64 * 4,
+        colors.len()
+    ))
+}
+
 /// Serialize the shared [`StreamMeta`] onto a JS object as the wire fields the
 /// host reads: `unitScale`, `planeAngleToRadians`, `rtcOffset` (`[x,y,z]`),
 /// `needsShift`, `buildingRotation` (`null` when absent). Used by both the
@@ -24,11 +40,12 @@ pub(super) fn set_stream_meta_props(
     crate::api::set_js_prop(obj, "unitScale", &meta.length_unit_scale.into());
     crate::api::set_js_prop(obj, "planeAngleToRadians", &meta.plane_angle_to_radians.into());
     let rtc_arr = js_sys::Float64Array::new_with_length(3);
-    rtc_arr.set_index(0, meta.rtc_offset.0);
-    rtc_arr.set_index(1, meta.rtc_offset.1);
-    rtc_arr.set_index(2, meta.rtc_offset.2);
+    let (rtc_x, rtc_y, rtc_z) = meta.frame.rtc_offset();
+    rtc_arr.set_index(0, rtc_x);
+    rtc_arr.set_index(1, rtc_y);
+    rtc_arr.set_index(2, rtc_z);
     crate::api::set_js_prop(obj, "rtcOffset", &rtc_arr);
-    crate::api::set_js_prop(obj, "needsShift", &meta.needs_shift.into());
+    crate::api::set_js_prop(obj, "needsShift", &meta.frame.needs_shift().into());
     match meta.building_rotation {
         Some(rot) => crate::api::set_js_prop(obj, "buildingRotation", &rot.into()),
         None => crate::api::set_js_prop(obj, "buildingRotation", &JsValue::NULL),
@@ -64,20 +81,9 @@ impl IfcAPI {
         index_lengths: &[u32],
         index_classes: &[u8],
     ) -> Result<JsValue, JsValue> {
-        let prebuilt = ifc_lite_core::ColumnarEntityIndex::from_columns(
-            index_ids,
-            index_starts,
-            index_lengths,
-        );
-        self.pre_pass_streaming_impl(
-            data,
-            on_event,
-            chunk_size,
-            disabled_type_names,
-            skip_type_geometry,
-            Some(prebuilt),
-            true,
-            Some((index_ids, index_starts, index_lengths, index_classes)),
+        self.pre_pass_streaming_sharded_impl(
+            data, on_event, chunk_size, disabled_type_names, skip_type_geometry,
+            index_ids, index_starts, index_lengths, index_classes, false,
         )
     }
 
@@ -87,16 +93,36 @@ impl IfcAPI {
     /// range_end)` shard; the main thread stitches the returned columns into the
     /// full entity index (byte-identical to the single-threaded
     /// `build_entity_index`) by binary-searching each shard for the previous
-    /// shard's `handoff`. Delegates to `ifc_lite_processing::scan_shard`, the
-    /// exact per-chunk primitive the native `build_entity_index_parallel` fans
-    /// across cores — so the sharded merge cannot drift from the serial builder.
+    /// shard's `handoff`. Delegates to
+    /// `ifc_lite_processing::scan_shard_classified_with_refusals` — a
+    /// separately-maintained loop over the same `EntityScanner` primitive as
+    /// `scan_shard` (the one the native `build_entity_index_parallel` fans across
+    /// cores), plus a per-record class column this sharded path also needs. The
+    /// two loops' records/handoff are kept in parity by a dedicated test
+    /// (`rust/processing/tests/issue_2053_shard_scan_parity.rs`), not by
+    /// delegation — edit one without the other and that test catches the drift.
     ///
     /// Byte offsets returned are GLOBAL (relative to file start), so shards
     /// concatenate without rewriting. Returns a plain object:
     ///   `{ ids: Uint32Array, starts: Uint32Array, lengths: Uint32Array,
-    ///      handoff: number }`
-    /// where `handoff` is the global start of the first entity at/after
+    ///      classes: Uint8Array, handoff: number,
+    ///      oversizedIdStarts: Uint32Array }`
+    /// where `classes` is the parallel per-record prepass class byte
+    /// (`PREPASS_CLASS_*`: named code in the low bits plus the geometry-job /
+    /// type-candidate flags) the host filters on to rebuild pre-pass span
+    /// lists, and `handoff` is the global start of the first entity at/after
     /// `range_end` (the next shard's first real entity), or `-1` at EOF.
+    ///
+    /// `oversizedIdStarts` carries the global start byte of every record this
+    /// shard refused for an express id above `u32::MAX` (#3395). Offsets, not
+    /// a count, and deliberately NOT reported from here: a shard begins at an
+    /// arbitrary byte, so it can start inside a quoted value and refuse a
+    /// string literal shaped like `#4294967297=IFCWALL(` — text no file
+    /// declared. Reporting per shard would warn "skipped N records" on a file
+    /// that is fine. The host's stitch keeps only the offsets at/after the
+    /// retained boundary it computed for this shard and reports once, which is
+    /// what makes the number attributable to a record the stitch retained
+    /// (#3430).
     #[wasm_bindgen(js_name = scanEntityIndexShard)]
     pub fn scan_entity_index_shard(
         &self,
@@ -107,8 +133,8 @@ impl IfcAPI {
         let total = data.len();
         let start = (range_start as usize).min(total);
         let end = (range_end as usize).min(total);
-        let (records, classes, handoff) =
-            ifc_lite_processing::scan_shard_classified(data, start, end);
+        let (records, classes, handoff, oversized_id_starts) =
+            ifc_lite_processing::scan_shard_classified_with_refusals(data, start, end);
 
         let n = records.len() as u32;
         let ids = js_sys::Uint32Array::new_with_length(n);
@@ -136,6 +162,22 @@ impl IfcAPI {
             None => -1.0,
         };
         crate::api::set_js_prop(&result, "handoff", &handoff_val.into());
+        // #3395: the stitched columns are the ONLY thing the parser worker sees
+        // on the SAB-backed pre-scanned load, and a refused record is absent
+        // from them by construction — the host cannot recount it. Carry the
+        // offsets so the stitch can attribute them and `scanIfcEntities` can
+        // report ONCE on the canonical viewer path, instead of returning an
+        // apparently clean, incomplete model. No console line from here: a
+        // per-shard report is exactly the false alarm #3430 retracted.
+        let refusals = js_sys::Uint32Array::new_with_length(oversized_id_starts.len() as u32);
+        for (i, &offset) in oversized_id_starts.iter().enumerate() {
+            debug_assert!(
+                offset <= u32::MAX as usize,
+                "refusal offset exceeds the u32 column ceiling"
+            );
+            refusals.set_index(i as u32, offset as u32);
+        }
+        crate::api::set_js_prop(&result, "oversizedIdStarts", &refusals);
         result.into()
     }
 
@@ -208,7 +250,9 @@ impl IfcAPI {
     /// CANONICAL styles flatten. Returns the exact `styles` event payload the
     /// serial path emits. Runs on any worker with `setEntityIndex` installed.
     /// Span arguments are `[id, start, len]` triples; `plane_angle_to_radians`
-    /// comes from the meta event.
+    /// comes from the meta event. `orphanColors` / `geomColors` carry exactly
+    /// four floats per id in `orphanIds` / `geomIds`; any other length throws
+    /// before either column is read.
     #[wasm_bindgen(js_name = finalizePrepassStyles)]
     #[allow(clippy::too_many_arguments)]
     pub fn finalize_prepass_styles(
@@ -227,6 +271,9 @@ impl IfcAPI {
         plane_angle_to_radians: f64,
     ) -> Result<JsValue, JsValue> {
         use ifc_lite_core::EntityDecoder;
+        check_rgba_columns("orphan", orphan_ids, orphan_colors)
+            .and_then(|()| check_rgba_columns("geometry", geom_ids, geom_colors))
+            .map_err(|message| JsValue::from_str(&format!("finalizePrepassStyles: {message}")))?;
         fn triples(v: &[u32]) -> Vec<(u32, usize, usize)> {
             v.chunks_exact(3)
                 .map(|c| (c[0], c[1] as usize, c[1] as usize + c[2] as usize))
@@ -240,6 +287,11 @@ impl IfcAPI {
             void_rels: triples(void_spans),
             fills_rels: triples(fills_spans),
             aggregate_rels: triples(aggregate_spans),
+            // Not plumbed across this wasm_bindgen boundary (no
+            // rel-defines-by-type span param here yet): occurrences merged
+            // via this sharded-finalize path get no type-material fallback.
+            // The serial and columns-discovery paths (the common case) do.
+            defines_by_type: Vec::new(),
         };
         let index = {
             let slot = self
@@ -259,13 +311,8 @@ impl IfcAPI {
         // orphan_styled_items, so injecting after resolve_prepass loses
         // material-dependent styles.
         let mut orphan_seed = rustc_hash::FxHashMap::default();
-        for (i, &id) in orphan_ids.iter().enumerate() {
-            orphan_seed.insert(id, [
-                orphan_colors[i * 4],
-                orphan_colors[i * 4 + 1],
-                orphan_colors[i * 4 + 2],
-                orphan_colors[i * 4 + 3],
-            ]);
+        for (&id, rgba) in orphan_ids.iter().zip(orphan_colors.chunks_exact(4)) {
+            orphan_seed.insert(id, [rgba[0], rgba[1], rgba[2], rgba[3]]);
         }
         // Geometry styles stay as COLUMNS (stage 2): the support resolution
         // only consults the ORPHAN map (material chain), and the column-based
@@ -323,3 +370,7 @@ pub(super) fn styles_payload_with_flat(
     crate::api::set_js_prop(&result, "materialColors", &js_sys::Uint8Array::from(mat_colors_vec.as_slice()));
     result
 }
+
+#[cfg(test)]
+#[path = "prepass_sharded_tests.rs"]
+mod tests;

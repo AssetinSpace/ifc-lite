@@ -29,6 +29,29 @@ const lookup = federationRegistry.fromGlobalId(globalId);
 // { modelId: 'arch-model', expressId: 42 }
 ```
 
+### Ids Carried on Geometry
+
+`MeshData.expressId` is not the only id a mesh carries, and every id that is
+resolved through the registry must be in the same space. When the viewer loads a
+federated model it re-homes the mesh's `geometryItemId` (the
+`IfcRepresentationItem` the mesh was tessellated from, see the
+[Geometry Guide](geometry.md)) by the same `idOffset` as `expressId`, on the flat
+path and on the instanced shards alike. So a `geometryItemId` you read off a
+loaded mesh is a **global id**: pass it to `fromGlobalId` like any other, and
+subtract the offset before comparing it to raw ids in the source file.
+
+This matters more than it looks. Resolution back to a model is **range-based**:
+`fromGlobalId` and `getModelForGlobalId` ask which model's id range contains the
+number. A raw, unshifted item id from a model loaded at offset 1,000,000 is a
+small number, so it lands inside the *primary* model's range: it does not miss
+and it does not throw, it resolves to a real entity in the wrong model. Absence
+stays absence, though: a mesh with no item id still has none after the shift.
+
+`MeshData.materialId` is **not** re-homed and stays in its model's local space
+(tracked in #3525). Do not assume the ids on a mesh are uniformly global; today
+`expressId`, `textureRef.textureId` and `geometryItemId` are, and `materialId` is
+not.
+
 ## Loading Multiple Models
 
 In the viewer, drop multiple IFC files or load them sequentially. Each model appears as a collapsible group in the hierarchy panel.
@@ -83,6 +106,85 @@ The viewer provides controls for each loaded model:
 | **Remove** | Unload a model and free its ID range |
 | **Set Active** | Focus the properties panel on a specific model |
 
+## Repositioning models and pointclouds
+
+![Reposition panel aligning an orange diagnostic pointcloud with an Archicad IFC model](../assets/model-reposition.png)
+
+Open **Home → Reposition**, the model's hierarchy action, or the command
+palette's Reposition command. IFC models, embedded pointclouds and streamed
+scans use the same workspace translation. Either upload order is supported.
+Select one or several moving models and choose a fixed reference model.
+
+1. For a large mismatch, use **Frame moving**, **Frame reference** or **Frame
+   both** to locate the data. **Move near reference** brings the first selected
+   model's bounds centre to the reference centre; it is an approximate preview.
+2. Pick a source point on the moving model and a target point on the reference.
+   Snapping uses mesh vertices, edges and faces, and actual scan points. The
+   highlighted point and live dimensions show the proposed displacement.
+3. Refine with X/Y/Z or XY/XZ/YZ constraints, the axis and plane handles, or
+   typed values. Numbers accept a decimal dot or comma, scientific notation,
+   and `mm`, `cm`, `m`, `km`, `in` and `ft`; bare numbers mean metres. Workspace
+   coordinates use engineering axes with Z as elevation.
+4. **Move by ΔX / ΔY / ΔZ** enters a displacement from the committed position.
+   **Set source point X / Y / Z** sets the picked point's destination in the
+   workspace frame. A signed distance follows the constrained axis or current
+   move direction. Hold Shift during point picking for orthogonal movement.
+   Choose X/Y/Z and use ↑/↓ for the configured nudge increment.
+5. **Apply** creates one undo operation for the whole group. Escape or Cancel
+   discards the preview. Enter in a numeric field previews its value; Enter
+   with focus in the viewport applies. Focused buttons keep their normal keyboard
+   activation. **Reset placement** returns selected models to
+   their automatically aligned positions. Locks prevent starting new moves;
+   undo restores positions without changing subsequent lock settings.
+
+Manual placement composes with automatic georeference alignment. It does not
+edit `IfcLocalPlacement`, map conversion, source geometry or scan files.
+Re-aligning the federation cancels picked anchors and preserves manual
+translations as literal workspace vectors. Rotation, scaling, CRS conversion
+and automatic scan registration are separate operations.
+
+Positions are saved locally by source contents and coordinate frame. Reloading
+an unambiguous source restores its committed position; previews are never
+saved. Matching reads every source byte using bounded SHA-256 chunks; renaming a file keeps its identity, while changed contents require a new placement. For streamed scans, matching runs after loading completes so it does not delay the first points. Automatic restore and local saving become available once that background pass finishes; moves made meanwhile are preserved and then saved. Removing the scan stops the pass. **Export placements** downloads a versioned JSON manifest. Import
+checks units, axes, frame and source identity before applying the entire group.
+Repeated copies of one source need explicit instance bindings. Import respects
+current locks. Placement is local to this browser workspace and is not shared
+with collaboration peers.
+
+Rendering, selection, snapping, bounds, section geometry and graphical exports
+use the placed geometry. Existing measurements keep their recorded workspace
+points and are labelled **Stale** after movement; remeasure them. Clash and scan
+deviation results are invalidated and must be recomputed after applying a move.
+Cancelling a preview restores prior measurement validity and analysis results;
+a deviation result whose GPU buffers were overwritten during the preview must
+be recomputed. Source-model
+comparison still describes authored changes rather than registration offsets.
+STEP IFC exports retain authored coordinates; graphical GLB and IFC5 geometry
+exports include workspace placement. Export the placement manifest alongside
+source IFC or scan files when sharing this arrangement. Transformed LAS/E57
+writing is not provided.
+
+World Context refreshes its Cesium model after movement pauses, using the same
+placed geometry. Its previous model stays visible until the replacement is ready;
+the WebGPU view updates immediately throughout the move.
+
+Both the 3D cut and the 2D drawing resolve section percentages from the same
+placed bounds, including a model moved beyond its original extent.
+Construction projection also uses the placed floor elevations. Moving a model
+and its section plane together preserves the floor/ceiling projection bands and
+the resulting drawing geometry, for either section direction. Floor bands
+refresh when the model moves or its storey membership changes; no reload is
+needed. See [2D drawings after repositioning](drawing-2d.md#drawings-after-repositioning).
+
+![A real Archicad IFC section after moving the model up 100 metres](../assets/model-reposition-section.png)
+
+Large translations and their subsequent fine corrections are retained in double
+precision. Mesh and scan vertices stay near their own decode/draw origins;
+manual correction is composed before GPU narrowing. Precision still depends on
+the source data, a scan's spatial extent and the final distance from the render
+origin. Bring distant data near the reference before millimetre adjustment;
+repositioning cannot recover detail already rounded in the source file.
+
 ## Merging to a Single File (CLI)
 
 In-viewer federation keeps each model as a separate file with an ID offset. When
@@ -106,6 +208,7 @@ containers.
 | `--merge-sites` | `single` / `by-name` | combined heuristic | How `IfcSite` records are matched across models |
 | `--merge-buildings` | `single` / `by-name` | combined heuristic | How `IfcBuilding` records are matched |
 | `--merge-storeys` | `by-name` / `by-elevation` / `by-name-then-elevation` | combined heuristic | How `IfcBuildingStorey` records are matched |
+| `--drop-empty-containers` | flag | off | Leave out sites, buildings, storeys and spaces the merged model leaves holding nothing (the "Merge Projects" recipe step matching alone does not cover) |
 | `--json` | flag | off | Emit machine-readable stats (entity counts, warnings) to stdout |
 
 ## FederatedModel Type

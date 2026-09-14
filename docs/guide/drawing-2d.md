@@ -2,6 +2,10 @@
 
 IFClite can generate 2D architectural drawings from 3D IFC models, including section cuts, floor plans, and elevations. The `@ifc-lite/drawing-2d` package produces vector SVG output with proper architectural conventions.
 
+Direct annotation fills with a matching 3D mesh render once in the viewer's
+registered plane. Their symbolic fill data remains available to 2D drawings;
+the 3D overlay routing does not delete or flatten the authored geometry.
+
 ## What It Generates
 
 From any 3D IFC model, you can produce:
@@ -20,6 +24,23 @@ Each drawing includes:
 | **Hatching** | Material-based fill patterns (concrete, masonry, insulation, etc.) |
 | **Architectural symbols** | Door swings, window frames, stair arrows |
 | **Annotations** | Dimensions and labels |
+
+## Drawings After Repositioning
+
+In the viewer, section cuts and construction projection use the model's current
+workspace placement. After [repositioning a model](federation.md#repositioning-models-and-pointclouds),
+the floor and ceiling limits used for construction projection refresh with its
+displayed geometry and storey membership.
+
+To compare the same floor plan before and after a vertical move, move the
+section plane by the same amount, or use the same section percentage for the
+same model bounds. Once drawing generation finishes, the equivalent cut keeps
+the same projection geometry and floor/ceiling bands. Moving only the model
+while keeping an absolute section elevation fixed produces a different cut.
+
+This is a viewer workspace adjustment: it does not rewrite the source IFC
+placements. Existing measurements retain their recorded workspace points and
+are marked stale after movement; remeasure them in the new arrangement.
 
 ## Quick Start
 
@@ -95,6 +116,22 @@ resolved to the nearest AutoCAD Color Index. Layer names follow the strict
 R12 symbol rules (31 chars, `A-Z a-z 0-9 $ - _`); names that collide after
 sanitizing get a numeric suffix instead of merging.
 
+The returned string declares `$DWGCODEPAGE ANSI_1252` in its HEADER — DXF
+has no UTF-8 support before R2007 (AC1021). Encode it with
+`encodeDxfCp1252` before writing it to a file or `Blob`; a plain UTF-8
+encoder mismatches that declared codepage, and any real DXF reader
+(AutoCAD, `ezdxf`, ...) then decodes non-ASCII text as mojibake:
+
+```typescript
+import { exportToDXF, encodeDxfCp1252 } from '@ifc-lite/drawing-2d';
+
+declare const dxf: ReturnType<typeof exportToDXF>;
+const { bytes, hadUnmappable } = encodeDxfCp1252(dxf);
+// bytes is a Uint8Array ready to write to disk or a Blob.
+// hadUnmappable is true if a character outside windows-1252 (e.g. CJK)
+// was replaced with '?' — R12 TEXT has no wider single-byte encoding.
+```
+
 ## Drawing Sheets
 
 For presentation-ready output, drawings can be placed on sheets with frames and title blocks:
@@ -105,8 +142,8 @@ import {
   createTitleBlock,
   renderFrame,
   renderTitleBlock,
-  renderScaleBar,
   DEFAULT_SCALE_BAR,
+  DEFAULT_NORTH_ARROW,
   PAPER_SIZE_REGISTRY,
 } from '@ifc-lite/drawing-2d';
 
@@ -124,9 +161,15 @@ const titleBlock = createTitleBlock('standard');
 
 // Renderers return result objects, not raw SVG strings.
 const frameResult = renderFrame(paper, frame);
-const titleBlockResult = renderTitleBlock(titleBlock, frameResult.innerBounds);
+
+// The scale bar and north arrow are drawn inside the title block; pass them
+// as the fourth `extras` argument rather than rendering them separately.
 const scale = { name: '1:100', factor: 100, useCase: 'Floor plans' };
-const scaleBarSvg = renderScaleBar(DEFAULT_SCALE_BAR, scale, { x: 20, y: 20 });
+const titleBlockResult = renderTitleBlock(titleBlock, frameResult.innerBounds, [], {
+  scaleBar: DEFAULT_SCALE_BAR,
+  northArrow: DEFAULT_NORTH_ARROW,
+  scale,
+});
 
 const frameSvg = frameResult.svgElements;
 const titleBlockSvg = titleBlockResult.svgElements;

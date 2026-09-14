@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * BCFPanel - BIM Collaboration Format issue management panel
+ * BCFPanel - BIM Collaboration Format topic management panel
  *
  * Provides:
  * - Topic list with filtering
@@ -40,20 +40,20 @@ import { useBCF } from '@/hooks/useBCF';
 import { BCFTopicList } from './bcf/BCFTopicList';
 import { BCFTopicDetail } from './bcf/BCFTopicDetail';
 import { BCFCreateTopicForm } from './bcf/BCFCreateTopicForm';
+import { BCFServerControl } from './bcf/BCFServerControl';
 import { openGenericFileDialog } from '@/services/file-dialog';
 import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
+import { warnIfNoModelLoaded } from './bcf/bcfImportGuidance';
 
 // ============================================================================
 // Main BCF Panel Component
 // ============================================================================
-
 interface BCFPanelProps {
   onClose: () => void;
 }
 
 export function BCFPanel({ onClose }: BCFPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
-
   // Store state
   const bcfProject = useViewerStore((s) => s.bcfProject);
   const setBcfProject = useViewerStore((s) => s.setBcfProject);
@@ -86,7 +86,17 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     }
     return count;
   }, [selectedEntityId, selectedEntityIds]);
-  const hasIsolation = isolatedEntities !== null && isolatedEntities.size > 0;
+  // `isolatedEntities` is meaningfully nullable (`Set<number> | null`):
+  // `null` means no isolation channel is active, while a non-null Set --
+  // EMPTY included -- means one is and currently matches nothing (the
+  // convention `packages/renderer/src/entity-visibility.ts`'s
+  // `isEntityVisible` already enforces). A `.size > 0` check would read an
+  // active-but-empty isolate (reachable via `pinboardSlice.ts`'s
+  // `addToBasket`/`removeFromBasket` aliasing two `EntityRef`s onto one
+  // globalId, #4509) as "no isolation" and show "Hidden objects" -- or
+  // nothing at all -- instead of correctly reflecting that isolation is
+  // active. `useBCF.ts`'s `createViewpointFromState` has the same guard.
+  const hasIsolation = isolatedEntities !== null;
   const hasHiddenEntities = hiddenEntities.size > 0;
   const setBcfError = useViewerStore((s) => s.setBcfError);
   const models = useViewerStore((s) => s.models);
@@ -122,15 +132,15 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     if (models.size === 0) {
       // No models loaded, use date-based name
       const date = new Date().toISOString().split('T')[0];
-      return `BCF_Issues_${date}`;
+      return `BCF_Topics_${date}`;
     }
-    // Use first model's name (without extension) + "_Issues"
+    // Use first model's name (without extension) + "_Topics"
     const firstModel = models.values().next().value;
     if (firstModel?.name) {
       const baseName = firstModel.name.replace(/\.(ifc|ifczip)$/i, '');
-      return `${baseName}_Issues`;
+      return `${baseName}_Topics`;
     }
-    return `BCF_Issues_${new Date().toISOString().split('T')[0]}`;
+    return `BCF_Topics_${new Date().toISOString().split('T')[0]}`;
   }, [models]);
 
   // Initialize project if needed
@@ -149,14 +159,13 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
       setBcfError(null);
       const project = await readBCF(file);
       setBcfProject(project);
+      warnIfNoModelLoaded(useViewerStore.getState().models.size);
     } catch (error) {
       console.error('Failed to import BCF:', error);
       setBcfError(error instanceof Error ? error.message : 'Failed to import BCF file');
     } finally {
       setBcfLoading(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   }, [setBcfProject, setBcfLoading, setBcfError]);
 
@@ -195,7 +204,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
       setBcfLoading(true);
       const blob = await writeBCF(bcfProject);
       // Use project name, or generate from model name, or date-based fallback
-      const fileName = sanitizeFilename(bcfProject.name || getDefaultProjectName(), { fallback: 'issues' });
+      const fileName = sanitizeFilename(bcfProject.name || getDefaultProjectName(), { fallback: 'topics' });
       downloadBlob(blob, `${fileName}.bcfzip`);
       posthog.capture('bcf_exported', { topic_count: bcfProject.topics.size });
     } catch (error) {
@@ -384,7 +393,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
         <div className="flex items-center gap-2">
           <MessageSquare className="h-4 w-4" />
-          <h2 className="font-medium text-sm">BCF Issues</h2>
+          <h2 className="font-medium text-sm">BCF Topics</h2>
           {topics.length > 0 && (
             <Badge variant="secondary" className="text-xs">
               {topics.length}
@@ -406,7 +415,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             onClick={() => { void handleImportClick(); }}
             title="Import BCF"
           >
-            <Upload className="h-4 w-4" />
+            <Download className="h-4 w-4" />
           </Button>
           <Button
             variant="ghost"
@@ -417,8 +426,9 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             title="Export BCF"
             {...tourAnchor(TOUR_ANCHORS.bcfExport)}
           >
-            <Download className="h-4 w-4" />
+            <Upload className="h-4 w-4" />
           </Button>
+          <BCFServerControl />
           <Button
             variant={bcfOverlayVisible ? 'secondary' : 'ghost'}
             size="icon"

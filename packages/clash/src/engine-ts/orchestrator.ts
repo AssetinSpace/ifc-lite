@@ -2,9 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { matchesSelector } from '../selectors.js';
+import { clashMemberSet, inClashSet } from '../members.js';
 import { inferClashSeverity } from '../disciplines.js';
 import { isExcluded, qualifiedKey } from '../exclude.js';
+import { summarizeClashes } from '../analysis.js';
 import {
   DEFAULT_CLASH_SETTINGS,
   type Clash,
@@ -12,11 +13,54 @@ import {
   type ClashElementRef,
   type ClashResult,
   type ClashRule,
+  type ClashRuleCoverage,
   type ClashSettings,
-  type ClashSeverity,
-  type ClashSummary,
 } from '../types.js';
 import type { ClashKernel } from './kernel.js';
+
+/**
+ * Thrown by {@link runClash} when a `tolerance` — either the run-level
+ * `ClashSettings.tolerance` or a per-rule `ClashRule.tolerance` — is not a
+ * finite number (`NaN`, `+Infinity`, `-Infinity`).
+ *
+ * `??` (the substitution `runClash` uses for an omitted tolerance) only
+ * triggers on `null`/`undefined`, not `NaN`, so a `NaN` tolerance — e.g. from
+ * `Number('')`/`Number('abc')` on a cleared UI input, or a unit-conversion
+ * division by zero upstream — used to sail through unchanged. It then poisons
+ * `Math.max(tolerance, rule.clearance ?? 0)` (`NaN` on any `Math.max` operand
+ * is always `NaN`), which poisons the broad-phase AABB inflation
+ * (`inflate(bounds, NaN)`), which fails every BVH overlap comparison, which
+ * yields zero candidate pairs — silently, with the run still reporting
+ * `classifyRuleCoverage() === 'clean'` because `matchedA`/`matchedB` are
+ * selector-match counts taken before any geometry ran (#4244). Rejecting the
+ * non-finite value at the door, before it can reach `Math.max`, makes that
+ * whole chain structurally unreachable rather than merely harder to trigger.
+ *
+ * A NEGATIVE finite tolerance is unaffected by this check and keeps its
+ * existing, correct behaviour: `Math.max(tolerance, clearance ?? 0)` clamps
+ * it to at least the clearance (or zero), same as before.
+ */
+export class NonFiniteToleranceError extends Error {
+  readonly source: string;
+  readonly value: number;
+
+  constructor(source: string, value: number) {
+    super(
+      `runClash: ${source} is ${value} (not a finite number) — refusing to run, ` +
+        'which would silently poison the broad-phase AABB margin and report a ' +
+        'false "clean" result over zero examined geometry',
+    );
+    this.name = 'NonFiniteToleranceError';
+    this.source = source;
+    this.value = value;
+  }
+}
+
+function requireFiniteTolerance(source: string, value: number): void {
+  if (!Number.isFinite(value)) {
+    throw new NonFiniteToleranceError(source, value);
+  }
+}
 
 /**
  * Backend-agnostic clash orchestration: selection, exclusions, severity, stable
@@ -32,12 +76,14 @@ export async function runClash(
   kernel: ClashKernel,
 ): Promise<ClashResult> {
   const tolerance = settings.tolerance ?? DEFAULT_CLASH_SETTINGS.tolerance;
+  requireFiniteTolerance('settings.tolerance', tolerance);
   const excludeVoidsAndHosts =
     settings.excludeVoidsAndHosts ?? DEFAULT_CLASH_SETTINGS.excludeVoidsAndHosts;
   const exclusions = excludeVoidsAndHosts ? settings.exclusions : undefined;
   const maxPairs = settings.maxCandidatePairs ?? Infinity;
 
   const clashes: Clash[] = [];
+  const ruleCoverage: ClashRuleCoverage[] = [];
   const seen = new Set<string>();
   let droppedPairs = 0;
   // A single GLOBAL candidate-pair budget across the whole run (not per rule),
@@ -55,14 +101,47 @@ export async function runClash(
       }
 
       const groupA: number[] = [];
-      const groupB: number[] | null = rule.b ? [] : null;
+      // A second side exists when the rule names one — by selector OR by
+      // membership. Keying only on `b` would silently drop a `membersB` the
+      // caller gave without a selector and turn the rule into a self-clash.
+      const groupB: number[] | null = rule.b !== undefined || rule.membersB ? [] : null;
+      // Membership when the rule carries one, type selector otherwise — the
+      // ONE place a rule's sides are resolved, so both kernels see the same
+      // partition and every later stage is unaware there are two ways in.
+      const membersA = clashMemberSet(rule.membersA);
+      const membersB = clashMemberSet(rule.membersB);
+      // Durable keys of everything each side matched, for `compareClashRevisions`
+      // (revision.ts) to answer "was this SPECIFIC element re-examined?" — a
+      // count alone (`matchedA`/`matchedB`) cannot tell a narrowed selector that
+      // dropped one previously-matched element from one that kept it. Bounded by
+      // the same element set already held in memory for this run, so it costs
+      // nothing beyond the string references (deduplicated by `Set`).
+      const matchedKeysA = new Set<string>();
+      const matchedKeysB: Set<string> | null = groupB ? new Set<string>() : null;
       for (let i = 0; i < elements.length; i += 1) {
-        const tag = elements[i].tag;
-        if (matchesSelector(tag, rule.a)) groupA.push(i);
-        if (groupB && matchesSelector(tag, rule.b!)) groupB.push(i);
+        const el = elements[i];
+        if (inClashSet(el, rule.a, membersA)) {
+          groupA.push(i);
+          matchedKeysA.add(el.key);
+        }
+        if (groupB && inClashSet(el, rule.b ?? '', membersB)) {
+          groupB.push(i);
+          matchedKeysB!.add(el.key);
+        }
       }
+      const coverageEntry: ClashRuleCoverage = {
+        rule: rule.id,
+        matchedA: groupA.length,
+        matchedB: groupB ? groupB.length : null,
+        matchedKeysA: [...matchedKeysA].sort(),
+        matchedKeysB: matchedKeysB ? [...matchedKeysB].sort() : null,
+        ...(membersA ? { fromMembersA: true } : {}),
+        ...(membersB ? { fromMembersB: true } : {}),
+      };
+      ruleCoverage.push(coverageEntry);
 
       const ruleTolerance = rule.tolerance ?? tolerance;
+      requireFiniteTolerance(`rule "${rule.id}".tolerance`, ruleTolerance);
       settings.onProgress?.({ phase: 'broad', rule: rule.id, done: 0, total: 0 });
 
       const { records, candidatesProcessed, candidatesDropped } = await kernel.detectRule(
@@ -77,6 +156,10 @@ export async function runClash(
           ? (done, total) => settings.onProgress!({ phase: 'narrow', rule: rule.id, done, total })
           : undefined,
       );
+      // Threaded onto the coverage entry already pushed above — see
+      // `ClashRuleCoverage.candidatesExamined`'s doc for why this is a
+      // diagnostic, not a coverage verdict (#4244).
+      coverageEntry.candidatesExamined = candidatesProcessed;
       remaining = Math.max(0, remaining - candidatesProcessed);
       droppedPairs += candidatesDropped;
 
@@ -108,6 +191,7 @@ export async function runClash(
           rule: rule.id,
           status: rec.status,
           distance: rec.distance,
+          distanceKind: rec.distanceKind,
           point: rec.point,
           bounds: rec.bounds,
           severity: rule.severity ?? inferClashSeverity(elA.tag, elB.tag),
@@ -122,14 +206,27 @@ export async function runClash(
 
   const result: ClashResult = {
     clashes,
-    summary: buildSummary(clashes),
-    rulesRun: rules,
+    summary: summarizeClashes(clashes),
+    // Without the resolved membership: `rulesRun` is the DESCRIPTION of what
+    // ran, kept in store state and structured-cloned into the script sandbox,
+    // while a member list is run state that can hold a quarter-million strings
+    // per side. `ruleCoverage` reports how many elements each side matched,
+    // which is the part a reader of a finished run wants.
+    rulesRun: rules.map(withoutMembership),
+    ruleCoverage,
     settings: { tolerance, excludeVoidsAndHosts },
   };
   if (droppedPairs > 0) {
     result.truncated = { reason: 'maxCandidatePairs', droppedPairs };
   }
   return result;
+}
+
+/** A rule as it is reported back: config only, no resolved membership. */
+function withoutMembership(rule: ClashRule): ClashRule {
+  if (!rule.membersA && !rule.membersB) return rule;
+  const { membersA: _a, membersB: _b, ...config } = rule;
+  return config;
 }
 
 function toRef(el: ClashElement): ClashElementRef {
@@ -152,15 +249,3 @@ function cmp(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function buildSummary(clashes: Clash[]): ClashSummary {
-  const byRule: Record<string, number> = {};
-  const byTypePair: Record<string, number> = {};
-  const bySeverity: Record<ClashSeverity, number> = { critical: 0, major: 0, minor: 0, info: 0 };
-  for (const c of clashes) {
-    byRule[c.rule] = (byRule[c.rule] ?? 0) + 1;
-    const pair = [c.a.tag, c.b.tag].sort().join(' vs ');
-    byTypePair[pair] = (byTypePair[pair] ?? 0) + 1;
-    bySeverity[c.severity] += 1;
-  }
-  return { total: clashes.length, byRule, byTypePair, bySeverity };
-}

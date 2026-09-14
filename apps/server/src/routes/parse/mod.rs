@@ -4,24 +4,30 @@
 
 //! Parse endpoints for IFC file processing.
 
-mod cache_keys;
+pub(crate) mod cache_keys;
 mod cached_replay;
+mod stream_event;
+mod stream_progress;
 mod fetch;
 mod json;
 mod parquet;
+mod parquet_optimized;
 mod parquet_stream;
 
 pub use fetch::{check_cache, get_cached_geometry, get_data_model, get_symbolic};
 pub use json::{parse_full, parse_metadata, parse_stream};
-pub use parquet::{parse_parquet, parse_parquet_optimized};
+pub use parquet::parse_parquet;
+pub use parquet_optimized::parse_parquet_optimized;
 pub use parquet_stream::parse_parquet_stream;
 
 use crate::error::ApiError;
-use crate::services::OpeningFilterMode;
+use crate::services::cache::DiskCache;
+use crate::services::{OpeningFilterMode, ParquetLayout};
 use axum::extract::Multipart;
 use flate2::read::GzDecoder;
-use ifc_lite_processing::TessellationQuality;
+use ifc_lite_processing::{SymbolicDataWithProvenance, TessellationQuality};
 use std::io::{Cursor, Read};
+use std::sync::Arc;
 
 /// Query parameters shared by all parse endpoints.
 #[derive(serde::Deserialize, Default)]
@@ -35,6 +41,26 @@ pub struct ParseQuery {
     /// `setTessellationQuality`, keeping client and server meshes in parity).
     #[serde(default)]
     pub tessellation_quality: Option<String>,
+    /// Flat-Parquet mesh-table layout (#3888): "flat" (default) or
+    /// "shared-shapes" — see [`ParquetLayout`] for why it is opt-in. A query
+    /// parameter rather than a header because every endpoint it has to reach
+    /// (both parse routes, the cache check, the cached-geometry fetch) already
+    /// takes this struct, so the signal travels with the cache identity.
+    #[serde(default)]
+    pub parquet_layout: ParquetLayout,
+    /// SHA-256 of the file the client is asking about, hex, lowercase (#3901).
+    ///
+    /// Read only by `POST /api/v1/parse/parquet-stream`, and only when the
+    /// request carries no multipart body: see
+    /// [`cached_replay::replay_by_client_hash`] for what it does and what it
+    /// is not allowed to do. It lives on this struct rather than in a header
+    /// so it travels with the rest of the cache identity (`opening_filter`,
+    /// `tessellation_quality`, `parquet_layout`) through the one place every
+    /// parse route already parses. A hash paired with the wrong layout names a
+    /// different entry, and splitting one identity across two transports is how
+    /// such pairings drift apart.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 impl ParseQuery {
@@ -48,6 +74,28 @@ impl ParseQuery {
                 ))
             }),
         }
+    }
+}
+
+/// Write the symbolic sidecar through [`cache_keys::cache_symbolic_data`] on
+/// the blocking pool (#4696).
+///
+/// That call JSON-encodes the whole 2D symbol stream before it writes, and
+/// awaited on an async worker the encode holds that worker for its whole
+/// length. Every parse route writes the sidecar through here. The write itself
+/// is async, so the blocking thread drives it with `Handle::block_on`.
+async fn cache_symbolic_data_off_runtime(
+    cache: Arc<DiskCache>,
+    cache_key: String,
+    symbolic: SymbolicDataWithProvenance,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    let written = tokio::task::spawn_blocking(move || {
+        runtime.block_on(cache_keys::cache_symbolic_data(&cache, &cache_key, &symbolic))
+    })
+    .await;
+    if let Err(e) = written {
+        tracing::error!(error = %e, "Symbolic data cache task failed");
     }
 }
 
@@ -144,6 +192,29 @@ pub(crate) async fn extract_file(
 /// one candidate rather than silently guessing which model to load, and bounds
 /// the decompressed size (zip-bomb guard) against the same `max_bytes` ceiling
 /// the raw/gzip paths use.
+/// Whether an archive entry is a macOS AppleDouble sidecar rather than content.
+///
+/// Compressing in macOS Finder writes `__MACOSX/._<name>` beside each entry,
+/// carrying resource forks and extended attributes. It keeps the original
+/// extension, so `__MACOSX/._model.ifc` counted as a second model and every
+/// Mac-made archive was rejected as ambiguous (#2812, reported from
+/// production).
+///
+/// The test is the BASENAME, not the directory. `._` is what makes a file a
+/// sidecar; `__MACOSX/` is merely where macOS puts them, so matching on it is
+/// redundant (every entry inside is already `._`-prefixed) and wrong for a user
+/// whose archive genuinely contains a folder of that name. The basename form
+/// also covers a sidecar left beside its original by a rezip that flattens the
+/// directory away.
+///
+/// Mirrors `APPLE_DOUBLE_RE` in `packages/parser/src/ifczip.ts`. The two must
+/// agree, or an archive the browser accepts is rejected by the server.
+fn is_apple_double(name: &str) -> bool {
+    name.rsplit('/')
+        .next()
+        .is_some_and(|base| base.starts_with("._"))
+}
+
 fn unwrap_ifczip(
     bytes: &[u8],
     max_bytes: usize,
@@ -165,7 +236,7 @@ fn unwrap_ifczip(
         }
         let name = entry.name();
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".ifc") || lower.ends_with(".ifcxml") {
+        if (lower.ends_with(".ifc") || lower.ends_with(".ifcxml")) && !is_apple_double(name) {
             candidates.push((i, name.to_string()));
         }
     }
@@ -231,3 +302,38 @@ mod extract_file_tests;
 
 #[cfg(test)]
 mod ifczip_tests;
+
+#[cfg(test)]
+mod parquet_tests;
+
+#[cfg(test)]
+mod parquet_optimized_tests;
+
+#[cfg(test)]
+mod json_tests;
+
+#[cfg(test)]
+mod worker_thread_tests;
+
+#[cfg(test)]
+mod fetch_tests;
+
+#[cfg(test)]
+mod cache_keys_symbolic_tests;
+
+#[cfg(test)]
+mod cache_keys_tests;
+
+#[cfg(test)]
+mod cached_replay_tests;
+
+#[cfg(test)]
+mod cached_replay_batches_tests;
+
+#[cfg(test)]
+#[path = "resolved_tessellation_quality_tests.rs"]
+mod resolved_tessellation_quality_tests;
+
+#[cfg(test)]
+#[path = "apple_double_tests.rs"]
+mod apple_double_tests;

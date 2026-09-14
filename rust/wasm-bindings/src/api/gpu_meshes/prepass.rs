@@ -6,17 +6,8 @@ use crate::api::IfcAPI;
 use js_sys::Function;
 use wasm_bindgen::prelude::*;
 
-/// Reduce a 128-bit geometry hash to the 32-bit worker-affinity key the job
-/// stream carries. Jobs with the SAME key are routed to the same geometry worker,
-/// so their (byte-identical) geometry is meshed once per model instead of once per
-/// worker — the win the per-worker content-dedup cache can't get across separate
-/// WASM realms. A 32-bit collision only co-locates two unrelated geometries on one
-/// worker (harmless: the cache still keys them apart), so xor-folding the lanes is
-/// plenty.
-#[inline]
-fn fold_u128_to_u32(h: u128) -> u32 {
-    (h as u32) ^ ((h >> 32) as u32) ^ ((h >> 64) as u32) ^ ((h >> 96) as u32)
-}
+use super::prepass_affinity::fold_u128_to_u32;
+use super::prepass_discovery::is_disabled;
 
 // The per-submesh #858 palette split lives inside the canonical per-element
 // producer (`ifc_lite_processing::element`) — shared with the native pipeline.
@@ -101,8 +92,7 @@ impl IfcAPI {
             &pre_pass.resolved,
             &mut decoder,
         );
-        let (void_keys_vec, void_counts_vec, void_values_vec) =
-            ifc_lite_processing::prepass::flat_voids(&pre_pass.resolved.void_index);
+        let (void_keys_vec, void_counts_vec, void_values_vec) = ifc_lite_processing::prepass::flat_voids(&pre_pass.resolved.void_index);
         let (mat_ids_vec, mat_counts_vec, mat_colors_vec) =
             ifc_lite_processing::prepass::flat_material_colors(
                 &pre_pass.resolved.element_material_colors,
@@ -187,6 +177,7 @@ impl IfcAPI {
             None,
             false,
             None,
+            false,
         )
     }
 
@@ -201,12 +192,13 @@ impl IfcAPI {
         prebuilt: Option<ifc_lite_core::ColumnarEntityIndex>,
         external_styles: bool,
         columns: Option<super::prepass_discovery::IndexColumns<'_>>,
+        compute_source_fingerprint: bool,
     ) -> Result<JsValue, JsValue> {
         let prebuilt_arc: Option<std::sync::Arc<ifc_lite_core::ColumnarEntityIndex>> =
             prebuilt.map(std::sync::Arc::new);
         // Load START on the streaming pre-pass path (see build_pre_pass_once).
         self.reset_pipeline_diagnostics();
-        use ifc_lite_core::{has_geometry_by_name, EntityDecoder, EntityScanner, IfcType};
+        use ifc_lite_core::{has_geometry_by_name, keyword_eq, EntityDecoder, EntityScanner, IfcType};
         use ifc_lite_geometry::GeometryRouter;
         use ifc_lite_processing::stream_meta::{resolve_stream_meta, MetaMode};
 
@@ -234,7 +226,13 @@ impl IfcAPI {
         // one-time cost) instead of a fatal up-front OOM. Ordinary (<2GB) files
         // are unaffected — their `len/50` estimate stays under the cap.
         const PREPASS_INDEX_RESERVE_CAP: usize = 40_000_000; // ~0.5GB reserved
-        let estimated = (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP);
+        // #3985: a prebuilt index serves every lookup and is retained below;
+        // its unused staging map must not reserve another source-sized table.
+        let estimated = if prebuilt_arc.is_some() {
+            0
+        } else {
+            (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP)
+        };
         let mut entity_index: rustc_hash::FxHashMap<u32, (usize, usize)> =
             rustc_hash::FxHashMap::with_capacity_and_hasher(estimated, Default::default());
 
@@ -248,11 +246,9 @@ impl IfcAPI {
         // on their first batch to rebuild these three per-content structures
         // (referenced RepresentationMaps, instantiated type ids, the material-
         // layer index). Collect the spans they need HERE, during the one scan the
-        // pre-pass already runs, then build + ship each ONCE below so every
-        // worker skips its own full-file walk. `rel_associates_material` spans are
-        // already stashed in `prepass_spans`.
+        // pre-pass already runs, then build + ship each ONCE below (`rel_associates_material`
+        // and `defines_by_type` spans are already stashed in `prepass_spans`).
         let mut mapped_item_spans: Vec<(u32, usize, usize)> = Vec::new();
-        let mut rel_defines_by_type_spans: Vec<(u32, usize, usize)> = Vec::new();
         // #957/#962: IfcTypeProduct candidates (id, span, resolved type), stashed
         // here so the orphan-type-geometry pass reuses THIS scan instead of a
         // second full EntityScanner walk over the file. `IfcType` is captured
@@ -327,7 +323,6 @@ impl IfcAPI {
             prepass_spans = d.prepass_spans;
             prepass_spans.styled_items = Vec::new(); // shards resolve styles
             mapped_item_spans = d.mapped_item_spans;
-            rel_defines_by_type_spans = d.rel_defines_by_type_spans;
             type_candidate_spans = d.type_candidate_spans;
             has_layer_set = d.has_layer_set;
         } else {
@@ -336,73 +331,61 @@ impl IfcAPI {
                 entity_index.insert(id, (start, end)); // prebuilt mode: map unused
             }
 
-            match type_name {
-                "IFCPROJECT" => {
-                    if project_id.is_none() {
-                        project_id = Some(id);
-                    }
+            if prepass_spans.stash(type_name, id, start, end) {
+                // span-list record, nothing else to do for it
+            } else if keyword_eq(type_name, "IFCPROJECT") {
+                if project_id.is_none() {
+                    project_id = Some(id);
                 }
-                "IFCSITE" => {
-                    if site_position.is_none() {
-                        site_position = Some((id, start, end));
-                    }
-                    let ifc_type = IfcType::from_str(type_name);
+            } else if keyword_eq(type_name, "IFCSITE") {
+                if site_position.is_none() {
+                    site_position = Some((id, start, end));
+                }
+                let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+                buffered_jobs.push((id, start, end, ifc_type));
+                total_jobs += 1;
+            } else if keyword_eq(type_name, "IFCMAPPEDITEM") {
+                mapped_item_spans.push((id, start, end));
+            } else if keyword_eq(type_name, "IFCMATERIALLAYERSET")
+                || keyword_eq(type_name, "IFCMATERIALLAYERSETUSAGE")
+            {
+                has_layer_set = true;
+            } else {
+                // #957/#962: an IfcTypeProduct subtype (its geometry is
+                // authored on RepresentationMaps, not the type itself, so it
+                // never matches `has_geometry_by_name`). Stash it for the
+                // orphan-type pass; the RepresentationMaps attr-6 decode +
+                // referenced-filter happens later in
+                // `collect_type_geometry_jobs_from_spans`.
+                if let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) {
+                    type_candidate_spans.push((id, start, end, type_ty));
+                }
+                if has_geometry_by_name(type_name) && !is_disabled(&disabled_types, type_name) {
+                    let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+                    // We don't bucket by simple/complex here — the host
+                    // distributes work across N geometry workers anyway,
+                    // and the simple/complex split was a heuristic for
+                    // RTC sampling that we now resolve once after
+                    // RTC_SAMPLE_THRESHOLD jobs have been collected.
                     buffered_jobs.push((id, start, end, ifc_type));
                     total_jobs += 1;
-                }
-                "IFCSTYLEDITEM" => {
-                    prepass_spans.styled_items.push((id, start, end));
-                }
-                "IFCINDEXEDCOLOURMAP" => {
-                    prepass_spans.indexed_colour_maps.push((id, start, end));
-                }
-                "IFCMATERIALDEFINITIONREPRESENTATION" => {
-                    prepass_spans.material_def_reprs.push((id, start, end));
-                }
-                "IFCRELASSOCIATESMATERIAL" => {
-                    prepass_spans.rel_associates_material.push((id, start, end));
-                }
-                "IFCRELVOIDSELEMENT" => {
-                    prepass_spans.void_rels.push((id, start, end));
-                }
-                "IFCRELFILLSELEMENT" => {
-                    prepass_spans.fills_rels.push((id, start, end));
-                }
-                "IFCRELAGGREGATES" => {
-                    prepass_spans.aggregate_rels.push((id, start, end));
-                }
-                "IFCMAPPEDITEM" => {
-                    mapped_item_spans.push((id, start, end));
-                }
-                "IFCRELDEFINESBYTYPE" => {
-                    rel_defines_by_type_spans.push((id, start, end));
-                }
-                "IFCMATERIALLAYERSET" | "IFCMATERIALLAYERSETUSAGE" => {
-                    has_layer_set = true;
-                }
-                _ => {
-                    // #957/#962: an IfcTypeProduct subtype (its geometry is
-                    // authored on RepresentationMaps, not the type itself, so it
-                    // never matches `has_geometry_by_name`). Stash it for the
-                    // orphan-type pass; the RepresentationMaps attr-6 decode +
-                    // referenced-filter happens later in
-                    // `collect_type_geometry_jobs_from_spans`.
-                    if type_name.ends_with("TYPE") || type_name.ends_with("STYLE") {
-                        let type_ty = IfcType::from_str(type_name);
-                        if type_ty.is_subtype_of(IfcType::IfcTypeProduct) {
-                            type_candidate_spans.push((id, start, end, type_ty));
-                        }
-                    }
-                    if has_geometry_by_name(type_name) && !disabled_types.contains(type_name) {
-                        let ifc_type = IfcType::from_str(type_name);
-                        // We don't bucket by simple/complex here — the host
-                        // distributes work across N geometry workers anyway,
-                        // and the simple/complex split was a heuristic for
-                        // RTC sampling that we now resolve once after
-                        // RTC_SAMPLE_THRESHOLD jobs have been collected.
-                        buffered_jobs.push((id, start, end, ifc_type));
-                        total_jobs += 1;
-                    }
+                } else if !is_disabled(&disabled_types, type_name)
+                    && ifc_lite_core::is_representationless_spatial_container_by_name(
+                        type_name,
+                    )
+                    && ifc_lite_core::nth_attribute_is_present(&content[start..end], 6)
+                {
+                    // #1910: mirrors the identical exception in
+                    // `rust/processing/src/processor/mod.rs` — a spatial
+                    // container `has_geometry_by_name` blocks by name
+                    // (`IfcBuilding` et al.) that exceptionally carries a
+                    // real `Representation` (e.g. a DGM/terrain export
+                    // with no `IfcBuildingElement` children at all) must
+                    // still be scheduled for meshing, or the browser
+                    // viewer renders nothing despite a correct scene tree.
+                    let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+                    buffered_jobs.push((id, start, end, ifc_type));
+                    total_jobs += 1;
                 }
             }
 
@@ -507,6 +490,8 @@ impl IfcAPI {
             on_event.call1(&JsValue::NULL, &meta.into())?;
         }
 
+        let (oversized_id_count, malformed_record_found) = (scanner.skipped_oversized_ids(), scanner.malformed_record_start().is_some()); // #3395/#3695, reported here and exported below
+        ifc_lite_core::report_scan_diagnostics(oversized_id_count, malformed_record_found);
         // Cache for processGeometryBatch reuse. Convert the scan's FxHashMap
         // into a compact columnar index (sorted u32 columns + binary search):
         // ~229 MB vs the hashmap's ~436 MB on a 19.1 M-entity model (#1682).
@@ -552,6 +537,8 @@ impl IfcAPI {
             crate::api::set_js_prop(&index_event, "ids", &ids_arr);
             crate::api::set_js_prop(&index_event, "starts", &starts_arr);
             crate::api::set_js_prop(&index_event, "lengths", &lengths_arr);
+            crate::api::set_js_prop(&index_event, "oversizedIdCount", &(oversized_id_count as f64).into()); // #3395: the parser worker sees only these columns
+            crate::api::set_js_prop(&index_event, "malformedRecordFound", &malformed_record_found.into()); // #3695
             on_event.call1(&JsValue::NULL, &index_event.into())?;
         }
 
@@ -592,7 +579,7 @@ impl IfcAPI {
             );
         let instantiated_type_ids =
             crate::api::styling::build_instantiated_type_ids_from_spans(
-                &rel_defines_by_type_spans,
+                &prepass_spans.defines_by_type,
                 &mut decoder,
             );
         // #1623 Phase 3 don't-bake plan: the RepresentationMap ids an IfcMappedItem
@@ -693,24 +680,18 @@ impl IfcAPI {
         {
             let mut akey_decoder =
                 EntityDecoder::with_arc_columnar_index(content, entity_index_arc.clone());
-            let akey_router = GeometryRouter::new();
+            let akey_router = GeometryRouter::new(); // not drained: meshes nothing (issue_3821_auxiliary_routers_mesh_nothing.rs)
             let rest = &buffered_jobs[first_n..];
-            let mut affinity: Vec<u32> = Vec::with_capacity(rest.len());
-            for &(id, _s, _e, _t) in rest {
-                let key = match akey_decoder.decode_by_id(id) {
+            super::affinity_chunks::emit_affinity_chunks(rest, chunk_size,
+                |&(id, _s, _e, _t)| match akey_decoder.decode_by_id(id) {
                     Ok(ent) => akey_router
                         .geometry_routing_key(&ent, &mut akey_decoder)
                         .map(fold_u128_to_u32)
                         .unwrap_or(id),
                     Err(_) => id,
-                };
-                affinity.push(key);
-            }
-            for (jobs_chunk, aff_chunk) in
-                rest.chunks(chunk_size).zip(affinity.chunks(chunk_size))
-            {
-                emit_jobs_chunk(on_event, jobs_chunk, aff_chunk)?;
-            }
+                },
+                |jobs_chunk, affinity| emit_jobs_chunk(on_event, jobs_chunk, affinity),
+            )?;
         }
         buffered_jobs.clear();
 
@@ -734,7 +715,7 @@ impl IfcAPI {
         // type-library (#957) geometry, so skip producing it at load when the
         // caller asks (the Types view re-loads on demand).
         if !skip_type_geometry
-            && memchr::memmem::find(content, b"IFCREPRESENTATIONMAP").is_some()
+            && ifc_lite_core::find_keyword(content, b"IFCREPRESENTATIONMAP").is_some()
         {
             let type_jobs = crate::api::styling::collect_type_geometry_jobs_from_spans(
                 &mapped_item_spans,
@@ -754,27 +735,13 @@ impl IfcAPI {
         let done = js_sys::Object::new();
         crate::api::set_js_prop(&done, "type", &"complete".into());
         crate::api::set_js_prop(&done, "totalJobs", &(total_jobs as f64).into());
+        if compute_source_fingerprint {
+            // Whole original source, including malformed/unparsed trailing bytes.
+            let key = super::source_fingerprint::source_fingerprint(data);
+            crate::api::set_js_prop(&done, "sourceContentKey", &key.into());
+        }
         on_event.call1(&JsValue::NULL, &done.into())?;
 
         Ok(JsValue::UNDEFINED)
-    }
-}
-
-#[cfg(test)]
-mod affinity_tests {
-    use super::fold_u128_to_u32;
-
-    #[test]
-    fn fold_is_stable_and_mixes_all_lanes() {
-        // Identical hashes fold to identical keys (routing stickiness).
-        assert_eq!(fold_u128_to_u32(0x1234_5678_9abc_def0_1111_2222_3333_4444),
-                   fold_u128_to_u32(0x1234_5678_9abc_def0_1111_2222_3333_4444));
-        // A change confined to ANY single 32-bit lane changes the key — so two
-        // geometries differing only in their high bits still route apart.
-        let base = 0u128;
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 0)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 40)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 72)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 120)));
     }
 }

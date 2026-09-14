@@ -43,7 +43,7 @@ canvas.addEventListener('click', async (e) => {
 });
 ```
 
-For exact world-space hits with surface normals, use `raycastScene(x, y)` — slower but returns the precise intersection point + normal.
+For exact world-space hits with surface normals, use `raycastScene(x, y)` — slower but returns the precise intersection point, normal and, where provenance is unambiguous, the federation model, representation item and canonical evaluated-surface triangle.
 
 ## Section planes
 
@@ -88,6 +88,10 @@ renderer.requestRender();
 ```typescript
 import { federationRegistry } from '@ifc-lite/renderer';
 
+// The highest expressId in each model decides the offset spacing
+const maxArchExpressId = 500_000;
+const maxStructExpressId = 250_000;
+
 // Register each model with a unique ID offset
 federationRegistry.registerModel('arch', maxArchExpressId);
 federationRegistry.registerModel('struct', maxStructExpressId);
@@ -104,3 +108,13 @@ See the [Rendering Guide](https://ifclite.dev/docs/guide/rendering/) and [API Re
 ## License
 
 [MPL-2.0](../../LICENSE)
+
+Registered raster references are available through `renderer.getReferenceImages()`; see the [rendering guide](../../docs/guide/rendering.md#registered-raster-references) for identity, coordinates, resource ownership and picking.
+
+### Exact surface tools and clipping
+
+`renderer.hasActiveClipping()` reports whether the last rendered frame applied
+section, terrain or box clipping. It reads the retained render snapshot, so
+mutating a previous options object does not change the answer.
+`raycastScene()` applies that same clip state while walking triangles, so a
+clipped front face cannot hide a visible face behind it.

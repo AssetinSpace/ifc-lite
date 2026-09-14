@@ -1,7 +1,10 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { hasWorkspaceHistory, replayWorkspaceHistory } from '@/lib/model-placement/history';
 
+import { AuthorPanelMenuItems } from './toolbar/AuthorPanelMenuItems.js';
+import { BottomPanelMenuItems } from './toolbar/BottomPanelMenuItems.js';
 import React, { useCallback, useMemo } from 'react';
 import {
   FolderOpen,
@@ -19,20 +22,12 @@ import {
   Home,
   Maximize2,
   Grid3x3,
-  ArrowUp,
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  Box,
   HelpCircle,
   Loader2,
-  Camera,
   Info,
   Plus,
-  PackagePlus,
   MessageSquare,
   ClipboardCheck,
-  Puzzle,
   Palette,
   // >>> AIM-FORK: icon for the Drawing Underlays panel toggle (D-072)
   Map as MapIcon,
@@ -41,8 +36,6 @@ import {
   Layout,
   Layers,
   LayoutTemplate,
-  FileCode2,
-  CalendarClock,
   Globe2,
   Sun,
   Move,
@@ -66,9 +59,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  DropdownMenuSub,
-  DropdownMenuSubTrigger,
-  DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu';
 import { Progress } from '@/components/ui/progress';
 import { useViewerStore } from '@/store';
@@ -76,11 +66,7 @@ import { goHomeFromStore, resetVisibilityForHomeFromStore } from '@/store/homeVi
 import { executeBasketIsolate } from '@/store/basket/basketCommands';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
-import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, DraftingCompass } from 'lucide-react';
-import { ExportDialog } from './ExportDialog';
-import { GLBExportDialog } from './GLBExportDialog';
-import { KmzExportDialog } from './KmzExportDialog';
-import { HbjsonExportDialog } from './HbjsonExportDialog';
+import { Filter, Upload, Pencil, DraftingCompass, Box, Cloud } from 'lucide-react';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
 import { DataConnector } from './DataConnector';
 import { ExportChangesButton } from './ExportChangesButton';
@@ -93,9 +79,10 @@ import { ThemeSwitch } from './ThemeSwitch';
 import { ExtensionToolbarSlot } from '@/components/extensions/ExtensionToolbarSlot';
 import { tourAnchor, toolAnchor } from '@/lib/tours/anchors';
 import { useFileCommands } from './toolbar/useFileCommands';
-import { useExportCommands } from './toolbar/useExportCommands';
+import { ClassicExportMenuItems } from './toolbar/ClassicExportMenuItems';
 import { useWorkspacePanelControls } from './toolbar/useWorkspacePanelControls';
 import { ClassVisibilityMenuContent } from './toolbar/ClassVisibilityMenu';
+import { CameraCommandMenuItems } from './toolbar/CameraCommands';
 
 type Tool = 'select' | 'walk' | 'measure' | 'section' | 'annotate' | 'addElement' | 'split' | 'spaceSketch';
 
@@ -165,18 +152,15 @@ function ToolButton({
  * in `useKeyboardShortcuts`.
  */
 function UndoRedoButtons() {
-  const activeModelId = useViewerStore((s) => s.activeModelId);
-  const undoStacks = useViewerStore((s) => s.undoStacks);
-  const redoStacks = useViewerStore((s) => s.redoStacks);
-  const undo = useViewerStore((s) => s.undo);
-  const redo = useViewerStore((s) => s.redo);
   // Undo/redo replay authoring mutations, so they honour the same collab
   // role gate as edit mode (null role = single-user, always editable).
   const collabRole = useViewerStore((s) => s.collabRole);
   const canEditInSession = collabRole === null || collabRole === 'editor' || collabRole === 'admin';
 
-  const canUndo = canEditInSession && activeModelId !== null && (undoStacks.get(activeModelId)?.length ?? 0) > 0;
-  const canRedo = canEditInSession && activeModelId !== null && (redoStacks.get(activeModelId)?.length ?? 0) > 0;
+  const hasUndo = useViewerStore(state => hasWorkspaceHistory(state, 'undo'));
+  const canUndo = canEditInSession && hasUndo;
+  const hasRedo = useViewerStore(state => hasWorkspaceHistory(state, 'redo'));
+  const canRedo = canEditInSession && hasRedo;
 
   return (
     <>
@@ -188,7 +172,7 @@ function UndoRedoButtons() {
             disabled={!canUndo}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
-              if (activeModelId) undo(activeModelId);
+              replayWorkspaceHistory(useViewerStore.getState(), 'undo');
             }}
             aria-label="Undo"
           >
@@ -207,7 +191,7 @@ function UndoRedoButtons() {
             disabled={!canRedo}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
-              if (activeModelId) redo(activeModelId);
+              replayWorkspaceHistory(useViewerStore.getState(), 'redo');
             }}
             aria-label="Redo"
           >
@@ -291,7 +275,6 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
     canRefresh,
     hasModelsLoaded,
   } = useFileCommands();
-  const { handleExportCSV, handleExportJSON, handleScreenshot } = useExportCommands();
   const {
     activeWorkspacePanels,
     workspacePanelLabel,
@@ -464,75 +447,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
-          <ExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <FileText className="h-4 w-4 mr-2" />
-                Export IFC (with changes)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <GLBExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Download className="h-4 w-4 mr-2" />
-                Export GLB (3D Model)
-              </DropdownMenuItem>
-            }
-          />
-          <KmzExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Globe2 className="h-4 w-4 mr-2" />
-                Export KMZ (Google Earth Pro)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <HbjsonExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Download className="h-4 w-4 mr-2" />
-                Export HBJSON (Energy Model)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger disabled={!ifcDataStore}>
-              <FileSpreadsheet className="h-4 w-4 mr-2" />
-              Export CSV
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent>
-              <DropdownMenuItem onClick={() => handleExportCSV('entities')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Entities
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('properties')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Properties
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('quantities')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Quantities
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => handleExportCSV('spatial')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Spatial Hierarchy
-              </DropdownMenuItem>
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-          <DropdownMenuItem onClick={handleExportJSON} disabled={!ifcDataStore}>
-            <FileJson className="h-4 w-4 mr-2" />
-            Export JSON (All Data)
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onClick={handleScreenshot}>
-            <Camera className="h-4 w-4 mr-2" />
-            Screenshot
-          </DropdownMenuItem>
+          <ClassicExportMenuItems />
         </DropdownMenuContent>
       </DropdownMenu>
 
@@ -638,30 +553,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <TooltipContent>{workspacePanelLabel ? `Panels: ${workspacePanelLabel}` : 'Panels'}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="start" className="w-56">
-          <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Workspace
-          </DropdownMenuLabel>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('script')}
-            onCheckedChange={() => handleToggleBottomPanel('script')}
-          >
-            <FileCode2 className="h-4 w-4 mr-2" />
-            Script Editor
-          </DropdownMenuCheckboxItem>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('list')}
-            onCheckedChange={() => handleToggleBottomPanel('list')}
-          >
-            <FileSpreadsheet className="h-4 w-4 mr-2" />
-            Lists
-          </DropdownMenuCheckboxItem>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('gantt')}
-            onCheckedChange={() => handleToggleBottomPanel('gantt')}
-          >
-            <CalendarClock className="h-4 w-4 mr-2" />
-            Schedule (Gantt)
-          </DropdownMenuCheckboxItem>
+          <BottomPanelMenuItems active={activeWorkspacePanels} onToggle={handleToggleBottomPanel} />
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
             Inspect & validate
@@ -671,7 +563,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             onCheckedChange={() => handleToggleRightPanel('bcf')}
           >
             <MessageSquare className="h-4 w-4 mr-2" />
-            BCF Issues
+            BCF Topics
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('ids')}
@@ -701,12 +593,31 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <GitCompareArrows className="h-4 w-4 mr-2" />
             Compare Models
           </DropdownMenuCheckboxItem>
+          {/* Cloud sources (CDE integrations): the ActivityBar rail was its
+              only entry point, exactly as Location Zones was before #2508.
+              The ribbon files it under File, where models come from. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('sources')}
+            onCheckedChange={() => handleToggleRightPanel('sources')}
+          >
+            <Cloud className="h-4 w-4 mr-2" />
+            Cloud Sources
+          </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('layers')}
             onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('layers')}
           >
             <Layers className="h-4 w-4 mr-2" />
             Layer Stack
+          </DropdownMenuCheckboxItem>
+          {/* Location zones (#1810), reachable from a toolbar for the first
+              time (#2508): the ActivityBar rail was its only entry point. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('zones')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('zones')}
+          >
+            <Box className="h-4 w-4 mr-2" />
+            Location Zones
           </DropdownMenuCheckboxItem>
           {collabEnabled && (
             <DropdownMenuCheckboxItem
@@ -718,6 +629,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             </DropdownMenuCheckboxItem>
           )}
           <DropdownMenuSeparator />
+<<<<<<< HEAD
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
             Author
           </DropdownMenuLabel>
@@ -746,6 +658,9 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             Drawing Underlays
           </DropdownMenuCheckboxItem>
           {/* <<< AIM-FORK */}
+=======
+          <AuthorPanelMenuItems active={activeWorkspacePanels} canEdit={canEditInSession} onToggle={handleToggleRightPanel} />
+>>>>>>> upstream/main
           {(rightAnalysisExtensions.length > 0 || bottomAnalysisExtensions.length > 0) && (
             <>
               <DropdownMenuSeparator />
@@ -920,7 +835,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         sense with a selection, so they don't get to live in the
         toolbar chrome at rest. When a user selects anything, the
         slot opens with a "N selected" pill + the three actions next
-        to it. Hotkeys (Del / F / I / =) keep working regardless of
+        to it. Hotkeys (Del / F / I) keep working regardless of
         whether the chip is rendered, so power users feel no change.
 
         The chip lives in the same separator zone the buttons used to
@@ -938,7 +853,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           >
             {selectionCount} sel
           </span>
-          <ActionButton icon={Equal} label="Isolate Selection (Set Basket)" onClick={handleIsolate} shortcut="I / =" />
+          <ActionButton icon={Equal} label="Isolate Selection (Set Basket)" onClick={handleIsolate} shortcut="I" />
           <ActionButton icon={EyeOff} label="Hide Selection" onClick={handleHide} shortcut="Del / Space" />
           <ActionButton
             icon={Crosshair}
@@ -1131,30 +1046,10 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <TooltipContent>View options</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="end" className="w-56">
-          <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Preset views
-          </DropdownMenuLabel>
-          <DropdownMenuItem onClick={handleHome}>
-            <Box className="h-4 w-4 mr-2" /> Isometric <span className="ml-auto text-xs opacity-60">H</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('top')}>
-            <ArrowUp className="h-4 w-4 mr-2" /> Top <span className="ml-auto text-xs opacity-60">1</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('bottom')}>
-            <ArrowDown className="h-4 w-4 mr-2" /> Bottom <span className="ml-auto text-xs opacity-60">2</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('front')}>
-            <ArrowRight className="h-4 w-4 mr-2" /> Front <span className="ml-auto text-xs opacity-60">3</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('back')}>
-            <ArrowLeft className="h-4 w-4 mr-2" /> Back <span className="ml-auto text-xs opacity-60">4</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('left')}>
-            <ArrowLeft className="h-4 w-4 mr-2" /> Left <span className="ml-auto text-xs opacity-60">5</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('right')}>
-            <ArrowRight className="h-4 w-4 mr-2" /> Right <span className="ml-auto text-xs opacity-60">6</span>
-          </DropdownMenuItem>
+          {/* Camera, preset views and the 90° rotations — rendered from the
+              shared command list so this menu can't fall behind the ribbon's
+              View tab (it did: rotate was ribbon-only, see CameraCommands). */}
+          <CameraCommandMenuItems />
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
             Projection

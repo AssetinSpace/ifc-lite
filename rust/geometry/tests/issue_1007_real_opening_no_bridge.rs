@@ -21,6 +21,8 @@
 //! the pre-fix tree and PASS after. Runs under `--no-default-features` (pure-Rust
 //! kernel, NO Manifold).
 
+mod support;
+
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityIndex, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
 use rustc_hash::FxHashMap;
@@ -181,8 +183,25 @@ fn open_boundary_edges(tris: &[[[f64; 3]; 3]]) -> usize {
 
 /// Process the host with voids through the VIEWER path and probe every opening's
 /// footprint on each cut plane. Returns the worst per-cap bridged-sample count.
+///
+/// `None` here is overloaded: it also means "host has no voids", checked
+/// below. Only the fixture read itself distinguishes absence from a broken
+/// read: `NotFound` is the fresh-clone case (`pnpm fixtures` not run yet)
+/// and skips unless `IFC_LITE_REQUIRE_FIXTURES=1`, in which case it panics
+/// naming the path; any other `io::Error` means the environment is broken,
+/// not merely missing an optional download, so it panics unconditionally.
 fn worst_bridged_samples(path: &str, host_id: u32) -> Option<usize> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture {path} not present and IFC_LITE_REQUIRE_FIXTURES=1 -- run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)"
+            );
+            return None;
+        }
+        Err(e) => panic!("fixture {path} exists but could not be read: {e}"),
+    };
     let index: EntityIndex = build_entity_index(&content);
     let voids = build_void_index(&content);
     let opening_ids = voids.get(&host_id).cloned().unwrap_or_default();
@@ -365,10 +384,20 @@ fn real_1112_roof_openings_have_no_bridging_triangle() {
 /// real-world axis-aligned flush window; if the corpus model is present in this
 /// checkout it must also cut clean via the exact path. (Host id is read from the
 /// env so the corpus model can be wired without hardcoding an entity id.)
+///
+/// NOTE: `SCHEP_HOST` is never set in CI, so this test could only ever skip; it
+/// is `#[ignore]` to make that explicit (same convention as `dedup_validate.rs`).
+/// Verified locally against the manifest fixture with a partition wall that has
+/// two openings:
+/// `SCHEP_HOST=534371 cargo test -p ifc-lite-geometry --test issue_1007_real_opening_no_bridge -- --ignored`
 #[test]
+#[ignore = "manual; needs SCHEP_HOST=<wall entity id> (e.g. 534371)"]
 fn real_schependomlaan_window_has_no_bridging_triangle() {
     // Common staging locations; first hit wins.
     let candidates = [
+        // The manifest ships the fixture here (`pnpm fixtures`); the rest are
+        // legacy staging locations kept for local checkouts.
+        "../../tests/models/ara3d/schependomlaan.ifc",
         "../../tests/models/various/schependomlaan.ifc",
         "../../tests/models/local/schependomlaan.ifc",
         "../../tests/models/issues/schependomlaan.ifc",

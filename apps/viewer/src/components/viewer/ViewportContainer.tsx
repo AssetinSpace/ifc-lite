@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { usePlacementCoordinateInfo } from '@/hooks/usePlacementCoordinateInfo';
+import { useFederatedGeometry } from './useFederatedGeometry';
+import { modelIndices } from '@/lib/model-placement/model-indices';
 import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useLevelDisplayEffect } from '@/hooks/useLevelDisplayEffect';
 import { ingestDxfFiles, splitDxfFiles } from '@/hooks/ingest/dxfIngest';
@@ -13,6 +16,7 @@ import {
   type DragOverlayState,
 } from './dragOverlayState';
 import { ViewportOverlays } from './ViewportOverlays';
+import { WebGpuDisabledCaption, WebGpuTroubleshootingDetails, webGpuBannerBlurb } from './WebGpuTroubleshooting';
 import { MergeLayersBanner } from './MergeLayersBanner';
 import { GeometryModeBanner } from './GeometryModeBanner';
 import { LevelDisplayIndicator } from './LevelDisplayIndicator';
@@ -42,57 +46,43 @@ import { isTypeVisible } from '@/store/typeVisibilityFilter';
 import type { AggregationRelationships } from '@/utils/aggregation';
 import { useIfc } from '@/hooks/useIfc';
 import { useWebGPU } from '@/hooks/useWebGPU';
-import { cacheFileBlobs, formatFileSize, getCachedFile, getRecentFiles, recordRecentFiles, type RecentFileEntry } from '@/lib/recent-files';
+import { formatFileSize, getCachedFile, type RecentFileEntry } from '@/lib/recent-files';
 import {
   supportsFileSystemAccess,
   openIfcFilesWithHandles,
   handlesFromDataTransfer,
 } from '@/services/file-system-access';
+import { FILE_ACCEPT, isGltfBundleFile, isSupportedModelFile } from '@/services/supported-model-files';
+import { usePreparedModelFileRoute } from '@/hooks/ingest/usePreparedModelFileRoute';
+import {
+  SOURCE_DOWNLOAD_EVENT,
+  type SourceDownloadEvent,
+  type SourceDownloadItem,
+} from '@/services/sources/source-host';
+import { useOptionalSourceHost } from '@/services/sources/SourceHostProvider';
+import { recordDownloadedSourceFile } from '@/lib/sources/persistence';
+import { sanitizeFilename } from '@/lib/export/download';
+import { enqueueSourceLoad } from '@/lib/sources/loadQueue';
 import { toast } from '@/components/ui/toast';
 import { TourInvite } from '@/components/tours/TourInvite';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
-import { describeUnsupportedFormat } from '@/hooks/ingest/pointCloudIngest';
-import { Upload, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus, GitMerge } from 'lucide-react';
+import { describeUnsupportedFormat } from '@/hooks/ingest/unsupportedFormat';
+import { Upload, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus, Cloud, GitMerge } from 'lucide-react';
 import { createBlankIfcFile } from '@/utils/createBlankIfc';
-import type { MeshData, CoordinateInfo, GeometryResult, PointCloudAsset } from '@ifc-lite/geometry';
+import type { MeshData, PointCloudAsset } from '@ifc-lite/geometry';
 import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
 import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
-import { isMeshVisibleInViewMode, meshClassIsPlaced } from '@/lib/type-view-visibility';
-
-const ZERO_VEC3 = { x: 0, y: 0, z: 0 };
-const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
-  originShift: ZERO_VEC3,
-  originalBounds: { min: ZERO_VEC3, max: ZERO_VEC3 },
-  shiftedBounds: { min: ZERO_VEC3, max: ZERO_VEC3 },
-  hasLargeCoordinates: false,
-};
-
-type Vec3Bounds = { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } };
-
-/** True for a real (non-placeholder, non-degenerate) bounds box. */
-function isUsableBounds(b: Vec3Bounds | undefined): b is Vec3Bounds {
-  if (!b) return false;
-  return (
-    b.max.x > b.min.x || b.max.y > b.min.y || b.max.z > b.min.z
-  );
-}
-
-/** Axis-aligned union of two bounds boxes (either may be undefined). */
-function unionBounds(acc: Vec3Bounds | undefined, b: Vec3Bounds | undefined): Vec3Bounds | undefined {
-  if (!isUsableBounds(b)) return acc;
-  if (!acc) return { min: { ...b.min }, max: { ...b.max } };
-  return {
-    min: { x: Math.min(acc.min.x, b.min.x), y: Math.min(acc.min.y, b.min.y), z: Math.min(acc.min.z, b.min.z) },
-    max: { x: Math.max(acc.max.x, b.max.x), y: Math.max(acc.max.y, b.max.y), z: Math.max(acc.max.z, b.max.z) },
-  };
-}
+import { isMeshVisibleInViewMode, meshClassIsPlaced, meshIsNonOccurrence } from '@/lib/type-view-visibility';
 
 export function ViewportContainer() {
   // Drive Stacked / Solo / Exploded level display from the slice.
   // Mount-once hook — it self-gates on mode + gap + model changes.
   useLevelDisplayEffect();
 
-  const { loadFile, loading, clearAllModels, loadFilesSequentially } = useIfc();
+  const { loadFile, loading, clearAllModels, loadFilesSequentially, addModel } = useIfc();
+  // Resolves a source provider's display title for toasts; null outside the
+  // SourceHostProvider tree (tests), in which case the machine name is shown.
+  const sourceHost = useOptionalSourceHost();
   const setActiveTool = useViewerStore((s) => s.setActiveTool);
   const releaseGeometryMemory = useViewerStore((s) => s.releaseGeometryMemory);
   const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
@@ -130,147 +120,16 @@ export function ViewportContainer() {
     geometryResult,
     ifcDataStore,
     models,
-    boundedGeometryMode,
-    geometryUpdateTick,
     geometryContentVersion,
   } = viewportStoreState;
   const storeModels = models;
-  const mergedContentVersionRef = useRef(geometryContentVersion);
-
-  // Check if we have models loaded (for determining add vs replace behavior)
-  const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
 
   // Multi-model: create mapping from modelId to modelIndex (stable order)
-  const modelIdToIndex = useMemo(() => {
-    const map = new Map<string, number>();
-    let index = 0;
-    for (const modelId of storeModels.keys()) {
-      map.set(modelId, index++);
-    }
-    return map;
-  }, [storeModels]);
+  const modelIdToIndex = useMemo(() => modelIndices(storeModels), [storeModels]);
 
-  const mergedCacheRef = useRef<MeshData[]>([]);
-  const mergedLengthsRef = useRef<Map<string, number>>(new Map());
-  const mergedVisibilityRef = useRef<Map<string, boolean>>(new Map());
+  const mergedGeometryResult = useFederatedGeometry(storeModels, geometryResult, modelIdToIndex, geometryContentVersion);
 
-  // Multi-model: merge geometries from all visible models
-  const mergedGeometryResult = useMemo(() => {
-    if (storeModels.size === 1) {
-      const firstModel = storeModels.values().next().value;
-      if (!firstModel?.visible) {
-        return {
-          meshes: [],
-          totalVertices: 0,
-          totalTriangles: 0,
-          coordinateInfo: DEFAULT_COORDINATE_INFO,
-        } satisfies GeometryResult;
-      }
-      return firstModel.geometryResult ?? geometryResult;
-    }
-
-    if (storeModels.size > 1) {
-      let totalVertices = 0;
-      let totalTriangles = 0;
-      // The merged coordinateInfo must cover ALL visible models, not just the
-      // first one — the renderer fits the camera to `shiftedBounds`, so a
-      // first-wins box left every model after the first off-screen (it only
-      // showed its 2D grid overlay). Union the bounds across visible models;
-      // keep the first model's frame metadata (originShift / RTC) since
-      // federated models share a coordinate frame.
-      let baseCoordInfo: CoordinateInfo | undefined;
-      let unionedShifted: Vec3Bounds | undefined;
-      let unionedOriginal: Vec3Bounds | undefined;
-      let anyLargeCoords = false;
-      let shouldRebuild = false;
-
-      if (mergedLengthsRef.current.size !== storeModels.size) {
-        shouldRebuild = true;
-      }
-
-      // An external content version bump (e.g. realignFederation re-baked
-      // vertices in place) requires a full cache rebuild — length/visibility
-      // triggers above can't detect in-place mutation. Compare against the
-      // last version we honoured; rebuild when it bumps.
-      if (mergedContentVersionRef.current !== geometryContentVersion) {
-        shouldRebuild = true;
-        mergedContentVersionRef.current = geometryContentVersion;
-      }
-
-      for (const [modelId, model] of storeModels) {
-        const modelGeometry = model.geometryResult;
-        const meshCount = model.visible ? (modelGeometry?.meshes.length ?? 0) : 0;
-        totalVertices += model.visible ? (modelGeometry?.totalVertices ?? 0) : 0;
-        totalTriangles += model.visible ? (modelGeometry?.totalTriangles ?? 0) : 0;
-        if (model.visible && modelGeometry?.coordinateInfo) {
-          const ci = modelGeometry.coordinateInfo;
-          if (!baseCoordInfo) baseCoordInfo = ci;
-          anyLargeCoords = anyLargeCoords || !!ci.hasLargeCoordinates;
-          unionedShifted = unionBounds(unionedShifted, ci.shiftedBounds);
-          unionedOriginal = unionBounds(unionedOriginal, ci.originalBounds);
-        }
-
-        if (
-          mergedVisibilityRef.current.get(modelId) !== model.visible ||
-          (mergedLengthsRef.current.get(modelId) ?? 0) > meshCount
-        ) {
-          shouldRebuild = true;
-        }
-      }
-
-      if (shouldRebuild) {
-        const rebuilt: MeshData[] = [];
-        mergedLengthsRef.current = new Map();
-        mergedVisibilityRef.current = new Map();
-        for (const [modelId, model] of storeModels) {
-          const modelGeometry = model.geometryResult;
-          mergedVisibilityRef.current.set(modelId, model.visible);
-          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
-          if (!model.visible || !modelGeometry?.meshes) {
-            mergedLengthsRef.current.set(modelId, 0);
-            continue;
-          }
-          for (const mesh of modelGeometry.meshes) {
-            rebuilt.push({ ...mesh, modelIndex });
-          }
-          mergedLengthsRef.current.set(modelId, modelGeometry.meshes.length);
-        }
-        mergedCacheRef.current = rebuilt;
-      } else {
-        for (const [modelId, model] of storeModels) {
-          const modelGeometry = model.geometryResult;
-          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
-          const previousLength = mergedLengthsRef.current.get(modelId) ?? 0;
-          const nextMeshes = model.visible ? (modelGeometry?.meshes ?? []) : [];
-          for (let i = previousLength; i < nextMeshes.length; i++) {
-            const mesh = nextMeshes[i];
-            mergedCacheRef.current.push({ ...mesh, modelIndex });
-          }
-          mergedLengthsRef.current.set(modelId, nextMeshes.length);
-          mergedVisibilityRef.current.set(modelId, model.visible);
-        }
-      }
-
-      const mergedCoordinateInfo: CoordinateInfo | undefined = baseCoordInfo
-        ? {
-            ...baseCoordInfo,
-            originalBounds: unionedOriginal ?? baseCoordInfo.originalBounds,
-            shiftedBounds: unionedShifted ?? baseCoordInfo.shiftedBounds,
-            hasLargeCoordinates: anyLargeCoords,
-          }
-        : undefined;
-
-      return {
-        meshes: mergedCacheRef.current,
-        totalVertices,
-        totalTriangles,
-        coordinateInfo: mergedCoordinateInfo ?? DEFAULT_COORDINATE_INFO,
-      } satisfies GeometryResult;
-    }
-
-    // Legacy mode (no federation): use original geometryResult
-    return geometryResult;
-  }, [storeModels, geometryResult, modelIdToIndex, geometryContentVersion]);
+  const placedCoordinateInfo = usePlacementCoordinateInfo(mergedGeometryResult?.coordinateInfo);
 
   /**
    * Aggregate point clouds across visible models.
@@ -480,12 +339,7 @@ export function ViewportContainer() {
     applyDragEvent('leave');
   }, [applyDragEvent]);
 
-  const isSupportedFile = useCallback((f: File) => {
-    const n = f.name.toLowerCase();
-    return n.endsWith('.ifc') || n.endsWith('.ifcx') || n.endsWith('.ifczip') || n.endsWith('.glb')
-      || n.endsWith('.las') || n.endsWith('.laz') || n.endsWith('.ply') || n.endsWith('.pcd')
-      || n.endsWith('.e57') || n.endsWith('.pts') || n.endsWith('.xyz');
-  }, []);
+  const isSupportedFile = isSupportedModelFile;
 
   // Single routing point for every ingestion path (picker / drop / input). The
   // optional `handles` array is positionally aligned with `files` and carries a
@@ -495,6 +349,11 @@ export function ViewportContainer() {
     files: File[],
     handles?: (FileSystemFileHandle | undefined)[],
   ) => {
+    // Read the loaded state now, not at render: bundle preparation awaits
+    // before routing, and a model that arrived meanwhile must be added to,
+    // not replaced (#4476 review).
+    const current = viewerStoreApi.getState();
+    const hasModelsLoaded = current.models.size > 0 || (current.geometryResult?.meshes?.length ?? 0) > 0;
     if (hasModelsLoaded) {
       // Models already loaded - add new files sequentially (federate).
       void loadFilesSequentially(files, handles);
@@ -507,7 +366,99 @@ export function ViewportContainer() {
       clearAllModels();
       void loadFilesSequentially(files, handles);
     }
-  }, [loadFile, loadFilesSequentially, resetViewerState, clearAllModels, hasModelsLoaded]);
+  }, [loadFile, loadFilesSequentially, resetViewerState, clearAllModels, viewerStoreApi]);
+
+  const prepareAndRoute = usePreparedModelFileRoute(routeLoad, setRecentFiles);
+
+  // Cloud source providers (Dalux Build, etc.) download bytes outside the
+  // viewer and hand them off via this event rather than calling addModel()
+  // directly — keeps the sources UI decoupled from viewer internals.
+  //
+  // Batches are SERIALIZED through the shared source-load queue: a second
+  // batch arriving while the first is still loading must not run
+  // `resetViewerState()` / `clearAllModels()` mid-finalize, and two
+  // `addModel` loops must never interleave (the WASM parser is not
+  // thread-safe). Per-model syncs (syncSourceModel) route through the same
+  // queue, so a Sync clicked mid-batch waits its turn too. "Are models
+  // loaded?" is read from the store at run time, not from a closure captured
+  // at dispatch time. Each item's buffer reference is dropped as soon as its
+  // model has loaded so a large batch is not held in memory wholesale.
+  useEffect(() => {
+    const handleSourceDownload = (event: Event) => {
+      const detail = (event as SourceDownloadEvent).detail;
+      if (detail.items.length === 0) return;
+      // Take ownership of the items and drop the event's own reference so
+      // consumed buffers become collectable as the queue works through them.
+      const batch: Array<SourceDownloadItem | null> = [...detail.items];
+      detail.items.length = 0;
+
+      void enqueueSourceLoad(async () => {
+        // An unexpected throw must never escape this task unreported: the
+        // queue itself survives rejections, but the user still needs to hear
+        // that their batch died rather than watching nothing happen.
+        try {
+          const store = useViewerStore.getState();
+          const anyLoaded =
+            store.models.size > 0 || (store.geometryResult?.meshes?.length ?? 0) > 0;
+          if (!anyLoaded) {
+            resetViewerState();
+            clearAllModels();
+          }
+
+          for (let i = 0; i < batch.length; i++) {
+            const item = batch[i];
+            if (!item) continue;
+            batch[i] = null; // release the buffer once this iteration owns it
+            // `item.name` comes from a remote provider's file listing — it is
+            // untrusted input reaching a filename position (the File
+            // constructor, the model name, and every toast below). Sanitize
+            // once and use the sanitized value everywhere downstream.
+            const safeName = sanitizeFilename(item.name, { fallback: 'model.ifc' });
+            const file = new File([item.buffer], safeName);
+            // Pass an explicit id and treat "registered in the store" as
+            // success: addModel returns null when a concurrent load
+            // (drag-drop, viewport picker) bumps the shared load session,
+            // even though this model finished registering — same recovery
+            // syncSourceModel uses. Without it the toast would falsely report
+            // a failure and the model would get no source tag (no sync
+            // button, no badge, no downloaded-file record).
+            const providerTitle =
+              sourceHost?.get(item.tag.provider)?.manifest.title ?? item.tag.provider;
+            // Isolate each item: a single corrupt or unparseable file must not
+            // abandon the rest of the batch. Without this, one bad IFC out of
+            // ten throws to the outer catch and the other nine silently never
+            // load — with one generic toast for the whole batch.
+            try {
+              const modelId = crypto.randomUUID();
+              const added = await addModel(file, { name: safeName, modelId });
+              const registered = added !== null || useViewerStore.getState().models.has(modelId);
+              if (registered) {
+                useViewerStore.getState().setSourceTag(modelId, item.tag);
+                recordDownloadedSourceFile(item.tag, item.sourceFile);
+                toast.success(`Loaded ${safeName} from ${providerTitle}`);
+              } else {
+                toast.error(`Failed to load ${safeName} from ${providerTitle}`);
+              }
+            } catch (itemError) {
+              console.error(`[sources] Failed to load ${safeName}:`, itemError);
+              toast.error(`Failed to load ${safeName} from ${providerTitle}`);
+            }
+          }
+        } catch (error) {
+          console.error('[sources] Failed to load a source download batch:', error);
+          toast.error(
+            error instanceof Error
+              ? `Failed to load models from cloud source: ${error.message}`
+              : 'Failed to load models from cloud source',
+          );
+        }
+      });
+    };
+
+    window.addEventListener(SOURCE_DOWNLOAD_EVENT, handleSourceDownload);
+    return () =>
+      window.removeEventListener(SOURCE_DOWNLOAD_EVENT, handleSourceDownload);
+  }, [addModel, resetViewerState, clearAllModels, sourceHost]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -530,8 +481,8 @@ export function ViewportContainer() {
     if (dxfFiles.length > 0) void ingestDxfFiles(dxfFiles);
     if (allDropped.length === 0) return;
 
-    // Filter to supported files (IFC, IFCX, GLB, point clouds)
-    const supportedFiles = allDropped.filter(isSupportedFile);
+    // Keep glTF sidecars beside the document until they are packed into GLB.
+    const supportedFiles = allDropped.filter(file => isSupportedFile(file) || isGltfBundleFile(file));
 
     if (supportedFiles.length === 0) {
       // Tell the user *why* — common case is a Recap project / SketchUp
@@ -547,18 +498,14 @@ export function ViewportContainer() {
       // Prefer the handle-paired files (Chromium): each file + handle comes from
       // the same dropped item, so no filename matching is needed. Fall back to
       // the plain dropped files when no handles were captured (Firefox/Safari).
-      const supportedOpened = (opened ?? []).filter((o) => isSupportedFile(o.file));
+      const supportedOpened = (opened ?? []).filter((o) => isSupportedFile(o.file) || isGltfBundleFile(o.file));
       const useHandles = supportedOpened.length > 0;
       const files = useHandles ? supportedOpened.map((o) => o.file) : supportedFiles;
       const handles = useHandles ? supportedOpened.map((o) => o.handle) : undefined;
 
-      recordRecentFiles(files.map((file) => ({ name: file.name, size: file.size })));
-      void cacheFileBlobs(files);
-      setRecentFiles(getRecentFiles().slice(0, 3));
-
-      routeLoad(files, handles);
+      void prepareAndRoute(files, handles);
     });
-  }, [routeLoad, applyDragEvent, isSupportedFile, webgpu.supported]);
+  }, [prepareAndRoute, applyDragEvent, isSupportedFile, webgpu.supported]);
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     // Block file loading if WebGPU not supported
@@ -575,22 +522,18 @@ export function ViewportContainer() {
 
     // Filter to supported files (IFC, IFCX, GLB). The <input> path yields no
     // live handle, so these models are not refreshable.
-    const supportedFiles = modelFiles.filter(isSupportedFile);
+    const supportedFiles = modelFiles.filter(file => isSupportedFile(file) || isGltfBundleFile(file));
 
     if (supportedFiles.length === 0) {
       e.target.value = '';
       return;
     }
 
-    recordRecentFiles(supportedFiles.map((file) => ({ name: file.name, size: file.size })));
-    void cacheFileBlobs(supportedFiles);
-    setRecentFiles(getRecentFiles().slice(0, 3));
-
-    routeLoad(supportedFiles);
+    void prepareAndRoute(supportedFiles);
 
     // Reset input so same file can be selected again
     e.target.value = '';
-  }, [routeLoad, isSupportedFile, webgpu.supported]);
+  }, [prepareAndRoute, isSupportedFile, webgpu.supported]);
 
   // Preferred open path: the File System Access picker (Chromium) captures a
   // live handle per file so the model can be refreshed from disk. Falls back to
@@ -606,16 +549,12 @@ export function ViewportContainer() {
     // DXF reference underlays split off before model routing (issue #1782).
     const dxfPicked = opened.filter((o) => o.file.name.toLowerCase().endsWith('.dxf'));
     if (dxfPicked.length > 0) void ingestDxfFiles(dxfPicked.map((o) => o.file));
-    const supported = opened.filter((o) => isSupportedFile(o.file));
+    const supported = opened.filter((o) => isSupportedFile(o.file) || isGltfBundleFile(o.file));
     if (supported.length === 0) return;
 
     const files = supported.map((o) => o.file);
-    recordRecentFiles(files.map((f) => ({ name: f.name, size: f.size })));
-    void cacheFileBlobs(files);
-    setRecentFiles(getRecentFiles().slice(0, 3));
-
-    routeLoad(files, supported.map((o) => o.handle));
-  }, [routeLoad, isSupportedFile, webgpu.supported]);
+    prepareAndRoute(files, supported.map((o) => o.handle));
+  }, [prepareAndRoute, isSupportedFile, webgpu.supported]);
 
   const handleStartBlank = useCallback(async () => {
     if (!webgpu.supported) return;
@@ -689,7 +628,6 @@ export function ViewportContainer() {
     }
   }, [loadFile]);
 
-  const hasGeometry = mergedGeometryResult?.meshes && mergedGeometryResult.meshes.length > 0;
 
   // Check if any models are loaded (even if hidden) - used to show empty 3D vs starting UI
   const hasLoadedModels = storeModels.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -720,7 +658,7 @@ export function ViewportContainer() {
     }
     if (!sawTypeGeometryRef.current) {
       for (let i = typeGeoScanLenRef.current; i < meshes.length; i++) {
-        if ((meshes[i].geometryClass ?? 0) !== 0) { sawTypeGeometryRef.current = true; break; }
+        if (meshIsNonOccurrence(meshes[i])) { sawTypeGeometryRef.current = true; break; }
       }
     }
     typeGeoScanLenRef.current = meshes.length;
@@ -995,7 +933,7 @@ export function ViewportContainer() {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz,.dxf"
+          accept={FILE_ACCEPT}
           multiple
           onChange={handleFileSelect}
           className="hidden"
@@ -1039,7 +977,7 @@ export function ViewportContainer() {
                     WebGPU Not Available
                   </h3>
                   <p className="font-mono text-sm text-[#a9b1d6] leading-relaxed">
-                    This viewer requires WebGPU which is not supported by your browser or device.
+                    {webGpuBannerBlurb(webgpu.category)}
                     {webgpu.reason && (
                       <span className="block mt-1 text-[#565f89]">
                         {webgpu.reason}
@@ -1071,54 +1009,7 @@ export function ViewportContainer() {
                   </button>
 
                   {showTroubleshooting && (
-                    <div className="mt-4 p-4 bg-[#1f2335] border border-[#3b4261] text-xs font-mono space-y-4">
-                      <div>
-                        <h4 className="font-bold text-[#ff9e64] uppercase tracking-wide mb-2">Blocklist Override</h4>
-                        <p className="text-[#a9b1d6] mb-2">
-                          WebGPU may be disabled due to GPU/driver blocklist. Try these flags:
-                        </p>
-                        <div className="space-y-1 text-[#7dcfff]">
-                          <p><code className="bg-[#16161e] px-1.5 py-0.5">chrome://flags/#enable-unsafe-webgpu</code> → Enable</p>
-                          <p><code className="bg-[#16161e] px-1.5 py-0.5">chrome://flags/#ignore-gpu-blocklist</code> → Enable</p>
-                        </div>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#bb9af7] uppercase tracking-wide mb-2">Firefox</h4>
-                        <p className="text-[#a9b1d6] mb-2">
-                          WebGPU enabled by default in Firefox 141+. For older versions:
-                        </p>
-                        <p className="text-[#7dcfff]">
-                          <code className="bg-[#16161e] px-1.5 py-0.5">about:config</code> → <code className="bg-[#16161e] px-1.5 py-0.5">dom.webgpu.enabled</code> → true
-                        </p>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#9ece6a] uppercase tracking-wide mb-2">Safari</h4>
-                        <p className="text-[#a9b1d6]">
-                          Safari → Settings → Feature Flags → Enable "WebGPU"
-                        </p>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#7aa2f7] uppercase tracking-wide mb-2">Verify Status</h4>
-                        <p className="text-[#a9b1d6] mb-2">Check your GPU status page:</p>
-                        <div className="space-y-1 text-[#7dcfff]">
-                          <p>Chrome/Edge: <code className="bg-[#16161e] px-1.5 py-0.5">chrome://gpu</code></p>
-                          <p>Firefox: <code className="bg-[#16161e] px-1.5 py-0.5">about:support</code></p>
-                        </div>
-                      </div>
-
-                      <a
-                        href="https://developer.chrome.com/docs/web-platform/webgpu/troubleshooting-tips"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 text-[#7aa2f7] hover:underline"
-                      >
-                        Full Troubleshooting Guide
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
-                    </div>
+                    <WebGpuTroubleshootingDetails category={webgpu.category} />
                   )}
                 </div>
               </div>
@@ -1196,7 +1087,7 @@ export function ViewportContainer() {
             </button>
 
             <p className="mt-2.5 text-[11px] font-mono text-center text-zinc-400 dark:text-[#565f89]">
-              {webgpu.supported ? 'or drag & drop anywhere' : 'file upload disabled'}
+              {webgpu.supported ? 'or drag & drop anywhere' : <WebGpuDisabledCaption />}
             </p>
 
             {/* Subtle "or" rule — anchors the symmetry between the two tracks */}
@@ -1224,6 +1115,22 @@ export function ViewportContainer() {
               >
                 <PackagePlus className="h-3 w-3 transition-transform group-enabled:group-hover:-translate-y-0.5" />
                 <span>Start blank</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => useViewerStore.getState().openPanelInHome('sources')}
+                disabled={!webgpu.supported || webgpu.checking}
+                className={`group inline-flex items-center gap-1.5 px-3 py-1.5 font-mono text-[11px] border border-dashed transition-all ${
+                  !webgpu.supported || webgpu.checking
+                    ? 'border-zinc-200 dark:border-[#3b4261]/50 text-zinc-300 dark:text-[#565f89]/50 cursor-not-allowed'
+                    : 'border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#7a82a5] hover:border-primary hover:text-primary cursor-pointer'
+                }`}
+              >
+                <Cloud className="h-3 w-3 transition-transform group-enabled:group-hover:-translate-y-0.5" />
+                {/* Provider-neutral: this opens the Cloud Sources panel, which
+                    lists every registered provider. Naming one vendor on the
+                    front door stopped being accurate at the second provider. */}
+                <span>Open from cloud</span>
               </button>
               <a
                 href="/mcp"
@@ -1367,6 +1274,7 @@ export function ViewportContainer() {
           projectedCRS={georef.projectedCRS}
           coordinateInfo={georef.coordinateInfo}
           geometryResult={cesiumGeometryResult}
+          computedIsolatedIds={computedIsolatedIds}
           lengthUnitScale={georef.lengthUnitScale}
           storeyElevations={georef.storeyElevations}
         />
@@ -1395,6 +1303,7 @@ export function ViewportContainer() {
         geometryContentVersion={geometryContentVersion}
         pointClouds={mergedPointClouds}
         coordinateInfo={mergedGeometryResult?.coordinateInfo}
+        sectionCoordinateInfo={placedCoordinateInfo}
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}
         cesiumActive={cesiumEnabled && georef !== null}

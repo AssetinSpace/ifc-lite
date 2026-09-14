@@ -7,11 +7,10 @@
  * (Cesium / sun / SpaceMouse), and interface options.
  */
 
-import { Globe2, MousePointerClick, Move, PanelTop, } from 'lucide-react';
-import { TopView, BottomView, FrontView, BackView, LeftView, RightView, ZoomIn, ZoomOut, IsometricView, Orthographic, Viewpoint, SpaceMouse, Lighting, FitAll, RotateLeft, RotateRight } from '@/icons';
+import { Orthographic, Viewpoint, SpaceMouse, Lighting, World, Move, FollowWork, ClassicBar } from '@/icons';
 import { useViewerStore } from '@/store';
-import { goHomeFromStore } from '@/store/homeView';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
+import { useCameraCommands } from '../../toolbar/CameraCommands';
 import {
   RibbonGroup,
   RibbonGroupDivider,
@@ -21,7 +20,10 @@ import {
 } from '../primitives';
 
 export function ViewTab() {
-  const cameraCallbacks = useViewerStore((state) => state.cameraCallbacks);
+  // Camera, preset views and the 90° rotations come from the shared
+  // command list the classic toolbar also renders, so the two styles
+  // cannot host different camera commands (see toolbar/CameraCommands).
+  const cameraCommands = useCameraCommands();
   const projectionMode = useViewerStore((state) => state.projectionMode);
   const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
   const setToolbarStyle = useViewerStore((state) => state.setToolbarStyle);
@@ -71,59 +73,55 @@ export function ViewTab() {
       <RibbonGroupDivider />
 
       <RibbonGroup label="Camera">
-        <RibbonLargeButton
-          icon={IsometricView}
-          label="Isometric"
-          tooltip="Home (isometric + reset visibility)"
-          shortcut="H"
-          onClick={goHomeFromStore}
-        />
-        <RibbonLargeButton
-          icon={ZoomIn}
-          label="Zoom in"
-          tooltip="Zoom In"
-          onClick={() => cameraCallbacks.zoomIn?.()}
-        />
-        <RibbonLargeButton
-          icon={ZoomOut}
-          label="Zoom out"
-          tooltip="Zoom Out"
-          onClick={() => cameraCallbacks.zoomOut?.()}
-        />
+        {cameraCommands
+          .filter((command) => command.group === 'camera')
+          .map((command) => (
+            <RibbonLargeButton
+              key={command.id}
+              icon={command.icon}
+              label={command.label}
+              tooltip={command.tooltip}
+              shortcut={command.shortcut}
+              onClick={command.run}
+            />
+          ))}
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
       <RibbonGroup label="View">
-        <RibbonSmallStack>
-          <RibbonSmallButton icon={TopView} label="Top" shortcut="1" onClick={() => cameraCallbacks.setPresetView?.('top')} />
-          <RibbonSmallButton icon={FrontView} label="Front" shortcut="3" onClick={() => cameraCallbacks.setPresetView?.('front')} />
-          <RibbonSmallButton icon={LeftView} label="Left" shortcut="5" onClick={() => cameraCallbacks.setPresetView?.('left')} />
-        </RibbonSmallStack>
-        <RibbonSmallStack>
-          <RibbonSmallButton icon={BottomView} label="Bottom" shortcut="2" onClick={() => cameraCallbacks.setPresetView?.('bottom')} />
-          <RibbonSmallButton icon={BackView} label="Back" shortcut="4" onClick={() => cameraCallbacks.setPresetView?.('back')} />
-          <RibbonSmallButton icon={RightView} label="Right" shortcut="6" onClick={() => cameraCallbacks.setPresetView?.('right')} />
-        </RibbonSmallStack>
-        <RibbonLargeButton
-          icon={RotateLeft}
-          label="Rotate left"
-          tooltip="Rotate Left 90°"
-          onClick={() => cameraCallbacks.rotateLeft?.()}
-        />
-        <RibbonLargeButton
-          icon={RotateRight}
-          label="Rotate right"
-          tooltip="Rotate Right 90°"
-          onClick={() => cameraCallbacks.rotateRight?.()}
-        />
-        <RibbonLargeButton
-          icon={FitAll}
-          label="Fit all"
-          tooltip="Fit all in view"
-          shortcut="Z"
-          onClick={() => cameraCallbacks.fitAll?.()}
-        />
+        {/* The six axis views split across two small stacks in registry
+            order (top/front/left over bottom/back/right). */}
+        {[0, 1].map((column) => (
+          <RibbonSmallStack key={column}>
+            {cameraCommands
+              .filter((command) => command.group === 'preset')
+              .filter((_, index) => index % 2 === column)
+              .map((command) => (
+                <RibbonSmallButton
+                  key={command.id}
+                  icon={command.icon}
+                  label={command.label}
+                  shortcut={command.shortcut}
+                  onClick={command.run}
+                />
+              ))}
+          </RibbonSmallStack>
+        ))}
+        {/* Everything that isn't a camera command or an axis view — the 90°
+            rotations today, and whatever the shared list grows next. */}
+        {cameraCommands
+          .filter((command) => command.group !== 'camera' && command.group !== 'preset')
+          .map((command) => (
+            <RibbonLargeButton
+              key={command.id}
+              icon={command.icon}
+              label={command.label}
+              tooltip={command.tooltip}
+              shortcut={command.shortcut}
+              onClick={command.run}
+            />
+          ))}
       </RibbonGroup>
 
       <RibbonGroupDivider />
@@ -135,7 +133,7 @@ export function ViewTab() {
             tint signals a modal pose whose exit affordance stays visible). */}
         {cesiumAvailable && (
           <RibbonLargeButton
-            icon={Globe2}
+            icon={World}
             label="World"
             tooltip={cesiumEnabled ? 'Hide 3D world context (Cesium)' : 'Show 3D world context (Cesium)'}
             active={cesiumEnabled}
@@ -201,7 +199,7 @@ export function ViewTab() {
         />
         <RibbonSmallStack>
           <RibbonSmallButton
-            icon={MousePointerClick}
+            icon={FollowWork}
             label="Follow work"
             tooltip="Open the Elements tab on selection and Author in edit mode, then hand the tab back"
             active={ribbonContextualTabs}
@@ -209,7 +207,7 @@ export function ViewTab() {
             {...tourAnchor(TOUR_ANCHORS.ribbonFollowWork)}
           />
           <RibbonSmallButton
-            icon={PanelTop}
+            icon={ClassicBar}
             label="Classic bar"
             tooltip="Switch back to the classic single-strip toolbar (remembered on this browser)"
             onClick={() => setToolbarStyle('classic')}

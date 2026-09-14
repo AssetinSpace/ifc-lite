@@ -30,12 +30,19 @@ import {
   Table2,
   ListTree,
   Users,
+  Cloud,
   Layers as LayersIcon,
   Box,
+<<<<<<< HEAD
   // >>> AIM-FORK: icons for the fork-only panels below (D-072, D-075)
   Map as MapIcon,
   Files,
   // <<< AIM-FORK
+=======
+  FileWarning,
+  BarChart3,
+  FileText,
+>>>>>>> upstream/main
   type LucideIcon,
 } from 'lucide-react';
 
@@ -53,16 +60,24 @@ export type WorkspacePanelId =
   | 'lens'
   | 'clash'
   | 'extensions'
+  | 'sources'
   | 'script'
   | 'gantt'
   | 'lists'
   | 'collab'
   | 'layers'
   | 'zones'
+<<<<<<< HEAD
   // >>> AIM-FORK: fork-only panels (D-072 underlays, D-075 documents)
   | 'drawing-underlay'
   | 'documents';
   // <<< AIM-FORK
+=======
+  | 'loadReport'
+  | 'appearance'
+  | 'charts'
+  | 'document';
+>>>>>>> upstream/main
 
 /** Activity-bar clustering — a divider is drawn whenever the group changes. */
 export type PanelGroup = 'navigate' | 'inspect' | 'review' | 'author' | 'work';
@@ -90,7 +105,7 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Alt+1..9 / Alt+0 — order frozen since #1200 for the first seven.
   { id: 'properties', title: 'Information', short: 'Info', Icon: Info, group: 'inspect', region: 'side' },
   { id: 'compare', title: 'Compare models', short: 'Compare', Icon: GitCompareArrows, group: 'inspect', region: 'side' },
-  { id: 'bcf', title: 'BCF issues', short: 'BCF', Icon: MessageSquare, group: 'review', region: 'side' },
+  { id: 'bcf', title: 'BCF topics', short: 'BCF', Icon: MessageSquare, group: 'review', region: 'side' },
   { id: 'ids', title: 'IDS validation', short: 'IDS', Icon: ClipboardCheck, group: 'review', region: 'side' },
   { id: 'lens', title: 'Lens rules', short: 'Lens', Icon: Palette, group: 'review', region: 'side' },
   { id: 'clash', title: 'Clash detection', short: 'Clash', Icon: Crosshair, group: 'review', region: 'side' },
@@ -108,6 +123,9 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Alt+1..0 mapping stays intact (no Alt shortcut). The activity bar hides it
   // while the collab feature flag is off (see ActivityBar).
   { id: 'collab', title: 'Collaboration room', short: 'Room', Icon: Users, group: 'review', region: 'side' },
+  // Cloud sources (CDE integrations). APPENDED — no Alt shortcut. Always on
+  // the rail; providers that failed to register are reported inside the panel.
+  { id: 'sources', title: 'Cloud sources', short: 'Sources', Icon: Cloud, group: 'inspect', region: 'side' },
   // IFCX layer stack + per-layer diff (#1717). APPENDED so the frozen
   // Alt+1..0 mapping stays intact (no Alt shortcut). The activity bar only
   // surfaces it while a federated layer stack is loaded.
@@ -115,6 +133,7 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // Location zones (construction sections / takt areas, #1810). APPENDED so
   // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
   { id: 'zones', title: 'Location zones', short: 'Zones', Icon: Box, group: 'review', region: 'side' },
+<<<<<<< HEAD
   // >>> AIM-FORK: fork-only panels, kept last so upstream keeps appending above us.
   // Georeferenced PDF drawing underlays (D-072 in the AIM repo). APPENDED so
   // the frozen Alt+1..0 mapping stays intact (no Alt shortcut).
@@ -123,15 +142,23 @@ export const WORKSPACE_PANELS: readonly WorkspacePanelDef[] = [
   // tabs in the center document pane. APPENDED — frozen Alt mapping untouched.
   { id: 'documents', title: 'Documents', short: 'Docs', Icon: Files, group: 'navigate', region: 'side' },
   // <<< AIM-FORK
+=======
+  // Flag-free like 'zones' above (#1869 precedent) — no dedicated
+  // `loadReportPanelVisible` boolean; `openWorkspacePanel`'s generic
+  // non-SIDEBAR_PANEL_FLAGS branch adopts it directly (issue #3927).
+  { id: 'loadReport', title: 'Load report', short: 'Load report', Icon: FileWarning, group: 'review', region: 'side' },
+  { id: 'appearance', title: 'Appearance', short: 'Appearance', Icon: Palette, group: 'author', region: 'side' },
+  // Charts bound to the model, bidirectional with the 3D view (#3944). Bottom
+  // strip like Lists / Schedule; the table in `bottom-panels.ts` carries it.
+  { id: 'charts', title: 'Charts', short: 'Charts', Icon: BarChart3, group: 'work', region: 'bottom', prefersWide: true },
+  // A free-form page over the model — text with bindings, logos, charts, BCF topics — printed to PDF (#4594).
+  { id: 'document', title: 'Document', short: 'Document', Icon: FileText, group: 'work', region: 'bottom', prefersWide: true },
+>>>>>>> upstream/main
 ];
 
-/** The bottom-strip panel ids, mapped to their store visibility flag + setter
- *  names — these stay independent of the single-tenant right pane. */
-export type BottomPanelId = Extract<WorkspacePanelId, 'script' | 'gantt' | 'lists'>;
-
-export function isBottomPanel(id: WorkspacePanelId): id is BottomPanelId {
-  return id === 'script' || id === 'gantt' || id === 'lists';
-}
+// The bottom strip (Script / Schedule / Lists) is table-driven; the id union and
+// the type guard are re-exported here so registry consumers keep one import.
+export { isBottomPanel, type BottomPanelId } from './bottom-panels';
 
 /** The left-slot nav panel (Hierarchy, #1267): toggled via `leftPanelCollapsed`,
  *  never floated / popped / docked into the right pane. */

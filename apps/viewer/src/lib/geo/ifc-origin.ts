@@ -28,7 +28,8 @@ import proj4 from 'proj4';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import { resolveProjection } from './reproject';
-import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from './geo-scale';
+import { getEffectiveAxisScales, resolveMapUnitToMetreScale } from './geo-scale';
+import { effectiveMapConversionForGeometry } from './map-absolute';
 
 export interface IfcOriginPlacement {
   /** Viewer-local position (Y-up) where this model's IFC (0,0,0) currently sits. */
@@ -90,9 +91,19 @@ export async function computeIfcOriginViewerPosition(
   // multiply zero — only the eastings/northings/orthogonalHeight remain.
   const modelLengthScale = model.lengthUnitScale ?? 1;
   const modelMapUnitScale = resolveMapUnitToMetreScale(model.projectedCRS.mapUnitScale, modelLengthScale);
-  const eM = model.mapConversion.eastings * modelMapUnitScale;
-  const nM = model.mapConversion.northings * modelMapUnitScale;
-  const hM = model.mapConversion.orthogonalHeight * modelMapUnitScale;
+  // Map-absolute geometry (#2526): `federationAlign.ts` aligns this model's
+  // GEOMETRY through the neutralised conversion (`effectiveConv`); inverting
+  // the AUTHORED conversion here instead would draw the origin dot far from
+  // the geometry it belongs to the moment a map-absolute model is federated
+  // — the two computations must read the same effective conversion.
+  const modelConv = effectiveMapConversionForGeometry(
+    model.mapConversion,
+    modelMapUnitScale,
+    model.coordinateInfo,
+  );
+  const eM = modelConv.eastings * modelMapUnitScale;
+  const nM = modelConv.northings * modelMapUnitScale;
+  const hM = modelConv.orthogonalHeight * modelMapUnitScale;
 
   // Step 2: same CRS → identity; different CRS → proj4 hop.
   let eA = eM;
@@ -120,24 +131,30 @@ export async function computeIfcOriginViewerPosition(
   // Step 3: anchor projected → anchor IFC (invert anchor's MapConversion).
   const anchorLengthScale = anchor.lengthUnitScale ?? 1;
   const anchorMapUnitScale = resolveMapUnitToMetreScale(anchor.projectedCRS.mapUnitScale, anchorLengthScale);
-  const eAnchor = anchor.mapConversion.eastings * anchorMapUnitScale;
-  const nAnchor = anchor.mapConversion.northings * anchorMapUnitScale;
-  const hAnchor = anchor.mapConversion.orthogonalHeight * anchorMapUnitScale;
-  const anchorAbsc = anchor.mapConversion.xAxisAbscissa ?? 1;
-  const anchorOrd = anchor.mapConversion.xAxisOrdinate ?? 0;
-  const anchorScale = getEffectiveHorizontalScale(
-    anchor.mapConversion.scale,
+  // Same neutralisation on the anchor side: a map-absolute ANCHOR must be
+  // inverted through its own effective (identity) conversion too, or a
+  // non-anchor model federated onto it lands via the authored rotation while
+  // the anchor's own geometry never moved.
+  const anchorConv = effectiveMapConversionForGeometry(
+    anchor.mapConversion,
     anchorMapUnitScale,
-    anchorLengthScale,
+    anchor.coordinateInfo,
   );
-  const anchorDenom = anchorScale * Math.max(anchorAbsc * anchorAbsc + anchorOrd * anchorOrd, 1e-12);
-  if (Math.abs(anchorDenom) < 1e-12) return null;
-  const invDenom = 1 / anchorDenom;
+  const eAnchor = anchorConv.eastings * anchorMapUnitScale;
+  const nAnchor = anchorConv.northings * anchorMapUnitScale;
+  const hAnchor = anchorConv.orthogonalHeight * anchorMapUnitScale;
+  const anchorAbsc = anchorConv.xAxisAbscissa ?? 1;
+  const anchorOrd = anchorConv.xAxisOrdinate ?? 0;
+  const { x: anchorScaleX, y: anchorScaleY, z: anchorScaleZ } = getEffectiveAxisScales(
+    anchorConv, anchorMapUnitScale, anchorLengthScale,
+  );
+  const axisDenom = Math.max(anchorAbsc * anchorAbsc + anchorOrd * anchorOrd, 1e-12);
+  if ([anchorScaleX, anchorScaleY, anchorScaleZ].some((value) => Math.abs(value) < 1e-12)) return null;
   const dE = eA - eAnchor;
   const dN = nA - nAnchor;
-  const ifcX = invDenom * (anchorAbsc * dE + anchorOrd * dN);
-  const ifcY = invDenom * (-anchorOrd * dE + anchorAbsc * dN);
-  const ifcZ = hA - hAnchor;
+  const ifcX = (anchorAbsc * dE + anchorOrd * dN) / (anchorScaleX * axisDenom);
+  const ifcY = (-anchorOrd * dE + anchorAbsc * dN) / (anchorScaleY * axisDenom);
+  const ifcZ = (hA - hAnchor) / anchorScaleZ;
 
   // Step 4 + 5: IFC Z-up → world Y-up → anchor viewer-local
   const anchorOff = totalYupOffset(anchor.coordinateInfo);

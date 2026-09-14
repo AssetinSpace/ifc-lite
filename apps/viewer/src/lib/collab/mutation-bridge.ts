@@ -12,16 +12,22 @@
  *                                                       │  (y-websocket)
  *   peer's Y.Doc update ─▶ observeDeep (txn.local=false) ─▶ apply to MutablePropertyView
  *
- * Entities are addressed by GUID path (`/<guid>`), matching `seedFromStep`.
- * Inbound apply writes straight to the `MutablePropertyView` (not the slice's
- * undo-tracked actions) so remote edits don't pollute the local undo stack and
- * can't echo back to the doc. The collab runtime is injected (the module the
- * caller already lazy-loaded) so this file pulls no collab code eagerly.
+ * Entities are addressed by slot-qualified GUID path (`slotPath(slot, guid)`
+ * — `/<slotId>/<guid>`, or the legacy `/<guid>` of a single-model room),
+ * matching `seedFromStep` (#4444); the per-store expressId↔path registry
+ * lives in `entity-paths.ts`. Inbound, the path itself names the slot, so the
+ * observer resolves the store BY PATH and hands every handler the model the
+ * edit belongs to. Inbound apply writes straight to the `MutablePropertyView`
+ * (not the slice's undo-tracked actions) so remote edits don't pollute the
+ * local undo stack and can't echo back to the doc. The collab runtime is
+ * injected (the module the caller already lazy-loaded) so this file pulls no
+ * collab code eagerly.
  */
 
 import { PropertyValueType } from '@ifc-lite/data';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { CollabSession, LocalPlacement } from '@ifc-lite/collab';
+import { entityForPath, pathForEntity } from './entity-paths';
 
 /** The slice of the collab runtime this bridge needs (injected, never eager-imported). */
 export interface CollabDocApi {
@@ -52,84 +58,6 @@ export interface CollabDocApi {
   PROPERTY_TYPE_NAMES: Record<number, string>;
 }
 
-const guidPath = (guid: string): string => `/${guid}`;
-
-// ── expressId ↔ GUID-path maps (cached per store) ───────────────────────────
-
-interface EntityMaps {
-  toPath: Map<number, string>;
-  toExpressId: Map<string, number>;
-}
-const mapCache = new WeakMap<IfcDataStore, EntityMaps>();
-
-function entityMaps(store: IfcDataStore): EntityMaps {
-  const cached = mapCache.get(store);
-  if (cached) return cached;
-  const toPath = new Map<number, string>();
-  const toExpressId = new Map<string, number>();
-  for (const [expressId] of store.entityIndex.byId.entries()) {
-    // Resolve the GUID from the entity TABLE, not on-demand attribute extraction:
-    // the compact index can't decode attributes for many geometric products on
-    // large models, so extraction returned no GUID and those products were absent
-    // from both maps — breaking geometry seeding AND inbound/outbound edit sync
-    // for them. The table carries their GlobalId reliably (see step-seed.ts).
-    const guid = store.entities?.getGlobalId?.(expressId);
-    if (!guid) continue;
-    const path = guidPath(guid);
-    toPath.set(expressId, path);
-    toExpressId.set(path, expressId);
-  }
-  const maps: EntityMaps = { toPath, toExpressId };
-  mapCache.set(store, maps);
-  return maps;
-}
-
-export function pathForEntity(store: IfcDataStore, entityId: number): string | null {
-  const cached = entityMaps(store).toPath.get(entityId);
-  if (cached) return cached;
-  // The compact `entityIndex.byId` (and on-demand attribute extraction) omits
-  // many geometric products on large models, so the pre-built map misses them —
-  // which dropped the vast majority of meshes at seed time. The entity *table*
-  // still carries their GlobalId, so fall back to it. (No-op for IFCX stores,
-  // whose maps are pre-registered via `registerEntityMaps`.)
-  const guid = store.entities?.getGlobalId?.(entityId);
-  return guid ? guidPath(guid) : null;
-}
-/** Inbound counterpart to `pathForEntity` — internal to the apply observer. */
-function entityForPath(store: IfcDataStore, path: string): number | null {
-  return entityMaps(store).toExpressId.get(path) ?? null;
-}
-
-/**
- * Pre-register expressId↔path maps for a store whose `entityIndex.byId` isn't
- * STEP-populated — i.e. an IFCX-origin store or a recipient's reconstructed
- * store. Without this, `entityMaps` derives an empty map from `byId`, so the
- * outbound mirror (`pathForEntity`) and inbound apply (`entityForPath`) both
- * resolve `null` and edits silently don't sync. Pass the `idToPath`/`pathToId`
- * maps that `parseIfcxViewerModel` returns. STEP stores need no registration —
- * their lazy `byId`-derived maps work.
- */
-export function registerEntityMaps(
-  store: IfcDataStore,
-  idToPath: Map<number, string>,
-  pathToId: Map<string, number>,
-): void {
-  mapCache.set(store, { toPath: idToPath, toExpressId: pathToId });
-}
-
-/**
- * Add a single expressId↔path mapping to a store's cache. Needed for entities
- * created at runtime (StoreEditor overlay entities), which are intentionally
- * absent from `entityIndex.byId` and the entity table — so `pathForEntity`
- * can't derive their path. Without this, a created entity (and any later edit
- * to it) wouldn't resolve a path and wouldn't sync.
- */
-export function registerEntityPath(store: IfcDataStore, expressId: number, path: string): void {
-  const maps = entityMaps(store);
-  maps.toPath.set(expressId, path);
-  maps.toExpressId.set(path, expressId);
-}
-
 // ── value conversion ─────────────────────────────────────────────────────────
 
 function toScalar(value: unknown): string | number | boolean | null {
@@ -142,7 +70,7 @@ function toScalar(value: unknown): string | number | boolean | null {
 }
 
 /** Map a collab IFC type string back to the closest `PropertyValueType`. */
-function propertyValueTypeFor(ifcType: string): PropertyValueType {
+export function propertyValueTypeFor(ifcType: string): PropertyValueType {
   switch (ifcType) {
     case 'IfcBoolean':
     case 'IfcLogical':
@@ -248,23 +176,50 @@ export function mirrorEntityDelete(
 
 export type ScalarValue = string | number | boolean | null;
 
+/**
+ * Every inbound handler is told WHICH model the edit belongs to: a room holds
+ * one model per slot (#4444) and an expressId is meaningless without its
+ * model. `modelId` is the viewer model whose store the path resolved against;
+ * `entityId` is an expressId in that model's id space.
+ */
 export interface RemoteApplyHandlers {
   /** Apply a remote property write to the local view (no undo tracking). */
-  onProperty(entityId: number, pset: string, prop: string, value: ScalarValue, type: PropertyValueType): void;
+  onProperty(modelId: string, entityId: number, pset: string, prop: string, value: ScalarValue, type: PropertyValueType): void;
   /** Apply a remote property deletion. */
-  onPropertyDelete(entityId: number, pset: string, prop: string): void;
+  onPropertyDelete(modelId: string, entityId: number, pset: string, prop: string): void;
   /** Apply a remote attribute write. */
-  onAttribute(entityId: number, attrName: string, value: ScalarValue): void;
+  onAttribute(modelId: string, entityId: number, attrName: string, value: ScalarValue): void;
   /**
    * Apply a remote placement (move / rotate) write. Receives the entity's full
    * new local placement decoded from `usd::xformop`; the handler reconciles it
    * against the entity's baseline to move the rendered mesh. Optional so older
    * callers keep working.
    */
-  onPlacement?(entityId: number, placement: LocalPlacement): void;
+  onPlacement?(modelId: string, entityId: number, placement: LocalPlacement): void;
   /** A peer tombstoned an entity — hide/remove its rendered mesh locally. */
-  onEntityDelete?(entityId: number): void;
+  onEntityDelete?(modelId: string, entityId: number): void;
+  /** The whole Pset vanished. Property names are unavailable by design: Yjs
+   *  detaches the map before the event is observed, so `forEach` yields 0
+   *  entries. The consumer drops the entire set for (entityId, pset). */
+  onPsetDelete?(modelId: string, entityId: number, pset: string): void;
 }
+
+/** The model an inbound room path resolved to: its viewer id and its store. */
+export interface RoomEntityTarget {
+  modelId: string;
+  store: IfcDataStore;
+}
+
+/**
+ * Resolves a room entity path to the model it belongs to — the ROOM's model
+ * for that path's slot, never whatever is active. A function, not a value,
+ * because the target can change or not exist yet: a recipient's room models
+ * are registered by the first reconstruct, which can land after the observer
+ * is attached, and a captured store would keep resolving room paths against a
+ * stale — possibly entirely unrelated — model. Returning `null` drops the
+ * event.
+ */
+export type RoomEntityResolver = (entityPath: string) => RoomEntityTarget | null;
 
 /**
  * Observe remote (non-local) Y.Doc edits and dispatch property/attribute
@@ -275,7 +230,7 @@ export interface RemoteApplyHandlers {
 export function attachRemoteApply(
   api: CollabDocApi,
   session: CollabSession,
-  store: IfcDataStore,
+  resolve: RoomEntityResolver,
   handlers: RemoteApplyHandlers,
 ): () => void {
   // `entities` is inferred as Y.Map<unknown>; deriving the observer type from
@@ -294,13 +249,18 @@ export function attachRemoteApply(
         if (!handlers.onEntityDelete) continue;
         for (const [entityPath, change] of ev.changes.keys) {
           if (change.action !== 'delete') continue;
-          const id = entityForPath(store, entityPath);
-          if (id !== null) handlers.onEntityDelete(id);
+          const hit = resolve(entityPath);
+          if (!hit) continue;
+          const id = entityForPath(hit.store, entityPath);
+          if (id !== null) handlers.onEntityDelete(hit.modelId, id);
         }
         continue;
       }
       const entityPath = typeof path[0] === 'string' ? path[0] : undefined;
       if (!entityPath) continue;
+      const hit = resolve(entityPath);
+      if (!hit) continue;
+      const { modelId, store } = hit;
       const entityId = entityForPath(store, entityPath);
       if (entityId === null) continue;
       const target = ev.target as { get(key: string): unknown };
@@ -313,21 +273,58 @@ export function attachRemoteApply(
           // mesh moves, and skip the generic stringifying attribute path.
           if (attrName === api.XFORMOP_KEY) {
             const placement = api.placementFromXformOp(target.get(attrName));
-            if (placement && handlers.onPlacement) handlers.onPlacement(entityId, placement);
+            if (placement && handlers.onPlacement) handlers.onPlacement(modelId, entityId, placement);
             continue;
           }
-          handlers.onAttribute(entityId, attrName, toScalar(target.get(attrName)));
+          handlers.onAttribute(modelId, entityId, attrName, toScalar(target.get(attrName)));
         }
       } else if (path[1] === 'psets' && path.length === 3 && typeof path[2] === 'string') {
         const psetName = path[2];
         for (const [prop, change] of ev.changes.keys) {
           if (change.action === 'delete') {
-            handlers.onPropertyDelete(entityId, psetName, prop);
+            handlers.onPropertyDelete(modelId, entityId, psetName, prop);
             continue;
           }
           const pv = target.get(prop) as { type?: string; value?: ScalarValue } | undefined;
           if (!pv) continue;
-          handlers.onProperty(entityId, psetName, prop, pv.value ?? null, propertyValueTypeFor(pv.type ?? 'IfcLabel'));
+          handlers.onProperty(modelId, entityId, psetName, prop, pv.value ?? null, propertyValueTypeFor(pv.type ?? 'IfcLabel'));
+        }
+      } else if (path[1] === 'psets' && path.length === 2) {
+        // A pset appearing (or vanishing) wholesale. When a remote peer writes
+        // the FIRST property of a brand-new pset, Yjs reports it as a single
+        // `add` on the `psets` map itself — the nested pset map does not exist
+        // yet when the transaction is observed, so no `path.length === 3`
+        // event is ever emitted. Without this branch that first property lands
+        // in the Y.Doc but never reaches the live view until a full
+        // reconstruct.
+        //
+        // The mirror case — deleting a pset's LAST property, which cascades to
+        // removing the pset entry — reports as a single `delete` here too. By
+        // the time the event is observed the removed map is already detached
+        // — `oldValue.forEach` yields nothing, `size` is 0 and `toJSON()` is
+        // `{}` — so the property names are unrecoverable. `onPsetDelete` tells
+        // the consumer to drop the whole set for (entityId, pset) rather than
+        // trying to replay per-property deletes it has no names for.
+        for (const [psetName, change] of ev.changes.keys) {
+          if (change.action === 'delete') {
+            if (handlers.onPsetDelete) handlers.onPsetDelete(modelId, entityId, psetName);
+            continue;
+          }
+          const added = target.get(psetName) as
+            | { forEach?(fn: (v: unknown, k: string) => void): void }
+            | undefined;
+          added?.forEach?.((v, prop) => {
+            const pv = v as { type?: string; value?: ScalarValue } | undefined;
+            if (!pv) return;
+            handlers.onProperty(
+              modelId,
+              entityId,
+              psetName,
+              prop,
+              pv.value ?? null,
+              propertyValueTypeFor(pv.type ?? 'IfcLabel'),
+            );
+          });
         }
       }
     }

@@ -41,13 +41,17 @@ import {
 } from '@/components/ui/alert';
 import { useViewerStore } from '@/store';
 import { buildHiddenIfcTypes } from '@/store/typeVisibilityFilter';
+import { resolveExportVisibility } from '@/store/exportVisibility';
 import { posthog } from '@/lib/analytics';
 import { toast } from '@/components/ui/toast';
 import { GeometryProcessor, isNoRenderGeometryError, type MeshData } from '@ifc-lite/geometry';
-import { classifyLoadError, formatLoadError } from '@/lib/load-errors';
+import { GEOM_CLASS_INSTANCED_TYPE } from '@ifc-lite/geometry/geometry-class';
+import { classifyLoadError } from '@/lib/load-errors';
+import { formatLoadError } from '@/lib/load-error-message';
 import { exportGlbFromGeometry } from '@/lib/export/glb';
 import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
 import { withInstancedMeshes } from '../../utils/instancedExport.js';
+import { displayedTranslation } from '@/lib/model-placement/state';
 
 type ColorSource = 'rendering' | 'shading';
 
@@ -67,6 +71,13 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
   // openings the user never rendered (issue surfaced on the Revit door
   // fixture where IfcOpeningElement #2438 leaked through).
   const typeVisibility = useViewerStore((s) => s.typeVisibility);
+  // Not read directly below — `resolveExportVisibility` reads the live store
+  // snapshot at export time — but subscribed so the dialog re-renders when
+  // the Class tab filter, storey isolation, or a lens hides something while
+  // the dialog is open (#4328).
+  const classFilter = useViewerStore((s) => s.classFilter);
+  const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
+  const lensHiddenIds = useViewerStore((s) => s.lensHiddenIds);
   // Legacy single-model fallback so this dialog works before any
   // FederatedModel is registered (the common case for v1 users). Only
   // the geometryResult is needed — GLB export doesn't read the parsed
@@ -139,57 +150,27 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
    * (which works in local entity space), so don't reuse ExportDialog's
    * helpers here.
    */
-  const getGlobalHiddenIds = useCallback((modelId: string): Set<number> => {
-    if (modelId === '__legacy__') return hiddenEntities;
+  // Single resolver every export path routes through (`resolveExportVisibility`,
+  // `@/store/exportVisibility`) — folds in `classFilter` (Class tab) and storey
+  // isolation on top of hidden/isolated entities, which this dialog used to
+  // miss entirely (#4328: filtering the Class tab did nothing to a GLB
+  // "Visible Only" export). Reads `useViewerStore.getState()` at call time so
+  // export always sees the state at click time, not a stale render.
+  const getExportVisibility = useCallback(
+    (modelId: string) => resolveExportVisibility(useViewerStore.getState(), modelId),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [models, hiddenEntities, isolatedEntities, hiddenEntitiesByModel, isolatedEntitiesByModel, classFilter, selectedStoreys, typeVisibility, lensHiddenIds],
+  );
 
-    const model = models.get(modelId);
-    if (!model) return new Set();
-    const offset = model.idOffset ?? 0;
+  const getGlobalHiddenIds = useCallback(
+    (modelId: string): Set<number> => getExportVisibility(modelId).hiddenGlobalIds,
+    [getExportVisibility],
+  );
 
-    const out = new Set<number>();
-    // Global IDs from the legacy / global store — already global, just
-    // restrict to this model's range so we don't carry over hidden IDs
-    // that belong to sibling federated models.
-    for (const globalId of hiddenEntities) {
-      const localId = globalId - offset;
-      if (localId > 0 && localId <= model.maxExpressId) {
-        out.add(globalId);
-      }
-    }
-    // Per-model entries are LOCAL IDs — convert to global.
-    const modelHidden = hiddenEntitiesByModel.get(modelId);
-    if (modelHidden) {
-      for (const localId of modelHidden) {
-        out.add(localId + offset);
-      }
-    }
-    return out;
-  }, [models, hiddenEntities, hiddenEntitiesByModel]);
-
-  const getGlobalIsolatedIds = useCallback((modelId: string): Set<number> | null => {
-    if (modelId === '__legacy__') return isolatedEntities;
-
-    const model = models.get(modelId);
-    if (!model) return null;
-    const offset = model.idOffset ?? 0;
-
-    const out = new Set<number>();
-    if (isolatedEntities) {
-      for (const globalId of isolatedEntities) {
-        const localId = globalId - offset;
-        if (localId > 0 && localId <= model.maxExpressId) {
-          out.add(globalId);
-        }
-      }
-    }
-    const modelIsolated = isolatedEntitiesByModel.get(modelId);
-    if (modelIsolated) {
-      for (const localId of modelIsolated) {
-        out.add(localId + offset);
-      }
-    }
-    return out.size > 0 ? out : null;
-  }, [models, isolatedEntities, isolatedEntitiesByModel]);
+  const getGlobalIsolatedIds = useCallback(
+    (modelId: string): Set<number> | null => getExportVisibility(modelId).isolatedGlobalIds,
+    [getExportVisibility],
+  );
 
   const handleExport = useCallback(async () => {
     if (!selectedModel?.geometryResult) return;
@@ -229,11 +210,10 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
       // the primary id space (idOffset 0) so node-extras expressIds stay
       // consistent with the from-meshes output. Everything else keeps the
       // from-meshes assembler over the meshes the viewer already holds.
-      // NOTE on fidelity: the on-screen load may skip small cuts / lower the
-      // tessellation tier; exporters deliberately re-mesh at full fidelity
-      // (the house rule - see GeometryProcessorOptions.skipSmallCuts). Only
-      // mergeLayers changes model CONTENT, so it forces the from-meshes path.
+      // Re-meshing uses full fidelity; merged layers and manual workspace
+      // placement require the current meshes to preserve their content/frame.
       const canUseSource =
+        !displayedTranslation(useViewerStore.getState().modelPlacement, selectedModelId).some((value) => value !== 0) &&
         colorSource === 'rendering' &&
         !mergeLayers &&
         idOffset === 0 &&
@@ -245,8 +225,11 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
       let glb: Uint8Array;
       if (canUseSource) {
         const bytes = new Uint8Array(await sourceFile.arrayBuffer());
-        const toLocal = (set: Set<number> | null | undefined): Uint32Array => {
-          if (!set || set.size === 0) return new Uint32Array();
+        // `null`/`undefined` (no filter) must stay distinct from an empty-but-active
+        // filter all the way to the wasm boundary — collapsing them here silently
+        // exported the whole model when isolation matched nothing (#4328 follow-up).
+        const toLocal = (set: Set<number> | null | undefined): Uint32Array | undefined => {
+          if (set == null) return undefined;
           const out: number[] = [];
           for (const g of set) {
             const local = g - idOffset;
@@ -254,8 +237,8 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
           }
           return new Uint32Array(out);
         };
-        const hidden = visibleOnly ? toLocal(getGlobalHiddenIds(selectedModelId)) : new Uint32Array();
-        const isolated = visibleOnly ? toLocal(getGlobalIsolatedIds(selectedModelId)) : new Uint32Array();
+        const hidden = visibleOnly ? (toLocal(getGlobalHiddenIds(selectedModelId)) ?? new Uint32Array()) : new Uint32Array();
+        const isolated = visibleOnly ? toLocal(getGlobalIsolatedIds(selectedModelId)) : undefined;
         const hiddenTypesCsv = visibleOnly
           ? [...buildHiddenIfcTypes(typeVisibility)].join(',')
           : '';
@@ -269,21 +252,38 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
           gp.dispose();
         }
       } else {
+        // GPU instancing stopped being primary-only on 2026-08-06 (#2255) — a
+        // federated model can carry instanced occurrences too, re-homed onto
+        // its own global id space at drain. `getAllInstancedMeshData()`
+        // returns every loaded model's occurrences unfiltered, so scope it to
+        // THIS model's `{ idOffset, maxExpressId }` bracket (both on
+        // `FederatedModel`) rather than the old primary-only gate, or a
+        // federation of N models would splice every other model's instanced
+        // entities into this one's export too. `federatedModel` is undefined
+        // only for the legacy `__legacy__` slot, which is provably the sole
+        // model loaded — nothing else to wrongly include, so `null` (no
+        // filter) is correct there (#2865/#2878 follow-up).
         const exportGeometry = withInstancedMeshes(
           selectedModel.geometryResult,
-          idOffset === 0,
+          federatedModel
+            ? { modelId: federatedModel.id, idOffset: federatedModel.idOffset ?? 0, maxExpressId: federatedModel.maxExpressId ?? 0 }
+            : null,
         );
         const globalHidden = visibleOnly ? getGlobalHiddenIds(selectedModelId) : undefined;
         const globalIsolated = visibleOnly ? getGlobalIsolatedIds(selectedModelId) : undefined;
         const hiddenIfcTypes = visibleOnly ? buildHiddenIfcTypes(typeVisibility) : undefined;
-        const hasIsolation = !!globalIsolated && globalIsolated.size > 0;
+        // `globalIsolated` is `null` for "no filter" vs an empty-but-non-null `Set`
+        // for "isolation active, matches nothing" (`resolveExportVisibility`) — a
+        // `.size > 0` check here would collapse the two and export the whole model
+        // when isolation matched nothing (#4328 follow-up). `!= null` catches both
+        // `null` (no filter) and `undefined` (`!visibleOnly`).
+        const hasIsolation = globalIsolated != null;
 
         const meshes = (exportGeometry.meshes as MeshData[])
           .filter((m) => {
-            // Instanced type-library duplicates (geometryClass 2) duplicate
-            // occurrence geometry at the origin; the from-bytes assembler
-            // excludes them (mesh_visible) and so must this path.
-            if (m.geometryClass === 2) return false;
+            // Instanced type-library duplicates repeat occurrence geometry at the
+            // origin; the from-bytes assembler excludes them (mesh_visible), as must this.
+            if (m.geometryClass === GEOM_CLASS_INSTANCED_TYPE) return false;
             if (!visibleOnly) return true;
             if (hiddenIfcTypes && m.ifcType && hiddenIfcTypes.has(m.ifcType)) return false;
             if (hasIsolation && !globalIsolated!.has(m.expressId)) return false;
@@ -382,7 +382,7 @@ export function GLBExportDialog({ trigger }: GLBExportDialogProps) {
             Export GLB File
           </DialogTitle>
           <DialogDescription>
-            Export the 3D model as binary glTF for use in other viewers and renderers
+            Export model geometry as binary glTF, including its current workspace placement
           </DialogDescription>
         </DialogHeader>
 

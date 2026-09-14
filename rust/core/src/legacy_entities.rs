@@ -7,6 +7,7 @@
 //! Maps deprecated IFC2x3/IFC4 entities (removed in IFC4x3) to their IFC4x3 equivalents.
 //! This allows parsing older IFC files without maintaining full multi-schema support.
 
+use crate::generated::legacy_attribute_names::LEGACY_ATTRIBUTE_NAMES;
 use crate::generated::IfcType;
 
 /// Information about a legacy entity
@@ -100,13 +101,75 @@ pub fn get_legacy_entity_info(entity_name: &str) -> Option<LegacyEntityInfo> {
         }),
 
         // IFC2x3 names that have no IFC4x3 enum variant. They map to the
-        // closest modern equivalent; both carry geometry.
+        // closest modern equivalent; all of them carry geometry.
+        //
+        // This block is the set `scripts/check-legacy-entity-coverage.mjs`
+        // derives: every CONCRETE `IfcProduct` subtype in `@ifc-lite/data`'s
+        // IFC2X3/IFC4 tables that `IfcType::from_str` resolves to `Unknown`.
+        // Anything missing here is dropped from BOTH the attribute export
+        // (`rust/export/src/model.rs` keeps only `is_subtype_of(IfcProduct)`,
+        // and `Unknown` is a subtype of nothing) and from meshing
+        // (`has_geometry_by_name` refuses `Unknown`) -- silent data loss, not
+        // a visible inconsistency (#3172).
         "IFCEQUIPMENTELEMENT" => Some(LegacyEntityInfo {
             base_type: IfcType::IfcDistributionElement,
             has_geometry: true,
         }),
-        "IFCELECTRICALDISTRIBUTIONPOINT" => Some(LegacyEntityInfo {
-            base_type: IfcType::IfcDistributionElement,
+        // Spelled IFCELECTRICALDISTRIBUTIONPOINT until #3172. There is no such
+        // IFC2X3 entity -- the real one has no "AL" -- so that arm matched no
+        // file that has ever existed. `IfcFlowController` is this entity's own
+        // IFC2X3 supertype and is still in IFC4X3, so it is the closest
+        // equivalent rather than a guess; it remains a subtype of
+        // `IfcDistributionElement`, which is what the misspelt arm intended.
+        "IFCELECTRICDISTRIBUTIONPOINT" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcFlowController,
+            has_geometry: true,
+        }),
+        // Its own IFC2X3 parent, which survives into IFC4X3. This said
+        // `IfcDistributionElement` on the reasoning that IFC4 deprecated it in
+        // favour of that family -- a claim that was asserted and never
+        // measured, and that contradicted the rule every other arm here
+        // follows. The bundled IFC2X3 table declares the parent as `IfcElement`
+        // (entities-ifc2x3.ts:559) and the entity carries no distribution
+        // attribute, so the wider mapping would also have relabelled it in the
+        // public `ifcType` and moved it to secondary render priority via
+        // `compute_is_simple`. Reported by Codex on #3178.
+        "IFCELECTRICALELEMENT" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcElement,
+            has_geometry: true,
+        }),
+        // The two concrete `IfcEdgeFeature` leaves, dropped by IFC4.
+        //
+        // `IfcFeatureElementSubtraction` is not merely AN ancestor that happens
+        // to work. It is the NEAREST SURVIVING one, and that is why these two
+        // need an arm at all: walking outward, their own parent is the first
+        // casualty and the very next link is the first survivor.
+        //
+        //     IfcEdgeFeature                 in ifc2x3, NOT in ifc4x3
+        //     IfcFeatureElementSubtraction   in ifc2x3, in ifc4x3   <- nearest
+        //
+        // Mapping there rather than to `IfcOpeningElement` also keeps them out
+        // of the void/CSG path, which matches `IfcType::IfcOpeningElement`
+        // exactly rather than by inheritance, while still excluding them from
+        // construction-projection profiles, which gate on
+        // `is_subtype_of(IfcFeatureElement)` -- the link directly above (#979).
+        "IFCCHAMFEREDGEFEATURE" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcFeatureElementSubtraction,
+            has_geometry: true,
+        }),
+        "IFCROUNDEDEDGEFEATURE" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcFeatureElementSubtraction,
+            has_geometry: true,
+        }),
+        // IFC4 folded the "Varying" structural actions into their base types,
+        // which carry the varying load on an attribute instead. Each maps to
+        // its own IFC2X3 supertype, both of which survive into IFC4X3.
+        "IFCSTRUCTURALLINEARACTIONVARYING" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcStructuralLinearAction,
+            has_geometry: true,
+        }),
+        "IFCSTRUCTURALPLANARACTIONVARYING" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcStructuralPlanarAction,
             has_geometry: true,
         }),
 
@@ -138,6 +201,45 @@ pub fn get_legacy_entity_info(entity_name: &str) -> Option<LegacyEntityInfo> {
     }
 }
 
+/// Own positional attribute names for a legacy (IFC2X3/IFC4, removed by
+/// IFC4X3) entity, read from `generated::legacy_attribute_names` — a table
+/// generated per schema version from the same EXPRESS-derived tables the
+/// TypeScript side reads (#4203) — rather than approximated from the entity's
+/// resolved [`get_legacy_entity_info`] base type.
+///
+/// The base type is NOT a safe substitute here: `IFCDOORSTYLE` (IFC2X3/IFC4)
+/// ends `[…, "OperationType", "ConstructionType", "ParameterTakesPrecedence",
+/// "Sizeable"]` while its resolved base type `IfcDoorType` (IFC4X3) ends
+/// `[…, "PredefinedType", "OperationType", "ParameterTakesPrecedence",
+/// "UserDefinedOperationType"]` — same length, different names from index 8
+/// on, so reusing the base type's names would rename `Sizeable`'s value to
+/// `UserDefinedOperationType` rather than merely drop it. `None` means the
+/// name is not a recognised legacy entity (including: it is a modern name the
+/// generated `IfcType` enum already resolves, which should call
+/// [`IfcType::attribute_names`] instead).
+pub fn legacy_attribute_names(entity_name: &str) -> Option<&'static [&'static str]> {
+    // Case-insensitive, same as `legacy_aware_ifc_type` (and every other
+    // legacy lookup in `schema_helpers.rs`): a STEP keyword is not guaranteed
+    // to arrive uppercase, and this table's caller (`render_attributes`)
+    // passes the raw keyword as written in the file, unnormalised. Reuses the
+    // SAME `normalise_uppercase` helper `legacy_aware_ifc_type` uses (rather
+    // than a second, divergent normalisation) so this and the DISPLAY-type
+    // resolver cannot disagree on case handling again — that disagreement
+    // used to make a lowercase legacy entity (`ifcproxy`) fall through to
+    // `IfcType::attribute_names()` on its resolved BASE type, silently
+    // relabelling its own attribute values under the base type's names
+    // instead of just dropping them (#4203 follow-up).
+    let entity_name = crate::schema_helpers::normalise_uppercase(entity_name);
+    // Linear scan, not `binary_search`: the table is sorted by the
+    // generator's JS `localeCompare`, which this crate has no obligation to
+    // match byte-for-byte, and a 285-row scan is not on any hot path (it
+    // fires once per legacy entity occurrence, not per attribute).
+    LEGACY_ATTRIBUTE_NAMES
+        .iter()
+        .find(|(k, _)| *k == entity_name.as_ref())
+        .map(|(_, v)| *v)
+}
+
 /// Check if an entity name is a known legacy entity
 pub fn is_legacy_entity(entity_name: &str) -> bool {
     get_legacy_entity_info(entity_name).is_some()
@@ -146,4 +248,73 @@ pub fn is_legacy_entity(entity_name: &str) -> bool {
 /// Get the IFC4x3 base type for a legacy entity, or None if not legacy
 pub fn map_legacy_to_base_type(entity_name: &str) -> Option<IfcType> {
     get_legacy_entity_info(entity_name).map(|info| info.base_type)
+}
+
+/// Every key of [`get_legacy_entity_info`]'s match arms, enumerable.
+///
+/// A `match` on string literals answers "is this name legacy?" but cannot be
+/// walked, and callers need to walk it: the cross-language rooted-type sweep
+/// (`rust/export/examples/dump_rooted_type_sweep.rs`) has to put every legacy
+/// name into its universe, or the gate is structurally blind to exactly the
+/// names the two languages are most likely to disagree on -- which is how the
+/// three stratum leaves stayed divergent (#3124 review). Rather than leave
+/// this as a second hand-maintained list that must agree with the match,
+/// `legacy_entity_names_match_the_lookup_arms` below re-derives the arm keys
+/// from this module's own source text and asserts set equality, so adding an
+/// arm without adding a name here fails the test.
+pub const LEGACY_ENTITY_NAMES: &[&str] = &[
+    "IFCPRESENTATIONSTYLEASSIGNMENT",
+    "IFCBEAMSTANDARDCASE",
+    "IFCCOLUMNSTANDARDCASE",
+    "IFCMEMBERSTANDARDCASE",
+    "IFCPLATESTANDARDCASE",
+    "IFCSLABSTANDARDCASE",
+    "IFCDOORSTANDARDCASE",
+    "IFCWINDOWSTANDARDCASE",
+    "IFCOPENINGSTANDARDCASE",
+    "IFCSLABELEMENTEDCASE",
+    "IFCWALLELEMENTEDCASE",
+    "IFCDOORSTYLE",
+    "IFCWINDOWSTYLE",
+    "IFCPROXY",
+    "IFCBUILDINGELEMENT",
+    "IFCBUILDINGELEMENTTYPE",
+    "IFCEQUIPMENTELEMENT",
+    "IFCELECTRICDISTRIBUTIONPOINT",
+    "IFCELECTRICALELEMENT",
+    "IFCCHAMFEREDGEFEATURE",
+    "IFCROUNDEDEDGEFEATURE",
+    "IFCSTRUCTURALLINEARACTIONVARYING",
+    "IFCSTRUCTURALPLANARACTIONVARYING",
+    "IFCSOLIDSTRATUM",
+    "IFCVOIDSTRATUM",
+    "IFCWATERSTRATUM",
+];
+
+#[cfg(test)]
+mod legacy_entity_name_tests {
+    use super::*;
+
+    /// The arm/const parity check that used to live here is now
+    /// `scripts/check-legacy-entity-coverage.mjs`, which already reads this
+    /// file to derive the arm keys and gained a `LEGACY_ENTITY_NAMES`
+    /// comparison to go with it.
+    ///
+    /// It moved because the only way to state it in-crate was `include_str!`
+    /// of this module's own source, which is a source-text assertion — banned
+    /// by AGENTS.md and flagged by `check-rust-source-text-assertions` (#3195).
+    /// The repo had already made the same call for
+    /// `check-clash-degenerate-reason-parity.mjs`: a claim about two SOURCES
+    /// belongs in a lint. The gate is also strictly stronger here, since it
+    /// fails on drift in BOTH directions and its own harness proves it cannot
+    /// pass by extracting nothing.
+    ///
+    /// Every listed name really is legacy -- the cheap direction, but it also
+    /// pins that the const holds arm keys and not, say, base-type names.
+    #[test]
+    fn every_listed_name_resolves_as_legacy() {
+        for &name in LEGACY_ENTITY_NAMES {
+            assert!(is_legacy_entity(name), "{name} is not a legacy entity");
+        }
+    }
 }

@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import type { ObjectCountSummary } from './objectCountSummary';
+
 /** Node types for the hierarchy tree */
 export type NodeType =
   | 'unified-storey'      // Grouped storey across models (multi-model only)
@@ -19,6 +21,8 @@ export type NodeType =
   | 'IfcBridgePart'       // IFC4.3 bridge part
   | 'IfcRoadPart'         // IFC4.3 road part
   | 'IfcRailwayPart'      // IFC4.3 railway part
+  | 'IfcMarinePart'       // IFC4.3 marine facility part
+  | 'IfcFacilityPartCommon' // IFC4.3 generic facility part
   | 'IfcSpace'            // Space node (net room area)
   | 'IfcSpatialZone'      // Spatial zone node (modelled gross area / GFA)
   | 'type-group'          // IFC class grouping header (e.g., "IfcWall (47)")
@@ -26,14 +30,32 @@ export type NodeType =
   | 'material-group'      // Material grouping (e.g., "Concrete (47)") from the Materials tab
   | 'group'               // IfcGroup/IfcSystem/IfcZone entity row from the Groups tab (#1622)
   | 'group-member'        // Member row under an expanded group (#1622)
+  | 'model-tag-group'     // Model-tag group header in the Models section's "By tag" view (#4215)
+  | 'other-group'         // "Other" bucket header for geometry-less physical elements (#4764)
   | 'element';            // Individual element
 
 export interface TreeNode {
   id: string;  // Unique ID for the node (can be composite)
   /** Local express IDs this node represents */
   expressIds: number[];
-  /** Federated global IDs for selection/visibility operations */
+  /**
+   * Federated global IDs for selection/visibility operations. For a
+   * `type-group`/`ifc-type` node, a geometry-less assembly member is
+   * substituted for its geometry-bearing `IfcRelAggregates` parts and the
+   * list is deduped — so it is NOT index-aligned with `expressIds`/
+   * `memberGlobalIds` (different length, different order). Use `globalIds`
+   * for "what to isolate / eye-toggle"; use `memberGlobalIds` (or
+   * `expressIds`) for "which entity is this row's Nth member".
+   */
   globalIds: number[];
+  /**
+   * Index-aligned with `expressIds`: each member's OWN global ID, never a
+   * substituted aggregated part. Only populated on grouping nodes
+   * (`type-group`, `ifc-type`) where `globalIds` above is not aligned —
+   * lets a click resolve "the first member of this group" to the group's
+   * own first entity instead of an arbitrary aggregated part of it.
+   */
+  memberGlobalIds?: number[];
   /** Structured entity expressId for selectable non-element nodes (for example IFC type entities) */
   entityExpressId?: number;
   /** Model IDs this node belongs to */
@@ -54,7 +76,26 @@ export interface TreeNode {
   hasChildren: boolean;
   isExpanded: boolean;
   isVisible: boolean; // Note: For storeys, computed lazily during render for performance
+  /**
+   * The badge number. On a spatial node it is a count of PHYSICAL OBJECTS THAT
+   * HAVE A SHAPE — see `objectCountSummary.ts` — not a count of the rows
+   * underneath it, which also list annotations and shapeless elements.
+   */
   elementCount?: number;
+  /**
+   * The breakdown behind `elementCount`, for the badge's hover card. Present
+   * on spatial nodes only; rows whose badge counts something else (a class's
+   * instances, a model's entities) leave it undefined and keep the plain
+   * wording.
+   */
+  countSummary?: ObjectCountSummary;
+  /**
+   * The badge's hover lines, ready to render — headline first, then only the
+   * breakdown lines that have something to say. Built here rather than in the
+   * component so the hover a user actually reads is part of the tree model and
+   * can be asserted through the same entry point as the number it explains.
+   */
+  countTooltipLines?: string[];
   storeyElevation?: number;
   /** Internal: ID offset for lazy visibility computation */
   _idOffset?: number;
@@ -67,6 +108,18 @@ export interface TreeNode {
    * frame / isolate the whole assembly at once (issue #1133).
    */
   assemblyChildGlobalIds?: number[];
+  /**
+   * True when this row is a physical element that is known to have no shape
+   * — its own Representation is `$` and, if it decomposes via
+   * `IfcRelAggregates`, none of its parts has one either. Set only once
+   * geometry is known (never during streaming, when absence is
+   * unanswerable — see `makeShapeTest`'s `geometryKnown` gate). The row
+   * renderer grays these out and the tree builders bucket them under an
+   * "Other" node instead of dropping them (#4764); the headline object
+   * count (`elementCount`) already excludes them via the shape test, so
+   * this flag changes only how a row is *shown*, never what is *counted*.
+   */
+  noGeometry?: boolean;
 }
 
 /** Data for a storey from a single model */
@@ -75,7 +128,10 @@ export interface StoreyData {
   storeyId: number;
   name: string;
   elevation: number;
+  /** Everything contained in the storey — what the tree lists. */
   elements: number[];
+  /** The object count and its breakdown — what a badge may show. */
+  objects: ObjectCountSummary;
 }
 
 /** Unified storey grouping storeys from multiple models */
@@ -84,7 +140,10 @@ export interface UnifiedStorey {
   name: string;
   elevation: number;
   storeys: StoreyData[];
+  /** Contained entities across every contributing model — rows, not objects. */
   totalElements: number;
+  /** The object count and its breakdown, summed across contributing models. */
+  objects: ObjectCountSummary;
 }
 
 /**
@@ -121,5 +180,11 @@ const SPATIAL_CONTAINER_TYPES: Set<NodeType> = new Set([
   'IfcBridgePart',
   'IfcRoadPart',
   'IfcRailwayPart',
+  'IfcMarinePart',
+  'IfcFacilityPartCommon',
 ]);
 export const isSpatialContainer = (type: NodeType): boolean => SPATIAL_CONTAINER_TYPES.has(type);
+
+/** Rows muted because they represent known geometry-less physical objects. */
+export const isNoGeometryNode = (node: TreeNode): boolean =>
+  node.noGeometry === true || node.type === 'other-group';

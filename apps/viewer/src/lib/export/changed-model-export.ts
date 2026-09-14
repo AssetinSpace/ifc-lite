@@ -17,6 +17,8 @@
  */
 
 import { StepExporter, Ifc5Exporter } from '@ifc-lite/export';
+import { prepareAppearanceSerialization } from '../appearance/serialization.js';
+import { packagePortableIfcAsync } from './portable-ifc.js';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import { spliceScheduleIntoExport } from '@/sdk/adapters/export-schedule-splice';
@@ -39,7 +41,8 @@ export async function exportChangedModelToStep(
   view: MutablePropertyView | undefined,
   invocation: StepExportInvocation,
 ): Promise<ChangesExportArtifact> {
-  const exporter = new StepExporter(dataStore, view);
+  const serialized = prepareAppearanceSerialization(modelId, dataStore, view);
+  const exporter = new StepExporter(dataStore, serialized.view);
   const result = await exporter.exportAsync({
     schema: invocation.schema,
     includeGeometry: true,
@@ -55,7 +58,7 @@ export async function exportChangedModelToStep(
     content = spliceScheduleIntoExport({ content }, modelId, dataStore, invocation.scheduleState).content;
   }
 
-  return { content, ext: 'ifc', mime: 'text/plain' };
+  return packagePortableIfcAsync(modelId, content, serialized.resources);
 }
 
 /**
@@ -66,14 +69,25 @@ export async function exportChangedModelToStep(
  * without loading the browser renderer.
  */
 export async function exportChangedModelToIfcx(
-  _modelId: string,
+  modelId: string,
   dataStore: IfcDataStore,
   view: MutablePropertyView | undefined,
   invocation: IfcxExportInvocation,
 ): Promise<ChangesExportArtifact> {
   const { withInstancedMeshes } = await import('../../utils/instancedExport.js');
+  // GPU instancing stopped being primary-only on 2026-08-06 (#2255) — scope by
+  // THIS model's `{ idOffset, maxExpressId }` bracket rather than an
+  // `idOffset === 0` gate, or a federation of N models would splice every
+  // other model's instanced entities into this one's export.
+  // `invocation.maxExpressId` is undefined only for the legacy slot, which is
+  // provably the sole model loaded (#2865/#2878 follow-up).
   const exportGeometry = invocation.geometryResult
-    ? withInstancedMeshes(invocation.geometryResult, invocation.idOffset === 0)
+    ? withInstancedMeshes(
+        invocation.geometryResult,
+        invocation.maxExpressId !== undefined
+          ? { modelId, idOffset: invocation.idOffset, maxExpressId: invocation.maxExpressId }
+          : null,
+      )
     : invocation.geometryResult;
 
   const exporter = new Ifc5Exporter(dataStore, exportGeometry, view, invocation.idOffset);
@@ -82,6 +96,9 @@ export async function exportChangedModelToIfcx(
     includeProperties: true,
     applyMutations: true,
     visibleOnly: false,
+    // A recipient's room model is keyed by room path; `buildChangedArtifacts`
+    // resolves the slot to drop so the file carries its own paths (#4444).
+    stripPathPrefix: invocation.stripPathPrefix,
     // A round-trip "export my edits" should not silently drop properties that
     // lack an official IFC5 schema, so keep full fidelity here. (The Export
     // dialog exposes this as a user toggle that defaults to on; the one-click

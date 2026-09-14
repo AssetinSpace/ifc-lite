@@ -9,6 +9,7 @@
 //! Note: The IfcType enum is renamed to FullIfcType to avoid conflicts
 //! with the main schema::IfcType enum.
 
+pub mod legacy_attribute_names;
 mod schema;
 mod type_ids;
 
@@ -16,4 +17,4 @@ mod type_ids;
 pub use type_ids::*;
 
 // Re-export the generated IfcType directly (this is now the canonical schema)
-pub use schema::IfcType;
+pub use schema::{IfcType, ALL as IFC_TYPES};

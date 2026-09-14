@@ -3,11 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import {
+  Move3D,
   ChevronRight,
   Layers,
   Eye,
   EyeOff,
   FileBox,
+  RefreshCw,
   X,
   // >>> AIM-FORK: ikonky AIM badge (D-077)
   FileText,
@@ -19,10 +21,13 @@ import {
 import type { AimTreeDecoration } from '@/aim/bridge-protocol';
 // <<< AIM-FORK
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { openRepositionModels } from '@/lib/model-placement/commands';
 import { cn } from '@/lib/utils';
-import type { TreeNode } from './types';
-import { isSpatialContainer } from './types';
+import { isNoGeometryNode, isSpatialContainer, type TreeNode } from './types';
+import { CountBadgeTooltip } from './CountBadgeTooltip';
 import { IFC_ICON_CODEPOINTS, IFC_ICON_DEFAULT } from './ifc-icons';
+import { ModelRowTags } from './ModelRowTags';
+import { ModelTagGroupRow } from './ModelTagGroupRow';
 
 /**
  * Resolve the Material Symbols code point for a given IFC type string.
@@ -52,10 +57,16 @@ export interface HierarchyNodeProps {
   onVisibilityToggle: (node: TreeNode) => void;
   onModelVisibilityToggle: (modelId: string, e: React.MouseEvent) => void;
   onRemoveModel: (modelId: string, e: React.MouseEvent) => void;
+  onSyncSourceModel?: (modelId: string, e: React.MouseEvent) => void;
   onModelHeaderClick: (modelId: string, nodeId: string, hasChildren: boolean) => void;
+<<<<<<< HEAD
   // >>> AIM-FORK: per-GUID badge counts z AIM hosta (D-077); undefined = bez badge
   aimDecoration?: AimTreeDecoration;
   // <<< AIM-FORK
+=======
+  sourceBacked?: boolean;
+  sourceSyncing?: boolean;
+>>>>>>> upstream/main
 }
 
 export function HierarchyNode({
@@ -71,10 +82,16 @@ export function HierarchyNode({
   onVisibilityToggle,
   onModelVisibilityToggle,
   onRemoveModel,
+  onSyncSourceModel,
   onModelHeaderClick,
+<<<<<<< HEAD
   // >>> AIM-FORK
   aimDecoration,
   // <<< AIM-FORK
+=======
+  sourceBacked = false,
+  sourceSyncing = false,
+>>>>>>> upstream/main
 }: HierarchyNodeProps) {
   const resolvedType = node.ifcType || node.type;
   // Use Lucide icon for non-IFC structural nodes, Material Symbols for IFC classes
@@ -91,11 +108,13 @@ export function HierarchyNode({
     node.type === 'unified-storey' ||
     node.type === 'type-group' ||
     node.type === 'material-group' ||
-    node.type === 'group'
+    node.type === 'group' ||
+    node.type === 'other-group'
       ? 'font-medium text-zinc-900 dark:text-zinc-100'
       : 'text-zinc-700 dark:text-zinc-300';
   const strikeWhenHidden = nodeHidden && 'line-through decoration-zinc-400 dark:decoration-zinc-600';
-
+  const noGeometry = isNoGeometryNode(node);
+  if (node.type === 'model-tag-group') return <ModelTagGroupRow node={node} virtualRow={virtualRow} />;
   // Model header nodes (for visibility control and expansion)
   if (node.type === 'model-header' && node.id.startsWith('model-')) {
     const modelId = node.modelIds[0];
@@ -144,7 +163,12 @@ export function HierarchyNode({
               {node.elementCount.toLocaleString()}
             </span>
           )}
+          <ModelRowTags modelId={modelId} modelName={node.name} />
 
+          <button className="p-0.5" aria-label={`Reposition model ${node.name}`} title="Reposition model"
+            onClick={(event) => { event.stopPropagation(); openRepositionModels([modelId]); }}>
+            <Move3D className="h-3.5 w-3.5" />
+          </button>
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -166,6 +190,37 @@ export function HierarchyNode({
               <p className="text-xs">{modelVisible ? 'Hide model' : 'Show model'}</p>
             </TooltipContent>
           </Tooltip>
+
+          {sourceBacked && onSyncSourceModel && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSyncSourceModel(modelId, e);
+                  }}
+                  aria-label={`Sync model ${node.name} from source`}
+                  className={cn(
+                    'p-0.5 opacity-0 group-hover:opacity-100 transition-opacity',
+                    sourceSyncing && 'opacity-100',
+                  )}
+                  disabled={sourceSyncing}
+                >
+                  <RefreshCw
+                    className={cn(
+                      'h-3.5 w-3.5 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100',
+                      sourceSyncing && 'animate-spin',
+                    )}
+                  />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p className="text-xs">
+                  {sourceSyncing ? 'Syncing model…' : 'Sync from source'}
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          )}
 
           {modelsCount > 1 && (
             <Tooltip>
@@ -213,7 +268,7 @@ export function HierarchyNode({
                 'cursor-pointer',
                 isSelected ? 'border-l-primary font-medium selected' : 'border-transparent'
               ),
-          nodeHidden && 'opacity-50 grayscale'
+          (nodeHidden || noGeometry) && 'opacity-50 grayscale'
         )}
         style={{
           paddingLeft: `${node.depth * 16 + 8}px`,
@@ -380,33 +435,11 @@ export function HierarchyNode({
               </span>
             </TooltipTrigger>
             <TooltipContent>
-              <p className="text-xs">{node.elementCount.toLocaleString()} {node.elementCount === 1 ? 'element' : 'elements'}</p>
+              <CountBadgeTooltip elementCount={node.elementCount} lines={node.countTooltipLines} summary={node.countSummary} />
             </TooltipContent>
           </Tooltip>
         )}
       </div>
-    </div>
-  );
-}
-
-export interface SectionHeaderProps {
-  icon: React.ElementType;
-  title: string;
-  count?: number;
-}
-
-export function SectionHeader({ icon: IconComponent, title, count }: SectionHeaderProps) {
-  return (
-    <div className="flex items-center gap-2 px-3 py-2 bg-zinc-100 dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-800">
-      <IconComponent className="h-3.5 w-3.5 text-zinc-500" />
-      <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-600 dark:text-zinc-400">
-        {title}
-      </span>
-      {count !== undefined && (
-        <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500 ml-auto">
-          {count}
-        </span>
-      )}
     </div>
   );
 }

@@ -19,20 +19,23 @@ import {
   Database,
   Building2,
   Ruler,
+  BookMarked,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { PropertySetCard } from './PropertySetCard';
 import { GeoreferencingPanel } from './GeoreferencingPanel';
 import type { PropertySet } from './encodingUtils';
 import type { FederatedModel } from '@/store/types';
-import { extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
+import { extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, extractClassificationSystemsOnDemand, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
+import { computeModelStats } from './modelMetadataStats';
 
 /** Model metadata panel - displays file info, schema version, entity counts, etc. */
 export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
   const dataStore = model.ifcDataStore;
   // Display-unit converter overrides (issue #1573 proposal 2).
   const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
+  const fromGlobalId = useViewerStore((s) => s.fromGlobalId);
 
   // Format file size
   const formatFileSize = (bytes: number): string => {
@@ -71,18 +74,26 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
     return { name, globalId, description, properties };
   }, [dataStore]);
 
-  // Count storeys and elements
-  const stats = useMemo(() => {
-    if (!dataStore?.spatialHierarchy) {
-      return { storeys: 0, elementsWithGeometry: 0 };
-    }
-    const storeys = dataStore.spatialHierarchy.byStorey.size;
-    let elementsWithGeometry = 0;
-    for (const elements of dataStore.spatialHierarchy.byStorey.values()) {
-      elementsWithGeometry += (elements as number[]).length;
-    }
-    return { storeys, elementsWithGeometry };
-  }, [dataStore]);
+  // Count storeys and elements — see `modelMetadataStats.ts` for what
+  // "Elements with Geometry" means and why raw `byStorey` membership isn't it.
+  const stats = useMemo(
+    () => computeModelStats(dataStore, model.geometryResult, {
+      // A completed cache hit may validly contain no geometry result. That is
+      // a known-empty model, unlike the same null while streaming.
+      geometryReady:
+        model.geometryResult != null ||
+        model.loadState === 'complete' ||
+        model.geometryLoadState === 'complete',
+      toLocalId: (globalId) => {
+        if (model.id === 'legacy' || model.id === 'default' || model.id === '__legacy__') {
+          return globalId;
+        }
+        const ref = fromGlobalId(globalId);
+        return ref?.modelId === model.id ? ref.expressId : undefined;
+      },
+    }),
+    [dataStore, fromGlobalId, model.geometryLoadState, model.geometryResult, model.id, model.loadState],
+  );
 
   // Extract georeferencing info
   const georef = useMemo(() => {
@@ -108,6 +119,18 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
   const projectUnits = useMemo(() => {
     if (!dataStore?.source?.length || !dataStore?.entityIndex) return ProjectUnits.empty();
     return extractProjectUnits(dataStore.source, dataStore.entityIndex);
+  }, [dataStore]);
+
+  // Classification systems used in THIS model (e.g. Uniclass, OmniClass, a
+  // national system — a model can carry several at once). Walks only the
+  // handful of IfcClassification entities via the byType index, so it's
+  // cheap even on large models — not a per-element scan. `unresolved` means
+  // the model HAS classification systems but this store (server-parsed, no
+  // source bytes) can't read their names — distinct from "genuinely none"
+  // (#3948); `names` is always `[]` in that case.
+  const classificationSystems = useMemo(() => {
+    if (!dataStore) return { names: [], unresolved: false };
+    return extractClassificationSystemsOnDemand(dataStore as IfcDataStore);
   }, [dataStore]);
 
   return (
@@ -232,8 +255,10 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
             {/* Project Properties */}
             {projectData.properties.length > 0 && (
               <div className="p-3 pt-0 space-y-2">
-                {projectData.properties.map((pset) => (
-                  <PropertySetCard key={pset.name} pset={pset} projectUnits={projectUnits} unitDisplayOverrides={unitDisplayOverrides} />
+                {projectData.properties.map((pset, index) => (
+                  // Pset names are not unique per entity (two IfcPropertySet
+                  // entities may legitimately share a Name); index disambiguates.
+                  <PropertySetCard key={`${pset.name}-${index}`} pset={pset} projectUnits={projectUnits} unitDisplayOverrides={unitDisplayOverrides} />
                 ))}
               </div>
             )}
@@ -276,6 +301,39 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
                 {model.maxExpressId.toLocaleString()}
               </span>
             </div>
+          </div>
+        </div>
+
+        {/* Classification Systems — lists every system found in this
+            model (not just one), matching the request that a model can
+            carry several (Uniclass, OmniClass, a national system, ...). */}
+        <div className="border-b border-zinc-200 dark:border-zinc-800">
+          <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
+            <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
+              Classification Systems
+            </h4>
+          </div>
+          <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
+            {classificationSystems.unresolved ? (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs text-zinc-500">Classification systems present, but unavailable on this data source</span>
+              </div>
+            ) : classificationSystems.names.length === 0 ? (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs text-zinc-500">No classification systems</span>
+              </div>
+            ) : (
+              classificationSystems.names.map((system) => (
+                <div key={system} className="flex items-center gap-3 px-3 py-2">
+                  <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                  <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100">
+                    {system}
+                  </span>
+                </div>
+              ))
+            )}
           </div>
         </div>
 
