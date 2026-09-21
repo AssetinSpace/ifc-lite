@@ -20,10 +20,11 @@ use nalgebra::{Point3, Vector3};
 use std::sync::OnceLock;
 
 fn t_alignment_curve() -> IfcType {
-    // IfcAlignmentCurve is an IFC4X1-only entity; the codegen targets
-    // IFC4X3 so it's not in the enum. Resolve by name and cache.
+    // IfcAlignmentCurve is IFC4X1-only. The supported-schema enum retains its
+    // exact variant; keep this cached name lookup aligned with sibling helpers.
     static T: OnceLock<IfcType> = OnceLock::new();
-    *T.get_or_init(|| IfcType::from_str("IFCALIGNMENTCURVE"))
+    T.get_or_init(|| IfcType::from_str("IFCALIGNMENTCURVE"))
+        .clone()
 }
 
 /// IfcAlignment processor — emits a ribbon polyline mesh.

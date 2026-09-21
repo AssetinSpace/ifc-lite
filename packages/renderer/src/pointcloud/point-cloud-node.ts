@@ -276,10 +276,28 @@ function appendPointSubBuffer(
   // Pre-allocate the per-point deviation buffer (zero-initialised).
   // Bound as a vertex attribute by the splat pipeline AND as a
   // storage buffer by the deviation compute pass.
-  const deviationBuffer = device.createBuffer({
-    size: count * 4,
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
+  //
+  // This allocation is paired with `vertexBuffer` above: if it throws
+  // (e.g. OOM — the whole reason this upload is split into sub-buffers
+  // in the first place, see appendChunkToNode), `vertexBuffer` would
+  // otherwise be orphaned — created and written, but never referenced
+  // again and never destroyed. Free it before propagating the error.
+  let deviationBuffer: GPUBuffer;
+  try {
+    deviationBuffer = device.createBuffer({
+      size: count * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+  } catch (err) {
+    try {
+      vertexBuffer.destroy();
+    } catch (destroyErr) {
+      // Non-fatal: surfaced rather than swallowed, per the no-silent-catch
+      // house rule — this firing would mean a real teardown bug.
+      console.warn('[PointCloud] failed to release vertexBuffer after a paired allocation failure', destroyErr);
+    }
+    throw err;
+  }
   // Zero-init explicitly — WebGPU spec doesn't promise zeroed buffers
   // and some implementations skip the initial clear when STORAGE is set.
   device.queue.writeBuffer(deviationBuffer, 0, new Float32Array(count));
@@ -344,4 +362,17 @@ function growBounds(
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Destroy all nodes, or only assets belonging to one ingestion owner. */
+export function clearOwnedPointCloudNodes<Owner extends string>(
+  nodes: Map<number, PointCloudNode>, owners: Map<number, Owner>, owner?: Owner,
+): void {
+  for (const [id, node] of nodes) {
+    if (owner !== undefined && owners.get(id) !== owner) continue;
+    destroyNode(node);
+    nodes.delete(id);
+    owners.delete(id);
+  }
+  if (owner === undefined) owners.clear();
 }

@@ -7,6 +7,7 @@
  */
 
 import { useEffect, useCallback, useRef } from 'react';
+import { replayWorkspaceHistory } from '@/lib/model-placement/history';
 import { useViewerStore } from '@/store';
 import { resetVisibilityForHomeFromStore } from '@/store/homeView';
 import { workspacePanelForShortcutCode } from '@/lib/panels/registry';
@@ -58,6 +59,17 @@ export function useKeyboardShortcuts(options: KeyboardShortcutsOptions = {}) {
   const cancelMeasurement = useViewerStore((s) => s.cancelMeasurement);
   const clearMeasurements = useViewerStore((s) => s.clearMeasurements);
   const toggleSnap = useViewerStore((s) => s.toggleSnap);
+  // Polyline (multi-click) mode (#2199).
+  const activePolyline = useViewerStore((s) => s.activePolyline);
+  const cancelPolyline = useViewerStore((s) => s.cancelPolyline);
+  // Angle (fixed-count multi-click) mode (#2735).
+  const activeAngle = useViewerStore((s) => s.activeAngle);
+  const cancelAngle = useViewerStore((s) => s.cancelAngle);
+  const finishPolyline = useViewerStore((s) => s.finishPolyline);
+  // Radius (unbounded multi-click) mode (#2737 item 2).
+  const activeRadius = useViewerStore((s) => s.activeRadius);
+  const cancelRadius = useViewerStore((s) => s.cancelRadius);
+  const finishRadius = useViewerStore((s) => s.finishRadius);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     // Ignore if typing in an input or textarea
@@ -73,16 +85,10 @@ export function useKeyboardShortcuts(options: KeyboardShortcutsOptions = {}) {
     const key = eventKey(e);
     if (key === null) return;
 
-    // Undo / Redo — Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z, scoped to the
-    // active model's mutation stack. Always available regardless
-    // of edit mode so the user can recover from any change.
+    // Workspace moves interleave with active-model authoring history.
     if (key === 'z' && ctrl) {
       e.preventDefault();
-      const state = useViewerStore.getState();
-      const activeModelId = state.activeModelId;
-      if (!activeModelId) return;
-      if (shift) state.redo(activeModelId);
-      else state.undo(activeModelId);
+      replayWorkspaceHistory(useViewerStore.getState(), shift ? 'redo' : 'undo');
       return;
     }
 
@@ -275,10 +281,75 @@ export function useKeyboardShortcuts(options: KeyboardShortcutsOptions = {}) {
 
     // Measure tool shortcuts
     if (activeTool === 'measure') {
-      // Cancel active measurement with ESC
+      // Cancel active drag measurement with ESC
       if (key === 'escape' && activeMeasurement) {
         e.preventDefault();
         cancelMeasurement();
+        return;
+      }
+      // Cancel an in-progress polyline sequence with ESC (#2199) — discards
+      // it entirely, same as Escape already does for a drag in progress.
+      // Checked as its own branch (not merged with the one above) because
+      // the two are mutually exclusive: exactly one of activeMeasurement /
+      // activePolyline can be non-null at a time.
+      if (key === 'escape' && activePolyline) {
+        e.preventDefault();
+        cancelPolyline();
+        return;
+      }
+      // Same for a part-finished angle sequence (#2735). Its own branch for
+      // the same reason: at most one of activeMeasurement / activePolyline /
+      // activeAngle is non-null at a time, and merging them would hide that.
+      // No Enter counterpart - an angle finishes itself on its last pick, so
+      // there is no "finish early" state to confirm.
+      if (key === 'escape' && activeAngle) {
+        e.preventDefault();
+        cancelAngle();
+        return;
+      }
+      // Same for a part-finished radius sequence (#2737 item 2) — the same
+      // "own branch, mutually exclusive with the others" reasoning as angle
+      // above applies.
+      if (key === 'escape' && activeRadius) {
+        e.preventDefault();
+        cancelRadius();
+        return;
+      }
+      // Finish an in-progress polyline as OPEN with Enter (#2199) — reports
+      // the sum-of-segments length, not a perimeter. Closing the loop is a
+      // click gesture, not a keyboard one (see handlePolylineClick).
+      //
+      // finishPolyline is a no-op below its point minimum (2 open / 3
+      // closed) — most reachable right after a single click, since Enter
+      // can't fire before startPolyline runs. Its return value says whether
+      // it actually recorded anything; when it didn't, surface a toast
+      // instead of leaving Enter a silent, indistinguishable-from-working
+      // dead keypress. The sequence itself is left in progress (not
+      // cancelled) — same "reject and let the user keep going" choice
+      // `commitAddElementSlabPolygon` above makes for the analogous
+      // too-few-points case.
+      if (key === 'enter' && activePolyline) {
+        e.preventDefault();
+        if (!finishPolyline(false)) {
+          // Lazy import keeps toast out of the keyboard hook's synchronous
+          // bundle, same as the addElement branch above.
+          import('@/components/ui/toast').then(({ toast }) => {
+            toast.error('Polyline needs at least 2 points');
+          });
+        }
+        return;
+      }
+      // Finish an in-progress radius sequence with Enter (#2737 item 2) —
+      // the same explicit-finish gesture polyline uses, for the same reason
+      // (see the ActiveRadius doc comment in store/types.ts): radius has no
+      // fixed pick count for the store to finish itself on.
+      if (key === 'enter' && activeRadius) {
+        e.preventDefault();
+        if (!finishRadius()) {
+          import('@/components/ui/toast').then(({ toast }) => {
+            toast.error('Radius needs at least 3 points');
+          });
+        }
         return;
       }
       // Clear all measurements with Ctrl+C or Cmd+C
@@ -357,6 +428,10 @@ export function useKeyboardShortcuts(options: KeyboardShortcutsOptions = {}) {
     clearMeasurements,
     toggleSnap,
     toggleEditEnabled,
+    activePolyline, activeAngle, cancelAngle,
+    cancelPolyline,
+    finishPolyline,
+    activeRadius, cancelRadius, finishRadius,
   ]);
 
   useEffect(() => {
@@ -368,39 +443,3 @@ export function useKeyboardShortcuts(options: KeyboardShortcutsOptions = {}) {
     };
   }, [enabled, handleKeyDown]);
 }
-
-// Export shortcut definitions for UI display
-export const KEYBOARD_SHORTCUTS = [
-  { key: 'Ctrl+Z / Cmd+Z', description: 'Undo last authoring change for the active model', category: 'Editing' },
-  { key: 'Ctrl+Shift+Z / Cmd+Shift+Z', description: 'Redo last undone change', category: 'Editing' },
-  { key: 'V', description: 'Select tool', category: 'Tools' },
-  { key: 'C', description: 'Walk mode', category: 'Tools' },
-  { key: 'M', description: 'Measure tool', category: 'Tools' },
-  { key: 'P', description: 'Annotate tool — drop a pin with a note', category: 'Tools' },
-  { key: 'X', description: 'Section tool', category: 'Tools' },
-  { key: 'E', description: 'Toggle edit mode (unlocks property + geometry edits)', category: 'Tools' },
-  { key: 'K', description: 'Split the selected entity (requires a selection)', category: 'Tools' },
-  { key: 'R / Shift+R', description: 'Rotate selected entity ±15° about Z (requires edit mode)', category: 'Tools' },
-  { key: 'S', description: 'Toggle snapping (Measure tool)', category: 'Tools' },
-  { key: 'Esc', description: 'Cancel measurement (Measure tool)', category: 'Tools' },
-  { key: 'Ctrl+C', description: 'Clear measurements (Measure tool)', category: 'Tools' },
-  { key: 'I', description: 'Isolate (set basket from current context)', category: 'Visibility' },
-  { key: '=', description: 'Set basket from current context', category: 'Visibility' },
-  { key: '+', description: 'Add current context to basket', category: 'Visibility' },
-  { key: '−', description: 'Remove current context from basket', category: 'Visibility' },
-  { key: 'D', description: 'Toggle basket presentation dock', category: 'Visibility' },
-  { key: 'B', description: 'Save basket as presentation view', category: 'Visibility' },
-  { key: 'Del / Space', description: 'Hide selection', category: 'Visibility' },
-  { key: 'A', description: 'Show all (clear filters and basket)', category: 'Visibility' },
-  { key: 'H', description: 'Home (isometric + reset visibility)', category: 'Camera' },
-  { key: 'Z', description: 'Fit all (zoom extents)', category: 'Camera' },
-  { key: 'F', description: 'Frame selection', category: 'Camera' },
-  { key: '1-6', description: 'Preset views', category: 'Camera' },
-  { key: 'T', description: 'Toggle theme', category: 'UI' },
-  { key: 'Alt+1…0', description: 'Open a panel from the rail (Info, Compare, BCF, IDS, Lens, Clash, Extensions; Script, Schedule, Lists open at the bottom)', category: 'UI' },
-  { key: 'Alt+\\', description: 'Toggle sidebar (expand ⇄ collapse to icons)', category: 'UI' },
-  { key: 'Esc', description: 'Reset all (clear selection, basket, isolation)', category: 'Selection' },
-  { key: 'Esc Esc', description: 'Close all panels (return to starting view)', category: 'UI' },
-  { key: 'Ctrl+K', description: 'Command palette', category: 'UI' },
-  { key: '?', description: 'Show info panel', category: 'Help' },
-] as const;

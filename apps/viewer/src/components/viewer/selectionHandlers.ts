@@ -5,9 +5,10 @@
 /**
  * Selection handler functions extracted from useMouseControls.
  * Handles click/double-click selection and context menu interactions.
- * Pure functions that operate on a MouseHandlerContext — no React dependency.
+ * Pure functions operating on a MouseHandlerContext — no React dependency.
  */
-
+import { isTouchSelectionClick, selectViewportTarget } from './referenceSelection.js';
+import type { PickResult } from '@ifc-lite/renderer';
 import type { MouseHandlerContext } from './mouseHandlerTypes.js';
 import { worldToIfcMetres } from '@ifc-lite/drawing-underlay';
 import { useViewerStore } from '@/store';
@@ -15,6 +16,15 @@ import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { fromGlobalIdFromModels, toGlobalIdFromModels } from '@/store/globalId';
 import { pointInPolygon } from '@/lib/polygon-clip';
 import { toast } from '@/components/ui/toast';
+import { notifyWallSplit } from './wallSplitNotice.js';
+import { raycastForPolylinePoint, isNearPolylineStart,
+  isDuplicateClickPoint,
+} from './measureHandlers.js';
+import { pickViewportAppearanceFace, viewportFacePickError } from './appearance/face-mask/viewport-face-picker.js';
+import { displayedTranslation, placementFor } from '@/lib/model-placement/state.js';
+import { resolve as translate } from '@/i18n/registry';
+import { fromRenderTranslation, toRenderTranslation, type Translation } from '@/lib/model-placement/translation.js';
+import { modelPointToWorkspacePoint, workspacePointToModelFrame } from '@/lib/model-placement/rotation.js';
 
 /**
  * Handle click event for selection (single click and double click).
@@ -26,6 +36,7 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
   const tool = ctx.activeToolRef.current;
+  if (isTouchSelectionClick(canvas, e, x, y)) return;
 
   // Skip selection if user was dragging (orbiting/panning)
   if (mouseState.didDrag) {
@@ -37,9 +48,27 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
     return;
   }
 
-  // Measure tool now uses drag interaction (see mousedown/mousemove/mouseup)
+  if (tool === 'appearance-face') {
+    const message = viewportFacePickError(pickViewportAppearanceFace(renderer.raycastScene(x, y, ctx.getPickOptions())?.intersection ?? null));
+    if (message) toast.error(translate(message));
+    return;
+  }
+
+  // Measure tool: drag mode uses mousedown/mousemove/mouseup (see
+  // measureHandlers.ts) and never reaches here. Polyline mode (#2199) is the
+  // opposite — it does nothing on mousedown/drag, so a click is the ONLY
+  // gesture that adds a point, which is what makes the two modes unable to
+  // corrupt each other's state (see `setMeasureMode` in measurementSlice.ts).
   if (tool === 'measure') {
-    return; // Skip click handling for measure tool
+    const mode = useViewerStore.getState().measureMode;
+    if (mode === 'polyline') {
+      handlePolylineClick(ctx, x, y);
+    } else if (mode === 'angle') {
+      handleAngleClick(ctx, x, y);
+    } else if (mode === 'radius') {
+      handleRadiusClick(ctx, x, y);
+    }
+    return;
   }
 
   // Drawing-underlay calibration (D-072): while a 2-point calibration is
@@ -160,7 +189,7 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
         toast.error("Couldn't read cut point");
         return;
       }
-      const cursorIfc = rendererPointToIfcStoreyLocal(cutPoint);
+      const cursorIfc = rendererPointToIfcStoreyLocal(cutPoint, targetModelId);
       const result = state.splitSlabByLine(
         targetModelId,
         targetExpressId,
@@ -192,15 +221,13 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
       if (wallTry.ok) {
         state.clearSplitHover();
         state.setSelectedEntityId(wallTry.right.globalId);
-        // Mention opening reassignment in the toast only when it
-        // happened — silence is preferable to "0 openings moved"
-        // for a wall with no doors / windows.
-        const op = wallTry.openings;
-        const opSummary =
-          op.toLeft + op.toRight > 0
-            ? ` (${op.toLeft + op.toRight} opening${op.toLeft + op.toRight === 1 ? '' : 's'} reassigned)`
-            : '';
-        toast.success(`Wall split${opSummary} — Ctrl+Z to undo`);
+        // Both wall-split commit paths — here and the Split tool's
+        // numeric-distance panel — announce the split through the same
+        // emitter (`wallSplitNotice.ts`), so a notice added to one cannot
+        // go missing from the other. That is exactly how `openings.skipped`
+        // stayed silent on the typed-distance path after #3023 taught this
+        // one to report it.
+        notifyWallSplit(wallTry.openings);
         return;
       }
       const linearTry = state.splitLinearElementAtDistance(
@@ -219,16 +246,25 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
     // Fall through to the slab path: first click latches the
     // anchor, second click (handled above) commits. Anchor lands
     // on the source slab's storey floor (not the global active
-    // storey) — `slabFootprint.storeyElevation` is already the
-    // exact value we need, so pass it through directly.
+    // storey). The RAYCAST plane, unlike the anchor value stored
+    // below, has to be placement-aware (#4932 follow-up): the second
+    // click's plane already goes through `resolveSlabFloorY`, which
+    // adds the model's vertical translation, so this first click used
+    // a DIFFERENT (un-placed) plane than the second — on a vertically
+    // repositioned slab under an oblique camera the two clicks would
+    // raycast against different heights and the anchor would land off
+    // from where the cursor actually was. `resolveSlabFloorY` reads
+    // the same underlying elevation `slabFootprint.storeyElevation`
+    // does, so this is the same value made symmetric, not a new one.
     const slabFootprint = state.readSlabFootprint(targetModelId, targetExpressId);
     if (slabFootprint) {
-      const anchorPoint = raycastStoreyFloor(ctx, x, y, slabFootprint.storeyElevation);
+      const anchorPlaneY = resolveSlabFloorY(targetModelId, targetExpressId) ?? slabFootprint.storeyElevation;
+      const anchorPoint = raycastStoreyFloor(ctx, x, y, anchorPlaneY);
       if (!anchorPoint) {
         toast.error("Couldn't read anchor point");
         return;
       }
-      const anchorIfc = rendererPointToIfcStoreyLocal(anchorPoint);
+      const anchorIfc = rendererPointToIfcStoreyLocal(anchorPoint, targetModelId);
       state.setSlabCutAnchor(
         [anchorIfc[0], anchorIfc[1]],
         slabFootprint.footprint,
@@ -312,35 +348,25 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
   const now = Date.now();
   const timeSinceLastClick = now - ctx.lastClickTimeRef.current;
   const clickPos = { x, y };
-  if (ctx.lastClickPosRef.current &&
-    timeSinceLastClick < 300 &&
-    Math.abs(clickPos.x - ctx.lastClickPosRef.current.x) < 5 &&
-    Math.abs(clickPos.y - ctx.lastClickPosRef.current.y) < 5) {
-    const pickOptions = ctx.getPickOptions();
-    // Double-click - isolate element
-    // Uses visibility filtering so only visible elements can be selected
-    const pickResult = await renderer.pick(x, y, pickOptions);
-    if (pickResult) {
-      ctx.handlePickForSelection(pickResult);
-    }
-    ctx.lastClickTimeRef.current = 0;
-    ctx.lastClickPosRef.current = null;
-  } else {
-    const pickOptions = ctx.getPickOptions();
-    // Single click - uses visibility filtering so only visible elements can be selected
-    const pickResult = await renderer.pick(x, y, pickOptions);
-
-    // Multi-selection with Ctrl/Cmd
-    if (e.ctrlKey || e.metaKey) {
-      if (pickResult) {
-        ctx.toggleSelection(pickResult.expressId);
-      }
+  const doubleClick = ctx.lastClickPosRef.current && timeSinceLastClick < 300
+    && Math.abs(clickPos.x - ctx.lastClickPosRef.current.x) < 5
+    && Math.abs(clickPos.y - ctx.lastClickPosRef.current.y) < 5;
+  const applyIfc = (pickResult: PickResult | null) => {
+    if (doubleClick) {
+      if (pickResult) ctx.handlePickForSelection(pickResult);
+      ctx.lastClickTimeRef.current = 0; ctx.lastClickPosRef.current = null;
     } else {
-      ctx.handlePickForSelection(pickResult);
+      if (e.ctrlKey || e.metaKey) { if (pickResult) ctx.toggleSelection(pickResult.expressId); }
+      else ctx.handlePickForSelection(pickResult);
+      ctx.lastClickTimeRef.current = now; ctx.lastClickPosRef.current = clickPos;
     }
-
-    ctx.lastClickTimeRef.current = now;
-    ctx.lastClickPosRef.current = clickPos;
+  };
+  if (tool === 'select') {
+    await selectViewportTarget({ canvas, renderer, x, y, getTool: () => ctx.activeToolRef.current,
+      getPickOptions: ctx.getPickOptions, onIfc: applyIfc,
+      onReference: () => { ctx.lastClickTimeRef.current = 0; ctx.lastClickPosRef.current = null; } });
+  } else {
+    applyIfc(await renderer.pick(x, y, ctx.getPickOptions()));
   }
 }
 
@@ -388,15 +414,35 @@ function resolveActiveModelId(): string | null {
 }
 
 /**
- * Convert a renderer Y-up world point to IFC Z-up storey-local
- * coordinates with Z forced to the storey floor (0). Mirrors the
- * matrix in `packages/renderer/src/pipeline.ts`. Z is clamped so the
- * click landing on a vertical surface doesn't lift the element above
- * the floor — matches construction-tool placement intuition. Refine
- * via the Raw STEP tab if needed.
+ * `modelId`'s current reposition placement — translation (including an
+ * in-flight move-preview drag, so a pick made mid-drag matches what is on
+ * screen) and heading. The inverse `rendererPointToIfcStoreyLocal` applies
+ * so a pick against a moved/rotated model lands on the point the user
+ * actually clicked, not that point's un-repositioned twin (#4932).
  */
-export function rendererPointToIfcStoreyLocal(point: { x: number; y: number; z: number }): [number, number, number] {
-  return [point.x, -point.z, 0];
+function pickPlacement(modelId: string): { translation: ReturnType<typeof displayedTranslation>; rotation: ReturnType<typeof placementFor>['rotation'] } {
+  const state = useViewerStore.getState();
+  return { translation: displayedTranslation(state.modelPlacement, modelId),
+    rotation: placementFor(state.modelPlacement, modelId).rotation };
+}
+
+/**
+ * Convert a renderer Y-up world point — picked against `modelId`'s
+ * repositioned geometry — into IFC Z-up storey-local coordinates, with Z
+ * forced to the storey floor (0). Inverts `modelId`'s placement (heading
+ * about its pivot, then translation) before the axis swap, so authoring
+ * actions fed by this (`addWall`, `splitWallAtDistance`, …), which all work
+ * in the model's own un-repositioned frame, receive the point the user
+ * actually clicked rather than that point's un-repositioned twin (#4932).
+ * Z is clamped so a click landing on a vertical surface doesn't lift the
+ * element above the floor — matches construction-tool placement intuition.
+ */
+export function rendererPointToIfcStoreyLocal(
+  point: { x: number; y: number; z: number },
+  modelId: string,
+): [number, number, number] {
+  const modelPoint = workspacePointToModelFrame(fromRenderTranslation(point), pickPlacement(modelId));
+  return [modelPoint[0], modelPoint[1], 0];
 }
 
 /**
@@ -448,7 +494,11 @@ function raycastStoreyFloor(
  * Helper: resolve a slab's storey elevation in renderer-frame Y so
  * callers can pass it to `raycastStoreyFloor`. Read from the
  * model's spatialHierarchy (matches the rest of the split flow's
- * elevation lookups). Returns null when the slab isn't contained
+ * elevation lookups), offset by the model's own vertical reposition
+ * (#4932) — a model moved up or down renders its floor there too, and
+ * the fallback plane this drives has to agree with what's on screen.
+ * Rotation is a yaw and never tilts the floor, so only the
+ * translation's Z applies. Returns null when the slab isn't contained
  * in a storey we can resolve.
  */
 function resolveSlabFloorY(modelId: string, expressId: number): number | null {
@@ -458,12 +508,14 @@ function resolveSlabFloorY(modelId: string, expressId: number): number | null {
   const storeyId = ds.spatialHierarchy?.elementToStorey.get(expressId);
   if (storeyId === undefined) return null;
   const elev = ds.spatialHierarchy?.storeyElevations?.get(storeyId);
-  return typeof elev === 'number' ? elev : null;
+  return typeof elev === 'number' ? elev + displayedTranslation(state.modelPlacement, modelId)[2] : null;
 }
 
 /**
  * Resolve the renderer Y of the currently selected (or first
- * available) storey's floor. Falls back to 0 when nothing is loaded.
+ * available) storey's floor, offset by that model's own vertical
+ * reposition (#4932; see {@link resolveSlabFloorY}). Falls back to 0
+ * when nothing is loaded.
  */
 function resolveStoreyFloorY(): number {
   const state = useViewerStore.getState();
@@ -474,7 +526,8 @@ function resolveStoreyFloorY(): number {
   if (!ds) return 0;
   const storeyId = state.addElementStoreyId ?? firstStoreyExpressId(modelId);
   if (storeyId === null) return 0;
-  return ds.spatialHierarchy?.storeyElevations?.get(storeyId) ?? 0;
+  const elev = ds.spatialHierarchy?.storeyElevations?.get(storeyId) ?? 0;
+  return elev + displayedTranslation(state.modelPlacement, modelId)[2];
 }
 
 /**
@@ -595,7 +648,7 @@ export function handleSplitHover(ctx: MouseHandlerContext, x: number, y: number)
         if (store.splitMode === 'aiming') store.clearSplitHover();
         return;
       }
-      const cursorIfc = rendererPointToIfcStoreyLocal(worldPoint);
+      const cursorIfc = rendererPointToIfcStoreyLocal(worldPoint, targetModelId);
 
       // Project onto the target. Try wall (1D), then linear (1D),
       // then slab (2D — uses the cursor XY directly as a candidate
@@ -611,7 +664,11 @@ export function handleSplitHover(ctx: MouseHandlerContext, x: number, y: number)
             ? model?.ifcDataStore?.spatialHierarchy?.storeyElevations?.get(storeyId)
             : undefined) ?? 0;
         const [px, py, pz] = projection.cutPoint;
-        const cutRendererFrame: [number, number, number] = [px, pz + elevation, -py];
+        // Forward through the target's placement (#4932) so the ghost cut
+        // line the overlay draws lands on the same screen point as the
+        // commit this preview stands in for, on a moved/rotated model too.
+        const modelPoint: Translation = [px, py, pz + elevation];
+        const cutRendererFrame = toRenderTranslation(modelPointToWorkspacePoint(modelPoint, pickPlacement(targetModelId)));
         store.setSplitHover(
           cutRendererFrame,
           projection.distance,
@@ -626,11 +683,8 @@ export function handleSplitHover(ctx: MouseHandlerContext, x: number, y: number)
       const slabFootprint = store.readSlabFootprint(targetModelId, targetExpressId);
       if (slabFootprint) {
         const [cx, cy] = cursorIfc;
-        const cursorRendererFrame: [number, number, number] = [
-          cx,
-          slabFootprint.storeyElevation,
-          -cy,
-        ];
+        const modelPoint: Translation = [cx, cy, slabFootprint.storeyElevation];
+        const cursorRendererFrame = toRenderTranslation(modelPointToWorkspacePoint(modelPoint, pickPlacement(targetModelId)));
         store.setSplitHover(cursorRendererFrame, 0, 0, [cx, cy, 0], null);
         return;
       }
@@ -640,6 +694,213 @@ export function handleSplitHover(ctx: MouseHandlerContext, x: number, y: number)
     });
   }
   return true;
+}
+
+/**
+ * Handle a click landing on the scene while the Measure tool's polyline mode
+ * is active (#2199). One click state machine, three outcomes:
+ *
+ *   - no sequence in progress → start one at the clicked point.
+ *   - sequence in progress, click lands near the FIRST point (screen space,
+ *     ≥3 points already placed) → close the loop, finishing as a perimeter.
+ *   - otherwise → append the clicked point.
+ *
+ * Finishing an OPEN polyline is a different gesture entirely (double-click
+ * or Enter — see `finishOpenPolyline`'s call sites in useMouseControls.ts /
+ * useKeyboardShortcuts.ts), so a click never finishes anything but a closed
+ * loop. A miss (no raycast hit) is a no-op — it neither starts nor extends
+ * a sequence, matching how a drag-mode click into empty space does nothing.
+ */
+export function handlePolylineClick(ctx: MouseHandlerContext, x: number, y: number): void {
+  const picked = raycastForPolylinePoint(ctx, x, y);
+  if (!picked) return;
+
+  const state = useViewerStore.getState();
+  ctx.setSnapTarget(picked.snapTarget);
+
+  const active = state.activePolyline;
+  if (!active) {
+    state.startPolyline(picked.point);
+    return;
+  }
+
+  const first = active.points[0];
+  if (active.points.length >= 3 && isNearPolylineStart(picked.point, first)) {
+    state.finishPolyline(true);
+    return;
+  }
+
+  state.addPolylinePoint(picked.point);
+}
+
+/**
+ * Handle a click landing on the scene while the Measure tool's radius mode
+ * is active (#2737 item 2). Same click state machine as
+ * {@link handlePolylineClick} minus the close-the-loop branch — radius has
+ * no "closed" concept, so a click only ever starts a sequence or extends it:
+ *
+ *   - no sequence in progress → start one at the clicked point.
+ *   - otherwise → append the clicked point.
+ *
+ * Finishing is double-click or Enter (`finishRadiusFromDoubleClick`'s call
+ * sites in useMouseControls.ts / useKeyboardShortcuts.ts), the same gesture
+ * polyline uses and for the same reason: with an unbounded pick count there
+ * is no "last pick" for the store to recognise and finish itself on, unlike
+ * angle's fixed count. A miss (no raycast hit) is a no-op.
+ */
+export function handleRadiusClick(ctx: MouseHandlerContext, x: number, y: number): void {
+  const picked = raycastForPolylinePoint(ctx, x, y);
+  if (!picked) return;
+
+  const state = useViewerStore.getState();
+  ctx.setSnapTarget(picked.snapTarget);
+
+  const active = state.activeRadius;
+  if (!active) {
+    state.startRadius(picked.point);
+    return;
+  }
+
+  state.addRadiusPoint(picked.point);
+}
+
+/**
+ * Click handler for angle mode (#2735).
+ *
+ * There is no finish gesture - every angle kind has a FIXED pick count and the
+ * store finishes the measurement itself on the last pick - so polyline's
+ * `fromDoubleClick` apparatus has no analogue here.
+ *
+ * But the duplicate-click DEFENCE still does, and an earlier version of this
+ * comment claimed otherwise on false grounds. It argued a stray second click
+ * "lands where the maths already classifies coincident picks as degenerate".
+ * Only APEX-coincidence is degenerate. Browsers fire `click, click, dblclick`,
+ * so a habitual double-click produces three distinct failures here:
+ *
+ *   1. double-clicking a DIRECTION point makes picks 2 and 3 coincide - a
+ *      recorded "0.0°", rendered as a real answer rather than an em dash;
+ *   2. double-clicking the THIRD pick finishes on the first click and the
+ *      second click starts a stray new sequence, so "1/3 picks · apex set"
+ *      appears unbidden;
+ *   3. double-clicking the APEX puts picks 1 and 2 a pixel or two apart - a
+ *      ray whose direction is cursor noise, and pick 3 then yields a
+ *      confident, wrong `angled` number.
+ *
+ * So the same `isDuplicateClickPoint` guard polyline uses applies: a click
+ * within {@link DUPLICATE_POINT_SCREEN_RADIUS_PX} of the previous pick is the
+ * second half of one physical double-click and is dropped. Dropping is safe
+ * because a genuinely intended pick that close is unmeasurable anyway.
+ *
+ * A miss is a no-op, matching polyline's contract.
+ *
+ * Only the `'points'` kind ships today; `'edges'` and `'faces'` are the later
+ * slices of #2735 and will need their own pick resolution (an edge run from
+ * `SnapTarget.metadata`, a camera-oriented face normal from the intersection),
+ * which is why the pick carries its `kind` rather than being a bare point.
+ */
+export function handleAngleClick(ctx: MouseHandlerContext, x: number, y: number): void {
+  const state = useViewerStore.getState();
+  const kind = state.angleKind;
+
+  // Faces need the surface normal, which only the raycast hit carries, so they
+  // take a different path from the two point-based kinds rather than sharing
+  // the snap-driven one. Snapping a face pick to a nearby VERTEX would move the
+  // point off the surface whose normal we just read.
+  if (kind === 'faces') {
+    const hit = ctx.renderer?.raycastScene(x, y, {
+      hiddenIds: ctx.hiddenEntitiesRef.current,
+      isolatedIds: ctx.isolatedEntitiesRef.current,
+    });
+    const n = hit?.intersection?.normal;
+    const p = hit?.intersection?.point;
+    if (!n || !p) return;
+
+    // Faces need the SAME double-click guard as the point-based kinds, which
+    // this early-return path was skipping. A face pair needs exactly two picks,
+    // so a physical double-click on one face recorded both halves instantly and
+    // completed a bogus measurement reading "Parallel" - a plausible-looking
+    // number for two picks the user never made.
+    //
+    // There is no shape boundary to exempt here, unlike edges: both face picks
+    // belong to one measurement, and two clicks in the same spot are always the
+    // same face.
+    const facePrior = state.activeAngle?.picks ?? [];
+    const facePrev = facePrior.length > 0 ? facePrior[facePrior.length - 1].point : null;
+    const facePoint = { x: p.x, y: p.y, z: p.z, screenX: x, screenY: y };
+    if (facePrev && isDuplicateClickPoint(facePrev, facePoint)) return;
+
+    state.addAnglePick({
+      kind: 'faces',
+      // screen coords are the click itself, which is what the overlay
+      // reprojects from; `updateMeasurementScreenCoords` refreshes them on
+      // camera move exactly as it does for the other kinds.
+      point: facePoint,
+      normal: { x: n.x, y: n.y, z: n.z },
+    });
+    return;
+  }
+
+  const picked = raycastForPolylinePoint(ctx, x, y);
+  if (!picked) return;
+
+  // Drop the second half of a physical double-click (see the note above), but
+  // only WITHIN a shape, never across the boundary between the two edges.
+  //
+  // The natural gesture for an edge pair is to trace edge A into a shared
+  // corner and edge B out of it, so picks 2 and 3 are the SAME point. Guarding
+  // across that boundary swallowed pick 3, the measurement never completed, and
+  // the only recourse was to click slightly off the corner - degrading the very
+  // direction being measured. Worse, the opposite pick order (corner first)
+  // survived, so the mode worked or did not depending on which end of edge A
+  // the user started from, which is not a distinction they can see.
+  //
+  // A shared vertex is NOT a degenerate edge: a zero-length second edge needs
+  // pick 4 to coincide with pick 3, and that is still caught below.
+  const prior = state.activeAngle?.picks ?? [];
+  const startsNewShape = kind === 'edges' && prior.length % 2 === 0;
+  const last = !startsNewShape && prior.length > 0 ? prior[prior.length - 1].point : null;
+  if (last && isDuplicateClickPoint(last, picked.point)) return;
+
+  ctx.setSnapTarget(picked.snapTarget);
+  state.addAnglePick({ kind, point: picked.point });
+}
+
+/**
+ * The store side of the Measure tool's double-click finish (#2199), kept
+ * beside {@link handlePolylineClick} because the two are one gesture family
+ * and this one reads the store directly the same way.
+ *
+ * This is the ONLY finish path that may drop a trailing near-duplicate point:
+ * a physical double-click dispatches `click, click, dblclick`, so
+ * `handlePolylineClick` has already appended the browser's second click by
+ * the time this runs. Enter (useKeyboardShortcuts.ts) and the close-loop
+ * click above append nothing extra, and the screen coordinates the duplicate
+ * check compares are reprojected on every camera move, so passing
+ * `fromDoubleClick` from anywhere else would delete real vertices after an
+ * orbit — see `finishPolyline` in measurementSlice.ts.
+ *
+ * Returns `null` when the gesture does not apply (not in polyline mode, or
+ * no sequence in progress) so the caller knows to leave the DOM event alone;
+ * otherwise whether a measurement was actually recorded.
+ */
+export function finishPolylineFromDoubleClick(): boolean | null {
+  const state = useViewerStore.getState();
+  if (state.measureMode !== 'polyline' || !state.activePolyline) return null;
+  return state.finishPolyline(false, { fromDoubleClick: true });
+}
+
+/**
+ * The store side of the Measure tool's radius double-click finish (#2737
+ * item 2) — same shape as {@link finishPolylineFromDoubleClick}, for the
+ * same reason (radius is the other unbounded, explicit-finish click
+ * sequence). Returns `null` when the gesture does not apply (not in radius
+ * mode, or no sequence in progress); otherwise whether a measurement was
+ * actually recorded.
+ */
+export function finishRadiusFromDoubleClick(): boolean | null {
+  const state = useViewerStore.getState();
+  if (state.measureMode !== 'radius' || !state.activeRadius) return null;
+  return state.finishRadius({ fromDoubleClick: true });
 }
 
 /**
@@ -711,7 +972,7 @@ async function handleAddElementDrop(
 
   // Single-click placements: column / door / window all drop on one click.
   if (type === 'column') {
-    const ifc = rendererPointToIfcStoreyLocal(point);
+    const ifc = rendererPointToIfcStoreyLocal(point, modelId);
     const p = state.addElementColumnParams;
     finishAddElement(state.addColumn(modelId, storeyId, {
       Position: ifc, Width: p.Width, Depth: p.Depth, Height: p.Height,
@@ -719,7 +980,7 @@ async function handleAddElementDrop(
     return;
   }
   if (type === 'door') {
-    const ifc = rendererPointToIfcStoreyLocal(point);
+    const ifc = rendererPointToIfcStoreyLocal(point, modelId);
     const p = state.addElementDoorParams;
     finishAddElement(state.addDoor(modelId, storeyId, {
       Position: ifc, Width: p.Width, Height: p.Height, FrameThickness: p.FrameThickness,
@@ -727,7 +988,7 @@ async function handleAddElementDrop(
     return;
   }
   if (type === 'window') {
-    const ifc = rendererPointToIfcStoreyLocal(point);
+    const ifc = rendererPointToIfcStoreyLocal(point, modelId);
     const p = state.addElementWindowParams;
     finishAddElement(state.addWindow(modelId, storeyId, {
       Position: ifc, Width: p.Width, Height: p.Height, FrameThickness: p.FrameThickness,
@@ -743,8 +1004,8 @@ async function handleAddElementDrop(
       return;
     }
     // End point — convert both points to IFC at dispatch time.
-    const startIfc = rendererPointToIfcStoreyLocal(pending[0]);
-    const endIfc = rendererPointToIfcStoreyLocal(point);
+    const startIfc = rendererPointToIfcStoreyLocal(pending[0], modelId);
+    const endIfc = rendererPointToIfcStoreyLocal(point, modelId);
     if (type === 'wall') {
       const p = state.addElementWallParams;
       finishAddElement(state.addWall(modelId, storeyId, {
@@ -772,8 +1033,8 @@ async function handleAddElementDrop(
         state.appendAddElementPendingPoint({ x: point.x, y: point.y, z: point.z });
         return;
       }
-      const cornerIfc = rendererPointToIfcStoreyLocal(pending[0]);
-      const oppositeIfc = rendererPointToIfcStoreyLocal(point);
+      const cornerIfc = rendererPointToIfcStoreyLocal(pending[0], modelId);
+      const oppositeIfc = rendererPointToIfcStoreyLocal(point, modelId);
       const minX = Math.min(cornerIfc[0], oppositeIfc[0]);
       const minY = Math.min(cornerIfc[1], oppositeIfc[1]);
       const width = Math.abs(oppositeIfc[0] - cornerIfc[0]);
@@ -856,7 +1117,7 @@ export function commitAddElementSlabPolygon(): void {
   if (!ctx) return;
   const { modelId, storeyId } = ctx;
   const outer = pending.map((pt) => {
-    const ifc = rendererPointToIfcStoreyLocal(pt);
+    const ifc = rendererPointToIfcStoreyLocal(pt, modelId);
     return [ifc[0], ifc[1]] as [number, number];
   });
   // Reject degenerate (zero-area) polygons — repeated or collinear
@@ -905,9 +1166,9 @@ export function commitAddElementSlabPolygon(): void {
 export async function handleContextMenu(ctx: MouseHandlerContext, e: MouseEvent): Promise<void> {
   e.preventDefault();
   const { canvas, renderer, mouseState } = ctx;
-  // Right-drag is the pan gesture (see useMouseControls). Some browsers
+  // Right-drag is the fly gesture (see useMouseControls). Some browsers
   // still fire `contextmenu` after a tiny right-drag — skip when the
-  // user actually moved, so panning never accidentally pops the menu.
+  // user actually moved, so flying never accidentally pops the menu.
   if (mouseState.didDrag) {
     return;
   }

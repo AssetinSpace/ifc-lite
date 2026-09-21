@@ -35,6 +35,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/components/ui/toast';
 import { describeRunCommandError } from '@/services/extensions/runtime-errors';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 
 interface ExtensionDockHostProps {
   slot: DockContribution['slot'];
@@ -43,6 +44,7 @@ interface ExtensionDockHostProps {
 }
 
 export function ExtensionDockHost({ slot, className }: ExtensionDockHostProps) {
+  const { t } = useTranslation();
   const contributions = useSlotContributions<DockContribution>(slot);
   // Derive the when-clause context from live viewer state so
   // contributions can key on selection / model presence. Future
@@ -70,7 +72,7 @@ export function ExtensionDockHost({ slot, className }: ExtensionDockHostProps) {
   const active = visible.find((v) => v.payload.id === activeId) ?? visible[0];
 
   return (
-    <div className={cn('flex flex-col h-full border-t bg-background', className)} role="region" aria-label={`Extension dock (${slot})`}>
+    <div className={cn('flex flex-col h-full border-t bg-background', className)} role="region" aria-label={t('extensionsFlavors.extensionDockHost.dockAriaLabel', { slot })}>
       <div className="flex items-center gap-0 border-b overflow-x-auto" role="tablist">
         {visible.map((c) => {
           const isActive = c.payload.id === active.payload.id;
@@ -96,7 +98,13 @@ export function ExtensionDockHost({ slot, className }: ExtensionDockHostProps) {
         })}
       </div>
       <ScrollArea className="flex-1">
-        <DockBody contribution={active} />
+        {/* Keyed on the tab identity (same composite as the tab button
+            above) so switching tabs remounts `DockBody` — and, inside
+            it, `WidgetErrorBoundary` — instead of reusing the previous
+            tab's component instance and its state. See
+            `WidgetErrorBoundary`'s doc comment for why an unkeyed reuse
+            here masks every later widget behind a stale crash. */}
+        <DockBody key={`${active.extensionId}:${active.payload.id}`} contribution={active} />
       </ScrollArea>
     </div>
   );
@@ -117,6 +125,7 @@ function useFiltered(
 }
 
 function DockBody({ contribution }: { contribution: SlotContribution<DockContribution> }) {
+  const { t } = useTranslation();
   const host = useExtensionHost();
   const [widget, setWidget] = useState<unknown>();
   const [error, setError] = useState<string | undefined>();
@@ -198,11 +207,20 @@ function DockBody({ contribution }: { contribution: SlotContribution<DockContrib
     );
   }
   if (!widget) {
-    return <div className="p-3 text-xs text-muted-foreground">Loading widget…</div>;
+    return (
+      <div className="p-3 text-xs text-muted-foreground">
+        {t('extensionsFlavors.extensionDockHost.loadingWidget')}
+      </div>
+    );
   }
   return (
     <div className="p-3">
       <WidgetErrorBoundary
+        // Keyed on the same identity shown in the fallback label: the
+        // boundary never clears `state.error` itself (see its doc
+        // comment), so a `key` change is what forces React to discard
+        // a crashed instance and mount a fresh one for a new widget.
+        key={`${contribution.extensionId}/${contribution.payload.widget}`}
         label={`${contribution.extensionId}/${contribution.payload.widget}`}
       >
         <WidgetRenderer

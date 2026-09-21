@@ -8,17 +8,19 @@ import type { CoordinateInfo } from '@ifc-lite/geometry';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 
 import { toast } from '@/components/ui/toast';
+import { useTranslation } from '@/i18n';
 import { getGlobalRenderer } from '@/hooks/useBCF';
 import {
   closestYOnVerticalLineFromRay,
   getMapUnitScale,
   intersectRayWithHorizontalPlane,
-  mapUnitsToMeters,
   metersToMapUnits,
-  projectedDeltaToViewerDelta,
-  viewerDeltaToProjectedDelta,
+  projectedDeltaToViewerDeltaForGeometry,
+  viewerDeltaToProjectedDeltaForGeometry,
 } from '@/lib/geo/cesium-placement';
+import { orthogonalHeightDeltaToViewerDeltaForGeometry, viewerHeightDeltaToOrthogonalHeightDeltaForGeometry } from '@/lib/geo/viewer-up-scale';
 import { findClampAnchorY } from '@/lib/geo/clamp-anchor';
+import { effectiveMapConversionForGeometry } from '@/lib/geo/map-absolute';
 import { cn } from '@/lib/utils';
 import { useViewerStore, type CesiumPlacementDraft } from '@/store';
 
@@ -206,6 +208,7 @@ export function CesiumPlacementEditor({
   lengthUnitScale = 1,
   storeyElevations,
 }: CesiumPlacementEditorProps) {
+  const { t } = useTranslation();
   const editMode = useViewerStore((s) => s.cesiumPlacementEditMode);
   const draftModelId = useViewerStore((s) => s.cesiumPlacementDraftModelId);
   const draft = useViewerStore((s) => s.cesiumPlacementDraft);
@@ -354,34 +357,68 @@ export function CesiumPlacementEditor({
   const deltaN = activeDraft.northings - baseMapConversion.northings;
   const deltaH = activeDraft.orthogonalHeight - baseMapConversion.orthogonalHeight;
   const deltaAngle = normalizeDegrees(activeAngle - baseAngle);
-  const deltaHeightMeters = mapUnitsToMeters(deltaH, projectedCRS, lengthUnitScale);
   const dirty = Math.abs(deltaE) > 1e-6 || Math.abs(deltaN) > 1e-6 || Math.abs(deltaH) > 1e-6 || Math.abs(deltaAngle) > 1e-6;
   const nudgeStep = round2(metersToMapUnits(1, projectedCRS, lengthUnitScale));
+
+  // The map-absolute guard (#2526) reads the DECLARED anchor (eastings/
+  // northings) to decide whether geometry is already at the map coordinate.
+  // Both the visual preview (anchorWorld, below) and the drag math
+  // (handlePointerMove) must evaluate that guard against the SAME anchor —
+  // `baseMapConversion` overridden by the CURRENT draft's e/n/h/axis — or the
+  // two disagree about which regime (identity vs authored rotation) is
+  // active. Before this fix, the preview always used the frozen
+  // `baseMapConversion` (the whole editing session's baseline) while the
+  // drag used `{ ...mapConversion (base + live preview), ...startDraft
+  // (frozen at THIS gesture's start) }`; after a first drag moved the draft
+  // away from the session baseline, a second drag's guard decision diverged
+  // from the still-baseline-anchored preview mid-session.
+  const guardConversion: MapConversion = useMemo(
+    () => ({ ...baseMapConversion, ...activeDraft }),
+    [baseMapConversion, activeDraft],
+  );
+
+  // Whether the map-absolute guard is CURRENTLY firing for this model's
+  // active anchor. `effectiveMapConversionForGeometry` returns the SAME
+  // object reference when it doesn't fire, and a new (neutralised) object
+  // when it does — a cheap, exact signal with no separate re-derivation of
+  // the detection condition.
+  const mapAbsoluteActive = useMemo(
+    () => effectiveMapConversionForGeometry(guardConversion, mapUnitScale, coordinateInfo) !== guardConversion,
+    [guardConversion, mapUnitScale, coordinateInfo],
+  );
 
   const anchorWorld = useMemo((): WorldPoint => {
     const bounds = coordinateInfo?.originalBounds;
     const centerX = bounds ? (bounds.min.x + bounds.max.x) / 2 : 0;
     const centerZ = bounds ? (bounds.min.z + bounds.max.z) / 2 : 0;
     const anchorY = findClampAnchorY(bounds, storeyElevations);
-    const xyOffset = projectedDeltaToViewerDelta(
+    // Map-absolute geometry (#2526): route through the guard, evaluated
+    // against the SAME current-draft anchor the drag math uses (see
+    // `guardConversion` above), so the preview offset uses the map axes
+    // (identity rotation) the drag applies too.
+    const xyOffset = projectedDeltaToViewerDeltaForGeometry(
       deltaE,
       deltaN,
-      baseMapConversion,
+      guardConversion,
       projectedCRS,
       lengthUnitScale,
+      coordinateInfo,
     );
 
     return {
       x: centerX + xyOffset.x,
-      y: anchorY + deltaHeightMeters,
+      y: anchorY + orthogonalHeightDeltaToViewerDeltaForGeometry(
+        deltaH, guardConversion, projectedCRS, lengthUnitScale, coordinateInfo),
       z: centerZ + xyOffset.z,
     };
   }, [
-    baseMapConversion,
-    coordinateInfo?.originalBounds,
+    guardConversion,
+    // The guard also reads shiftedBounds/originShift/wasmRtcOffset, so depend
+    // on the whole coordinateInfo, not just originalBounds.
+    coordinateInfo,
     deltaE,
     deltaN,
-    deltaHeightMeters,
+    deltaH,
     lengthUnitScale,
     projectedCRS,
     storeyElevations,
@@ -482,17 +519,16 @@ export function CesiumPlacementEditor({
     const ray = rayFromPointerEvent(e.clientX, e.clientY);
     if (!ray) return;
 
+    // The session baseline under this gesture's frozen draft; see the XY note below.
+    const dragConversion = { ...baseMapConversion, ...dragState.startDraft };
     if (dragState.mode === 'height') {
       const worldY = closestYOnVerticalLineFromRay(ray, dragState.anchorX, dragState.anchorZ);
       if (worldY === null) return;
-      const deltaMeters = worldY - dragState.startWorldY;
       const mus = getMapUnitScale(projectedCRS, lengthUnitScale);
       updateDraft({
-        orthogonalHeight: roundToMm(
-          dragState.startDraft.orthogonalHeight
-            + metersToMapUnits(deltaMeters, projectedCRS, lengthUnitScale),
-          mus,
-        ),
+        orthogonalHeight: roundToMm(dragState.startDraft.orthogonalHeight
+          + viewerHeightDeltaToOrthogonalHeightDeltaForGeometry(
+            worldY - dragState.startWorldY, dragConversion, projectedCRS, lengthUnitScale, coordinateInfo), mus),
       });
       return;
     }
@@ -502,20 +538,46 @@ export function CesiumPlacementEditor({
     const deltaX = hit.x - dragState.startHit.x;
     const deltaZ = hit.z - dragState.startHit.z;
     // The horizontal-plane hit gives the world-space displacement directly;
-    // viewerDeltaToProjectedDelta then applies the file's xAxis rotation and
-    // unit scale to express it in Eastings/Northings.
-    const projectedDelta = viewerDeltaToProjectedDelta(
+    // viewerDeltaToProjectedDeltaForGeometry then applies the file's xAxis
+    // rotation and unit scale to express it in Eastings/Northings — routed
+    // through the map-absolute guard (#2526) so a drag on geometry that
+    // already sits at the absolute map coordinates moves E/N along the map
+    // axes instead of rotating the drag by the double-georeferenced axis.
+    // The draft is spread over `baseMapConversion` (NOT the live `mapConversion`
+    // prop, which already carries this render's in-progress preview) so the
+    // guard's detection basis matches `anchorWorld`'s `guardConversion` above
+    // exactly: both read `{ session baseline, ...current draft }`. Using the
+    // live `mapConversion` prop here previously let a SECOND drag gesture in
+    // the same edit session disagree with the (always baseline-anchored)
+    // preview about which anchor decides the guard.
+    //
+    // Known remaining limit, inherited from the guard's design rather than
+    // this routing: on a map-absolute file every placement consumer
+    // neutralises the SAVED anchor too, so an applied edit has no effect
+    // while the new anchor stays within the 10 km detection window of the
+    // geometry centre (the pin has behaved this way since #2526), and an
+    // edit that crosses the window snaps to the fully-applied conversion.
+    // `dragState.startDraft` freezes the guard decision for the DURATION of
+    // one gesture (so a single drag doesn't re-decide its own axis mid-move);
+    // a gesture that itself crosses the window boundary can still end
+    // disagreeing with the live preview for that one frame. The map-pick
+    // Apply flow is the sanctioned way to move such a model: reprojectFromLatLon
+    // deliberately saves an anchor that escapes the window (see reproject.ts).
+    // `mapAbsoluteActive` (below) surfaces this regime to the user instead of
+    // leaving a silent no-op.
+    const projectedDelta = viewerDeltaToProjectedDeltaForGeometry(
       deltaX,
       deltaZ,
-      dragState.startDraft,
+      dragConversion,
       projectedCRS,
       lengthUnitScale,
+      coordinateInfo,
     );
     updateDraft({
       eastings: round2(dragState.startDraft.eastings + projectedDelta.eastings),
       northings: round2(dragState.startDraft.northings + projectedDelta.northings),
     });
-  }, [lengthUnitScale, projectedCRS, updateDraft]);
+  }, [baseMapConversion, coordinateInfo, lengthUnitScale, projectedCRS, updateDraft]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent<Element>) => {
     if (!dragStateRef.current) return;
@@ -544,8 +606,8 @@ export function CesiumPlacementEditor({
       { field: 'xAxisOrdinate', value: activeDraft.xAxisOrdinate, oldValue: baseMapConversion.xAxisOrdinate ?? 0 },
     ]);
     resetDraft();
-    toast.success('Georeference placement updated');
-  }, [activeDraft, baseMapConversion, dirty, modelId, resetDraft, setGeorefFields]);
+    toast.success(t('cesiumGeo.placement.toastApplied'));
+  }, [activeDraft, baseMapConversion, dirty, modelId, resetDraft, setGeorefFields, t]);
 
   const nudge = useCallback((eastDelta: number, northDelta: number) => {
     updateDraft({
@@ -637,7 +699,7 @@ export function CesiumPlacementEditor({
             opacity="0.92"
             pointerEvents="none"
           >
-            <title>Drag to move Eastings/Northings</title>
+            <title>{t('cesiumGeo.placement.dragPlaneTitle')}</title>
           </polygon>
           <line
             x1={xAxisStart.x}
@@ -669,7 +731,7 @@ export function CesiumPlacementEditor({
             fontWeight="700"
             pointerEvents="none"
           >
-            DRAG XY
+            {t('cesiumGeo.placement.dragXYLabel')}
           </text>
           <line
             x1={projection.center.x}
@@ -691,7 +753,7 @@ export function CesiumPlacementEditor({
             cursor="grab"
             pointerEvents="none"
           >
-            <title>Drag to change OrthogonalHeight</title>
+            <title>{t('cesiumGeo.placement.dragHeightTitle')}</title>
           </circle>
           <circle
             cx={projection.center.x}
@@ -706,7 +768,7 @@ export function CesiumPlacementEditor({
 
       <button
         type="button"
-        aria-label="Drag Eastings and Northings"
+        aria-label={t('cesiumGeo.placement.dragPlaneAriaLabel')}
         className="absolute z-[21] cursor-grab bg-transparent active:cursor-grabbing"
         style={{
           left: minPlaneX - hitPadding,
@@ -721,7 +783,7 @@ export function CesiumPlacementEditor({
       />
       <button
         type="button"
-        aria-label="Drag OrthogonalHeight"
+        aria-label={t('cesiumGeo.placement.dragHeightAriaLabel')}
         className="absolute z-[22] cursor-grab rounded-full bg-transparent active:cursor-grabbing"
         style={{
           left: projection.heightTip.x - 18,
@@ -780,18 +842,18 @@ export function CesiumPlacementEditor({
           onPointerUp={handlePanelHeaderPointerUp}
           onPointerCancel={handlePanelHeaderPointerUp}
           role="toolbar"
-          aria-label="Move georeference panel header"
+          aria-label={t('cesiumGeo.placement.headerAriaLabel')}
         >
           <GripVertical className="h-3.5 w-3.5 text-zinc-400 dark:text-zinc-600" aria-hidden />
           <Move className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden />
           <span className="text-[11px] font-bold uppercase tracking-[0.18em]">
-            Move Georef
+            {t('cesiumGeo.placement.headerTitle')}
           </span>
           {dirty && (
             <span
               className="h-1.5 w-1.5 bg-amber-500"
-              title="Unsaved changes"
-              aria-label="Unsaved changes"
+              title={t('cesiumGeo.placement.unsavedChanges')}
+              aria-label={t('cesiumGeo.placement.unsavedChanges')}
             />
           )}
           <div className="ml-auto flex items-center gap-0.5">
@@ -803,7 +865,7 @@ export function CesiumPlacementEditor({
                 'inline-flex h-6 w-6 items-center justify-center border border-transparent',
                 'hover:bg-zinc-200 dark:hover:bg-zinc-800',
               )}
-              aria-label={panelCollapsed ? 'Expand panel' : 'Collapse panel'}
+              aria-label={t(panelCollapsed ? 'cesiumGeo.placement.expandPanel' : 'cesiumGeo.placement.collapsePanel')}
               aria-expanded={!panelCollapsed}
             >
               <ChevronDown
@@ -821,7 +883,7 @@ export function CesiumPlacementEditor({
                 'inline-flex h-6 w-6 items-center justify-center border border-transparent',
                 'hover:bg-zinc-200 dark:hover:bg-zinc-800',
               )}
-              aria-label="Close georeference move mode"
+              aria-label={t('cesiumGeo.placement.closeAriaLabel')}
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -832,31 +894,40 @@ export function CesiumPlacementEditor({
           <div className="p-3 text-[10px]">
             <div className="grid grid-cols-4 gap-1 border-b border-zinc-200 dark:border-zinc-800 pb-2">
               <Metric
-                label="Delta E"
+                label={t('cesiumGeo.placement.deltaELabel')}
                 value={formatSigned(deltaE, mapUnitSuffix)}
                 accent="text-emerald-700 dark:text-emerald-300"
               />
               <Metric
-                label="Delta N"
+                label={t('cesiumGeo.placement.deltaNLabel')}
                 value={formatSigned(deltaN, mapUnitSuffix)}
                 accent="text-emerald-700 dark:text-emerald-300"
               />
               <Metric
-                label="Delta Z"
+                label={t('cesiumGeo.placement.deltaZLabel')}
                 value={formatSigned(deltaH, mapUnitSuffix)}
                 accent="text-amber-700 dark:text-amber-300"
               />
               <Metric
-                label="Delta R"
+                label={t('cesiumGeo.placement.deltaRLabel')}
                 value={formatSigned(deltaAngle, 'deg')}
                 accent="text-fuchsia-700 dark:text-fuchsia-300"
               />
             </div>
 
+            {mapAbsoluteActive && (
+              <div
+                data-testid="cesium-placement-map-absolute-warning"
+                role="status"
+                className="mt-2 border border-amber-500 bg-amber-50 dark:bg-amber-950/40 px-2 py-1.5 text-[9px] leading-snug text-amber-800 dark:text-amber-300"
+              >
+                {t('cesiumGeo.placement.mapAbsoluteWarning')}
+              </div>
+            )}
+
             <div className="mt-2 space-y-1">
               <div className="pb-1 text-[9px] leading-snug text-zinc-500 dark:text-zinc-400">
-                Drag the pad on the model to move Eastings/Northings. Drag the
-                knob to change height.
+                {t('cesiumGeo.placement.dragHint')}
               </div>
               <PreviewRow
                 label="Eastings"
@@ -870,65 +941,65 @@ export function CesiumPlacementEditor({
                 label="OrthogonalHeight"
                 value={`${activeDraft.orthogonalHeight.toFixed(2)} ${mapUnitSuffix}`}
               />
-              <PreviewRow label="XAxis angle" value={`${activeAngle.toFixed(2)} deg`} />
+              <PreviewRow label={t('cesiumGeo.placement.xAxisAngleLabel')} value={`${activeAngle.toFixed(2)} deg`} />
             </div>
 
             <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-1 text-[9px]">
               <span className="text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
-                Nudge 1 m
+                {t('cesiumGeo.placement.nudgeOneMeter')}
               </span>
-              <NudgeButton onClick={() => nudge(0, nudgeStep)} aria-label="Nudge north">
-                N+
+              <NudgeButton onClick={() => nudge(0, nudgeStep)} aria-label={t('cesiumGeo.placement.nudgeNorthAriaLabel')}>
+                {t('cesiumGeo.placement.nudgeNorthLabel')}
               </NudgeButton>
               <span />
-              <NudgeButton onClick={() => nudge(-nudgeStep, 0)} aria-label="Nudge west">
-                E-
+              <NudgeButton onClick={() => nudge(-nudgeStep, 0)} aria-label={t('cesiumGeo.placement.nudgeWestAriaLabel')}>
+                {t('cesiumGeo.placement.nudgeWestLabel')}
               </NudgeButton>
-              <NudgeButton onClick={() => nudge(nudgeStep, 0)} aria-label="Nudge east">
-                E+
+              <NudgeButton onClick={() => nudge(nudgeStep, 0)} aria-label={t('cesiumGeo.placement.nudgeEastAriaLabel')}>
+                {t('cesiumGeo.placement.nudgeEastLabel')}
               </NudgeButton>
-              <NudgeButton onClick={() => nudge(0, -nudgeStep)} aria-label="Nudge south">
-                N-
+              <NudgeButton onClick={() => nudge(0, -nudgeStep)} aria-label={t('cesiumGeo.placement.nudgeSouthAriaLabel')}>
+                {t('cesiumGeo.placement.nudgeSouthLabel')}
               </NudgeButton>
             </div>
 
             <div className="mt-2 flex items-center gap-1 text-[9px]">
               <span className="mr-auto text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
-                Height
+                {t('cesiumGeo.placement.heightLabel')}
               </span>
               <NudgeButton
                 onClick={() => nudgeHeight(-nudgeStep)}
                 tone="amber"
-                aria-label="Nudge height down"
+                aria-label={t('cesiumGeo.placement.nudgeHeightDownAriaLabel')}
               >
-                Z-
+                {t('cesiumGeo.placement.nudgeHeightDownLabel')}
               </NudgeButton>
               <NudgeButton
                 onClick={() => nudgeHeight(nudgeStep)}
                 tone="amber"
-                aria-label="Nudge height up"
+                aria-label={t('cesiumGeo.placement.nudgeHeightUpAriaLabel')}
               >
-                Z+
+                {t('cesiumGeo.placement.nudgeHeightUpLabel')}
               </NudgeButton>
             </div>
 
             <div className="mt-2 flex items-center gap-1 text-[9px]">
               <span className="mr-auto text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
-                Rotate
+                {t('cesiumGeo.placement.rotateLabel')}
               </span>
               <NudgeButton
                 onClick={() => nudgeRotation(-1)}
                 tone="fuchsia"
-                aria-label="Rotate negative one degree"
+                aria-label={t('cesiumGeo.placement.rotateNegAriaLabel')}
               >
-                R-
+                {t('cesiumGeo.placement.rotateNegLabel')}
               </NudgeButton>
               <NudgeButton
                 onClick={() => nudgeRotation(1)}
                 tone="fuchsia"
-                aria-label="Rotate positive one degree"
+                aria-label={t('cesiumGeo.placement.rotatePosAriaLabel')}
               >
-                R+
+                {t('cesiumGeo.placement.rotatePosLabel')}
               </NudgeButton>
             </div>
 
@@ -945,7 +1016,7 @@ export function CesiumPlacementEditor({
                 )}
               >
                 <Check className="h-3 w-3" />
-                Set as georeference
+                {t('cesiumGeo.placement.applyButton')}
               </button>
               <button
                 type="button"
@@ -959,7 +1030,7 @@ export function CesiumPlacementEditor({
                 )}
               >
                 <RotateCcw className="h-3 w-3" />
-                Reset
+                {t('cesiumGeo.placement.resetButton')}
               </button>
             </div>
           </div>

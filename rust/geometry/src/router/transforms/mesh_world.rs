@@ -34,7 +34,7 @@ impl GeometryRouter {
     /// during raw world-coordinate triangulation are guarded by `rtc_applied`.
     #[inline]
     pub(crate) fn transform_mesh_world(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
-        self.transform_mesh_world_framed(mesh, transform, super::local_frame_enabled());
+        self.transform_mesh_world_framed(mesh, transform, self.local_frame_enabled());
     }
 
     /// World placement with an explicit choice of whether to relativize positions
@@ -61,23 +61,25 @@ impl GeometryRouter {
         // branches below only start mutating it in their own loops — so this is
         // exactly the object-space extent `transform` is about to bake into
         // world space. A single extra min/max pass, no allocation.
-        mesh.local_bounds = if mesh.positions.is_empty() {
-            None
-        } else {
-            let mut min = [f32::INFINITY; 3];
-            let mut max = [f32::NEG_INFINITY; 3];
-            for chunk in mesh.positions.chunks_exact(3) {
-                for k in 0..3 {
-                    if chunk[k] < min[k] {
-                        min[k] = chunk[k];
-                    }
-                    if chunk[k] > max[k] {
-                        max[k] = chunk[k];
+        mesh.local_bounds = mesh.local_bounds.or_else(|| {
+            if mesh.positions.is_empty() {
+                None
+            } else {
+                let mut min = [f32::INFINITY; 3];
+                let mut max = [f32::NEG_INFINITY; 3];
+                for chunk in mesh.positions.chunks_exact(3) {
+                    for k in 0..3 {
+                        if chunk[k] < min[k] {
+                            min[k] = chunk[k];
+                        }
+                        if chunk[k] > max[k] {
+                            max[k] = chunk[k];
+                        }
                     }
                 }
+                Some([min[0], min[1], min[2], max[0], max[1], max[2]])
             }
-            Some([min[0], min[1], min[2], max[0], max[1], max[2]])
-        };
+        });
         mesh.local_to_world = Some(super::mat4_to_row_major(transform));
 
         let rtc = self.rtc_offset;
@@ -250,5 +252,19 @@ mod local_bounds_tests {
         assert_eq!(mesh2.local_bounds, mesh.local_bounds);
         assert_eq!(mesh2.local_to_world, mesh.local_to_world);
         assert_eq!(mesh2.origin, [0.0; 3], "absolute path never sets origin");
+    }
+
+    #[test]
+    fn issue_4550_router_local_frame_policy_is_explicit_per_instance() {
+        let transform = Translation3::new(12.345, 67.891, 0.1).to_homogeneous();
+        let mut framed = unit_box();
+        GeometryRouter::with_scale_and_local_frame(1.0, true)
+            .transform_mesh_world(&mut framed, &transform);
+        assert_ne!(framed.origin, [0.0; 3]);
+
+        let mut absolute = unit_box();
+        GeometryRouter::with_scale_and_local_frame(1.0, false)
+            .transform_mesh_world(&mut absolute, &transform);
+        assert_eq!(absolute.origin, [0.0; 3]);
     }
 }

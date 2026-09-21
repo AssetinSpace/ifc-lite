@@ -38,6 +38,32 @@ const value = view.getPropertyValue(entityId, 'Pset_WallCommon', 'FireRating');
 // Returns 'REI 120'
 ```
 
+### Changing a property's declared IFC type
+
+The fifth argument is the property's `PropertyValueType`. Most of its members
+are *shapes* (`String`, `Real`, `Integer`, …) — what the parser collapses a
+source token into — but `Label`, `Identifier` and `Text` each *name* one
+`IfcValue` member, so passing one of those sets the type the exported file
+declares:
+
+```typescript
+import { PropertyValueType } from '@ifc-lite/data';
+
+// A value that outgrew IfcLabel's 255 characters: export it as IfcText.
+view.setProperty(entityId, 'Pset_WallCommon', 'Reference', 'a long description…', PropertyValueType.Text);
+```
+
+The exported line becomes `IFCTEXT('…')` where the source declared
+`IFCLABEL('…')` — which is what an IDS `property` facet with
+`dataType="IFCTEXT"` checks.
+
+Passing a *shape* instead leaves the declared type alone: a value-only edit
+(`String`, the default) keeps whatever token the source line carried, so
+re-serializing a property set never rewrites the declared types of the
+neighbours you did not touch. For the same reason a numeric type cannot be
+changed this way — `Real` names neither `IfcLengthMeasure` nor `IfcReal`, so
+the source token wins.
+
 ### Mutation History
 
 ```typescript
@@ -166,11 +192,42 @@ In the IFClite viewer:
 | Tab | Edits | Backed by |
 |---|---|---|
 | **Properties** | IfcRoot named attributes (Name, Description, …), property sets, classifications, materials, documents | `setProperty` / `setAttribute` |
-| **Quantities** | Quantity sets and individual quantities | `setQuantity` |
+| **Quantities** | Quantity sets and individual quantities | `setQuantity` / `deleteQuantity` / `createQuantitySet` / `deleteQuantitySet` |
 | **bSDD** | Add buildingSMART Data Dictionary properties | `setProperty` |
 | **Raw STEP** | Positional STEP arguments on the selected entity (one row per arg, inline pen-icon editor). Mutated rows show a purple dot. | `setPositionalAttribute` |
 
 The Raw STEP tab is the right place for non-IfcRoot edits — `IfcRectangleProfileDef.XDim`, `IfcCartesianPoint.Coordinates`, anything without a symbolic attribute name.
+
+### Zone shapes
+
+A zone is an oriented box by default. A zone whose JSON carries a `footprint` (an array of `[x, z]` points in world metres) is a vertical **prism** over that polygon instead, spanning the same `center[1] +/- size[1]/2`:
+
+```json
+{ "id": "z-1", "name": "Takt A", "center": [0, 1.5, 0], "size": [0, 3, 0], "rotationY": 0,
+  "footprint": [[0, 0], [12, 0], [12, 5], [4, 9]] }
+```
+
+- The polygon must be **convex**; a concave one is rejected on import, because the sweep, the point test and the overlap test are each silently wrong for it rather than visibly broken.
+- `center` / `size` in X/Z and `rotationY` are **derived** from the footprint on import, so every bounds consumer keeps working. The vertical extent stays yours to edit; the 3D handles stay off, since dragging a derived bounding box would change nothing.
+- Classification, apportionment and geometry splitting all follow the polygon. Apportionment costs a few times a box zone (one trapezoidal strip per footprint vertex pair), not a different order.
+
+### Zone assignment write-back
+
+The Zones panel writes a zone set's assignment onto the elements, so it survives an export instead of staying viewer state (issue #2508). Per element in the set:
+
+| Set | Name | Carries |
+|---|---|---|
+| Property set | `IfcLite_Zones [<set name>]` | `ZoneSet`, `Zone` (the home zone, empty when the centroid is in no zone), `Zones` (every touched zone, joined with `", "`), `Straddles`, and the basis labels |
+| Quantity set | `IfcLite_ZoneVolumes [<set name>] (<basis>)` | one `IfcQuantityVolume` per zone the element reaches, plus `Outside zones` when part of it is in none |
+
+Neither name uses the `Pset_` / `Qto_` prefix, which buildingSMART reserves for its own published definitions.
+
+Four things are deliberate:
+
+- **The basis is chosen, and it is in the name.** `mesh` is the as-built geometry; `net` / `gross` / `unqualified` apportion the file's own declared quantity by the measured fractions, so a `net` breakdown sums to the declared `NetVolume` by construction. Elements that declare nothing on the chosen basis are refused rather than quietly falling back to the mesh.
+- **Values are written in the model's declared volume unit**, converted per model, so a federated file in cubic millimetres and one in cubic metres both come out right.
+- **A refusal is written down.** An element whose mesh is not a proven closed solid gets its zone names plus a `VolumeUnavailable` sentence, and no quantities. A missing row would read as zero.
+- **The run does not enter the undo stack** - it writes to the overlay directly, because driving the per-mutation actions once per element is quadratic in the undo stack. Its inverse is the panel's own remove button, which clears the property set and the quantity set on every basis.
 
 ### Selection context menu
 
@@ -236,6 +293,100 @@ editor.removeEntity(unwantedExpressId);
 ```
 
 Edits accumulate in the same overlay used by `setProperty` / `setAttribute`. They land in the exported file the next time you call `exportToStep(store, { applyMutations: true })` from `@ifc-lite/export`.
+
+### Atomic overlay edits
+
+Use `StoreEditor.runAtomic` to create or modify a related set of IFC entities together. The callback receives a detached editor; a thrown error leaves the live overlay, mutation history and express-ID allocator unchanged. `MutablePropertyView.runAtomic` provides the same operation with a draft view for property and quantity edits.
+
+```typescript
+import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+
+const view = new MutablePropertyView(propertyTable, modelId);
+const editor = new StoreEditor(dataStore, view);
+const colour = editor.runAtomic(draft => {
+  const entity = draft.addEntity('IfcColourRgb', [null, 0.2, 0.4, 0.8]);
+  if (!draft.hasEntity(entity.expressId)) throw new Error('Missing created colour');
+  return entity;
+});
+console.log(editor.hasEntity(colour.expressId)); // true after publication
+```
+
+`hasEntity` recognizes live source, deferred-index and newly created entities, and rejects removed entities and invalid IDs. Atomic callbacks must be synchronous: prepare images, network requests and other asynchronous resources beforehand. Source tables and extractors remain shared read-only. Escaped draft editors and nested values cannot modify the published overlay. Reentering the original view is detected and preserves that independent edit rather than overwriting it.
+
+For commands coordinating IFC with another synchronous subsystem, `view.prepareAtomic(callback)` returns `{ result, validate, commit, rollback }`. Preparation runs the callback without publishing. Validate all external resources before calling `commit`; it rejects intervening overlay edits, including edits that skip history. Repeated successful commits are harmless and never replay an old snapshot over newer edits. After a successful commit, `rollback` restores the original overlay, history and allocator only if no subsequent edit occurred; otherwise it throws and preserves those newer edits. Repeated rollback is harmless, and a rolled-back transaction cannot be committed again. Rollback before commit is a no-op.
+
+These transactions publish IFC overlay state only. They do not group application undo stacks or roll back renderer, file or network effects. The caller must coordinate those effects and handle rollback refusal explicitly. Preparation copies the existing overlay and checks it for changes, so batch related edits in one transaction rather than opening a transaction for every entity.
+
+### Cooperative owned entity operations
+
+`StoreEditor.prepareEntityOperations` prepares a bounded list of `create`,
+`setPositionalAttribute` and `remove` operations cooperatively. It is intended for
+appearance authoring's staged IFC/history publication. It does not accept an async
+callback and never exposes its mutable working view. The existing `runAtomic` and
+`prepareAtomic` behavior is unchanged.
+
+```typescript
+import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+
+const view = new MutablePropertyView(propertyTable, modelId);
+const editor = new StoreEditor(dataStore, view); // establishes allocator watermark
+const abort = new AbortController();
+const operations = [{
+  kind: 'create' as const,
+  expressId: view.peekNextExpressId(),
+  type: 'IfcTextureVertexList',
+  attributes: [[[0, 0], [1, 0], [0, 1]]],
+}];
+const prepared = await editor.prepareEntityOperations(operations, { signal: abort.signal });
+try {
+  prepared.validate(); // coordinate other already-prepared resources here
+  prepared.commit();
+  console.log(prepared.effects, prepared.mutations);
+} finally {
+  prepared.dispose(); // release private checkpoints; does not undo a commit
+}
+```
+
+Construction initializes the live allocator before preparation starts; cancellation
+never advances it. Creation IDs must match the next sequential allocation. The
+operation executor uses the same `StoreEditor` rules as ordinary edits. A missing
+removal or invalid target discards the whole unpublished operation list.
+
+Copies yield inside large nested attribute arrays. The default scheduler yields to
+a host task, targeting four milliseconds per slice; `yieldTask` permits a host
+scheduler override. A microtask-only scheduler does not let browser rendering run.
+The defaults cap cumulative traversal at 16 million entries and conservatively
+account 512 MiB across the owned copies; these are work/allocation estimates, not
+measured heap use. `maxWork`, `maxBytes`, and `maxSliceMs` customize finite positive
+budgets. Budget failures and unsupported values reject without publication.
+
+The supported overlay vocabulary is strings, numbers, booleans, null and undefined (preserving negative
+zero), plain objects, sparse arrays, maps with primitive keys, and sets
+with primitive members. Aliases and cycles are preserved. Host objects, accessors,
+functions and mutable map keys/set members are rejected on this opt-in path rather
+than silently converted. Synchronous transaction support remains unchanged.
+
+The handle's effects/history records are separate owned copies: caller edits
+cannot modify the live publication or rollback checkpoint. Keep the input operation
+list stable until commit. Exact synchronous comparisons reject changes to its owned
+checkpoint or the captured live overlay, including skip-history/escaped nested SDK
+edits. A changed source-index identity or size also rejects publication. Source
+index records must otherwise follow their existing immutable-source contract.
+
+Capture itself is cooperative, so it is not an instantaneous snapshot at method
+entry. The final fence accepts only a coherent captured input equal to the live
+input at publication. Callers whose operations depend on an earlier model revision
+(such as a worker's appearance plan) must also retain and validate that earlier
+source checkpoint. Neither a revision counter alone nor a yielded comparison can
+replace the exact final fence. Its worst-case synchronous cost is linear in the
+mutable input/overlay size; this API does not promise a universal frame budget.
+
+Abort rejects preparation, including a pending scheduler wait, and abort after
+preparation prevents commit. Commit is idempotent. Rollback restores the captured
+original only while the published state still matches its private checkpoint;
+newer SDK edits are preserved and cause rollback to throw. Dispose is idempotent;
+before commit it abandons work, after commit it relinquishes rollback. No GPU,
+image, network or application undo resources are implicitly published by this API.
 
 #### STEP value conventions
 
@@ -315,11 +466,11 @@ The detector also picks up overlay walls (placed via `addWallToStore` since the 
 
 ### `bim.store.*` — Scripting & SDK
 
-In the viewer's QuickJS sandbox and the TypeScript SDK, the same surface is exposed as `bim.store`:
+The viewer's QuickJS sandbox and the TypeScript SDK expose the core mutation surface as `bim.store`:
 
 ```typescript
 // SDK (TypeScript app)
-const profile = bim.store.addEntity('arch', {
+const profile = bim.store.addEntity('default', {
   type: 'IfcRectangleProfileDef',
   attributes: ['.AREA.', null, '#34', 0.6, 0.4],
 });
@@ -328,14 +479,18 @@ bim.store.removeEntity(unwantedRef);
 
 // High-level builder
 const storey = bim.query().byType('IfcBuildingStorey').refs()[0].expressId;
-const col = bim.store.addColumn('arch', storey, {
+const col = bim.store.addColumn('default', storey, {
   Position: [1, 1, 0],
   Width: 0.3, Depth: 0.4, Height: 3,
   Name: 'Column 1',
 });
 ```
 
+**Which `modelId`?** The headless backend behind `ifc-lite run` and `ifc-lite eval` holds exactly one model and answers for two spellings of it: `'default'` and the file's basename (`'tower.ifc'`). Any other id throws at the create call, rather than handing back a ref that the next `bim.mutate.*` write would refuse. Use the id you were given: the refs from `bim.query()` already carry it, and in the viewer it is the real model id from the model registry.
+
 The sandbox gates `bim.store.*` behind a `store: true` permission (default `false`, mirrors the existing `mutate` permission). The viewer opts in.
+
+**Cost / 5D authoring (#4857)** — `addCostSchedule`, `addCostItem`, `addCostValue`, `addCostQuantity`, `nestCostItems`, `assignCostItemsToSchedule`, `assignToCostItem`, `setCostItemValues`, `removeCostEntity` — is available through the CLI/headless and viewer SDK adapters and is registered in the viewer's QuickJS `bim.store` bridge (subject to the existing `store` permission). The viewer's cost panel stays read-only by design (see [Cost Panel → Authoring from scripts](cost-panel.md#authoring-from-scripts)). An authored `IfcCostItem`/`IfcCostValue` is visible to `bim.cost.data()` immediately, before export.
 
 ### Viewer UI
 

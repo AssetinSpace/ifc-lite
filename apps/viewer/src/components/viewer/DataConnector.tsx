@@ -61,6 +61,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
 import { Separator } from '@/components/ui/separator';
 import { useViewerStore } from '@/store';
+import { useTranslation, localeCount } from '@/i18n';
+import { roleCanEdit } from '@/store/slices/collabSlice';
 import { useIfc } from '@/hooks/useIfc';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { PropertyValueType } from '@ifc-lite/data';
@@ -97,9 +99,24 @@ interface MappingRow {
 }
 
 export function DataConnector({ trigger }: DataConnectorProps) {
+  const { t, locale } = useTranslation();
   const { models } = useIfc();
   const getMutationView = useViewerStore((s) => s.getMutationView);
   const registerMutationView = useViewerStore((s) => s.registerMutationView);
+  // Collab role gate, two layers deep. (1) canCollabEdit is injected straight into
+  // CsvConnector's constructor (see mutation-guard.ts): CSV import reaches the
+  // mutation view's setProperty directly via generateMutations/importAsync,
+  // bypassing the store's own setProperty action (and its canCollabEdit() check)
+  // entirely, so the connector itself refuses a write for a viewer/commenter role
+  // as containment. (2) canEditInSession mirrors that same role check here in the
+  // component, the same way MainToolbar/AuthorTab gate Edit mode, so the Import
+  // button is disabled and never gets clicked in the first place. Both layers read
+  // the one shared `roleCanEdit` rule that `canCollabEdit()` is itself built from,
+  // so a future role change cannot leave them disagreeing. null role = single-user,
+  // always editable.
+  const canCollabEdit = useViewerStore((s) => s.canCollabEdit);
+  const collabEditRole = useViewerStore((s) => s.collabRole);
+  const canEditInSession = roleCanEdit(collabEditRole);
   // Also get legacy single-model state for backward compatibility
   const legacyIfcDataStore = useViewerStore((s) => s.ifcDataStore);
   const legacyGeometryResult = useViewerStore((s) => s.geometryResult);
@@ -206,9 +223,10 @@ export function DataConnector({ trigger }: DataConnectorProps) {
     return new CsvConnector(
       dataStore.entities,
       mutationView,
-      dataStore.strings || null
+      dataStore.strings || null,
+      canCollabEdit
     );
-  }, [selectedModel, selectedModelId, getMutationView]);
+  }, [selectedModel, selectedModelId, getMutationView, canCollabEdit]);
 
   // Parse CSV file
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -434,7 +452,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
 
   // Import using CsvConnector.importAsync for non-blocking progress
   const handleImport = useCallback(async () => {
-    if (!csvConnector || !csvContent) return;
+    if (!csvConnector || !csvContent || !canEditInSession) return;
 
     setIsProcessing(true);
     setImportStats(null);
@@ -468,7 +486,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
     } finally {
       setIsProcessing(false);
     }
-  }, [csvConnector, csvContent, buildDataMapping]);
+  }, [csvConnector, csvContent, canEditInSession, buildDataMapping]);
 
   // Scroll to bottom of the body area — double rAF ensures DOM is painted
   const scrollToBottom = useCallback(() => {
@@ -561,7 +579,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
     return 0;
   }, [csvColumns.length, matchColumn, mappings.length, importStats]);
 
-  const steps = ['Upload CSV', 'Configure Mapping', 'Import'];
+  const steps = [t('dataConnector.step.upload'), t('dataConnector.step.configure'), t('dataConnector.step.import')];
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -569,7 +587,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
         {trigger || (
           <Button variant="outline" size="sm">
             <Upload className="h-4 w-4 mr-2" />
-            Import Data
+            {t('dataConnector.triggerButton')}
           </Button>
         )}
       </DialogTrigger>
@@ -578,10 +596,10 @@ export function DataConnector({ trigger }: DataConnectorProps) {
         <DialogHeader className="px-6 pt-6 pb-4 shrink-0 border-b">
           <DialogTitle className="flex items-center gap-2">
             <FileSpreadsheet className="h-5 w-5" />
-            Import External Data
+            {t('dataConnector.dialogTitle')}
           </DialogTitle>
           <DialogDescription>
-            Map CSV data to IFC entity properties
+            {t('dataConnector.dialogDescription')}
           </DialogDescription>
 
           {/* Step Indicator */}
@@ -617,10 +635,10 @@ export function DataConnector({ trigger }: DataConnectorProps) {
           <div className="space-y-6">
             {/* Model selector */}
             <div className="space-y-2">
-              <Label className="text-sm font-medium">Target Model</Label>
+              <Label className="text-sm font-medium">{t('dataConnector.targetModelLabel')}</Label>
               <Select value={selectedModelId} onValueChange={handleModelChange}>
                 <SelectTrigger>
-                  <SelectValue placeholder="Select a model" />
+                  <SelectValue placeholder={t('dataConnector.selectModelPlaceholder')} />
                 </SelectTrigger>
                 <SelectContent>
                   {modelList.map((m) => (
@@ -632,14 +650,14 @@ export function DataConnector({ trigger }: DataConnectorProps) {
               </Select>
               {selectedModelId && !csvConnector && (
                 <p className="text-xs text-amber-600">
-                  Note: MutationView not available for this model. Some features may be limited.
+                  {t('dataConnector.mutationViewUnavailableNote')}
                 </p>
               )}
             </div>
 
             {/* File Upload - Drag and Drop Zone */}
             <div className="space-y-2">
-              <Label className="text-sm font-medium">CSV File</Label>
+              <Label className="text-sm font-medium">{t('dataConnector.csvFileLabel')}</Label>
               <input
                 ref={fileInputRef}
                 type="file"
@@ -662,10 +680,10 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                   <Upload className={`h-8 w-8 ${isDragging ? 'text-primary' : 'text-muted-foreground'}`} />
                   <div className="text-center">
                     <p className="text-sm font-medium">
-                      {isDragging ? 'Drop CSV file here' : 'Drag & drop a CSV file'}
+                      {isDragging ? t('dataConnector.dropHereText') : t('dataConnector.dragDropText')}
                     </p>
                     <p className="text-xs text-muted-foreground mt-1">
-                      or click to browse
+                      {t('dataConnector.clickToBrowseText')}
                     </p>
                   </div>
                 </div>
@@ -681,7 +699,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                     className="h-7 text-xs"
                     onClick={() => fileInputRef.current?.click()}
                   >
-                    Change
+                    {t('dataConnector.changeFileButton')}
                   </Button>
                 </div>
               )}
@@ -693,7 +711,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
 
                 {/* CSV Preview */}
                 <div className="space-y-2">
-                  <Label className="text-sm font-medium">Data Preview</Label>
+                  <Label className="text-sm font-medium">{t('dataConnector.dataPreviewLabel')}</Label>
                   <ScrollArea className="h-32 border rounded-md">
                     <Table>
                       <TableHeader>
@@ -720,8 +738,8 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                   </ScrollArea>
                   <p className="text-xs text-muted-foreground">
                     {parsedRows.length > 0
-                      ? `${parsedRows.length} rows parsed`
-                      : `${csvColumns[0]?.sampleValues.length || 0} sample rows`}
+                      ? t('dataConnector.rowsParsedCount', localeCount(locale, parsedRows.length))
+                      : t('dataConnector.sampleRowsCount', localeCount(locale, csvColumns[0]?.sampleValues.length || 0))}
                   </p>
                 </div>
 
@@ -731,30 +749,30 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                 <div className="space-y-4">
                   <Label className="text-sm font-medium flex items-center gap-2">
                     <Link2 className="h-4 w-4" />
-                    Entity Matching
+                    {t('dataConnector.entityMatchingLabel')}
                   </Label>
 
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">Match By</Label>
+                      <Label className="text-xs text-muted-foreground">{t('dataConnector.matchByLabel')}</Label>
                       <Select value={matchType} onValueChange={(v) => setMatchType(v as MatchType)}>
                         <SelectTrigger>
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="globalId">GlobalId</SelectItem>
-                          <SelectItem value="expressId">EXPRESS ID</SelectItem>
-                          <SelectItem value="name">Entity Name</SelectItem>
-                          <SelectItem value="property">Property Value</SelectItem>
+                          <SelectItem value="globalId">{t('dataConnector.matchTypeGlobalId')}</SelectItem>
+                          <SelectItem value="expressId">{t('dataConnector.matchTypeExpressId')}</SelectItem>
+                          <SelectItem value="name">{t('dataConnector.matchTypeEntityName')}</SelectItem>
+                          <SelectItem value="property">{t('dataConnector.matchTypePropertyValue')}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
 
                     <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">CSV Column</Label>
+                      <Label className="text-xs text-muted-foreground">{t('dataConnector.csvColumnLabel')}</Label>
                       <Select value={matchColumn} onValueChange={setMatchColumn}>
                         <SelectTrigger>
-                          <SelectValue placeholder="Select column" />
+                          <SelectValue placeholder={t('dataConnector.selectColumnPlaceholder')} />
                         </SelectTrigger>
                         <SelectContent>
                           {csvColumns.map((col) => (
@@ -762,7 +780,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                               {col.name}
                               {col.sampleValues[0] && (
                                 <span className="ml-2 text-muted-foreground">
-                                  (e.g., {col.sampleValues[0].slice(0, 20)})
+                                  {t('dataConnector.columnSampleHint', { sample: col.sampleValues[0].slice(0, 20) })}
                                 </span>
                               )}
                             </SelectItem>
@@ -775,19 +793,19 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                   {matchType === 'property' && (
                     <div className="grid grid-cols-2 gap-4">
                       <div className="space-y-2">
-                        <Label className="text-xs text-muted-foreground">Property Set</Label>
+                        <Label className="text-xs text-muted-foreground">{t('dataConnector.propertySetFieldLabel')}</Label>
                         <Input
                           value={matchPset}
                           onChange={(e) => setMatchPset(e.target.value)}
-                          placeholder="e.g., Pset_WallCommon"
+                          placeholder={t('dataConnector.propertySetPlaceholder')}
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label className="text-xs text-muted-foreground">Property Name</Label>
+                        <Label className="text-xs text-muted-foreground">{t('dataConnector.propertyNameFieldLabel')}</Label>
                         <Input
                           value={matchProp}
                           onChange={(e) => setMatchProp(e.target.value)}
-                          placeholder="e.g., Reference"
+                          placeholder={t('dataConnector.propertyNamePlaceholder')}
                         />
                       </div>
                     </div>
@@ -799,17 +817,17 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                 {/* Property Mappings */}
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <Label className="text-sm font-medium">Property Mappings</Label>
+                    <Label className="text-sm font-medium">{t('dataConnector.propertyMappingsLabel')}</Label>
                     <div className="flex items-center gap-2">
                       {csvConnector && (
                         <Button variant="ghost" size="sm" onClick={handleAutoDetect}>
                           <Wand2 className="h-3 w-3 mr-1" />
-                          Auto-detect
+                          {t('dataConnector.autoDetectButton')}
                         </Button>
                       )}
                       <Button variant="ghost" size="sm" onClick={addMapping}>
                         <Plus className="h-3 w-3 mr-1" />
-                        Add
+                        {t('dataConnector.addMappingButton')}
                       </Button>
                     </div>
                   </div>
@@ -817,21 +835,21 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                   {mappings.length === 0 ? (
                     <div className="text-center py-6 border rounded-lg border-dashed">
                       <p className="text-sm text-muted-foreground">
-                        No property mappings configured
+                        {t('dataConnector.noMappingsText')}
                       </p>
                       <p className="text-xs text-muted-foreground mt-1">
-                        Click &quot;Auto-detect&quot; or &quot;Add&quot; to map CSV columns to IFC properties
+                        {t('dataConnector.noMappingsHint')}
                       </p>
                     </div>
                   ) : (
                     <div className="space-y-2">
                       {/* Column headers for mapping rows */}
                       <div className="grid grid-cols-[1fr_auto_1fr_1fr_auto_auto] gap-2 px-2 text-xs text-muted-foreground">
-                        <span>Source Column</span>
+                        <span>{t('dataConnector.sourceColumnHeader')}</span>
                         <span />
-                        <span>Target Pset</span>
-                        <span>Target Property</span>
-                        <span>Type</span>
+                        <span>{t('dataConnector.targetPsetHeader')}</span>
+                        <span>{t('dataConnector.targetPropertyHeader')}</span>
+                        <span>{t('dataConnector.typeHeader')}</span>
                         <span />
                       </div>
                       {mappings.map((mapping) => (
@@ -844,7 +862,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                             onValueChange={(v) => updateMapping(mapping.id, 'sourceColumn', v)}
                           >
                             <SelectTrigger className="h-8">
-                              <SelectValue placeholder="Column" />
+                              <SelectValue placeholder={t('dataConnector.columnPlaceholder')} />
                             </SelectTrigger>
                             <SelectContent>
                               {csvColumns.map((col) => (
@@ -858,7 +876,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                           <ArrowRight className="h-4 w-4 text-muted-foreground shrink-0" />
 
                           <Input
-                            placeholder="Pset name"
+                            placeholder={t('dataConnector.psetNamePlaceholder')}
                             value={mapping.targetPset}
                             onChange={(e) =>
                               updateMapping(mapping.id, 'targetPset', e.target.value)
@@ -867,7 +885,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                           />
 
                           <Input
-                            placeholder="Property"
+                            placeholder={t('dataConnector.propertyPlaceholder')}
                             value={mapping.targetProperty}
                             onChange={(e) =>
                               updateMapping(mapping.id, 'targetProperty', e.target.value)
@@ -886,16 +904,16 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value={PropertyValueType.String.toString()}>
-                                String
+                                {t('dataConnector.valueTypeString')}
                               </SelectItem>
                               <SelectItem value={PropertyValueType.Real.toString()}>
-                                Real
+                                {t('dataConnector.valueTypeReal')}
                               </SelectItem>
                               <SelectItem value={PropertyValueType.Integer.toString()}>
-                                Integer
+                                {t('dataConnector.valueTypeInteger')}
                               </SelectItem>
                               <SelectItem value={PropertyValueType.Boolean.toString()}>
-                                Boolean
+                                {t('dataConnector.valueTypeBoolean')}
                               </SelectItem>
                             </SelectContent>
                           </Select>
@@ -918,17 +936,13 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                 {matchStats && (
                   <Alert>
                     <Eye className="h-4 w-4" />
-                    <AlertTitle>Match Results</AlertTitle>
+                    <AlertTitle>{t('dataConnector.matchResultsTitle')}</AlertTitle>
                     <AlertDescription className="flex flex-wrap items-center gap-2">
-                      <Badge variant="default">{matchStats.matched} matched</Badge>
-                      <Badge variant="secondary">{matchStats.unmatched} unmatched</Badge>
-                      <Badge variant="outline">
-                        {matchStats.highConfidence} high confidence
-                      </Badge>
+                      <Badge variant="default">{t('dataConnector.matchedCount', localeCount(locale, matchStats.matched))}</Badge>
+                      <Badge variant="secondary">{t('dataConnector.unmatchedCount', localeCount(locale, matchStats.unmatched))}</Badge>
+                      <Badge variant="outline">{t('dataConnector.highConfidenceCount', localeCount(locale, matchStats.highConfidence))}</Badge>
                       {matchStats.multiMatch > 0 && (
-                        <Badge variant="destructive">
-                          {matchStats.multiMatch} multi-match
-                        </Badge>
+                        <Badge variant="destructive">{t('dataConnector.multiMatchCount', localeCount(locale, matchStats.multiMatch))}</Badge>
                       )}
                     </AlertDescription>
                   </Alert>
@@ -940,14 +954,14 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                     <div className="flex items-center justify-between text-sm text-muted-foreground">
                       <span className="flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        {importProgress.phase === 'parsing' && 'Parsing CSV...'}
-                        {importProgress.phase === 'matching' && 'Matching entities...'}
-                        {importProgress.phase === 'applying' && 'Applying properties...'}
+                        {importProgress.phase === 'parsing' && t('dataConnector.phaseParsing')}
+                        {importProgress.phase === 'matching' && t('dataConnector.phaseMatching')}
+                        {importProgress.phase === 'applying' && t('dataConnector.phaseApplying')}
                       </span>
                       <span className="tabular-nums">
-                        {importProgress.matchedRows.toLocaleString()} matched
+                        {t('dataConnector.matchedCount', localeCount(locale, importProgress.matchedRows))}
                         {importProgress.mutationsCreated > 0 &&
-                          ` \u00b7 ${importProgress.mutationsCreated.toLocaleString()} written`}
+                          t('dataConnector.writtenSuffix', localeCount(locale, importProgress.mutationsCreated))}
                       </span>
                     </div>
                     <Progress value={importProgress.percent * 100} />
@@ -956,26 +970,20 @@ export function DataConnector({ trigger }: DataConnectorProps) {
 
                 {/* Import Stats */}
                 {importStats && (
-                  <Alert
-                    variant={importStats.errors.length === 0 ? 'default' : 'destructive'}
-                  >
+                  <Alert variant={importStats.errors.length === 0 ? 'default' : 'destructive'}>
                     <Check className="h-4 w-4" />
-                    <AlertTitle>Import Complete</AlertTitle>
+                    <AlertTitle>{t('dataConnector.importCompleteTitle')}</AlertTitle>
                     <AlertDescription>
                       <div className="flex flex-wrap items-center gap-2 mt-1">
                         <Badge variant="default">
-                          {importStats.mutationsCreated} properties updated
+                          {t('dataConnector.propertiesUpdatedCount', localeCount(locale, importStats.mutationsCreated))}
                         </Badge>
-                        <Badge variant="secondary">
-                          {importStats.matchedRows} rows matched
-                        </Badge>
-                        <Badge variant="outline">
-                          {importStats.unmatchedRows} rows unmatched
-                        </Badge>
+                        <Badge variant="secondary">{t('dataConnector.rowsMatchedCount', localeCount(locale, importStats.matchedRows))}</Badge>
+                        <Badge variant="outline">{t('dataConnector.rowsUnmatchedCount', localeCount(locale, importStats.unmatchedRows))}</Badge>
                       </div>
                       {importStats.warnings.length > 0 && (
                         <div className="mt-2 text-xs text-amber-600">
-                          {importStats.warnings.length} warning(s)
+                          {t('dataConnector.warningsCount', localeCount(locale, importStats.warnings.length))}
                         </div>
                       )}
                     </AlertDescription>
@@ -986,7 +994,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
                 {error && (
                   <Alert variant="destructive">
                     <AlertCircle className="h-4 w-4" />
-                    <AlertTitle>Error</AlertTitle>
+                    <AlertTitle>{t('dataConnector.errorTitle')}</AlertTitle>
                     <AlertDescription className="whitespace-pre-wrap">
                       {error}
                     </AlertDescription>
@@ -1009,11 +1017,12 @@ export function DataConnector({ trigger }: DataConnectorProps) {
             ) : (
               <Eye className="h-4 w-4 mr-2" />
             )}
-            Preview Matches
+            {t('dataConnector.previewMatchesButton')}
           </Button>
           <Button
             onClick={handleImport}
             disabled={
+              !canEditInSession ||
               !csvConnector ||
               !csvContent ||
               !matchColumn ||
@@ -1021,6 +1030,7 @@ export function DataConnector({ trigger }: DataConnectorProps) {
               isProcessing ||
               !importDirty
             }
+            title={canEditInSession ? undefined : t('dataConnector.editRequiresAccessTitle')}
           >
             {isProcessing && importProgress ? (
               <>
@@ -1030,7 +1040,9 @@ export function DataConnector({ trigger }: DataConnectorProps) {
             ) : (
               <>
                 <Play className="h-4 w-4 mr-2" />
-                {matchStats ? `Import ${matchStats.matched} rows` : 'Import'}
+                {matchStats
+                  ? t('dataConnector.importRowsButton', localeCount(locale, matchStats.matched))
+                  : t('dataConnector.importButton')}
               </>
             )}
           </Button>

@@ -3,16 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Bulk Query Engine for mass property updates
- *
- * Provides SQL-like query capabilities for selecting and modifying
- * multiple IFC entities at once.
+ * Bulk Query Engine: SQL-like selection and modification for multiple
+ * IFC entities at once.
  */
-
 import type { EntityTable, SpatialHierarchy, PropertyTable } from '@ifc-lite/data';
 import { PropertyValueType } from '@ifc-lite/data';
 import type { MutablePropertyView } from './mutable-property-view.js';
 import type { Mutation, PropertyValue } from './types.js';
+import { checkMutationGuard, type MutationGuard } from './mutation-guard.js';
+import { compileGuardedRegex } from '@ifc-lite/regex-guard';
 
 /**
  * Filter operators for property values
@@ -131,19 +130,23 @@ export class BulkQueryEngine {
   private strings: { get(idx: number): string } | null;
   /** expressId → array index lookup, built once to avoid O(n) scans */
   private expressIdIndex: Map<number, number>;
+  /** See mutation-guard.ts: consulted once by `applyAction`, opt-in. */
+  private canEdit: MutationGuard | undefined;
 
   constructor(
     entities: EntityTable,
     mutationView: MutablePropertyView,
     spatialHierarchy?: SpatialHierarchy | null,
     properties?: PropertyTable | null,
-    strings?: { get(idx: number): string } | null
+    strings?: { get(idx: number): string } | null,
+    canEdit?: MutationGuard
   ) {
     this.entities = entities;
     this.mutationView = mutationView;
     this.spatialHierarchy = spatialHierarchy || null;
     this.properties = properties || null;
     this.strings = strings || null;
+    this.canEdit = canEdit;
 
     // Build O(1) lookup map once instead of O(n) linear scan per query
     this.expressIdIndex = new Map<number, number>();
@@ -202,6 +205,21 @@ export class BulkQueryEngine {
       candidates = candidates.filter((id) => buildingElements.has(id));
     }
 
+    // Filter by sites
+    if (criteria.sites && criteria.sites.length > 0 && this.spatialHierarchy) {
+      const siteSet = new Set(criteria.sites);
+      const siteElements = new Set<number>();
+      for (const siteId of siteSet) {
+        const elements = this.spatialHierarchy.bySite.get(siteId);
+        if (elements) {
+          for (const el of elements) {
+            siteElements.add(el);
+          }
+        }
+      }
+      candidates = candidates.filter((id) => siteElements.has(id));
+    }
+
     // Filter by spaces
     if (criteria.spaces && criteria.spaces.length > 0 && this.spatialHierarchy) {
       const spaceSet = new Set(criteria.spaces);
@@ -251,7 +269,7 @@ export class BulkQueryEngine {
 
     // Filter by name pattern
     if (criteria.namePattern && this.strings) {
-      const regex = new RegExp(criteria.namePattern, 'i');
+      const regex = compileGuardedRegex(criteria.namePattern, 'i'); // caller-supplied: guard against ReDoS
       candidates = candidates.filter((id) => {
         const idx = this.findEntityIndex(id);
         if (idx === -1) return false;
@@ -314,6 +332,7 @@ export class BulkQueryEngine {
    * Apply an action to a single entity (public for chunked execution from UI)
    */
   applyAction(entityId: number, action: BulkAction): Mutation | null {
+    checkMutationGuard(this.canEdit);
     switch (action.type) {
       case 'SET_PROPERTY':
         return this.mutationView.setProperty(

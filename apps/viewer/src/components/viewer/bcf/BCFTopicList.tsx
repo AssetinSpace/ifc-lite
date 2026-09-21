@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import type { BCFTopic } from '@ifc-lite/bcf';
+import { useTranslation } from '@/i18n';
 import { StatusBadge, PriorityBadge, formatDate, TOPIC_STATUSES } from './bcfHelpers';
 
 // ============================================================================
@@ -58,6 +59,7 @@ export function BCFTopicList({
   author,
   onSetAuthor,
 }: BCFTopicListProps) {
+  const { t } = useTranslation();
   const [editingEmail, setEditingEmail] = useState(false);
   const [emailInput, setEmailInput] = useState(author);
   const isDefaultEmail = author === 'user@example.com';
@@ -75,11 +77,13 @@ export function BCFTopicList({
     );
   }, [topics, statusFilter]);
 
-  // Sort by creation date (newest first)
+  // Sort by creation date (newest first); a topic read back from a
+  // non-conformant source that omitted CreationDate has it undefined
+  // (see @ifc-lite/bcf's reader.ts) and sorts as oldest, never fabricated.
   const sortedTopics = useMemo(() => {
-    return [...filteredTopics].sort(
-      (a, b) => new Date(b.creationDate).getTime() - new Date(a.creationDate).getTime()
-    );
+    const time = (t: (typeof filteredTopics)[number]) =>
+      t.creationDate ? new Date(t.creationDate).getTime() : 0;
+    return [...filteredTopics].sort((a, b) => time(b) - time(a));
   }, [filteredTopics]);
 
   return (
@@ -89,10 +93,10 @@ export function BCFTopicList({
         <Filter className="h-4 w-4 text-muted-foreground" />
         <Select value={statusFilter} onValueChange={onStatusFilterChange}>
           <SelectTrigger className="h-8 flex-1">
-            <SelectValue placeholder="All statuses" />
+            <SelectValue placeholder={t('bcf.topicList.allStatuses')} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="all">{t('bcf.topicList.allStatuses')}</SelectItem>
             {TOPIC_STATUSES.map((status) => (
               <SelectItem key={status} value={status.toLowerCase()}>
                 {status}
@@ -100,7 +104,7 @@ export function BCFTopicList({
             ))}
           </SelectContent>
         </Select>
-        <Button size="sm" variant="outline" aria-label="New topic" onClick={onCreateTopic} {...tourAnchor(TOUR_ANCHORS.bcfNewTopic)}>
+        <Button size="sm" variant="outline" aria-label={t('bcf.topicList.newTopicAria')} onClick={onCreateTopic} {...tourAnchor(TOUR_ANCHORS.bcfNewTopic)}>
           <Plus className="h-4 w-4" />
         </Button>
       </div>
@@ -110,14 +114,14 @@ export function BCFTopicList({
         {sortedTopics.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-8 px-4 text-muted-foreground text-sm">
             <MessageSquare className="h-8 w-8 mb-2 opacity-50" />
-            <p>No topics</p>
+            <p>{t('bcf.topicList.noTopics')}</p>
             <Button
               variant="link"
               size="sm"
               onClick={onCreateTopic}
               className="mt-1"
             >
-              Create first topic
+              {t('bcf.topicList.createFirstTopic')}
             </Button>
 
             {/* Email setup nudge */}
@@ -125,11 +129,11 @@ export function BCFTopicList({
               <div className="border border-border rounded-lg p-3 bg-muted/30">
                 {editingEmail ? (
                   <div className="space-y-2">
-                    <Label className="text-xs text-muted-foreground">Your email for BCF authorship</Label>
+                    <Label className="text-xs text-muted-foreground">{t('bcf.topicList.emailAuthorshipLabel')}</Label>
                     <Input
                       value={emailInput}
                       onChange={(e) => setEmailInput(e.target.value)}
-                      placeholder="your@email.com"
+                      placeholder={t('bcf.shared.emailPlaceholder')}
                       className="h-8 text-sm"
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') handleSaveEmail();
@@ -147,7 +151,7 @@ export function BCFTopicList({
                         }}
                         className="h-7 text-xs"
                       >
-                        Cancel
+                        {t('bcf.shared.cancel')}
                       </Button>
                       <Button
                         size="sm"
@@ -155,14 +159,14 @@ export function BCFTopicList({
                         disabled={!emailInput.trim() || !emailInput.includes('@')}
                         className="h-7 text-xs"
                       >
-                        Save
+                        {t('bcf.shared.save')}
                       </Button>
                     </div>
                   </div>
                 ) : (
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-muted-foreground mb-0.5">Author</p>
+                      <p className="text-xs text-muted-foreground mb-0.5">{t('bcf.topicList.authorLabel')}</p>
                       <p className={`text-sm truncate ${isDefaultEmail ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'}`}>
                         {author}
                       </p>
@@ -175,16 +179,16 @@ export function BCFTopicList({
                         setEditingEmail(true);
                       }}
                       className="h-7 text-xs shrink-0"
-                      aria-label={isDefaultEmail ? undefined : 'Edit author email'}
+                      aria-label={isDefaultEmail ? undefined : t('bcf.topicList.editAuthorEmailAria')}
                     >
-                      {isDefaultEmail ? 'Set email' : <Edit2 className="h-3 w-3" />}
+                      {isDefaultEmail ? t('bcf.topicList.setEmail') : <Edit2 className="h-3 w-3" />}
                     </Button>
                   </div>
                 )}
               </div>
               {isDefaultEmail && !editingEmail && (
                 <p className="text-xs text-muted-foreground mt-2 text-center">
-                  Set your email to identify your issues and comments
+                  {t('bcf.topicList.setEmailNudge')}
                 </p>
               )}
             </div>
@@ -210,14 +214,18 @@ export function BCFTopicList({
                 )}
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <PriorityBadge priority={topic.priority} />
-                  <span className="flex items-center gap-1">
-                    <User className="h-3 w-3" />
-                    {topic.creationAuthor.split('@')[0]}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <Calendar className="h-3 w-3" />
-                    {formatDate(topic.creationDate)}
-                  </span>
+                  {topic.creationAuthor && (
+                    <span className="flex items-center gap-1">
+                      <User className="h-3 w-3" />
+                      {topic.creationAuthor.split('@')[0]}
+                    </span>
+                  )}
+                  {topic.creationDate && (
+                    <span className="flex items-center gap-1">
+                      <Calendar className="h-3 w-3" />
+                      {formatDate(topic.creationDate)}
+                    </span>
+                  )}
                   {topic.comments.length > 0 && (
                     <span className="flex items-center gap-1">
                       <MessageSquare className="h-3 w-3" />

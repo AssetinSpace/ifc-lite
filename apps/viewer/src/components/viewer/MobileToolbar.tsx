@@ -8,7 +8,7 @@
  * and secondary actions in an overflow menu.
  */
 
-import React, { useRef, useCallback, useMemo } from 'react';
+import React, { useRef, useCallback } from 'react';
 import {
   FolderOpen,
   MousePointer2,
@@ -41,19 +41,25 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Progress } from '@/components/ui/progress';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { goHomeFromStore, resetVisibilityForHomeFromStore } from '@/store/homeView';
 import { executeBasketIsolate } from '@/store/basket/basketCommands';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
-import { exportGlbFromGeometry } from '@/lib/export/glb';
+import { exportPlacedModelGlb } from '@/lib/model-placement/quick-glb';
 import { downloadBlob } from '@/lib/export/download';
 import { recordRecentFiles, cacheFileBlobs } from '@/lib/recent-files';
 import { toast } from '@/components/ui/toast';
+<<<<<<< HEAD
 import { ViewModeSwitcher } from './ViewModeSwitcher';
+=======
+import { MOBILE_FILE_ACCEPT, isSupportedMobileModelFile } from '@/services/supported-model-files';
+>>>>>>> upstream/main
 
 type Tool = 'select' | 'walk' | 'measure' | 'section';
 
 export function MobileToolbar() {
+  const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addModelInputRef = useRef<HTMLInputElement>(null);
   const {
@@ -65,7 +71,6 @@ export function MobileToolbar() {
     geometryResult,
     models,
     loadFilesSequentially,
-    addModel,
   } = useIfc();
 
   const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -95,9 +100,7 @@ export function MobileToolbar() {
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    const supportedFiles = Array.from(files).filter(
-      f => f.name.endsWith('.ifc') || f.name.endsWith('.ifcx') || f.name.endsWith('.ifczip') || f.name.endsWith('.glb')
-    );
+    const supportedFiles = Array.from(files).filter(isSupportedMobileModelFile);
     if (supportedFiles.length === 0) return;
     recordRecentFiles(supportedFiles.map((file) => ({ name: file.name, size: file.size })));
     void cacheFileBlobs(supportedFiles);
@@ -114,9 +117,7 @@ export function MobileToolbar() {
   const handleAddModelSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    const supportedFiles = Array.from(files).filter(
-      f => f.name.endsWith('.ifc') || f.name.endsWith('.ifcx') || f.name.endsWith('.ifczip') || f.name.endsWith('.glb')
-    );
+    const supportedFiles = Array.from(files).filter(isSupportedMobileModelFile);
     if (supportedFiles.length === 0) return;
     recordRecentFiles(supportedFiles.map((file) => ({ name: file.name, size: file.size })));
     void cacheFileBlobs(supportedFiles);
@@ -145,19 +146,23 @@ export function MobileToolbar() {
   const handleExportGLB = useCallback(async () => {
     if (!geometryResult) return;
     try {
-      const glb = await exportGlbFromGeometry(geometryResult, { includeMetadata: true });
+      const glb = await exportPlacedModelGlb(geometryResult);
       const blob = new Blob([new Uint8Array(glb)], { type: 'model/gltf-binary' });
       downloadBlob(blob, 'model.glb');
-      toast.success(`Exported GLB (${(blob.size / 1024).toFixed(0)} KB)`);
+      toast.success(t('shellChrome.mobileToolbar.exportGlbSuccess', { size: (blob.size / 1024).toFixed(0) }));
     } catch (err) {
-      toast.error(`Export failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      toast.error(
+        t('shellChrome.mobileToolbar.exportGlbFailed', {
+          message: err instanceof Error ? err.message : t('shellChrome.mobileToolbar.unknownError'),
+        }),
+      );
     }
-  }, [geometryResult]);
+  }, [geometryResult, t]);
 
   const toolButtons: { tool: Tool; icon: React.ElementType; label: string }[] = [
-    { tool: 'select', icon: MousePointer2, label: 'Select' },
-    { tool: 'measure', icon: Ruler, label: 'Measure' },
-    { tool: 'section', icon: Scissors, label: 'Section' },
+    { tool: 'select', icon: MousePointer2, label: t('shellChrome.mobileToolbar.selectTool') },
+    { tool: 'measure', icon: Ruler, label: t('shellChrome.mobileToolbar.measureTool') },
+    { tool: 'section', icon: Scissors, label: t('shellChrome.mobileToolbar.sectionTool') },
   ];
 
   return (
@@ -166,7 +171,7 @@ export function MobileToolbar() {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".ifc,.ifcx,.ifczip,.glb"
+        accept={MOBILE_FILE_ACCEPT}
         multiple
         onChange={handleFileSelect}
         className="hidden"
@@ -174,7 +179,7 @@ export function MobileToolbar() {
       <input
         ref={addModelInputRef}
         type="file"
-        accept=".ifc,.ifcx,.ifczip,.glb"
+        accept={MOBILE_FILE_ACCEPT}
         multiple
         onChange={handleAddModelSelect}
         className="hidden"
@@ -231,13 +236,31 @@ export function MobileToolbar() {
       <div className="w-px h-5 bg-border mx-0.5 flex-shrink-0" />
 
       {/* Quick actions: Home, Fit, Show All */}
-      <Button variant="ghost" size="icon-sm" className="h-9 w-9 flex-shrink-0" onClick={handleHome} aria-label="Home">
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className="h-9 w-9 flex-shrink-0"
+        onClick={handleHome}
+        aria-label={t('shellChrome.mobileToolbar.homeAriaLabel')}
+      >
         <Home className="h-4 w-4" />
       </Button>
-      <Button variant="ghost" size="icon-sm" className="h-9 w-9 flex-shrink-0" onClick={() => cameraCallbacks.fitAll?.()} aria-label="Fit All">
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className="h-9 w-9 flex-shrink-0"
+        onClick={() => cameraCallbacks.fitAll?.()}
+        aria-label={t('shellChrome.mobileToolbar.fitAllAriaLabel')}
+      >
         <Maximize2 className="h-4 w-4" />
       </Button>
-      <Button variant="ghost" size="icon-sm" className="h-9 w-9 flex-shrink-0" onClick={handleShowAll} aria-label="Show All">
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className="h-9 w-9 flex-shrink-0"
+        onClick={handleShowAll}
+        aria-label={t('shellChrome.mobileToolbar.showAllAriaLabel')}
+      >
         <Eye className="h-4 w-4" />
       </Button>
 
@@ -280,7 +303,7 @@ export function MobileToolbar() {
             onCheckedChange={() => setActiveTool(activeTool === 'walk' ? 'select' : 'walk')}
           >
             <PersonStanding className="h-4 w-4 mr-2" />
-            Walk Mode
+            {t('shellChrome.mobileToolbar.walkMode')}
           </DropdownMenuCheckboxItem>
 
           <DropdownMenuSeparator />
@@ -288,16 +311,16 @@ export function MobileToolbar() {
           {/* Visibility */}
           <DropdownMenuItem onClick={handleIsolate}>
             <Eye className="h-4 w-4 mr-2" />
-            Isolate Selection
+            {t('shellChrome.mobileToolbar.isolateSelection')}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={handleHide} disabled={!hasSelection}>
             <EyeOff className="h-4 w-4 mr-2" />
-            Hide Selection
+            {t('shellChrome.mobileToolbar.hideSelection')}
           </DropdownMenuItem>
           {hasSelection && (
             <DropdownMenuItem onClick={() => cameraCallbacks.frameSelection?.()}>
               <Crosshair className="h-4 w-4 mr-2" />
-              Frame Selection
+              {t('shellChrome.mobileToolbar.frameSelection')}
             </DropdownMenuItem>
           )}
 
@@ -332,7 +355,7 @@ export function MobileToolbar() {
           {/* Camera */}
           <DropdownMenuItem onClick={() => toggleProjectionMode()}>
             <Orbit className="h-4 w-4 mr-2" />
-            {projectionMode === 'orthographic' ? 'Perspective' : 'Orthographic'}
+            {t(projectionMode === 'orthographic' ? 'shellChrome.mobileToolbar.perspective' : 'shellChrome.mobileToolbar.orthographic')}
           </DropdownMenuItem>
 
           <DropdownMenuSeparator />
@@ -341,14 +364,14 @@ export function MobileToolbar() {
           {geometryResult && (
             <DropdownMenuItem onClick={() => void handleExportGLB()}>
               <Download className="h-4 w-4 mr-2" />
-              Export GLB
+              {t('shellChrome.mobileToolbar.exportGlb')}
             </DropdownMenuItem>
           )}
 
           {/* Theme */}
           <DropdownMenuItem onClick={() => toggleTheme()}>
             {theme === 'dark' ? <Sun className="h-4 w-4 mr-2" /> : <Moon className="h-4 w-4 mr-2" />}
-            {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
+            {t(theme === 'dark' ? 'shellChrome.mobileToolbar.lightMode' : 'shellChrome.mobileToolbar.darkMode')}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

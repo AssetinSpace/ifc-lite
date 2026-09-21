@@ -21,6 +21,7 @@
 //! - `POST /api/v1/parse/parquet/optimized` - ara3d BOS-optimized format (~50x smaller)
 //! - `GET /api/v1/parse/symbolic/:cache_key` - 2D symbol stream (IfcAnnotation + IfcGrid) as JSON
 //! - `GET /api/v1/cache/:key` - Retrieve cached result
+//! - `DELETE /api/v1/cache/:hash` - Invalidate every cache entry for one source file
 
 // Native global allocator (#1623): the platform system heap's global lock was
 // ~70% of native geometry self-time and capped rayon scaling to ~1.8x on
@@ -51,8 +52,10 @@ mod config;
 mod mem_policy;
 mod error;
 mod middleware;
+mod panic_strategy;
 mod routes;
 mod services;
+mod write_timeout;
 mod types;
 
 /// Slack added on top of `max_file_size_mb` for the raw framework-level body
@@ -63,6 +66,10 @@ const BODY_LIMIT_SLACK_MB: usize = 16;
 
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+#[path = "cors_tests.rs"]
+mod cors_tests;
 
 use config::Config;
 use services::cache::DiskCache;
@@ -87,7 +94,7 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
 
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
             .max_age(Duration::from_secs(3600))
     }
@@ -184,7 +191,10 @@ fn build_router(state: AppState) -> Router {
             get(routes::parse::get_symbolic),
         )
         // Cache endpoints
-        .route("/api/v1/cache/{key}", get(routes::cache::get_cached))
+        .route(
+            "/api/v1/cache/{key}",
+            get(routes::cache::get_cached).delete(routes::cache::delete_cached),
+        )
         .route("/api/v1/cache/check/{hash}", get(routes::parse::check_cache))
         .route(
             "/api/v1/cache/geometry/{hash}",
@@ -230,6 +240,24 @@ fn build_router(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Build-profile self-check, before anything else starts. The release
+    // pipeline runs the SHIPPED binary with this flag to prove it unwinds,
+    // because `CatchPanicLayer` below is inert under `panic = "abort"` and
+    // nothing about an aborting binary looks wrong until the first malformed
+    // upload kills the process for every tenant on it. Under `abort` this
+    // call never returns (SIGABRT), which is the failure the CI step reads.
+    if std::env::args().skip(1).any(|arg| arg == panic_strategy::SELFTEST_FLAG) {
+        if panic_strategy::panic_unwinds() {
+            println!("{}", panic_strategy::UNWIND_VERDICT);
+            return Ok(());
+        }
+        anyhow::bail!(
+            "panic-strategy: NOT unwind. This binary was built with a non-unwinding \
+             panic strategy, so CatchPanicLayer cannot contain a malformed-IFC panic \
+             to one request. Build with `--profile server-release`."
+        );
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -323,11 +351,18 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;
+    let listener = write_timeout::WriteTimeoutListener::new(
+        listener,
+        Duration::from_secs(config.stream_idle_timeout_secs),
+    );
     axum::serve(listener, app)
         .await
         .context("server exited with an error")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod auth_and_cache_tests;
 
 #[cfg(test)]
 mod memory_admission_log_level_tests {

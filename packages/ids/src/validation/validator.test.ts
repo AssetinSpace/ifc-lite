@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { validateIDS } from './validator.js';
+import { parseIDS } from '../parser/xml-parser.js';
 import { createMockAccessor } from '../facets/test-helpers.js';
 import type {
   IDSDocument,
@@ -150,6 +151,36 @@ describe('validateIDS — optionality', () => {
     expect(reqResult.status).toBe('pass');
   });
 
+  it('optional requirement fails when facet is present but wrong (not merely absent)', async () => {
+    // `optional` pardons a wholly-absent facet, but must NOT pardon bad
+    // data: a present Description with the wrong value is an
+    // ATTRIBUTE_VALUE_MISMATCH, not an ATTRIBUTE_MISSING, so it must
+    // fail rather than be waved through by the missingFailures allowlist.
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcWall', description: 'Wrong value' },
+    ]);
+
+    const spec = makeSpec({
+      requirements: [
+        {
+          id: 'req-0',
+          facet: {
+            type: 'attribute',
+            name: sv('Description'),
+            value: sv('Expected value'),
+          },
+          optionality: 'optional',
+        },
+      ],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
+    expect(reqResult.failure?.type).toBe('ATTRIBUTE_VALUE_MISMATCH');
+    expect(reqResult.status).toBe('fail');
+    expect(report.specificationResults[0].status).toBe('fail');
+  });
+
   it('prohibited requirements fail when facet passes', async () => {
     const accessor = createMockAccessor([
       { expressId: 1, type: 'IfcWall', description: 'Should not exist' },
@@ -191,6 +222,131 @@ describe('validateIDS — optionality', () => {
     expect(report.specificationResults[0].status).toBe('pass');
     const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
     expect(reqResult.status).toBe('pass');
+  });
+
+  it('optional entity requirement passes when predefinedType is wholly absent', async () => {
+    // PREDEFINED_TYPE_MISSING means "this entity has no PredefinedType
+    // and no fallback ObjectType at all" — the same "wholly absent"
+    // shape as ATTRIBUTE_MISSING, so `optional` must give it a pass
+    // rather than treating it as bad data.
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcWall' }, // no objectType, no predefinedType
+    ]);
+
+    const spec = makeSpec({
+      requirements: [
+        {
+          id: 'req-0',
+          facet: { type: 'entity', name: sv('IFCWALL'), predefinedType: sv('SOLIDWALL') },
+          optionality: 'optional',
+        },
+      ],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
+    expect(reqResult.failure?.type).toBe('PREDEFINED_TYPE_MISSING');
+    expect(reqResult.status).toBe('pass');
+    expect(report.specificationResults[0].status).toBe('pass');
+  });
+
+  it('optional partOf requirement passes when parent predefinedType is wholly absent', async () => {
+    // Same "wholly absent" shape as above, one level removed: the
+    // relation exists (a parent was found) but the parent's own
+    // PredefinedType attribute is unset.
+    const accessor = createMockAccessor([
+      {
+        expressId: 1,
+        type: 'IfcWall',
+        parent: {
+          expressId: 2,
+          type: 'IfcBuildingStorey',
+          relation: 'IfcRelContainedInSpatialStructure',
+          // predefinedType intentionally omitted
+        },
+      },
+    ]);
+
+    const spec = makeSpec({
+      requirements: [
+        {
+          id: 'req-0',
+          facet: {
+            type: 'partOf',
+            relation: 'IfcRelContainedInSpatialStructure',
+            entity: { type: 'entity', name: sv('IFCBUILDINGSTOREY'), predefinedType: sv('BASEMENT') },
+          },
+          optionality: 'optional',
+        },
+      ],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
+    expect(reqResult.failure?.type).toBe('PARTOF_PREDEFINED_TYPE_MISSING');
+    expect(reqResult.status).toBe('pass');
+    expect(report.specificationResults[0].status).toBe('pass');
+  });
+
+  it('optional property requirement passes when the entity has no pset at all (not merely the property)', async () => {
+    // PSET_MISSING means the entity carries zero property sets — a
+    // stronger "wholly absent" shape than PROPERTY_MISSING (pset
+    // present, named property missing). `optional` must pardon this,
+    // exactly like it pardons ATTRIBUTE_MISSING / PROPERTY_MISSING.
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcWall' }, // no `properties` at all -> getPropertySets() === []
+    ]);
+
+    const spec = makeSpec({
+      requirements: [
+        {
+          id: 'req-0',
+          facet: {
+            type: 'property',
+            propertySet: sv('Pset_WallCommon'),
+            baseName: sv('FireRating'),
+          },
+          optionality: 'optional',
+        },
+      ],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
+    expect(reqResult.failure?.type).toBe('PSET_MISSING');
+    expect(reqResult.status).toBe('pass');
+    expect(report.specificationResults[0].status).toBe('pass');
+  });
+
+  it('optional partOf requirement passes when the entity has no parent relation at all', async () => {
+    // PARTOF_RELATION_MISSING means the entity has no parent under the
+    // requested relation whatsoever — the relation itself is absent,
+    // not merely pointing at the wrong entity. `optional` must pardon
+    // this "wholly absent" shape the same way it pardons the sibling
+    // *_MISSING failure types.
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcWall' }, // no `parent` at all -> getParent() === undefined
+    ]);
+
+    const spec = makeSpec({
+      requirements: [
+        {
+          id: 'req-0',
+          facet: {
+            type: 'partOf',
+            relation: 'IfcRelContainedInSpatialStructure',
+            entity: { type: 'entity', name: sv('IFCBUILDINGSTOREY') },
+          },
+          optionality: 'optional',
+        },
+      ],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const reqResult = report.specificationResults[0].entityResults[0].requirementResults[0];
+    expect(reqResult.failure?.type).toBe('PARTOF_RELATION_MISSING');
+    expect(reqResult.status).toBe('pass');
+    expect(report.specificationResults[0].status).toBe('pass');
   });
 });
 
@@ -484,5 +640,76 @@ describe('validateIDS — report structure', () => {
     expect(entityResult.entityName).toBe('Wall_001');
     expect(entityResult.globalId).toBe('abc123');
     expect(entityResult.passed).toBe(true);
+  });
+});
+
+// ============================================================================
+// Unparseable bounds facet — the real user-visible message
+//
+// A present-but-unparseable `xs:restriction` facet (e.g.
+// `<xs:minInclusive value="not-a-number"/>`) fails closed everywhere,
+// but the ORIGINAL fix only routed the clear "this xs:restriction is
+// malformed" message through `getConstraintMismatchReason`, which
+// nothing in the real `validateIDS` path ever calls. The actual
+// `attribute-facet.ts` path builds `failureReason`/`expectedValue` via
+// `formatFailureReason` → `facet.expected` → `formatConstraint` →
+// `formatBounds`, which used to fall through to its `'any value'`
+// default whenever every numeric field was `undefined` — producing the
+// self-contradictory "does not match expected any value" for a
+// restriction that is rejecting every value. These tests exercise that
+// exact path (XML → `parseIDS` → `validateIDS`), not
+// `getConstraintMismatchReason` directly.
+// ============================================================================
+describe('validateIDS — unparseable bounds facet (issue #4231)', () => {
+  const malformedXml = `<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>T</title></info>
+  <specifications>
+    <specification name="Test" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <attribute>
+          <name><simpleValue>Name</simpleValue></name>
+          <value>
+            <xs:restriction>
+              <xs:minInclusive value="not-a-number"/>
+            </xs:restriction>
+          </value>
+        </attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+  const wellFormedXml = malformedXml
+    .replace('<xs:minInclusive value="not-a-number"/>', '<xs:minInclusive value="10"/>\n              <xs:maxInclusive value="20"/>');
+
+  it('names the broken facet in failureReason/expectedValue instead of claiming "any value"', async () => {
+    const doc = parseIDS(malformedXml);
+    const accessor = createMockAccessor([{ expressId: 1, type: 'IfcWall', name: '0' }]);
+    const report = await validateIDS(doc, accessor, modelInfo);
+    const result = report.specificationResults[0].entityResults[0].requirementResults[0];
+
+    expect(result.status).toBe('fail');
+    expect(result.failureReason).not.toContain('any value');
+    expect(result.expectedValue).not.toBe('any value');
+    expect(result.expectedValue).toContain('xs:minInclusive="not-a-number"');
+    expect(result.expectedValue).toContain('did not parse as a number');
+    expect(result.failureReason).toContain('xs:minInclusive="not-a-number"');
+  });
+
+  it('leaves a well-formed restriction failure message unchanged', async () => {
+    const doc = parseIDS(wellFormedXml);
+    const accessor = createMockAccessor([{ expressId: 1, type: 'IfcWall', name: '0' }]);
+    const report = await validateIDS(doc, accessor, modelInfo);
+    const result = report.specificationResults[0].entityResults[0].requirementResults[0];
+
+    expect(result.status).toBe('fail');
+    expect(result.expectedValue).toBe('between 10 and 20');
+    expect(result.failureReason).toBe(
+      'Attribute "Name" value "0" does not match expected between 10 and 20'
+    );
   });
 });

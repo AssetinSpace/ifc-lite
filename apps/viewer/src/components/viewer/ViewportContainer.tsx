@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { usePlacementCoordinateInfo } from '@/hooks/usePlacementCoordinateInfo';
+import { useFederatedGeometry } from './useFederatedGeometry';
+import { modelIndices } from '@/lib/model-placement/model-indices';
 import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useLevelDisplayEffect } from '@/hooks/useLevelDisplayEffect';
 import { ingestDxfFiles, splitDxfFiles } from '@/hooks/ingest/dxfIngest';
@@ -13,6 +16,8 @@ import {
   type DragOverlayState,
 } from './dragOverlayState';
 import { ViewportOverlays } from './ViewportOverlays';
+import { WebGpuDisabledCaption, WebGpuTroubleshootingDetails, webGpuBannerBlurb } from './WebGpuTroubleshooting';
+import { useTranslation } from '@/i18n';
 import { MergeLayersBanner } from './MergeLayersBanner';
 import { GeometryModeBanner } from './GeometryModeBanner';
 import { LevelDisplayIndicator } from './LevelDisplayIndicator';
@@ -42,57 +47,57 @@ import { isTypeVisible } from '@/store/typeVisibilityFilter';
 import type { AggregationRelationships } from '@/utils/aggregation';
 import { useIfc } from '@/hooks/useIfc';
 import { useWebGPU } from '@/hooks/useWebGPU';
-import { cacheFileBlobs, formatFileSize, getCachedFile, getRecentFiles, recordRecentFiles, type RecentFileEntry } from '@/lib/recent-files';
+import { formatFileSize, getCachedFile, type RecentFileEntry } from '@/lib/recent-files';
 import {
   supportsFileSystemAccess,
   openIfcFilesWithHandles,
   handlesFromDataTransfer,
 } from '@/services/file-system-access';
+import { FILE_ACCEPT, isGltfBundleFile, isSupportedModelFile } from '@/services/supported-model-files';
+import { usePreparedModelFileRoute } from '@/hooks/ingest/usePreparedModelFileRoute';
+import {
+  SOURCE_DOWNLOAD_EVENT,
+  type SourceDownloadEvent,
+  type SourceDownloadItem,
+} from '@/services/sources/source-host';
+import { useOptionalSourceHost } from '@/services/sources/SourceHostProvider';
+import { recordDownloadedSourceFile } from '@/lib/sources/persistence';
+import { sanitizeFilename } from '@/lib/export/download';
+import { enqueueSourceLoad } from '@/lib/sources/loadQueue';
 import { toast } from '@/components/ui/toast';
 import { TourInvite } from '@/components/tours/TourInvite';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
-import { describeUnsupportedFormat } from '@/hooks/ingest/pointCloudIngest';
-import { Upload, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus, GitMerge } from 'lucide-react';
+import { describeUnsupportedFormat } from '@/hooks/ingest/unsupportedFormat';
+import { Upload, Command, AlertTriangle, ChevronDown, ExternalLink, Plus, Clock3, Sparkles, ArrowUpRight, PackagePlus, Cloud, GitMerge } from 'lucide-react';
 import { createBlankIfcFile } from '@/utils/createBlankIfc';
-import type { MeshData, CoordinateInfo, GeometryResult, PointCloudAsset } from '@ifc-lite/geometry';
+import type { MeshData, PointCloudAsset } from '@ifc-lite/geometry';
 import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
 import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
-import { isMeshVisibleInViewMode, meshClassIsPlaced } from '@/lib/type-view-visibility';
+import { isMeshVisibleInViewMode, meshClassIsPlaced, meshIsNonOccurrence } from '@/lib/type-view-visibility';
 
-const ZERO_VEC3 = { x: 0, y: 0, z: 0 };
-const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
-  originShift: ZERO_VEC3,
-  originalBounds: { min: ZERO_VEC3, max: ZERO_VEC3 },
-  shiftedBounds: { min: ZERO_VEC3, max: ZERO_VEC3 },
-  hasLargeCoordinates: false,
-};
-
-type Vec3Bounds = { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } };
-
-/** True for a real (non-placeholder, non-degenerate) bounds box. */
-function isUsableBounds(b: Vec3Bounds | undefined): b is Vec3Bounds {
-  if (!b) return false;
-  return (
-    b.max.x > b.min.x || b.max.y > b.min.y || b.max.z > b.min.z
-  );
-}
-
-/** Axis-aligned union of two bounds boxes (either may be undefined). */
-function unionBounds(acc: Vec3Bounds | undefined, b: Vec3Bounds | undefined): Vec3Bounds | undefined {
-  if (!isUsableBounds(b)) return acc;
-  if (!acc) return { min: { ...b.min }, max: { ...b.max } };
-  return {
-    min: { x: Math.min(acc.min.x, b.min.x), y: Math.min(acc.min.y, b.min.y), z: Math.min(acc.min.z, b.min.z) },
-    max: { x: Math.max(acc.max.x, b.max.x), y: Math.max(acc.max.y, b.max.y), z: Math.max(acc.max.z, b.max.z) },
-  };
-}
+/** Plain CSS text, not UI copy — kept as a module-level constant (rather than
+ *  an inline `<style>{`…`}</style>` template literal) so the i18n literal
+ *  gate, which only inspects JSX-child string LITERALS, never mistakes a
+ *  keyframe declaration for translatable prose. */
+const FLOAT_SLOW_KEYFRAMES = `
+  @keyframes float-slow {
+    0%, 100% { transform: translateY(0px) rotate(0deg); }
+    50% { transform: translateY(-6px) rotate(1deg); }
+  }
+  .animate-float-slow {
+    animation: float-slow 5s ease-in-out infinite;
+  }
+`;
 
 export function ViewportContainer() {
   // Drive Stacked / Solo / Exploded level display from the slice.
   // Mount-once hook — it self-gates on mode + gap + model changes.
   useLevelDisplayEffect();
 
-  const { loadFile, loading, clearAllModels, loadFilesSequentially } = useIfc();
+  const { loadFile, loading, clearAllModels, loadFilesSequentially, addModel } = useIfc();
+  // Resolves a source provider's display title for toasts; null outside the
+  // SourceHostProvider tree (tests), in which case the machine name is shown.
+  const sourceHost = useOptionalSourceHost();
   const setActiveTool = useViewerStore((s) => s.setActiveTool);
   const releaseGeometryMemory = useViewerStore((s) => s.releaseGeometryMemory);
   const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
@@ -118,6 +123,11 @@ export function ViewportContainer() {
   const [showTroubleshooting, setShowTroubleshooting] = useState(false);
   const [recentFiles, setRecentFiles] = useState<RecentFileEntry[]>([]);
   const webgpu = useWebGPU();
+  // `webGpuBannerBlurb` is a plain function, not a component — pass this
+  // component's own `t` so the banner headline re-renders on a live locale
+  // switch instead of reading the registry's non-reactive `resolve` default
+  // (review on #5086).
+  const { t } = useTranslation();
 
   const viewerStoreApi = getViewerStoreApi();
   const viewportStoreState = useSyncExternalStore(
@@ -130,147 +140,16 @@ export function ViewportContainer() {
     geometryResult,
     ifcDataStore,
     models,
-    boundedGeometryMode,
-    geometryUpdateTick,
     geometryContentVersion,
   } = viewportStoreState;
   const storeModels = models;
-  const mergedContentVersionRef = useRef(geometryContentVersion);
-
-  // Check if we have models loaded (for determining add vs replace behavior)
-  const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
 
   // Multi-model: create mapping from modelId to modelIndex (stable order)
-  const modelIdToIndex = useMemo(() => {
-    const map = new Map<string, number>();
-    let index = 0;
-    for (const modelId of storeModels.keys()) {
-      map.set(modelId, index++);
-    }
-    return map;
-  }, [storeModels]);
+  const modelIdToIndex = useMemo(() => modelIndices(storeModels), [storeModels]);
 
-  const mergedCacheRef = useRef<MeshData[]>([]);
-  const mergedLengthsRef = useRef<Map<string, number>>(new Map());
-  const mergedVisibilityRef = useRef<Map<string, boolean>>(new Map());
+  const mergedGeometryResult = useFederatedGeometry(storeModels, geometryResult, modelIdToIndex, geometryContentVersion);
 
-  // Multi-model: merge geometries from all visible models
-  const mergedGeometryResult = useMemo(() => {
-    if (storeModels.size === 1) {
-      const firstModel = storeModels.values().next().value;
-      if (!firstModel?.visible) {
-        return {
-          meshes: [],
-          totalVertices: 0,
-          totalTriangles: 0,
-          coordinateInfo: DEFAULT_COORDINATE_INFO,
-        } satisfies GeometryResult;
-      }
-      return firstModel.geometryResult ?? geometryResult;
-    }
-
-    if (storeModels.size > 1) {
-      let totalVertices = 0;
-      let totalTriangles = 0;
-      // The merged coordinateInfo must cover ALL visible models, not just the
-      // first one — the renderer fits the camera to `shiftedBounds`, so a
-      // first-wins box left every model after the first off-screen (it only
-      // showed its 2D grid overlay). Union the bounds across visible models;
-      // keep the first model's frame metadata (originShift / RTC) since
-      // federated models share a coordinate frame.
-      let baseCoordInfo: CoordinateInfo | undefined;
-      let unionedShifted: Vec3Bounds | undefined;
-      let unionedOriginal: Vec3Bounds | undefined;
-      let anyLargeCoords = false;
-      let shouldRebuild = false;
-
-      if (mergedLengthsRef.current.size !== storeModels.size) {
-        shouldRebuild = true;
-      }
-
-      // An external content version bump (e.g. realignFederation re-baked
-      // vertices in place) requires a full cache rebuild — length/visibility
-      // triggers above can't detect in-place mutation. Compare against the
-      // last version we honoured; rebuild when it bumps.
-      if (mergedContentVersionRef.current !== geometryContentVersion) {
-        shouldRebuild = true;
-        mergedContentVersionRef.current = geometryContentVersion;
-      }
-
-      for (const [modelId, model] of storeModels) {
-        const modelGeometry = model.geometryResult;
-        const meshCount = model.visible ? (modelGeometry?.meshes.length ?? 0) : 0;
-        totalVertices += model.visible ? (modelGeometry?.totalVertices ?? 0) : 0;
-        totalTriangles += model.visible ? (modelGeometry?.totalTriangles ?? 0) : 0;
-        if (model.visible && modelGeometry?.coordinateInfo) {
-          const ci = modelGeometry.coordinateInfo;
-          if (!baseCoordInfo) baseCoordInfo = ci;
-          anyLargeCoords = anyLargeCoords || !!ci.hasLargeCoordinates;
-          unionedShifted = unionBounds(unionedShifted, ci.shiftedBounds);
-          unionedOriginal = unionBounds(unionedOriginal, ci.originalBounds);
-        }
-
-        if (
-          mergedVisibilityRef.current.get(modelId) !== model.visible ||
-          (mergedLengthsRef.current.get(modelId) ?? 0) > meshCount
-        ) {
-          shouldRebuild = true;
-        }
-      }
-
-      if (shouldRebuild) {
-        const rebuilt: MeshData[] = [];
-        mergedLengthsRef.current = new Map();
-        mergedVisibilityRef.current = new Map();
-        for (const [modelId, model] of storeModels) {
-          const modelGeometry = model.geometryResult;
-          mergedVisibilityRef.current.set(modelId, model.visible);
-          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
-          if (!model.visible || !modelGeometry?.meshes) {
-            mergedLengthsRef.current.set(modelId, 0);
-            continue;
-          }
-          for (const mesh of modelGeometry.meshes) {
-            rebuilt.push({ ...mesh, modelIndex });
-          }
-          mergedLengthsRef.current.set(modelId, modelGeometry.meshes.length);
-        }
-        mergedCacheRef.current = rebuilt;
-      } else {
-        for (const [modelId, model] of storeModels) {
-          const modelGeometry = model.geometryResult;
-          const modelIndex = modelIdToIndex.get(modelId) ?? 0;
-          const previousLength = mergedLengthsRef.current.get(modelId) ?? 0;
-          const nextMeshes = model.visible ? (modelGeometry?.meshes ?? []) : [];
-          for (let i = previousLength; i < nextMeshes.length; i++) {
-            const mesh = nextMeshes[i];
-            mergedCacheRef.current.push({ ...mesh, modelIndex });
-          }
-          mergedLengthsRef.current.set(modelId, nextMeshes.length);
-          mergedVisibilityRef.current.set(modelId, model.visible);
-        }
-      }
-
-      const mergedCoordinateInfo: CoordinateInfo | undefined = baseCoordInfo
-        ? {
-            ...baseCoordInfo,
-            originalBounds: unionedOriginal ?? baseCoordInfo.originalBounds,
-            shiftedBounds: unionedShifted ?? baseCoordInfo.shiftedBounds,
-            hasLargeCoordinates: anyLargeCoords,
-          }
-        : undefined;
-
-      return {
-        meshes: mergedCacheRef.current,
-        totalVertices,
-        totalTriangles,
-        coordinateInfo: mergedCoordinateInfo ?? DEFAULT_COORDINATE_INFO,
-      } satisfies GeometryResult;
-    }
-
-    // Legacy mode (no federation): use original geometryResult
-    return geometryResult;
-  }, [storeModels, geometryResult, modelIdToIndex, geometryContentVersion]);
+  const placedCoordinateInfo = usePlacementCoordinateInfo(mergedGeometryResult?.coordinateInfo);
 
   /**
    * Aggregate point clouds across visible models.
@@ -480,12 +359,7 @@ export function ViewportContainer() {
     applyDragEvent('leave');
   }, [applyDragEvent]);
 
-  const isSupportedFile = useCallback((f: File) => {
-    const n = f.name.toLowerCase();
-    return n.endsWith('.ifc') || n.endsWith('.ifcx') || n.endsWith('.ifczip') || n.endsWith('.glb')
-      || n.endsWith('.las') || n.endsWith('.laz') || n.endsWith('.ply') || n.endsWith('.pcd')
-      || n.endsWith('.e57') || n.endsWith('.pts') || n.endsWith('.xyz');
-  }, []);
+  const isSupportedFile = isSupportedModelFile;
 
   // Single routing point for every ingestion path (picker / drop / input). The
   // optional `handles` array is positionally aligned with `files` and carries a
@@ -495,6 +369,11 @@ export function ViewportContainer() {
     files: File[],
     handles?: (FileSystemFileHandle | undefined)[],
   ) => {
+    // Read the loaded state now, not at render: bundle preparation awaits
+    // before routing, and a model that arrived meanwhile must be added to,
+    // not replaced (#4476 review).
+    const current = viewerStoreApi.getState();
+    const hasModelsLoaded = current.models.size > 0 || (current.geometryResult?.meshes?.length ?? 0) > 0;
     if (hasModelsLoaded) {
       // Models already loaded - add new files sequentially (federate).
       void loadFilesSequentially(files, handles);
@@ -507,7 +386,99 @@ export function ViewportContainer() {
       clearAllModels();
       void loadFilesSequentially(files, handles);
     }
-  }, [loadFile, loadFilesSequentially, resetViewerState, clearAllModels, hasModelsLoaded]);
+  }, [loadFile, loadFilesSequentially, resetViewerState, clearAllModels, viewerStoreApi]);
+
+  const prepareAndRoute = usePreparedModelFileRoute(routeLoad, setRecentFiles);
+
+  // Cloud source providers (Dalux Build, etc.) download bytes outside the
+  // viewer and hand them off via this event rather than calling addModel()
+  // directly — keeps the sources UI decoupled from viewer internals.
+  //
+  // Batches are SERIALIZED through the shared source-load queue: a second
+  // batch arriving while the first is still loading must not run
+  // `resetViewerState()` / `clearAllModels()` mid-finalize, and two
+  // `addModel` loops must never interleave (the WASM parser is not
+  // thread-safe). Per-model syncs (syncSourceModel) route through the same
+  // queue, so a Sync clicked mid-batch waits its turn too. "Are models
+  // loaded?" is read from the store at run time, not from a closure captured
+  // at dispatch time. Each item's buffer reference is dropped as soon as its
+  // model has loaded so a large batch is not held in memory wholesale.
+  useEffect(() => {
+    const handleSourceDownload = (event: Event) => {
+      const detail = (event as SourceDownloadEvent).detail;
+      if (detail.items.length === 0) return;
+      // Take ownership of the items and drop the event's own reference so
+      // consumed buffers become collectable as the queue works through them.
+      const batch: Array<SourceDownloadItem | null> = [...detail.items];
+      detail.items.length = 0;
+
+      void enqueueSourceLoad(async () => {
+        // An unexpected throw must never escape this task unreported: the
+        // queue itself survives rejections, but the user still needs to hear
+        // that their batch died rather than watching nothing happen.
+        try {
+          const store = useViewerStore.getState();
+          const anyLoaded =
+            store.models.size > 0 || (store.geometryResult?.meshes?.length ?? 0) > 0;
+          if (!anyLoaded) {
+            resetViewerState();
+            clearAllModels();
+          }
+
+          for (let i = 0; i < batch.length; i++) {
+            const item = batch[i];
+            if (!item) continue;
+            batch[i] = null; // release the buffer once this iteration owns it
+            // `item.name` comes from a remote provider's file listing — it is
+            // untrusted input reaching a filename position (the File
+            // constructor, the model name, and every toast below). Sanitize
+            // once and use the sanitized value everywhere downstream.
+            const safeName = sanitizeFilename(item.name, { fallback: 'model.ifc' });
+            const file = new File([item.buffer], safeName);
+            // Pass an explicit id and treat "registered in the store" as
+            // success: addModel returns null when a concurrent load
+            // (drag-drop, viewport picker) bumps the shared load session,
+            // even though this model finished registering — same recovery
+            // syncSourceModel uses. Without it the toast would falsely report
+            // a failure and the model would get no source tag (no sync
+            // button, no badge, no downloaded-file record).
+            const providerTitle =
+              sourceHost?.get(item.tag.provider)?.manifest.title ?? item.tag.provider;
+            // Isolate each item: a single corrupt or unparseable file must not
+            // abandon the rest of the batch. Without this, one bad IFC out of
+            // ten throws to the outer catch and the other nine silently never
+            // load — with one generic toast for the whole batch.
+            try {
+              const modelId = crypto.randomUUID();
+              const added = await addModel(file, { name: safeName, modelId });
+              const registered = added !== null || useViewerStore.getState().models.has(modelId);
+              if (registered) {
+                useViewerStore.getState().setSourceTag(modelId, item.tag);
+                recordDownloadedSourceFile(item.tag, item.sourceFile);
+                toast.success(`Loaded ${safeName} from ${providerTitle}`);
+              } else {
+                toast.error(`Failed to load ${safeName} from ${providerTitle}`);
+              }
+            } catch (itemError) {
+              console.error(`[sources] Failed to load ${safeName}:`, itemError);
+              toast.error(`Failed to load ${safeName} from ${providerTitle}`);
+            }
+          }
+        } catch (error) {
+          console.error('[sources] Failed to load a source download batch:', error);
+          toast.error(
+            error instanceof Error
+              ? `Failed to load models from cloud source: ${error.message}`
+              : 'Failed to load models from cloud source',
+          );
+        }
+      });
+    };
+
+    window.addEventListener(SOURCE_DOWNLOAD_EVENT, handleSourceDownload);
+    return () =>
+      window.removeEventListener(SOURCE_DOWNLOAD_EVENT, handleSourceDownload);
+  }, [addModel, resetViewerState, clearAllModels, sourceHost]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -530,8 +501,8 @@ export function ViewportContainer() {
     if (dxfFiles.length > 0) void ingestDxfFiles(dxfFiles);
     if (allDropped.length === 0) return;
 
-    // Filter to supported files (IFC, IFCX, GLB, point clouds)
-    const supportedFiles = allDropped.filter(isSupportedFile);
+    // Keep glTF sidecars beside the document until they are packed into GLB.
+    const supportedFiles = allDropped.filter(file => isSupportedFile(file) || isGltfBundleFile(file));
 
     if (supportedFiles.length === 0) {
       // Tell the user *why* — common case is a Recap project / SketchUp
@@ -547,18 +518,14 @@ export function ViewportContainer() {
       // Prefer the handle-paired files (Chromium): each file + handle comes from
       // the same dropped item, so no filename matching is needed. Fall back to
       // the plain dropped files when no handles were captured (Firefox/Safari).
-      const supportedOpened = (opened ?? []).filter((o) => isSupportedFile(o.file));
+      const supportedOpened = (opened ?? []).filter((o) => isSupportedFile(o.file) || isGltfBundleFile(o.file));
       const useHandles = supportedOpened.length > 0;
       const files = useHandles ? supportedOpened.map((o) => o.file) : supportedFiles;
       const handles = useHandles ? supportedOpened.map((o) => o.handle) : undefined;
 
-      recordRecentFiles(files.map((file) => ({ name: file.name, size: file.size })));
-      void cacheFileBlobs(files);
-      setRecentFiles(getRecentFiles().slice(0, 3));
-
-      routeLoad(files, handles);
+      void prepareAndRoute(files, handles);
     });
-  }, [routeLoad, applyDragEvent, isSupportedFile, webgpu.supported]);
+  }, [prepareAndRoute, applyDragEvent, isSupportedFile, webgpu.supported]);
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     // Block file loading if WebGPU not supported
@@ -575,22 +542,18 @@ export function ViewportContainer() {
 
     // Filter to supported files (IFC, IFCX, GLB). The <input> path yields no
     // live handle, so these models are not refreshable.
-    const supportedFiles = modelFiles.filter(isSupportedFile);
+    const supportedFiles = modelFiles.filter(file => isSupportedFile(file) || isGltfBundleFile(file));
 
     if (supportedFiles.length === 0) {
       e.target.value = '';
       return;
     }
 
-    recordRecentFiles(supportedFiles.map((file) => ({ name: file.name, size: file.size })));
-    void cacheFileBlobs(supportedFiles);
-    setRecentFiles(getRecentFiles().slice(0, 3));
-
-    routeLoad(supportedFiles);
+    void prepareAndRoute(supportedFiles);
 
     // Reset input so same file can be selected again
     e.target.value = '';
-  }, [routeLoad, isSupportedFile, webgpu.supported]);
+  }, [prepareAndRoute, isSupportedFile, webgpu.supported]);
 
   // Preferred open path: the File System Access picker (Chromium) captures a
   // live handle per file so the model can be refreshed from disk. Falls back to
@@ -606,16 +569,12 @@ export function ViewportContainer() {
     // DXF reference underlays split off before model routing (issue #1782).
     const dxfPicked = opened.filter((o) => o.file.name.toLowerCase().endsWith('.dxf'));
     if (dxfPicked.length > 0) void ingestDxfFiles(dxfPicked.map((o) => o.file));
-    const supported = opened.filter((o) => isSupportedFile(o.file));
+    const supported = opened.filter((o) => isSupportedFile(o.file) || isGltfBundleFile(o.file));
     if (supported.length === 0) return;
 
     const files = supported.map((o) => o.file);
-    recordRecentFiles(files.map((f) => ({ name: f.name, size: f.size })));
-    void cacheFileBlobs(files);
-    setRecentFiles(getRecentFiles().slice(0, 3));
-
-    routeLoad(files, supported.map((o) => o.handle));
-  }, [routeLoad, isSupportedFile, webgpu.supported]);
+    prepareAndRoute(files, supported.map((o) => o.handle));
+  }, [prepareAndRoute, isSupportedFile, webgpu.supported]);
 
   const handleStartBlank = useCallback(async () => {
     if (!webgpu.supported) return;
@@ -689,7 +648,6 @@ export function ViewportContainer() {
     }
   }, [loadFile]);
 
-  const hasGeometry = mergedGeometryResult?.meshes && mergedGeometryResult.meshes.length > 0;
 
   // Check if any models are loaded (even if hidden) - used to show empty 3D vs starting UI
   const hasLoadedModels = storeModels.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -720,7 +678,7 @@ export function ViewportContainer() {
     }
     if (!sawTypeGeometryRef.current) {
       for (let i = typeGeoScanLenRef.current; i < meshes.length; i++) {
-        if ((meshes[i].geometryClass ?? 0) !== 0) { sawTypeGeometryRef.current = true; break; }
+        if (meshIsNonOccurrence(meshes[i])) { sawTypeGeometryRef.current = true; break; }
       }
     }
     typeGeoScanLenRef.current = meshes.length;
@@ -995,7 +953,7 @@ export function ViewportContainer() {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz,.dxf"
+          accept={FILE_ACCEPT}
           multiple
           onChange={handleFileSelect}
           className="hidden"
@@ -1006,7 +964,7 @@ export function ViewportContainer() {
           <div className="pointer-events-none absolute inset-0 z-50 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center p-8">
             <div className="border-4 border-dashed border-primary bg-white/90 dark:bg-black/90 p-12 max-w-2xl w-full text-center shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] transition-all">
               <Upload className="h-20 w-20 mx-auto text-primary mb-6" />
-              <p className="text-3xl font-black uppercase tracking-tight text-primary">Drop File to Load</p>
+              <p className="text-3xl font-black uppercase tracking-tight text-primary">{t('viewportLighting.container.emptyState.dropOverlay.title')}</p>
             </div>
           </div>
         )}
@@ -1036,10 +994,10 @@ export function ViewportContainer() {
 
                 <div className="flex-1 min-w-0">
                   <h3 className="font-black text-lg uppercase tracking-wider text-[#f7768e] mb-1">
-                    WebGPU Not Available
+                    {t('viewportLighting.container.emptyState.webgpuBanner.heading')}
                   </h3>
                   <p className="font-mono text-sm text-[#a9b1d6] leading-relaxed">
-                    This viewer requires WebGPU which is not supported by your browser or device.
+                    {webGpuBannerBlurb(webgpu.category, t)}
                     {webgpu.reason && (
                       <span className="block mt-1 text-[#565f89]">
                         {webgpu.reason}
@@ -1053,11 +1011,11 @@ export function ViewportContainer() {
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-mono uppercase tracking-wide border border-[#3b4261] text-[#7aa2f7] hover:border-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
                     >
-                      Check Browser Support
+                      {t('viewportLighting.container.emptyState.webgpuBanner.checkBrowserSupport')}
                       <ExternalLink className="h-3 w-3" />
                     </a>
                     <span className="inline-flex items-center px-3 py-1 text-xs font-mono text-[#565f89] border border-[#3b4261]">
-                      Chrome 113+ / Edge 113+ / Firefox 141+ / Safari 18+
+                      {t('viewportLighting.container.emptyState.webgpuBanner.supportedBrowsers')}
                     </span>
                   </div>
 
@@ -1067,58 +1025,13 @@ export function ViewportContainer() {
                     className="mt-4 flex items-center gap-2 text-xs font-mono uppercase tracking-wide text-[#ff9e64] hover:text-[#e0af68] transition-colors"
                   >
                     <ChevronDown className={`h-4 w-4 transition-transform ${showTroubleshooting ? 'rotate-180' : ''}`} />
-                    {showTroubleshooting ? 'Hide' : 'Show'} Troubleshooting
+                    {showTroubleshooting
+                      ? t('viewportLighting.container.emptyState.webgpuBanner.hideTroubleshooting')
+                      : t('viewportLighting.container.emptyState.webgpuBanner.showTroubleshooting')}
                   </button>
 
                   {showTroubleshooting && (
-                    <div className="mt-4 p-4 bg-[#1f2335] border border-[#3b4261] text-xs font-mono space-y-4">
-                      <div>
-                        <h4 className="font-bold text-[#ff9e64] uppercase tracking-wide mb-2">Blocklist Override</h4>
-                        <p className="text-[#a9b1d6] mb-2">
-                          WebGPU may be disabled due to GPU/driver blocklist. Try these flags:
-                        </p>
-                        <div className="space-y-1 text-[#7dcfff]">
-                          <p><code className="bg-[#16161e] px-1.5 py-0.5">chrome://flags/#enable-unsafe-webgpu</code> → Enable</p>
-                          <p><code className="bg-[#16161e] px-1.5 py-0.5">chrome://flags/#ignore-gpu-blocklist</code> → Enable</p>
-                        </div>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#bb9af7] uppercase tracking-wide mb-2">Firefox</h4>
-                        <p className="text-[#a9b1d6] mb-2">
-                          WebGPU enabled by default in Firefox 141+. For older versions:
-                        </p>
-                        <p className="text-[#7dcfff]">
-                          <code className="bg-[#16161e] px-1.5 py-0.5">about:config</code> → <code className="bg-[#16161e] px-1.5 py-0.5">dom.webgpu.enabled</code> → true
-                        </p>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#9ece6a] uppercase tracking-wide mb-2">Safari</h4>
-                        <p className="text-[#a9b1d6]">
-                          Safari → Settings → Feature Flags → Enable "WebGPU"
-                        </p>
-                      </div>
-
-                      <div>
-                        <h4 className="font-bold text-[#7aa2f7] uppercase tracking-wide mb-2">Verify Status</h4>
-                        <p className="text-[#a9b1d6] mb-2">Check your GPU status page:</p>
-                        <div className="space-y-1 text-[#7dcfff]">
-                          <p>Chrome/Edge: <code className="bg-[#16161e] px-1.5 py-0.5">chrome://gpu</code></p>
-                          <p>Firefox: <code className="bg-[#16161e] px-1.5 py-0.5">about:support</code></p>
-                        </div>
-                      </div>
-
-                      <a
-                        href="https://developer.chrome.com/docs/web-platform/webgpu/troubleshooting-tips"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 text-[#7aa2f7] hover:underline"
-                      >
-                        Full Troubleshooting Guide
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
-                    </div>
+                    <WebGpuTroubleshootingDetails category={webgpu.category} />
                   )}
                 </div>
               </div>
@@ -1138,15 +1051,7 @@ export function ViewportContainer() {
           {/* Main Card */}
           <div {...tourAnchor(TOUR_ANCHORS.emptyStateCard)} className="max-w-md w-full bg-white dark:bg-[#16161e] border border-zinc-300 dark:border-[#3b4261] p-8 flex flex-col items-center transition-transform hover:-translate-y-1 duration-200 shadow-lg">
             
-            <style>{`
-              @keyframes float-slow {
-                0%, 100% { transform: translateY(0px) rotate(0deg); }
-                50% { transform: translateY(-6px) rotate(1deg); }
-              }
-              .animate-float-slow {
-                animation: float-slow 5s ease-in-out infinite;
-              }
-            `}</style>
+            <style>{FLOAT_SLOW_KEYFRAMES}</style>
 
             {/* Logo Section */}
             <div className="mb-10 relative group/logo cursor-pointer">
@@ -1160,17 +1065,17 @@ export function ViewportContainer() {
               <div className="relative z-10 animate-float-slow transition-transform duration-300 group-hover/logo:scale-110">
                 <img 
                   src="/logo.png" 
-                  alt="IFClite Logo" 
+                  alt={t('viewportLighting.container.emptyState.logoAlt')}
                   className="h-28 w-auto drop-shadow-lg"
                 />
               </div>
             </div>
 
             <h2 className="text-3xl font-black tracking-tighter text-center mb-2 text-zinc-900 dark:text-[#a9b1d6]">
-              IFClite
+              {t('viewportLighting.container.emptyState.title')}
             </h2>
             <p className="text-zinc-500 dark:text-[#565f89] font-mono text-sm text-center mb-8 border-b border-zinc-200 dark:border-[#3b4261] pb-4 w-full">
-              IFC toolkit for the open web
+              {t('viewportLighting.container.emptyState.tagline')}
             </p>
 
             {/*
@@ -1192,17 +1097,23 @@ export function ViewportContainer() {
               }`}
             >
               <Upload className={`h-4 w-4 transition-transform ${webgpu.supported ? 'group-hover:-translate-y-0.5' : ''}`} />
-              <span>{webgpu.checking ? 'Checking WebGPU...' : webgpu.supported ? 'Open .ifc file' : 'WebGPU Required'}</span>
+              <span>
+                {webgpu.checking
+                  ? t('viewportLighting.container.emptyState.openButton.checking')
+                  : webgpu.supported
+                    ? t('viewportLighting.container.emptyState.openButton.open')
+                    : t('viewportLighting.container.emptyState.openButton.required')}
+              </span>
             </button>
 
             <p className="mt-2.5 text-[11px] font-mono text-center text-zinc-400 dark:text-[#565f89]">
-              {webgpu.supported ? 'or drag & drop anywhere' : 'file upload disabled'}
+              {webgpu.supported ? t('viewportLighting.container.emptyState.dragDropHint') : <WebGpuDisabledCaption />}
             </p>
 
             {/* Subtle "or" rule — anchors the symmetry between the two tracks */}
             <div className="mt-5 mb-5 w-full flex items-center gap-3 text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-400 dark:text-[#565f89]">
               <span className="h-px flex-1 bg-zinc-200 dark:bg-[#3b4261]" />
-              <span>or</span>
+              <span>{t('viewportLighting.container.emptyState.orDivider')}</span>
               <span className="h-px flex-1 bg-zinc-200 dark:bg-[#3b4261]" />
             </div>
 
@@ -1223,20 +1134,36 @@ export function ViewportContainer() {
                 }`}
               >
                 <PackagePlus className="h-3 w-3 transition-transform group-enabled:group-hover:-translate-y-0.5" />
-                <span>Start blank</span>
+                <span>{t('viewportLighting.container.emptyState.startBlank')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => useViewerStore.getState().openPanelInHome('sources')}
+                disabled={!webgpu.supported || webgpu.checking}
+                className={`group inline-flex items-center gap-1.5 px-3 py-1.5 font-mono text-[11px] border border-dashed transition-all ${
+                  !webgpu.supported || webgpu.checking
+                    ? 'border-zinc-200 dark:border-[#3b4261]/50 text-zinc-300 dark:text-[#565f89]/50 cursor-not-allowed'
+                    : 'border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#7a82a5] hover:border-primary hover:text-primary cursor-pointer'
+                }`}
+              >
+                <Cloud className="h-3 w-3 transition-transform group-enabled:group-hover:-translate-y-0.5" />
+                {/* Provider-neutral: this opens the Cloud Sources panel, which
+                    lists every registered provider. Naming one vendor on the
+                    front door stopped being accurate at the second provider. */}
+                <span>{t('viewportLighting.container.emptyState.openFromCloud')}</span>
               </button>
               <a
                 href="/mcp"
                 className="group inline-flex items-center gap-1.5 px-3 py-1.5 font-mono text-[11px] border border-dashed border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#7a82a5] hover:border-primary hover:text-primary transition-all cursor-pointer"
               >
                 <Sparkles className="h-3 w-3 transition-transform group-hover:-translate-y-0.5" />
-                <span>Drive with any LLM</span>
+                <span>{t('viewportLighting.container.emptyState.driveWithLlm')}</span>
                 <ArrowUpRight className="h-2.5 w-2.5 opacity-60 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
               </a>
             </div>
 
             <p className="mt-1.5 text-[10px] font-mono text-center text-zinc-400 dark:text-[#565f89]">
-              new untitled project · or LLM via MCP
+              {t('viewportLighting.container.emptyState.footerCaption')}
             </p>
 
             {/* First-run tour invite — needs loadFile, so it shares the
@@ -1247,7 +1174,7 @@ export function ViewportContainer() {
               <div className="mt-6 w-full border-t border-zinc-200 dark:border-[#3b4261] pt-4">
                 <div className="mb-3 flex items-center gap-2 text-xs font-mono uppercase tracking-[0.2em] text-zinc-400 dark:text-[#565f89]">
                   <Clock3 className="h-3.5 w-3.5" />
-                  <span>Recent Files</span>
+                  <span>{t('viewportLighting.container.emptyState.recentFiles.heading')}</span>
                 </div>
                 <div className="flex flex-col gap-2">
                   {recentFiles.map((file) => (
@@ -1295,15 +1222,15 @@ export function ViewportContainer() {
             </div>
             <div className="min-w-0 flex-1">
               <h3 className="font-bold uppercase text-sm tracking-wide text-zinc-900 dark:text-[#a9b1d6]">
-                <span className="mr-2 rounded-sm bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">New</span>
-                Layers
+                <span className="mr-2 rounded-sm bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">{t('viewportLighting.container.emptyState.layersPromo.badge')}</span>
+                {t('viewportLighting.container.emptyState.layersPromo.title')}
               </h3>
               <p className="text-xs font-mono text-zinc-500 dark:text-[#565f89]">
-                Version your model like code: layers, drafts, merges, reviews
+                {t('viewportLighting.container.emptyState.layersPromo.description')}
               </p>
             </div>
             <span className="text-xs font-mono font-bold text-primary group-hover:translate-x-0.5 transition-transform">
-              Try the demo stack &rarr;
+              {t('viewportLighting.container.emptyState.layersPromo.cta')}
             </span>
           </button>
 
@@ -1319,12 +1246,12 @@ export function ViewportContainer() {
               rel="noopener noreferrer"
               className="group inline-flex items-center gap-2 text-xs font-mono px-3 py-1.5 bg-zinc-100 dark:bg-[#1f2335] border border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#565f89] hover:border-primary hover:text-primary transition-colors"
             >
-              <span>New here?</span>
-              <span className="font-bold text-primary group-hover:translate-x-0.5 transition-transform">ifclite.dev →</span>
+              <span>{t('viewportLighting.container.emptyState.footer.discoverPrompt')}</span>
+              <span className="font-bold text-primary group-hover:translate-x-0.5 transition-transform">{t('viewportLighting.container.emptyState.footer.discoverLink')}</span>
             </a>
             <div className="flex items-center gap-2 text-xs font-mono px-3 py-1.5 bg-zinc-100 dark:bg-[#1f2335] border border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#565f89]">
               <Command className="h-3 w-3" />
-              <span>SHORTCUTS</span>
+              <span>{t('viewportLighting.container.emptyState.footer.shortcutsLabel')}</span>
               <span className="px-1.5 ml-1 font-bold text-primary bg-primary/20">?</span>
             </div>
           </div>
@@ -1350,9 +1277,9 @@ export function ViewportContainer() {
           <div className="bg-white dark:bg-[#1a1b26] border-4 border-dashed border-[#9ece6a] p-8 shadow-2xl">
             <div className="text-center">
               <Plus className="h-12 w-12 mx-auto text-[#9ece6a] mb-4" />
-              <p className="text-xl font-black uppercase text-[#9ece6a]">Add Model to Scene</p>
+              <p className="text-xl font-black uppercase text-[#9ece6a]">{t('viewportLighting.container.dropOverlay.addModelTitle')}</p>
               <p className="text-sm font-mono text-zinc-500 dark:text-[#565f89] mt-2">
-                Drop to federate with {models.size} existing model{models.size !== 1 ? 's' : ''}
+                {t('viewportLighting.container.dropOverlay.addModelSubtitle', { count: models.size })}
               </p>
             </div>
           </div>
@@ -1367,6 +1294,7 @@ export function ViewportContainer() {
           projectedCRS={georef.projectedCRS}
           coordinateInfo={georef.coordinateInfo}
           geometryResult={cesiumGeometryResult}
+          computedIsolatedIds={computedIsolatedIds}
           lengthUnitScale={georef.lengthUnitScale}
           storeyElevations={georef.storeyElevations}
         />
@@ -1395,6 +1323,7 @@ export function ViewportContainer() {
         geometryContentVersion={geometryContentVersion}
         pointClouds={mergedPointClouds}
         coordinateInfo={mergedGeometryResult?.coordinateInfo}
+        sectionCoordinateInfo={placedCoordinateInfo}
         computedIsolatedIds={computedIsolatedIds}
         modelIdToIndex={modelIdToIndex}
         cesiumActive={cesiumEnabled && georef !== null}

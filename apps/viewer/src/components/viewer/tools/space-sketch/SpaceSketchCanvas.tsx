@@ -16,6 +16,7 @@ import { sX, sY, centroid, polyArea, uniqueVerts, type Fit, type Pt } from '@/li
 import type { SnapKind } from '@/lib/space-snap';
 import type { BoundaryMode } from '@ifc-lite/create';
 import type { Hover, SplitTarget, Intent, IntentTone } from './types';
+import { useTranslation } from '@/i18n';
 
 const EPS = 1e-6;
 const ROOM_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#a855f7', '#ef4444'];
@@ -40,7 +41,9 @@ interface BoundaryInfo { disp: Pt[]; unbounded: boolean }
 interface Diagnostic { a: Pt; b: Pt; bounding: boolean }
 
 export interface SpaceSketchCanvasProps {
-  svgRef: React.RefObject<SVGSVGElement | null>;
+  /** Callback OR object ref — the overlay passes a callback so the wheel
+   *  listener re-binds when this canvas is remounted (minimize/reopen). */
+  svgRef: React.Ref<SVGSVGElement>;
   width: number;
   height: number;
   cursor: string;
@@ -60,6 +63,8 @@ export interface SpaceSketchCanvasProps {
   snapKind: SnapKind;
   drawPts: Pt[];
   drawCursor: Pt | null;
+  /** Rectangle tool: the 4 in-progress corners (null when not drawing one). */
+  rectPreview: Pt[] | null;
   alignGuides: { vRef: Pt | null; hRef: Pt | null };
   deleteHover: Pt | null;
   intent: Intent | null;
@@ -72,10 +77,11 @@ export interface SpaceSketchCanvasProps {
 }
 
 export function SpaceSketchCanvas(props: SpaceSketchCanvasProps) {
+  const { t } = useTranslation();
   const {
     svgRef, width, height, cursor, fit: f, gridLines, underlay, rooms, boundaryInfo,
     boundaryMode, mergeFaces, diagnostics, hover, splitPick, previewEnd, splitHover,
-    snapPos, snapKind, drawPts, drawCursor, alignGuides, deleteHover, intent,
+    snapPos, snapKind, drawPts, drawCursor, rectPreview, alignGuides, deleteHover, intent,
     onPointerDown, onPointerMove, onPointerUp, onDoubleClick, onContextMenu, onPointerLeave,
   } = props;
 
@@ -91,6 +97,10 @@ export function SpaceSketchCanvas(props: SpaceSketchCanvasProps) {
       )}
       <svg ref={svgRef} width={width} height={height} style={{ cursor }}
         className="rounded border bg-muted/20 touch-none"
+        // Suppress the browser's native HTML5 drag: without this, pressing a
+        // vertex/edge and moving starts a native element drag that the viewer's
+        // file-drop zone catches ("Drop to federate"), hijacking the edit drag.
+        onDragStart={(e) => e.preventDefault()}
         onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
         onDoubleClick={onDoubleClick}
         onContextMenu={onContextMenu}
@@ -118,7 +128,7 @@ export function SpaceSketchCanvas(props: SpaceSketchCanvasProps) {
               <polygon points={pts} fill={bad ? '#ef4444' : color} fillOpacity={lit ? 0.42 : bad ? 0.3 : 0.16}
                 stroke={bad ? '#ef4444' : color} strokeWidth={lit ? 3 : 2}
                 strokeDasharray={unbounded && !bad ? '5 4' : undefined}>
-                {unbounded && <title>Boundary “{boundaryMode}” made no change to this room — no wall offset applies (no wall runs along its edges, or it's fully internal in Outer mode).</title>}
+                {unbounded && <title>{t('spaceSketch.canvas.unboundedBoundaryTitle', { boundaryMode })}</title>}
               </polygon>
               <text x={cx} y={cy - 5} textAnchor="middle" fontSize={12} fontWeight={600} fill="currentColor" className="pointer-events-none">{area.toFixed(2)}</text>
               <text x={cx} y={cy + 9} textAnchor="middle" fontSize={9} fill="currentColor" opacity={0.55} className="pointer-events-none">m²</text>
@@ -213,6 +223,18 @@ export function SpaceSketchCanvas(props: SpaceSketchCanvasProps) {
             {drawPts.map((p, i) => (
               <circle key={`d${i}`} cx={sX(f, p[0])} cy={sY(f, p[1])} r={i === 0 && drawPts.length >= 3 ? 6 : 3.5}
                 fill={i === 0 && drawPts.length >= 3 ? '#22c55e' : '#fff'} stroke="#16a34a" strokeWidth={1.5} />
+            ))}
+          </g>
+        )}
+
+        {/* Rectangle tool — the live rubber-band rectangle between the first
+            corner and the cursor (committed as a room on the next click). */}
+        {rectPreview && rectPreview.length === 4 && (
+          <g pointerEvents="none">
+            <polygon points={rectPreview.map((p) => `${sX(f, p[0])},${sY(f, p[1])}`).join(' ')}
+              fill="#22c55e" fillOpacity={0.1} stroke="#22c55e" strokeWidth={1.5} strokeDasharray="4 3" />
+            {rectPreview.map((p, i) => (
+              <circle key={`r${i}`} cx={sX(f, p[0])} cy={sY(f, p[1])} r={3.5} fill="#fff" stroke="#16a34a" strokeWidth={1.5} />
             ))}
           </g>
         )}

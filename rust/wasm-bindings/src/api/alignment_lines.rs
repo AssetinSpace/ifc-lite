@@ -10,19 +10,21 @@
 //! strip and not the thin LINE users expect (matching IfcGrid axes and
 //! IfcAnnotation curves) — we sample the alignment directrix into a flat
 //! line-list vertex buffer and feed it through the renderer's existing
-//! `uploadAnnotationLines3D` line pipeline.
+//! `setLineOverlay('alignment', …)` line pipeline.
 //!
-//! The output is `[x0,y0,z0, x1,y1,z1, …]` line-list pairs in the renderer's
-//! **Y-up, RTC-subtracted, metres** world space — the exact frame the mesh
-//! pipeline produces after its IFC Z-up → WebGL Y-up swap (see
-//! `MeshDataJs::new` in `zero_copy.rs`), so alignment lines land on the same
-//! ground as the terrain meshes.
+//! The output is `[x0,y0,z0, x1,y1,z1, …]` line-list pairs in renderer
+//! **Y-up, metres** space. The explicit-frame binding uses the exact mesh
+//! pre-pass RTC decision before the IFC Z-up → WebGL Y-up swap, so its lines
+//! share the mesh frame. The legacy standalone binding detects RTC from the
+//! whole source and can differ from an earlier streaming sample or federation
+//! override.
 
 use super::IfcAPI;
 use ifc_lite_core::{
     build_entity_index, extract_length_unit_scale, EntityDecoder, EntityScanner, IfcType,
 };
 use ifc_lite_geometry::{AlignmentCurve, GeometryRouter};
+use ifc_lite_processing::MeshFrame;
 use wasm_bindgen::prelude::*;
 
 /// Station spacing for centerline sampling, in file length units. Mirrors the
@@ -38,19 +40,34 @@ impl IfcAPI {
     /// `Float32Array` of 3D line-list vertices `[x0,y0,z0, x1,y1,z1, …]` in
     /// the renderer's Y-up world space (RTC-subtracted, metres). Consecutive
     /// samples form line segments. Feed straight to
-    /// `renderer.uploadAnnotationLines3D(...)`.
+    /// `renderer.setLineOverlay('alignment', ...)`.
     ///
     /// Returns an empty array when the file has no alignments (or none with a
     /// resolvable Axis curve), so the caller can clear the overlay cheaply.
     #[wasm_bindgen(js_name = parseAlignmentLines)]
     pub fn parse_alignment_lines(&self, content: String) -> js_sys::Float32Array {
-        let verts = extract_alignment_line_vertices(&content);
+        let verts = extract_alignment_line_vertices(&content, None);
         js_sys::Float32Array::from(&verts[..])
+    }
+
+    /// Parse alignments in the exact RTC frame selected by the mesh pre-pass.
+    #[wasm_bindgen(js_name = parseAlignmentLinesInFrame)]
+    pub fn parse_alignment_lines_in_frame(
+        &self,
+        content: String,
+        #[wasm_bindgen(unchecked_param_type = "RtcFrame")] frame: JsValue,
+    ) -> Result<js_sys::Float32Array, JsValue> {
+        let frame = super::overlay_frame::parse_overlay_frame(&frame)?;
+        let verts = extract_alignment_line_vertices(&content, Some(frame));
+        Ok(js_sys::Float32Array::from(&verts[..]))
     }
 }
 
 /// Pure-Rust core (unit-testable without wasm-bindgen).
-pub(crate) fn extract_alignment_line_vertices(content: &str) -> Vec<f32> {
+pub(crate) fn extract_alignment_line_vertices(
+    content: &str,
+    frame: Option<MeshFrame>,
+) -> Vec<f32> {
     let entity_index = build_entity_index(content);
     let mut decoder = EntityDecoder::with_index(content, entity_index);
 
@@ -59,7 +76,7 @@ pub(crate) fn extract_alignment_line_vertices(content: &str) -> Vec<f32> {
     let mut project_scanner = EntityScanner::new(content);
     let mut unit_scale = 1.0_f64;
     while let Some((id, type_name, _, _)) = project_scanner.next_entity() {
-        if type_name == "IFCPROJECT" {
+        if ifc_lite_core::keyword_eq(type_name, "IFCPROJECT") {
             if let Ok(s) = extract_length_unit_scale(&mut decoder, id) {
                 unit_scale = s;
             }
@@ -67,16 +84,18 @@ pub(crate) fn extract_alignment_line_vertices(content: &str) -> Vec<f32> {
         }
     }
 
-    // RTC offset (metres) — `detect_rtc_offset_from_first_element` returns
-    // (0,0,0) for models within 10 km of the origin, so this is a no-op for
-    // local files and a true shift for georeferenced infrastructure.
+    // RTC offset (metres): exact when supplied by the browser mesh pre-pass;
+    // otherwise the standalone whole-source choice (#4665, #4799).
+    // Not drained: meshes nothing. Pinned by rust/geometry/tests/issue_3821_auxiliary_routers_mesh_nothing.rs.
     let router = GeometryRouter::with_scale(unit_scale);
-    let rtc = router.detect_rtc_offset_from_first_element(content, &mut decoder);
+    let rtc = frame
+        .unwrap_or_else(|| MeshFrame::for_overlay(&router, content.as_bytes(), &mut decoder))
+        .rtc_offset();
 
     let mut out: Vec<f32> = Vec::new();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        if type_name != "IFCALIGNMENT" {
+        if !ifc_lite_core::keyword_eq(type_name, "IFCALIGNMENT") {
             continue;
         }
         let Ok(entity) = decoder.decode_at_with_id(id, start, end) else {
@@ -181,7 +200,7 @@ END-ISO-10303-21;
 
     #[test]
     fn emits_line_list_for_polyline_alignment() {
-        let verts = extract_alignment_line_vertices(CONTENT);
+        let verts = extract_alignment_line_vertices(CONTENT, None);
         assert!(!verts.is_empty(), "alignment must emit centerline vertices");
         // Flat [x,y,z] triples, even count of vertices (line-list pairs).
         assert_eq!(verts.len() % 3, 0, "vertices must be xyz triples");
@@ -207,8 +226,166 @@ END-ISO-10303-21;
     }
 
     #[test]
+    fn explicit_model_rtc_overrides_standalone_alignment_detection() {
+        let verts = extract_alignment_line_vertices(
+            CONTENT,
+            Some(MeshFrame::ModelRtc {
+                anchor: (5.0, 0.0, 0.0),
+            }),
+        );
+        assert!((verts[0] + 5.0).abs() < 1e-4);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Render-frame conversion
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // `CONTENT` above is a metre file (unit_scale exactly 1) with no
+    // IfcProject at all, sits at the origin (RTC exactly 0), and its
+    // assertions take `.abs()` of the renderer Z. Between them, three
+    // independent halves of `append_alignment_segments` are unobservable:
+    // dropping the `unit_scale` multiply, adding the RTC offset instead of
+    // subtracting it, and dropping the negation on the renderer Z all pass
+    // that test unchanged. These two pin each one on its own.
+
+    /// Millimetre file (`IfcSIUnit` with the `.MILLI.` prefix): every file
+    /// coordinate is 1000x its metre value, so a dropped `unit_scale` puts the
+    /// centerline kilometres away. The directrix runs to `(10000, 4000)` mm =
+    /// `(10, 4)` m, whose renderer Z is `-4` — SIGNED, so the negation cannot
+    /// hide behind an absolute value either.
+    const MILLIMETRE_ALIGNMENT: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('','',(''),(''),'','','');
+FILE_SCHEMA(('IFC4X1'));
+ENDSEC;
+DATA;
+#6=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#7=IFCUNITASSIGNMENT((#6));
+#8=IFCPROJECT('0PrOjEcTpRoJeCtPrOjEc',$,'P',$,$,$,$,$,#7);
+#1=IFCCARTESIANPOINT((0.,0.,0.));
+#2=IFCCARTESIANPOINT((10000.,4000.,0.));
+#4=IFCPOLYLINE((#1,#2));
+#10=IFCALIGNMENT('0aBcDeFgHiJkLmNoPqRsT0',$,'Test Alignment',$,$,$,$,#4,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+    #[test]
+    fn millimetre_alignment_is_unit_scaled_and_yup_swapped() {
+        let verts = extract_alignment_line_vertices(MILLIMETRE_ALIGNMENT, None);
+        assert!(!verts.is_empty(), "alignment must emit centerline vertices");
+        assert_eq!(verts.len() % 3, 0, "vertices must be xyz triples");
+
+        let mut max_x = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        for v in verts.chunks_exact(3) {
+            assert!(v[1].abs() < 1e-2, "planar alignment elevation must be ~0, got {}", v[1]);
+            max_x = max_x.max(v[0]);
+            min_z = min_z.min(v[2]);
+            max_z = max_z.max(v[2]);
+        }
+        // 10 000 mm -> 10 m. Unscaled it would read 10 000.
+        assert!((max_x - 10.0).abs() < 0.05, "max renderer-x = 10 m, got {max_x}");
+        // 4 000 mm -> 4 m, NEGATED on the way into the renderer frame: the
+        // whole path lies at z <= 0, so a dropped negation flips the interval.
+        assert!((min_z + 4.0).abs() < 0.05, "min renderer-z = -4 m, got {min_z}");
+        assert!(max_z <= 1e-2, "renderer-z must never go positive, got {max_z}");
+    }
+
+    /// A georeferenced metre file: a wall out at survey coordinates trips RTC
+    /// detection, and the alignment shares that frame. The offset is
+    /// SUBTRACTED, so the centerline lands near the origin; adding it instead
+    /// (or subtracting the wrong component) puts it ~2x the offset out, i.e.
+    /// megametres away, which no near-origin bound can miss.
+    #[test]
+    fn georeferenced_alignment_is_rebased_near_the_origin() {
+        let content = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('','',(''),(''),'','','');
+FILE_SCHEMA(('IFC4X1'));
+ENDSEC;
+DATA;
+#2=IFCDIRECTION((0.,0.,1.));
+#3=IFCDIRECTION((1.,0.,0.));
+/* a wall far out at survey coords so RTC detection trips (>10 km) */
+#6=IFCCARTESIANPOINT((10400000.,2000000.,0.));
+#7=IFCAXIS2PLACEMENT3D(#6,#2,#3);
+#8=IFCLOCALPLACEMENT($,#7);
+#9=IFCPRODUCTDEFINITIONSHAPE($,$,(#41));
+#40=IFCCARTESIANPOINT((10400000.,2000000.,0.));
+#41=IFCSHAPEREPRESENTATION($,'Body','Curve2D',(#42));
+#42=IFCPOLYLINE((#40,#40));
+#43=IFCWALL('1WaLLWaLLWaLLWaLLWaLL00',$,'W',$,$,#8,#9,$,$);
+/* the alignment directrix in the same survey frame */
+#50=IFCCARTESIANPOINT((10400000.,2000000.,0.));
+#51=IFCCARTESIANPOINT((10400010.,2000004.,0.));
+#52=IFCPOLYLINE((#50,#51));
+#10=IFCALIGNMENT('0aBcDeFgHiJkLmNoPqRsT0',$,'A',$,$,$,$,#52,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let verts = extract_alignment_line_vertices(content, None);
+        assert!(!verts.is_empty(), "alignment must emit centerline vertices");
+        for v in verts.chunks_exact(3) {
+            for c in v {
+                assert!(
+                    c.abs() < 1000.0,
+                    "render-frame coord must be near origin after RTC, got {c}"
+                );
+            }
+        }
+
+
+        let raw = extract_alignment_line_vertices(content, Some(MeshFrame::RawIfc));
+        assert!(
+            raw[0] > 1_000_000.0,
+            "an explicit known-false frame must not fall back to standalone RTC detection",
+        );
+    }
+
+    /// `locate_axis_curve` tries attributes 7, 8, then 6 — `Axis` first, with
+    /// `Representation` (6) only as a last-resort fallback for publishers that
+    /// reuse it. Every other fixture here leaves 6 null, so the ORDER of that
+    /// list is unobservable: searching 6 first passes them all. Here both
+    /// resolve to a polyline and only `Axis` gives the right geometry.
+    #[test]
+    fn axis_attribute_wins_over_the_representation_fallback() {
+        let content = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('','',(''),(''),'','','');
+FILE_SCHEMA(('IFC4X1'));
+ENDSEC;
+DATA;
+/* Axis (attr 7): runs 10 m along +X. */
+#1=IFCCARTESIANPOINT((0.,0.,0.));
+#2=IFCCARTESIANPOINT((10.,0.,0.));
+#4=IFCPOLYLINE((#1,#2));
+/* Representation (attr 6): a decoy running 500 m along +X. */
+#5=IFCCARTESIANPOINT((500.,0.,0.));
+#6=IFCPOLYLINE((#1,#5));
+#10=IFCALIGNMENT('0aBcDeFgHiJkLmNoPqRsT0',$,'A',$,$,$,#6,#4,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+        let verts = extract_alignment_line_vertices(content, None);
+        assert!(!verts.is_empty(), "alignment must emit centerline vertices");
+        let max_x = verts
+            .chunks_exact(3)
+            .map(|v| v[0])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (max_x - 10.0).abs() < 0.5,
+            "the Axis curve (10 m) must win over the Representation decoy (500 m), got {max_x}"
+        );
+    }
+
+    #[test]
     fn empty_for_no_alignment() {
         let none = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
-        assert!(extract_alignment_line_vertices(none).is_empty());
+        assert!(extract_alignment_line_vertices(none, None).is_empty());
     }
 }

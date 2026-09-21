@@ -8,6 +8,11 @@
  * Build valid IFC4 STEP files programmatically with building elements,
  * geometry, property sets, and element quantities.
  *
+ * Element coordinates are STOREY-RELATIVE: every `addIfcXxx(storeyId, …)`
+ * chains the product's `IfcLocalPlacement` to that storey's placement, which
+ * is where `Elevation` is applied. Pass `Z = 0` for something standing on the
+ * storey floor, whatever the storey's elevation is.
+ *
  * ```ts
  * import { IfcCreator } from '@ifc-lite/create';
  *
@@ -32,10 +37,34 @@ export { addBeamToStore, type BeamInStoreParams, type BeamBuildResult } from './
 export { addDoorToStore, type DoorInStoreParams, type DoorBuildResult } from './in-store/door.js';
 export { addWindowToStore, type WindowInStoreParams, type WindowBuildResult } from './in-store/window.js';
 export { addSpaceToStore, type SpaceInStoreParams, type SpaceRectangleParams, type SpacePolygonParams, type SpaceBuildResult } from './in-store/space.js';
+export {
+  addSpatialZonesToStore,
+  spatialZonesSupported,
+  type SpatialZoneInput,
+  type SpatialZoneInStoreParams,
+  type SpatialZoneBuildResult,
+  type SpatialZoneType,
+} from './in-store/spatial-zone.js';
+export {
+  applyStylesInStore,
+  collectLeafRepresentationItems,
+  type ApplyStyleOptions,
+  type ApplyStyleResult,
+  type StyleBatch,
+  type SurfaceStyleColor,
+} from './in-store/apply-style.js';
 export { addRoofToStore, type RoofInStoreParams, type RoofRectangleParams, type RoofPolygonParams, type RoofBuildResult } from './in-store/roof.js';
 export { addPlateToStore, type PlateInStoreParams, type PlateRectangleParams, type PlatePolygonParams, type PlateBuildResult } from './in-store/plate.js';
 export { addMemberToStore, type MemberInStoreParams, type MemberBuildResult } from './in-store/member.js';
+export {
+  addCostScheduleToStore, addCostItemToStore, addCostValueToStore, addCostQuantityToStore,
+  nestCostItemsInStore, assignCostItemsToScheduleInStore, assignObjectsToCostItemInStore,
+  attachCostValuesToItemInStore,
+  type CostAnchor, type ExistingRelatedList,
+} from './in-store/cost.js';
+export { removeCostEntityInStore, type CostRemovalReferrers } from './in-store/cost-removal.js';
 export { resolveSpatialAnchor } from './in-store/resolve-anchor.js';
+export { toNativeLength, fromNativeLength } from './in-store/anchor.js';
 export type { SpatialAnchor } from './in-store/anchor.js';
 export {
   duplicateInStore,
@@ -59,6 +88,12 @@ export {
   type WallExtractionResult,
 } from './in-store/extract-walls.js';
 export {
+  storeyPlanFrame,
+  toStoreyLocal,
+  fromStoreyLocal,
+  type StoreyPlanFrame,
+} from './in-store/storey-plan-frame.js';
+export {
   generateSpacesFromWalls,
   offsetRoomFootprint,
   GENERATED_SPACE_OBJECTTYPE,
@@ -74,6 +109,29 @@ export {
   type GenerateSpacesStoreyResult,
   type StoreyInfo,
 } from './in-store/generate-spaces-all.js';
+export {
+  addDrawingMarkupToStore,
+  addMeasureMarkupToStore,
+  addPolygonAreaMarkupToStore,
+  addTextMarkupToStore,
+  addCloudMarkupToStore,
+  DRAWING_MARKUP_OBJECTTYPE,
+  DRAWING_MARKUP_PSET_NAME,
+  DRAWING_MARKUP_QSET_NAME,
+  type DrawingMarkupObjectType,
+  type MarkupAnchor,
+  type MarkupPoint2D,
+  type MeasureMarkupParams,
+  type MeasureMarkupResult,
+  type PolygonAreaMarkupParams,
+  type PolygonAreaMarkupResult,
+  type TextMarkupParams,
+  type TextMarkupResult,
+  type CloudMarkupParams,
+  type CloudMarkupResult,
+  type DrawingMarkupBatchInput,
+  type DrawingMarkupBatchResult,
+} from './in-store/drawing-markup.js';
 
 export type {
   // Geometry primitives
@@ -139,27 +197,55 @@ export type {
   BuildingParams,
   StoreyParams,
 
-  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence)
+  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence, IfcWorkCalendar)
   // Canonical IFC-prefixed names are preferred; legacy short names are kept
   // as aliases for existing callers.
   IfcWorkScheduleParams,
   IfcWorkPlanParams,
   IfcTaskParams,
   IfcRelSequenceParams,
+  IfcWorkCalendarParams,
+  IfcWorkTimeParams,
+  IfcRecurrencePatternParams,
+  IfcTimePeriodParams,
   IfcWorkScheduleType,
   IfcTaskPredefinedType,
   IfcTaskDurationType,
   IfcRelSequenceType,
+  IfcWorkCalendarType,
+  IfcRecurrenceType,
   WorkScheduleParams,
   WorkPlanParams,
   TaskParams,
   SequenceParams,
+  WorkCalendarParams,
+  WorkTimeParams,
+  RecurrencePatternParams,
+  TimePeriodParams,
   WorkScheduleType,
   TaskPredefinedType,
   TaskDurationType,
   SequenceType,
+  WorkCalendarType,
+  RecurrenceType,
 
   // Results
   CreatedEntity,
   CreateResult,
 } from './types.js';
+
+// Cost / 5D authoring (IfcCostSchedule, IfcCostItem, IfcCostValue)
+export type {
+  CostArithmeticOperator,
+  CostItemParams,
+  CostItemPredefinedType,
+  CostMeasureType,
+  CostQuantityKind,
+  CostQuantityParams,
+  CostScheduleParams,
+  CostSchedulePredefinedType,
+  CostSIUnitType,
+  CostTypedValue,
+  CostValueParams,
+  SIUnitParams,
+} from './types-cost.js';

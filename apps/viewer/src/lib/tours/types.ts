@@ -172,6 +172,14 @@ export interface UiSnapshot {
     selectedEntitiesSet: string[];
     selectedEntities: EntityRef[];
     selectedModelId: string | null;
+    /** Whether Charts authored the captured entity selection revision. */
+    chartOwned: boolean;
+    /** Exact chart ownership restored with the selection after tour steps mutate it. */
+    chartSlice: number[] | null;
+    chartSliceSource: string | null;
+    chartSliceBuckets: ViewerState['chartSliceBuckets'];
+    /** Chart-owned shared visibility captured with the slice; ids are serializable. */
+    chartVisibilityOwned: { channel: 'isolate' | 'ghost'; ids: number[] } | null;
   };
   activeStorey: EntityRef | null;
   selectedStoreys: number[];
@@ -179,6 +187,8 @@ export interface UiSnapshot {
     axis: SectionPlaneAxis;
     position: number;
     enabled: boolean;
+    /** A cut parked outside the Section tool (`store/section-active.ts`). */
+    parked: boolean;
     flipped: boolean;
     /** Face-picked plane params; captured so an abort can restore a
      *  pre-tour custom cut, not just the cardinal fields. */

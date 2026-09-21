@@ -9,6 +9,7 @@
 import type { StateCreator } from 'zustand';
 import type { ListDefinition, ListResult } from '@ifc-lite/lists';
 import { loadListDefinitions, saveListDefinitions } from '../../lib/lists/persistence.js';
+import { defineSliceTeardown, notApplicable } from '../teardown.js';
 
 export interface ListSlice {
   // State
@@ -17,6 +18,11 @@ export interface ListSlice {
   listResult: ListResult | null;
   listPanelVisible: boolean;
   listExecuting: boolean;
+  /** Message from the most recent execution or import failure (e.g. a name
+   *  pattern column `compileNameMatcher` rejected as unsafe), or `null` when
+   *  there is none to show. Distinct from an empty `listResult` — a genuinely
+   *  empty result set is not an error and must never populate this field. */
+  listError: string | null;
   /** A list definition handed off from elsewhere (e.g. "Create list" in the
    *  search filter) for the ListPanel to open straight into the builder. */
   pendingListDraft: ListDefinition | null;
@@ -31,6 +37,7 @@ export interface ListSlice {
   setListPanelVisible: (visible: boolean) => void;
   toggleListPanel: () => void;
   setListExecuting: (executing: boolean) => void;
+  setListError: (error: string | null) => void;
   setPendingListDraft: (definition: ListDefinition | null) => void;
 }
 
@@ -41,6 +48,7 @@ export const createListSlice: StateCreator<ListSlice, [], [], ListSlice> = (set,
   listResult: null,
   listPanelVisible: false,
   listExecuting: false,
+  listError: null,
   pendingListDraft: null,
 
   // Actions
@@ -76,5 +84,35 @@ export const createListSlice: StateCreator<ListSlice, [], [], ListSlice> = (set,
   setListPanelVisible: (listPanelVisible) => set({ listPanelVisible }),
   toggleListPanel: () => set((state) => ({ listPanelVisible: !state.listPanelVisible })),
   setListExecuting: (listExecuting) => set({ listExecuting }),
+  setListError: (listError) => set({ listError }),
   setPendingListDraft: (pendingListDraft) => set({ pendingListDraft }),
 });
+
+/**
+ * What a session reset clears on the list slice.
+ *
+ * Carried verbatim from `resetViewerState` (`store/index.ts`):
+ *   "Lists - reset result but keep definitions (user's saved lists)"
+ *
+ * `listDefinitions` is the user's authored work and round-trips to
+ * localStorage, so it is absent from `owns` — this slice is not willing to
+ * destroy it. `pendingListDraft` is absent for the same reason no teardown
+ * path touches it today: it is a hand-off in flight from another panel, and
+ * clearing it here would drop a list the user just asked to build.
+ */
+export const listTeardown = defineSliceTeardown(
+  'listSlice',
+  ['listPanelVisible', 'activeListId', 'listResult', 'listExecuting'],
+  {
+    'session-reset': () => ({
+      listPanelVisible: false,
+      activeListId: null,
+      // The rows reference the OUTGOING model's entities; the user re-runs
+      // the definition against the new one.
+      listResult: null,
+      listExecuting: false,
+    }),
+    'model-removed': notApplicable,
+    'all-models-cleared': notApplicable,
+  },
+);

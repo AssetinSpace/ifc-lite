@@ -2,16 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Section2DPanel - 2D architectural drawing viewer panel
- *
- * Displays generated 2D drawings (floor plans, sections) with:
- * - Canvas-based rendering with pan/zoom
- * - Toggle controls for hidden lines
- * - Export to SVG functionality
- */
+/** Workspace drawings with pan/zoom, hidden lines and vector export. */
 
+import { drawingAnnotationFrame } from '@/lib/model-placement/drawing-annotation-frame';
+import { usePlacementCoordinateInfo } from '@/hooks/usePlacementCoordinateInfo';
 import React, { useCallback, useRef, useState, useEffect, useMemo } from 'react';
+import { placedViewGeometry } from '@/lib/model-placement/view-geometry';
 import { X, Download, FileDown, Eye, EyeOff, Maximize2, ZoomIn, ZoomOut, Loader2, Printer, GripVertical, MoreHorizontal, RefreshCw, Pin, PinOff, Palette, Ruler, Trash2, FileText, Shapes, Box, BoxSelect, PenTool, Hexagon, Type, Cloud, MousePointer2, Tag, Layers, ScanLine } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -22,10 +18,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useViewerStore } from '@/store';
+import { toast } from '@/components/ui/toast';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
 import { useDraggablePanel } from '@/hooks/useDraggablePanel';
-import { GraphicOverrideEngine } from '@ifc-lite/drawing-2d';
+import { GraphicOverrideEngine, COMMON_SCALES } from '@ifc-lite/drawing-2d';
 import { type GeometryResult } from '@ifc-lite/geometry';
 import { DrawingSettingsPanel } from './DrawingSettingsPanel';
 import { DxfUnderlayPanel } from './DxfUnderlayPanel';
@@ -34,14 +31,20 @@ import { SheetSetupPanel } from './SheetSetupPanel';
 import { TitleBlockEditor } from './TitleBlockEditor';
 import { TextAnnotationEditor } from './TextAnnotationEditor';
 import { Drawing2DCanvas } from './Drawing2DCanvas';
-import { useDrawingGeneration, AXIS_MAP, ANNOTATION_VIEW_DEPTH } from '@/hooks/useDrawingGeneration';
+import { useDrawingGeneration } from '@/hooks/useDrawingGeneration';
 import { useMeasure2D } from '@/hooks/useMeasure2D';
 import { useAnnotation2D } from '@/hooks/useAnnotation2D';
+import { useDrawingWithReferences } from '@/hooks/useReferenceImagesForDrawing';
 import { useViewControls } from '@/hooks/useViewControls';
 import { useDrawingExport } from '@/hooks/useDrawingExport';
-import { useSymbolicAnnotationsForDrawing } from '@/hooks/useSymbolicAnnotations';
-import { useDxfUnderlaysForDrawing, dxfWorldShift, dxfUnderlayDrawingBounds } from '@/hooks/useDxfUnderlay';
+import { useSymbolicAnnotationsForDrawing, symbolicAnnotationsOverlayEnabled } from '@/hooks/useSymbolicAnnotations';
+import { useDxfUnderlaysForDrawing, useDxfMapToWorldTransform, dxfWorldShift, dxfUnderlayDrawingBounds } from '@/hooks/useDxfUnderlay';
 import { useScanSectionLayer } from '@/hooks/useScanSectionLayer';
+import { useDrawing2DPersistence } from '@/hooks/useDrawing2DPersistence';
+import type { CachedSheetTransform } from '@/lib/drawing/sheet-geometry-key';
+import { useDrawingMarkupRestoreOnLoad } from '@/hooks/useDrawingMarkupRestoreOnLoad';
+import { SaveMarkupToModelButton, SaveMarkupToModelMenuItem } from './SaveMarkupToModelButton';
+import { useTranslation } from '@/i18n';
 
 interface Section2DPanelProps {
   mergedGeometry?: GeometryResult | null;
@@ -52,8 +55,14 @@ interface Section2DPanelProps {
 export function Section2DPanel({
   mergedGeometry,
   computedIsolatedIds,
-  modelIdToIndex
 }: Section2DPanelProps = {}): React.ReactElement | null {
+  const { t } = useTranslation();
+  // Both mounted unconditionally, before `!panelVisible` below, so each
+  // restore runs even with the panel closed — safe together, see
+  // `useDrawingMarkupRestoreOnLoad`'s module doc (#4153 vs #4159).
+  useDrawing2DPersistence();
+  useDrawingMarkupRestoreOnLoad();
+
   // ═══════════════════════════════════════════════════════════════════════════
   // STORE SELECTORS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -61,7 +70,8 @@ export function Section2DPanel({
   const setDrawingPanelVisible = useViewerStore((s) => s.setDrawing2DPanelVisible);
   const suppressNextSection2DPanelAutoOpen = useViewerStore((s) => s.suppressNextSection2DPanelAutoOpen);
   const setSuppressNextSection2DPanelAutoOpen = useViewerStore((s) => s.setSuppressNextSection2DPanelAutoOpen);
-  const drawing = useViewerStore((s) => s.drawing2D);
+  const sourceDrawing = useViewerStore((s) => s.drawing2D);
+  const { drawing, hasReferences } = useDrawingWithReferences(sourceDrawing);
   const setDrawing = useViewerStore((s) => s.setDrawing2D);
   const status = useViewerStore((s) => s.drawing2DStatus);
   const setDrawingStatus = useViewerStore((s) => s.setDrawing2DStatus);
@@ -72,12 +82,15 @@ export function Section2DPanel({
   const setDrawingError = useViewerStore((s) => s.setDrawing2DError);
   const displayOptions = useViewerStore((s) => s.drawing2DDisplayOptions);
   const updateDisplayOptions = useViewerStore((s) => s.updateDrawing2DDisplayOptions);
+  // LENGTHUNIT display override for the on-canvas measure distance/perimeter
+  // labels (#2199 slice not covered by #2538 — see Drawing2DCanvas.tsx).
+  const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
+  // Class-level Visibility toggles — the section honours them like the 3D
+  // viewport does, so a hidden IfcSpace/IfcOpeningElement is not cut (#2060).
+  const typeVisibility = useViewerStore((s) => s.typeVisibility);
   // Graphic overrides
-  const graphicOverridePresets = useViewerStore((s) => s.graphicOverridePresets);
   const activePresetId = useViewerStore((s) => s.activePresetId);
-  const setActivePreset = useViewerStore((s) => s.setActivePreset);
   const overridesEnabled = useViewerStore((s) => s.overridesEnabled);
-  const toggleOverridesEnabled = useViewerStore((s) => s.toggleOverridesEnabled);
   const getActiveOverrideRules = useViewerStore((s) => s.getActiveOverrideRules);
   const customOverrideRules = useViewerStore((s) => s.customOverrideRules);
 
@@ -103,7 +116,6 @@ export function Section2DPanel({
 
   // 2D Measure tool state
   const measure2DMode = useViewerStore((s) => s.measure2DMode);
-  const toggleMeasure2DMode = useViewerStore((s) => s.toggleMeasure2DMode);
   const measure2DStart = useViewerStore((s) => s.measure2DStart);
   const measure2DCurrent = useViewerStore((s) => s.measure2DCurrent);
   const setMeasure2DStart = useViewerStore((s) => s.setMeasure2DStart);
@@ -114,7 +126,6 @@ export function Section2DPanel({
   const measure2DResults = useViewerStore((s) => s.measure2DResults);
   const completeMeasure2D = useViewerStore((s) => s.completeMeasure2D);
   const cancelMeasure2D = useViewerStore((s) => s.cancelMeasure2D);
-  const clearMeasure2DResults = useViewerStore((s) => s.clearMeasure2DResults);
   const measure2DSnapPoint = useViewerStore((s) => s.measure2DSnapPoint);
   const setMeasure2DSnapPoint = useViewerStore((s) => s.setMeasure2DSnapPoint);
 
@@ -129,7 +140,6 @@ export function Section2DPanel({
   const addPolygonArea2DPoint = useViewerStore((s) => s.addPolygonArea2DPoint);
   const completePolygonArea2D = useViewerStore((s) => s.completePolygonArea2D);
   const cancelPolygonArea2D = useViewerStore((s) => s.cancelPolygonArea2D);
-  const clearPolygonArea2DResults = useViewerStore((s) => s.clearPolygonArea2DResults);
   // Text annotation state
   const textAnnotations2D = useViewerStore((s) => s.textAnnotations2D);
   const textAnnotation2DEditing = useViewerStore((s) => s.textAnnotation2DEditing);
@@ -156,8 +166,12 @@ export function Section2DPanel({
   const models = useViewerStore((s) => s.models);
   const { geometryResult: legacyGeometryResult, ifcDataStore } = useIfc();
 
-  // Use merged geometry from props if available (multi-model), otherwise fall back to legacy single-model
-  const geometryResult = mergedGeometry ?? legacyGeometryResult;
+  const placement = useViewerStore((state) => state.modelPlacement);
+  const placedCoordinateInfo = usePlacementCoordinateInfo((mergedGeometry ?? legacyGeometryResult)?.coordinateInfo);
+  const drawingActive = panelVisible || (activeTool === 'section' && displayOptions.show3DOverlay);
+  const geometryResult = useMemo(() => { const source = mergedGeometry ?? legacyGeometryResult;
+    return source && drawingActive ? { ...placedViewGeometry(source), coordinateInfo: placedCoordinateInfo ?? source.coordinateInfo } : source;
+  }, [mergedGeometry, legacyGeometryResult, placement, placedCoordinateInfo, drawingActive]);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // AUTO-SHOW PANEL EFFECT
@@ -179,7 +193,7 @@ export function Section2DPanel({
   // ═══════════════════════════════════════════════════════════════════════════
   // LOCAL STATE
   // ═══════════════════════════════════════════════════════════════════════════
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded] = useState(false);
   const [panelSize, setPanelSize] = useState({ width: 400, height: 300 });
   const [isNarrow, setIsNarrow] = useState(false);  // Track if panel is too narrow for all buttons
   const [isPinned, setIsPinned] = useState(true);  // Default ON: keep position on regenerate
@@ -193,7 +207,7 @@ export function Section2DPanel({
   // Track resize event handlers for cleanup
   const resizeHandlersRef = useRef<{ move: ((e: MouseEvent) => void) | null; up: (() => void) | null }>({ move: null, up: null });
   // Cache sheet drawing transform when pinned (to keep model fixed in place)
-  const cachedSheetTransformRef = useRef<{ translateX: number; translateY: number; scaleFactor: number } | null>(null);
+  const cachedSheetTransformRef = useRef<CachedSheetTransform | null>(null);
 
   // Track panel width for responsive header
   useEffect(() => {
@@ -201,7 +215,6 @@ export function Section2DPanel({
   }, [panelSize.width]);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MEMOIZED VALUES
   // ═══════════════════════════════════════════════════════════════════════════
 
   // Create graphic override engine with active rules
@@ -224,7 +237,6 @@ export function Section2DPanel({
   }, [geometryResult]);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // VISIBILITY STATE
   // ═══════════════════════════════════════════════════════════════════════════
 
   // Get visibility state from store for filtering
@@ -273,13 +285,12 @@ export function Section2DPanel({
   }, [isolatedEntities, isolatedEntitiesByModel, models]);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // EXTRACTED HOOKS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const { generateDrawing, doRegenerate, isRegenerating } = useDrawingGeneration({
-    geometryResult, ifcDataStore, sectionPlane, displayOptions,
+  const { generateDrawing, isRegenerating } = useDrawingGeneration({
+    geometryResult, ifcDataStore, sectionPlane, displayOptions, typeVisibility,
     combinedHiddenIds, combinedIsolatedIds, computedIsolatedIds,
-    models, panelVisible, drawing,
+    models, panelVisible, activeTool, drawing: sourceDrawing,
     setDrawing, setDrawingStatus, setDrawingProgress, setDrawingError,
   });
 
@@ -302,31 +313,12 @@ export function Section2DPanel({
   // useDrawingGeneration uses, so the annotation filter stays in lockstep
   // with the cut. Empty/missing bounds collapse to an inert range → hook
   // returns empty, the overlay simply does nothing.
-  const ifcAnnotationsForDrawing = useMemo(() => {
-    const bounds = geometryResult?.coordinateInfo?.shiftedBounds;
-    if (!bounds) {
-      return { sectionPosWorld: 0, viewDepth: 0, fallbackY: 0 };
-    }
-    const axis = AXIS_MAP[sectionPlane.axis];
-    const axisMin = bounds.min[axis];
-    const axisMax = bounds.max[axis];
-    const sectionPosWorld = axisMin + (sectionPlane.position / 100) * (axisMax - axisMin);
-    // IFC annotations get a tight 1.2 m view-depth slab — typical plan-view
-    // convention so dimension chains from the next storey don't stack onto
-    // the cut floor. The body cutter still uses half-extent for its own
-    // projection edges; the slab is annotation-specific.
-    const viewDepth = ANNOTATION_VIEW_DEPTH;
-    // For loose annotations (no resolvable storey), fall back to mid-Y like
-    // the 3D viewport does. This lets storeyless models still surface their
-    // annotations on the relevant section.
-    const yMin = bounds.min.y;
-    const yMax = bounds.max.y;
-    const fallbackY = Number.isFinite(yMin) && Number.isFinite(yMax) ? (yMin + yMax) * 0.5 : 0;
-    return { sectionPosWorld, viewDepth, fallbackY };
-  }, [geometryResult, sectionPlane.axis, sectionPlane.position]);
+  const ifcAnnotationsForDrawing = useMemo(() => drawingAnnotationFrame(
+    geometryResult?.coordinateInfo, (mergedGeometry ?? legacyGeometryResult)?.coordinateInfo, sectionPlane,
+  ), [geometryResult, mergedGeometry, legacyGeometryResult, sectionPlane]);
 
   const ifcAnnotationData = useSymbolicAnnotationsForDrawing({
-    enabled: displayOptions.showIfcAnnotations && status === 'ready',
+    enabled: symbolicAnnotationsOverlayEnabled(displayOptions.showIfcAnnotations, status, typeVisibility.ifcAnnotations),
     axis: sectionPlane.axis,
     sectionPosWorld: ifcAnnotationsForDrawing.sectionPosWorld,
     viewDepth: ifcAnnotationsForDrawing.viewDepth,
@@ -416,20 +408,44 @@ export function Section2DPanel({
 
   // Centre an underlay on the generated drawing: offset = model-drawing
   // centre − underlay centre at zero offset (same world→drawing mapping
-  // the render hook applies, including the current rotation/scale).
+  // the render hook applies, including the current rotation/scale and,
+  // for a georeferenced underlay, the inverse IfcMapConversion — issue
+  // #1929, same transform `dxfUnderlayData` above resolves).
+  const { transform: dxfMapToWorld, available: dxfGeoreferenceAvailable } = useDxfMapToWorldTransform();
   const handleCenterDxfUnderlay = useCallback((id: string) => {
     const entry = dxfUnderlays.find((u) => u.id === id);
     if (!entry || !drawing) return;
     const shift = dxfWorldShift(geometryResult?.coordinateInfo);
     const mirrorX = sectionPlane.flipped && sectionPlane.custom === undefined;
-    const underlayBounds = dxfUnderlayDrawingBounds(entry, shift, mirrorX);
-    if (!underlayBounds) return;
+    const underlayBounds = dxfUnderlayDrawingBounds(entry, shift, mirrorX, dxfMapToWorld, dxfGeoreferenceAvailable);
+    if (!underlayBounds) {
+      // PR #1965 review: this guard fires when the underlay has no usable
+      // bounds AT ALL (missing extents) OR the georeference produced a
+      // non-finite corner (`dxfUnderlayDrawingBounds` collapses both into
+      // `null` — see its docstring). Either way the button used to do
+      // nothing with no explanation; tell the user so a malformed
+      // `IfcMapConversion` doesn't read as an unresponsive button.
+      toast.error(t('section2d.underlay.missingBounds'));
+      return;
+    }
     const modelCx = (drawing.bounds.min.x + drawing.bounds.max.x) / 2;
     const modelCy = (drawing.bounds.min.y + drawing.bounds.max.y) / 2;
     const underlayCx = (underlayBounds.min.x + underlayBounds.max.x) / 2;
     const underlayCy = (underlayBounds.min.y + underlayBounds.max.y) / 2;
-    updateDxfUnderlayPlacement(id, { offsetX: modelCx - underlayCx, offsetY: modelCy - underlayCy });
-  }, [dxfUnderlays, drawing, geometryResult, sectionPlane.flipped, sectionPlane.custom, updateDxfUnderlayPlacement]);
+    const offsetX = modelCx - underlayCx;
+    const offsetY = modelCy - underlayCy;
+    // Defense-in-depth (PR #1965 review): `dxfUnderlayDrawingBounds`
+    // already returns null on a non-finite bound (so `underlayBounds`
+    // above would have short-circuited), but guard the DERIVED offset too
+    // — `drawing.bounds` comes from the generated drawing, not the
+    // underlay, and a NaN here would otherwise still get written into the
+    // stored placement, which survives toggling georeferencing back off.
+    if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY)) {
+      toast.error(t('section2d.underlay.nonFiniteDrawing'));
+      return;
+    }
+    updateDxfUnderlayPlacement(id, { offsetX, offsetY });
+  }, [dxfUnderlays, drawing, geometryResult, sectionPlane.flipped, sectionPlane.custom, updateDxfUnderlayPlacement, dxfMapToWorld, dxfGeoreferenceAvailable, t]);
 
   // Point-cloud scan overlay (issue #1805): a thin band of the loaded
   // scan(s) around the active section plane, projected into the SAME
@@ -445,14 +461,49 @@ export function Section2DPanel({
     legacyPointClouds: geometryResult?.pointClouds,
   });
 
-  const { formatDistance, handleExportSVG, handleExportDXF, handlePrint } = useDrawingExport({
+  const { handleExportSVG, handleExportDXF, handleExportPDF, handlePrint } = useDrawingExport({
     drawing, displayOptions, sectionPlane, activePresetId,
     entityColorMap, overridesEnabled, overrideEngine,
     measure2DResults, polygonArea2DResults, textAnnotations2D, cloudAnnotations2D,
     sheetEnabled, activeSheet, dxfUnderlays: dxfUnderlayData,
     ifcDataStore, coordinateInfo: geometryResult?.coordinateInfo,
     scanSection: scanSectionLayer,
+    // Pin View state and the preview's transform cache: without these the
+    // print/export path recomputed the sheet placement from the CURRENT
+    // bounds while a pinned preview kept the held one, so a regenerate at a
+    // new elevation printed a different layout from the one on screen. Pin
+    // View defaults ON, so this was the default path. The hook only READS
+    // the ref — the preview canvas owns the write.
+    isPinned, cachedSheetTransformRef,
   });
+
+  // Scale prompt for the scaled PDF export (issue #2042). A proper
+  // scale-selector dropdown (presets + custom input, matching the issue's
+  // exact wording) is a follow-up; this is the "smallest useful version"
+  // — it still gives every requested scale (defaults to "as displayed",
+  // accepts any of the common presets or a fully custom denominator) and
+  // never guesses silently. `window.prompt` matches this hook's existing
+  // `alert`-based error surface (no toast wiring here); see useDrawingExport.
+  const handleExportPdfPrompt = useCallback(() => {
+    const presetHint = COMMON_SCALES.map((s) => s.name).join(', ');
+    const asDisplayed = displayOptions.scale || 100;
+    const input = window.prompt(
+      t('section2d.pdf.prompt', { scale: asDisplayed, presets: presetHint }),
+      String(asDisplayed)
+    );
+    if (input === null) return; // cancelled
+    const trimmed = input.trim();
+    if (trimmed === '') {
+      handleExportPDF();
+      return;
+    }
+    const n = Number(trimmed.replace(/^1:/, ''));
+    if (!Number.isFinite(n) || n <= 0) {
+      window.alert(t('section2d.pdf.invalid', { input }));
+      return;
+    }
+    handleExportPDF(n);
+  }, [displayOptions.scale, handleExportPDF, t]);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // CALLBACKS
@@ -474,10 +525,6 @@ export function Section2DPanel({
     setDrawing(null);
     setDrawingStatus('idle');
   }, [displayOptions.useSymbolicRepresentations, updateDisplayOptions, setDrawing, setDrawingStatus]);
-
-  const toggleExpanded = useCallback(() => {
-    setIsExpanded((prev) => !prev);
-  }, []);
 
   const togglePinned = useCallback(() => {
     setIsPinned((prev) => !prev);
@@ -631,13 +678,13 @@ export function Section2DPanel({
           {!isExpanded && (
             <span
               onMouseDown={drag.onDragStart}
-              title="Drag to move"
+              title={t('section2d.dragTitle')}
               className="shrink-0 cursor-grab active:cursor-grabbing text-muted-foreground/50 hover:text-muted-foreground"
             >
               <GripVertical className="h-3.5 w-3.5" />
             </span>
           )}
-          <h2 className="font-semibold text-xs shrink-0">2D Section</h2>
+          <h2 className="font-semibold text-xs shrink-0">{t('section2d.heading')}</h2>
         </div>
 
         <div className="flex items-center gap-1 min-w-0">
@@ -649,7 +696,7 @@ export function Section2DPanel({
                 variant={displayOptions.show3DOverlay ? 'default' : 'ghost'}
                 size="icon-sm"
                 onClick={toggle3DOverlay}
-                title="Toggle 3D overlay"
+                title={t('section2d.overlay.toggleTitle')}
               >
                 {displayOptions.show3DOverlay ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
               </Button>
@@ -659,7 +706,7 @@ export function Section2DPanel({
                 variant={displayOptions.useSymbolicRepresentations ? 'default' : 'ghost'}
                 size="icon-sm"
                 onClick={toggleSymbolicRepresentations}
-                title={displayOptions.useSymbolicRepresentations ? 'Symbolic representations (Plan)' : 'Section cut (Body)'}
+                title={displayOptions.useSymbolicRepresentations ? t('section2d.symbolic.planTitle') : t('section2d.symbolic.cutTitle')}
               >
                 {displayOptions.useSymbolicRepresentations ? <Shapes className="h-4 w-4" /> : <Box className="h-4 w-4" />}
               </Button>
@@ -669,7 +716,7 @@ export function Section2DPanel({
                 variant={displayOptions.showIfcAnnotations ? 'default' : 'ghost'}
                 size="icon-sm"
                 onClick={toggleIfcAnnotations}
-                title={displayOptions.showIfcAnnotations ? 'Hide IFC annotations on this section' : 'Show IFC annotations on this section'}
+                title={displayOptions.showIfcAnnotations ? t('section2d.ifcAnnotations.hideTitle') : t('section2d.ifcAnnotations.showTitle')}
                 disabled={sectionPlane.axis !== 'down'}
               >
                 <Tag className="h-4 w-4" />
@@ -682,8 +729,8 @@ export function Section2DPanel({
                 onClick={toggleConstructionProjection}
                 title={
                   displayOptions.showConstructionProjection
-                    ? 'Hide construction projection (overhead & visible reference lines)'
-                    : 'Show construction projection (overhead & visible reference lines)'
+                    ? t('section2d.construction.hideTitle')
+                    : t('section2d.construction.showTitle')
                 }
                 disabled={sectionPlane.custom !== undefined}
               >
@@ -696,7 +743,7 @@ export function Section2DPanel({
                   <Button
                     variant={annotation2DActiveTool !== 'none' ? 'default' : 'ghost'}
                     size="icon-sm"
-                    title="Annotation tools"
+                    title={t('section2d.annotations.title')}
                   >
                     <PenTool className="h-4 w-4" />
                   </Button>
@@ -704,36 +751,31 @@ export function Section2DPanel({
                 <DropdownMenuContent align="start">
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool('none')}>
                     <MousePointer2 className="h-4 w-4 mr-2" />
-                    Select / Pan
-                    {annotation2DActiveTool === 'none' && <span className="ml-auto text-xs text-primary">Active</span>}
+                    {annotation2DActiveTool === 'none' ? t('section2d.annotations.selectActive') : t('section2d.annotations.select')}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'measure' ? 'none' : 'measure')}>
                     <Ruler className="h-4 w-4 mr-2" />
-                    Distance Measure
-                    {annotation2DActiveTool === 'measure' && <span className="ml-auto text-xs text-primary">Active</span>}
+                    {annotation2DActiveTool === 'measure' ? t('section2d.annotations.distanceActive') : t('section2d.annotations.distance')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'polygon-area' ? 'none' : 'polygon-area')}>
                     <Hexagon className="h-4 w-4 mr-2" />
-                    Area Measure
-                    {annotation2DActiveTool === 'polygon-area' && <span className="ml-auto text-xs text-primary">Active</span>}
+                    {annotation2DActiveTool === 'polygon-area' ? t('section2d.annotations.areaActive') : t('section2d.annotations.area')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'text' ? 'none' : 'text')}>
                     <Type className="h-4 w-4 mr-2" />
-                    Text Box
-                    {annotation2DActiveTool === 'text' && <span className="ml-auto text-xs text-primary">Active</span>}
+                    {annotation2DActiveTool === 'text' ? t('section2d.annotations.textActive') : t('section2d.annotations.text')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'cloud' ? 'none' : 'cloud')}>
                     <Cloud className="h-4 w-4 mr-2" />
-                    Revision Cloud
-                    {annotation2DActiveTool === 'cloud' && <span className="ml-auto text-xs text-primary">Active</span>}
+                    {annotation2DActiveTool === 'cloud' ? t('section2d.annotations.cloudActive') : t('section2d.annotations.cloud')}
                   </DropdownMenuItem>
                   {hasAnnotations && (
                     <>
                       <DropdownMenuSeparator />
                       <DropdownMenuItem onClick={clearAllAnnotations2D}>
                         <Trash2 className="h-4 w-4 mr-2" />
-                        Clear All Annotations
+                        {t('section2d.annotations.clear')}
                       </DropdownMenuItem>
                     </>
                   )}
@@ -754,7 +796,7 @@ export function Section2DPanel({
                     return !prev;
                   });
                 }}
-                title="Drawing settings"
+                title={t('section2d.settings.title')}
                 className="relative"
               >
                 <Palette className="h-4 w-4" />
@@ -775,7 +817,7 @@ export function Section2DPanel({
                   }
                   setSheetPanelVisible(!sheetPanelVisible);
                 }}
-                title="Drawing sheet setup"
+                title={t('section2d.sheet.title')}
                 className="relative"
               >
                 <FileText className="h-4 w-4" />
@@ -799,7 +841,7 @@ export function Section2DPanel({
                     return !prev;
                   });
                 }}
-                title="DXF underlays"
+                title={t('section2d.dxf.title')}
                 className="relative"
               >
                 <Layers className="h-4 w-4" />
@@ -823,7 +865,7 @@ export function Section2DPanel({
                     return !prev;
                   });
                 }}
-                title="Scan layer (point cloud overlay)"
+                title={t('section2d.scan.title')}
                 className="relative"
               >
                 <ScanLine className="h-4 w-4" />
@@ -835,23 +877,23 @@ export function Section2DPanel({
               <div className="w-px h-4 bg-border mx-1" />
 
               {/* Zoom controls */}
-              <Button variant="ghost" size="icon-sm" onClick={zoomOut} title="Zoom out">
+              <Button variant="ghost" size="icon-sm" onClick={zoomOut} title={t('section2d.zoom.out')}>
                 <ZoomOut className="h-4 w-4" />
               </Button>
               <span className="text-xs font-mono w-10 text-center">
                 {Math.round(viewTransform.scale * 100)}%
               </span>
-              <Button variant="ghost" size="icon-sm" onClick={zoomIn} title="Zoom in">
+              <Button variant="ghost" size="icon-sm" onClick={zoomIn} title={t('section2d.zoom.in')}>
                 <ZoomIn className="h-4 w-4" />
               </Button>
-              <Button variant="ghost" size="icon-sm" onClick={fitToView} title="Fit to view">
+              <Button variant="ghost" size="icon-sm" onClick={fitToView} title={t('section2d.zoom.fit')}>
                 <Maximize2 className="h-4 w-4" />
               </Button>
               <Button
                 variant={isPinned ? 'default' : 'ghost'}
                 size="icon-sm"
                 onClick={togglePinned}
-                title={isPinned ? 'Unpin view (auto-fit on regenerate)' : 'Pin view (keep position on regenerate)'}
+                title={isPinned ? t('section2d.pin.unpinTitle') : t('section2d.pin.pinTitle')}
               >
                 {isPinned ? <Pin className="h-4 w-4" /> : <PinOff className="h-4 w-4" />}
               </Button>
@@ -864,7 +906,7 @@ export function Section2DPanel({
                 size="icon-sm"
                 onClick={handleExportSVG}
                 disabled={!drawing}
-                title="Download SVG"
+                title={t('section2d.export.svg')}
               >
                 <Download className="h-4 w-4" />
               </Button>
@@ -873,19 +915,29 @@ export function Section2DPanel({
                 size="icon-sm"
                 onClick={handleExportDXF}
                 disabled={!drawing}
-                title="Download DXF"
+                title={t('section2d.export.dxf')}
               >
                 <FileDown className="h-4 w-4" />
               </Button>
               <Button
                 variant="ghost"
                 size="icon-sm"
+                onClick={handleExportPdfPrompt}
+                disabled={!drawing}
+                title={t('section2d.export.pdf')}
+              >
+                <FileText className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
                 onClick={handlePrint}
                 disabled={!drawing}
-                title="Print"
+                title={t('section2d.export.print')}
               >
                 <Printer className="h-4 w-4" />
               </Button>
+              <SaveMarkupToModelButton />
 
               <div className="w-px h-4 bg-border mx-1" />
 
@@ -895,7 +947,7 @@ export function Section2DPanel({
                 size="icon-sm"
                 onClick={() => generateDrawing(false)}
                 disabled={status === 'generating'}
-                title="Regenerate"
+                title={t('section2d.regenerate')}
               >
                 {status === 'generating' ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -910,106 +962,111 @@ export function Section2DPanel({
           {isNarrow && (
             <>
               {/* Essential zoom controls */}
-              <Button variant="ghost" size="icon-sm" onClick={fitToView} title="Fit to view">
+              <Button variant="ghost" size="icon-sm" onClick={fitToView} title={t('section2d.zoom.fit')}>
                 <Maximize2 className="h-4 w-4" />
               </Button>
 
               {/* Overflow menu */}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" title="More options">
+                  <Button variant="ghost" size="icon-sm" title={t('section2d.more')}>
                     <MoreHorizontal className="h-4 w-4" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-56">
                   <DropdownMenuItem onClick={toggle3DOverlay}>
                     {displayOptions.show3DOverlay ? <Eye className="h-4 w-4 mr-2" /> : <EyeOff className="h-4 w-4 mr-2" />}
-                    3D Overlay {displayOptions.show3DOverlay ? 'On' : 'Off'}
+                    {displayOptions.show3DOverlay ? t('section2d.menu.overlayOn') : t('section2d.menu.overlayOff')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={toggleSymbolicRepresentations}>
                     {displayOptions.useSymbolicRepresentations ? <Shapes className="h-4 w-4 mr-2" /> : <Box className="h-4 w-4 mr-2" />}
-                    {displayOptions.useSymbolicRepresentations ? 'Symbolic (Plan)' : 'Section Cut (Body)'}
+                    {displayOptions.useSymbolicRepresentations ? t('section2d.menu.symbolicPlan') : t('section2d.menu.sectionCut')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={toggleIfcAnnotations} disabled={sectionPlane.axis !== 'down'}>
                     <Tag className="h-4 w-4 mr-2" />
-                    IFC Annotations {displayOptions.showIfcAnnotations ? 'On' : 'Off'}
+                    {displayOptions.showIfcAnnotations ? t('section2d.menu.ifcAnnotationsOn') : t('section2d.menu.ifcAnnotationsOff')}
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onClick={toggleConstructionProjection}
                     disabled={sectionPlane.custom !== undefined}
                   >
                     <BoxSelect className="h-4 w-4 mr-2" />
-                    Construction Projection {displayOptions.showConstructionProjection ? 'On' : 'Off'}
+                    {displayOptions.showConstructionProjection ? t('section2d.menu.constructionOn') : t('section2d.menu.constructionOff')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool('none')}>
                     <MousePointer2 className="h-4 w-4 mr-2" />
-                    Select / Pan {annotation2DActiveTool === 'none' ? '(On)' : ''}
+                    {annotation2DActiveTool === 'none' ? t('section2d.annotations.selectActive') : t('section2d.annotations.select')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'measure' ? 'none' : 'measure')}>
                     <Ruler className="h-4 w-4 mr-2" />
-                    Distance Measure {annotation2DActiveTool === 'measure' ? '(On)' : ''}
+                    {annotation2DActiveTool === 'measure' ? t('section2d.annotations.distanceActive') : t('section2d.annotations.distance')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'polygon-area' ? 'none' : 'polygon-area')}>
                     <Hexagon className="h-4 w-4 mr-2" />
-                    Area Measure {annotation2DActiveTool === 'polygon-area' ? '(On)' : ''}
+                    {annotation2DActiveTool === 'polygon-area' ? t('section2d.annotations.areaActive') : t('section2d.annotations.area')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'text' ? 'none' : 'text')}>
                     <Type className="h-4 w-4 mr-2" />
-                    Text Box {annotation2DActiveTool === 'text' ? '(On)' : ''}
+                    {annotation2DActiveTool === 'text' ? t('section2d.annotations.textActive') : t('section2d.annotations.text')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setAnnotation2DActiveTool(annotation2DActiveTool === 'cloud' ? 'none' : 'cloud')}>
                     <Cloud className="h-4 w-4 mr-2" />
-                    Revision Cloud {annotation2DActiveTool === 'cloud' ? '(On)' : ''}
+                    {annotation2DActiveTool === 'cloud' ? t('section2d.annotations.cloudActive') : t('section2d.annotations.cloud')}
                   </DropdownMenuItem>
                   {hasAnnotations && (
                     <DropdownMenuItem onClick={clearAllAnnotations2D}>
                       <Trash2 className="h-4 w-4 mr-2" />
-                      Clear All Annotations
+                      {t('section2d.annotations.clear')}
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => { setDxfPanelOpen(false); setSettingsPanelOpen(true); }}>
                     <Palette className="h-4 w-4 mr-2" />
-                    Drawing Settings...
+                    {t('section2d.menu.settings')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => { setDxfPanelOpen(false); setSheetPanelVisible(true); }}>
                     <FileText className="h-4 w-4 mr-2" />
-                    Sheet Setup {sheetEnabled ? '(On)' : ''}
+                    {sheetEnabled ? t('section2d.menu.sheetOn') : t('section2d.menu.sheetOff')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => { setSettingsPanelOpen(false); setSheetPanelVisible(false); setScanPanelOpen(false); setDxfPanelOpen(true); }}>
                     <Layers className="h-4 w-4 mr-2" />
-                    DXF Underlays {dxfUnderlays.length > 0 ? `(${dxfUnderlays.length})` : ''}
+                    {dxfUnderlays.length > 0 ? t('section2d.menu.dxfCount', { count: dxfUnderlays.length }) : t('section2d.menu.dxf')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => { setSettingsPanelOpen(false); setSheetPanelVisible(false); setDxfPanelOpen(false); setScanPanelOpen(true); }}>
                     <ScanLine className="h-4 w-4 mr-2" />
-                    Scan Layer {displayOptions.showScanSection ? '(On)' : ''}
+                    {displayOptions.showScanSection ? t('section2d.menu.scanOn') : t('section2d.menu.scanOff')}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={zoomIn}>
                     <ZoomIn className="h-4 w-4 mr-2" />
-                    Zoom In
+                    {t('section2d.zoom.in')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={zoomOut}>
                     <ZoomOut className="h-4 w-4 mr-2" />
-                    Zoom Out
+                    {t('section2d.zoom.out')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={togglePinned}>
                     {isPinned ? <Pin className="h-4 w-4 mr-2" /> : <PinOff className="h-4 w-4 mr-2" />}
-                    Pin View {isPinned ? 'On' : 'Off'}
+                    {isPinned ? t('section2d.menu.pinOn') : t('section2d.menu.pinOff')}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={handleExportSVG} disabled={!drawing}>
                     <Download className="h-4 w-4 mr-2" />
-                    Download SVG
+                    {t('section2d.export.svg')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={handleExportDXF} disabled={!drawing}>
                     <FileDown className="h-4 w-4 mr-2" />
-                    Download DXF
+                    {t('section2d.export.dxf')}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={handleExportPdfPrompt} disabled={!drawing}>
+                    <FileText className="h-4 w-4 mr-2" />
+                    {t('section2d.export.pdf')}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={handlePrint} disabled={!drawing}>
                     <Printer className="h-4 w-4 mr-2" />
-                    Print
+                    {t('section2d.export.print')}
                   </DropdownMenuItem>
+                  <SaveMarkupToModelMenuItem />
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => generateDrawing(false)} disabled={status === 'generating'}>
                     {status === 'generating' ? (
@@ -1017,7 +1074,7 @@ export function Section2DPanel({
                     ) : (
                       <RefreshCw className="h-4 w-4 mr-2" />
                     )}
-                    Regenerate
+                    {t('section2d.regenerate')}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1025,7 +1082,7 @@ export function Section2DPanel({
           )}
 
           {/* Close button always visible */}
-          <Button variant="ghost" size="icon-sm" onClick={handleClose} title="Close">
+          <Button variant="ghost" size="icon-sm" onClick={handleClose} title={t('section2d.close')}>
             <X className="h-4 w-4" />
           </Button>
         </div>
@@ -1059,21 +1116,22 @@ export function Section2DPanel({
         {status === 'error' && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-destructive text-center">
-              <p className="font-medium">Generation failed</p>
+              <p className="font-medium">{t('section2d.error.generation')}</p>
               <p className="text-sm text-muted-foreground">
                 {drawingError}
               </p>
               <Button variant="outline" size="sm" className="mt-4" onClick={() => generateDrawing(false)}>
-                Retry
+                {t('section2d.error.retry')}
               </Button>
             </div>
           </div>
         )}
 
-        {status === 'ready' && drawing && (drawing.cutPolygons.length > 0 || drawing.lines?.length > 0 || dxfUnderlayData.length > 0) && (
+        {status === 'ready' && drawing && (drawing.cutPolygons.length > 0 || drawing.lines?.length > 0 || dxfUnderlayData.length > 0 || hasReferences) && (
           <>
             <Drawing2DCanvas
               drawing={drawing}
+              snapshotSourceDrawing={sourceDrawing ?? drawing}
               transform={viewTransform}
               showHiddenLines={displayOptions.showHiddenLines}
               overrideEngine={overrideEngine}
@@ -1105,12 +1163,13 @@ export function Section2DPanel({
               dxfUnderlays={dxfUnderlayData}
               scanPoints={displayOptions.showScanSection ? scanSectionLayer.points : undefined}
               scanOpacity={displayOptions.scanSectionOpacity}
+              unitDisplayOverrides={unitDisplayOverrides}
             />
             {/* Subtle updating indicator - shows while regenerating without hiding the drawing */}
             {isRegenerating && (
               <div className="absolute top-2 right-2 flex items-center gap-1.5 bg-background/80 backdrop-blur-sm px-2 py-1 rounded text-xs text-muted-foreground">
                 <Loader2 className="h-3 w-3 animate-spin" />
-                <span>Updating...</span>
+                <span>{t('section2d.updating')}</span>
               </div>
             )}
           </>
@@ -1138,9 +1197,8 @@ export function Section2DPanel({
         {/* Measure mode tip - bottom right */}
         {measure2DMode && measure2DStart && (
           <div className="absolute bottom-2 right-2 pointer-events-none z-10">
-            <div className="flex items-center gap-1.5 text-[10px] text-black">
-              <kbd className={`px-1 py-0.5 text-[9px] font-mono font-semibold ${measure2DShiftLocked ? 'text-primary' : 'text-black'}`}>Shift</kbd>
-              <span className="text-black">perpendicular</span>
+            <div className={`text-[10px] font-mono font-semibold ${measure2DShiftLocked ? 'text-primary' : 'text-black'}`}>
+              {t('section2d.tip.shift')}
             </div>
           </div>
         )}
@@ -1149,9 +1207,9 @@ export function Section2DPanel({
         {annotation2DActiveTool === 'polygon-area' && (
           <div className="absolute bottom-2 right-2 pointer-events-none z-10">
             <div className="text-[10px] text-black bg-white/80 px-1.5 py-0.5 rounded">
-              {polygonArea2DPoints.length === 0 ? 'Click to place first vertex · Hold Shift to constrain' :
-               polygonArea2DPoints.length < 3 ? `${polygonArea2DPoints.length} vertices — need at least 3 · Shift = constrain` :
-               'Double-click or click first vertex to close · Shift = constrain'}
+              {polygonArea2DPoints.length === 0 ? t('section2d.tip.polygonFirst') :
+               polygonArea2DPoints.length < 3 ? t('section2d.tip.polygonNeed', { count: polygonArea2DPoints.length }) :
+               t('section2d.tip.polygonClose')}
             </div>
           </div>
         )}
@@ -1160,7 +1218,7 @@ export function Section2DPanel({
         {annotation2DActiveTool === 'cloud' && (
           <div className="absolute bottom-2 right-2 pointer-events-none z-10">
             <div className="text-[10px] text-black bg-white/80 px-1.5 py-0.5 rounded">
-              {cloudAnnotation2DPoints.length === 0 ? 'Click to place first corner' : 'Click to place second corner · Shift = square'}
+              {cloudAnnotation2DPoints.length === 0 ? t('section2d.tip.cloudFirst') : t('section2d.tip.cloudSecond')}
             </div>
           </div>
         )}
@@ -1169,7 +1227,7 @@ export function Section2DPanel({
         {annotation2DActiveTool === 'text' && !textAnnotation2DEditing && (
           <div className="absolute bottom-2 right-2 pointer-events-none z-10">
             <div className="text-[10px] text-black bg-white/80 px-1.5 py-0.5 rounded">
-              Click to place text box
+              {t('section2d.tip.text')}
             </div>
           </div>
         )}
@@ -1178,16 +1236,16 @@ export function Section2DPanel({
         {selectedAnnotation2D && annotation2DActiveTool === 'none' && (
           <div className="absolute bottom-2 right-2 pointer-events-none z-10">
             <div className="text-[10px] text-black bg-white/80 px-1.5 py-0.5 rounded">
-              {selectedAnnotation2D.type === 'text' ? 'Del = delete · Drag to move · Double-click to edit' : 'Del = delete · Drag to move'} · Esc = deselect
+              {selectedAnnotation2D.type === 'text' ? t('section2d.tip.selectionText') : t('section2d.tip.selectionOther')}
             </div>
           </div>
         )}
 
-        {status === 'ready' && drawing && drawing.cutPolygons.length === 0 && (!drawing.lines || drawing.lines.length === 0) && dxfUnderlayData.length === 0 && (
+        {status === 'ready' && drawing && drawing.cutPolygons.length === 0 && (!drawing.lines || drawing.lines.length === 0) && dxfUnderlayData.length === 0 && !hasReferences && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-center text-muted-foreground">
-              <p className="font-medium">No geometry at this level</p>
-              <p className="text-sm mt-1">Move the section plane to cut through geometry</p>
+              <p className="font-medium">{t('section2d.empty.title')}</p>
+              <p className="text-sm mt-1">{t('section2d.empty.description')}</p>
             </div>
           </div>
         )}
@@ -1216,7 +1274,7 @@ export function Section2DPanel({
               <div
                 className="absolute top-0 right-0 w-4 h-4 cursor-nesw-resize hover:bg-primary/20 transition-colors"
                 onMouseDown={handleResizeStart('corner-top')}
-                title="Resize"
+                title={t('section2d.resize')}
               />
             </>
           ) : (
@@ -1228,7 +1286,7 @@ export function Section2DPanel({
               <div
                 className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize hover:bg-primary/20 transition-colors"
                 onMouseDown={handleResizeStart('corner-bottom')}
-                title="Resize"
+                title={t('section2d.resize')}
               />
             </>
           )}
@@ -1249,6 +1307,7 @@ export function Section2DPanel({
             onClose={() => setDxfPanelOpen(false)}
             onCenterOnModel={handleCenterDxfUnderlay}
             planViewActive={sectionPlane.axis === 'down' && sectionPlane.custom === undefined}
+            georeferenceAvailable={dxfGeoreferenceAvailable}
           />
         </div>
       )}

@@ -1,7 +1,10 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { hasWorkspaceHistory, replayWorkspaceHistory } from '@/lib/model-placement/history';
 
+import { AuthorPanelMenuItems } from './toolbar/AuthorPanelMenuItems.js';
+import { BottomPanelMenuItems } from './toolbar/BottomPanelMenuItems.js';
 import React, { useCallback, useMemo } from 'react';
 import {
   FolderOpen,
@@ -19,20 +22,12 @@ import {
   Home,
   Maximize2,
   Grid3x3,
-  ArrowUp,
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  Box,
   HelpCircle,
   Loader2,
-  Camera,
   Info,
   Plus,
-  PackagePlus,
   MessageSquare,
   ClipboardCheck,
-  Puzzle,
   Palette,
   // >>> AIM-FORK: icon for the Drawing Underlays panel toggle (D-072)
   Map as MapIcon,
@@ -41,8 +36,6 @@ import {
   Layout,
   Layers,
   LayoutTemplate,
-  FileCode2,
-  CalendarClock,
   Globe2,
   Sun,
   Move,
@@ -66,21 +59,16 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  DropdownMenuSub,
-  DropdownMenuSubTrigger,
-  DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu';
 import { Progress } from '@/components/ui/progress';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
+import { useEffectiveSkyEnabled } from '@/hooks/useEffectiveSkyEnabled';
 import { goHomeFromStore, resetVisibilityForHomeFromStore } from '@/store/homeView';
 import { executeBasketIsolate } from '@/store/basket/basketCommands';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
-import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, DraftingCompass } from 'lucide-react';
-import { ExportDialog } from './ExportDialog';
-import { GLBExportDialog } from './GLBExportDialog';
-import { KmzExportDialog } from './KmzExportDialog';
-import { HbjsonExportDialog } from './HbjsonExportDialog';
+import { Filter, Upload, Pencil, DraftingCompass, Box, Cloud, FileWarning, Coins } from 'lucide-react';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
 import { DataConnector } from './DataConnector';
 import { ExportChangesButton } from './ExportChangesButton';
@@ -93,9 +81,10 @@ import { ThemeSwitch } from './ThemeSwitch';
 import { ExtensionToolbarSlot } from '@/components/extensions/ExtensionToolbarSlot';
 import { tourAnchor, toolAnchor } from '@/lib/tours/anchors';
 import { useFileCommands } from './toolbar/useFileCommands';
-import { useExportCommands } from './toolbar/useExportCommands';
+import { ClassicExportMenuItems } from './toolbar/ClassicExportMenuItems';
 import { useWorkspacePanelControls } from './toolbar/useWorkspacePanelControls';
 import { ClassVisibilityMenuContent } from './toolbar/ClassVisibilityMenu';
+import { CameraCommandMenuItems } from './toolbar/CameraCommands';
 
 type Tool = 'select' | 'walk' | 'measure' | 'section' | 'annotate' | 'addElement' | 'split' | 'spaceSketch';
 
@@ -165,18 +154,16 @@ function ToolButton({
  * in `useKeyboardShortcuts`.
  */
 function UndoRedoButtons() {
-  const activeModelId = useViewerStore((s) => s.activeModelId);
-  const undoStacks = useViewerStore((s) => s.undoStacks);
-  const redoStacks = useViewerStore((s) => s.redoStacks);
-  const undo = useViewerStore((s) => s.undo);
-  const redo = useViewerStore((s) => s.redo);
+  const { t } = useTranslation();
   // Undo/redo replay authoring mutations, so they honour the same collab
   // role gate as edit mode (null role = single-user, always editable).
   const collabRole = useViewerStore((s) => s.collabRole);
   const canEditInSession = collabRole === null || collabRole === 'editor' || collabRole === 'admin';
 
-  const canUndo = canEditInSession && activeModelId !== null && (undoStacks.get(activeModelId)?.length ?? 0) > 0;
-  const canRedo = canEditInSession && activeModelId !== null && (redoStacks.get(activeModelId)?.length ?? 0) > 0;
+  const hasUndo = useViewerStore(state => hasWorkspaceHistory(state, 'undo'));
+  const canUndo = canEditInSession && hasUndo;
+  const hasRedo = useViewerStore(state => hasWorkspaceHistory(state, 'redo'));
+  const canRedo = canEditInSession && hasRedo;
 
   return (
     <>
@@ -188,15 +175,15 @@ function UndoRedoButtons() {
             disabled={!canUndo}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
-              if (activeModelId) undo(activeModelId);
+              replayWorkspaceHistory(useViewerStore.getState(), 'undo');
             }}
-            aria-label="Undo"
+            aria-label={t('mainToolbar.undo')}
           >
             <Undo2 className="h-4 w-4" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          Undo <span className="ml-2 text-xs opacity-60">⌘Z</span>
+          {t('mainToolbar.undo')} <span className="ml-2 text-xs opacity-60">⌘Z</span>
         </TooltipContent>
       </Tooltip>
       <Tooltip>
@@ -207,15 +194,15 @@ function UndoRedoButtons() {
             disabled={!canRedo}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
-              if (activeModelId) redo(activeModelId);
+              replayWorkspaceHistory(useViewerStore.getState(), 'redo');
             }}
-            aria-label="Redo"
+            aria-label={t('mainToolbar.redo')}
           >
             <Redo2 className="h-4 w-4" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          Redo <span className="ml-2 text-xs opacity-60">⌘⇧Z</span>
+          {t('mainToolbar.redo')} <span className="ml-2 text-xs opacity-60">⌘⇧Z</span>
         </TooltipContent>
       </Tooltip>
     </>
@@ -262,6 +249,7 @@ interface MainToolbarProps {
 }
 
 export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainToolbarProps) {
+  const { t } = useTranslation();
   // Collaboration: the Share button is gated behind the collab feature flag.
   // The ShareDialog + its `ifc-lite:open-share-dialog` listener live in
   // useFileCommands (always mounted for the active toolbar style).
@@ -291,7 +279,6 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
     canRefresh,
     hasModelsLoaded,
   } = useFileCommands();
-  const { handleExportCSV, handleExportJSON, handleScreenshot } = useExportCommands();
   const {
     activeWorkspacePanels,
     workspacePanelLabel,
@@ -344,7 +331,8 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   const solarEnabled = useViewerStore((state) => state.solarEnabled);
   const envPanelOpen = useViewerStore((state) => state.envPanelOpen);
   const toggleEnvPanel = useViewerStore((state) => state.toggleEnvPanel);
-  const envSkyEnabled = useViewerStore((state) => state.envSkyEnabled);
+  // Effective, not raw: the Cesium world context defaults this on (#4771).
+  const envSkyEnabled = useEffectiveSkyEnabled();
   const envPreset = useViewerStore((state) => state.envPreset);
   // SpaceMouse panel state (3D mouse navigation, #1677)
   const spaceMousePanelOpen = useViewerStore((state) => state.spaceMousePanelOpen);
@@ -394,7 +382,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label="Open IFC file"
+            aria-label={t('mainToolbar.openAriaLabel')}
             onClick={(e) => {
               // Blur button to close tooltip before opening file dialog
               (e.currentTarget as HTMLButtonElement).blur();
@@ -409,7 +397,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent>Open IFC File</TooltipContent>
+        <TooltipContent>{t('mainToolbar.openTooltip')}</TooltipContent>
       </Tooltip>
 
       {canRefresh && (
@@ -423,12 +411,12 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 void handleRefresh();
               }}
               disabled={loading}
-              aria-label={models.size > 1 ? 'Refresh models from disk' : 'Refresh model from disk'}
+              aria-label={models.size > 1 ? t('mainToolbar.refreshModels') : t('mainToolbar.refreshModel')}
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>{models.size > 1 ? 'Refresh models from disk' : 'Refresh model from disk'}</TooltipContent>
+          <TooltipContent>{models.size > 1 ? t('mainToolbar.refreshModels') : t('mainToolbar.refreshModel')}</TooltipContent>
         </Tooltip>
       )}
 
@@ -439,7 +427,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <Button
               variant="ghost"
               size="icon-sm"
-              aria-label="Add model to scene"
+              aria-label={t('mainToolbar.addModelAriaLabel')}
               onClick={(e) => {
                 (e.currentTarget as HTMLButtonElement).blur();
                 void handleAddModelClick();
@@ -450,7 +438,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               <Plus className="h-4 w-4" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Add Model to Scene (Multi-select supported)</TooltipContent>
+          <TooltipContent>{t('mainToolbar.addModelTooltip')}</TooltipContent>
         </Tooltip>
       )}
 
@@ -459,80 +447,12 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           {/* Gate on any loaded model, not the legacy single-model geometryResult:
               federated / multi-model sessions populate `models` but leave
               geometryResult null, which would hide the whole export menu (incl. KMZ). */}
-          <Button variant="ghost" size="icon-sm" aria-label="Export and download" disabled={!hasModelsLoaded && !ifcDataStore}>
+          <Button variant="ghost" size="icon-sm" aria-label={t('mainToolbar.exportAriaLabel')} disabled={!hasModelsLoaded && !ifcDataStore}>
             <Download className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
-          <ExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <FileText className="h-4 w-4 mr-2" />
-                Export IFC (with changes)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <GLBExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Download className="h-4 w-4 mr-2" />
-                Export GLB (3D Model)
-              </DropdownMenuItem>
-            }
-          />
-          <KmzExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Globe2 className="h-4 w-4 mr-2" />
-                Export KMZ (Google Earth Pro)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <HbjsonExportDialog
-            trigger={
-              <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
-                <Download className="h-4 w-4 mr-2" />
-                Export HBJSON (Energy Model)
-              </DropdownMenuItem>
-            }
-          />
-          <DropdownMenuSeparator />
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger disabled={!ifcDataStore}>
-              <FileSpreadsheet className="h-4 w-4 mr-2" />
-              Export CSV
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent>
-              <DropdownMenuItem onClick={() => handleExportCSV('entities')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Entities
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('properties')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Properties
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('quantities')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Quantities
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => handleExportCSV('spatial')}>
-                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                Spatial Hierarchy
-              </DropdownMenuItem>
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-          <DropdownMenuItem onClick={handleExportJSON} disabled={!ifcDataStore}>
-            <FileJson className="h-4 w-4 mr-2" />
-            Export JSON (All Data)
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onClick={handleScreenshot}>
-            <Camera className="h-4 w-4 mr-2" />
-            Screenshot
-          </DropdownMenuItem>
+          <ClassicExportMenuItems />
         </DropdownMenuContent>
       </DropdownMenu>
 
@@ -541,19 +461,19 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         <Tooltip>
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-sm" aria-label="Edit properties" disabled={!ifcDataStore}>
+              <Button variant="ghost" size="icon-sm" aria-label={t('mainToolbar.editPropertiesAriaLabel')} disabled={!ifcDataStore}>
                 <Pencil className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
-          <TooltipContent>Edit Properties</TooltipContent>
+          <TooltipContent>{t('mainToolbar.editPropertiesTooltip')}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent>
           <BulkPropertyEditor
             trigger={
               <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                 <Filter className="h-4 w-4 mr-2" />
-                Bulk Property Editor
+                {t('mainToolbar.bulkPropertyEditor')}
               </DropdownMenuItem>
             }
           />
@@ -561,7 +481,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             trigger={
               <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                 <Upload className="h-4 w-4 mr-2" />
-                Import Data (CSV)
+                {t('mainToolbar.importDataCsv')}
               </DropdownMenuItem>
             }
           />
@@ -582,7 +502,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 disabled={!hasModelsLoaded}
                 onClick={openShareDialog}
                 className="relative"
-                aria-label="Share"
+                aria-label={t('mainToolbar.share')}
               >
                 <Share2 className="h-4 w-4" />
                 {collabPeerCount > 0 && (
@@ -592,7 +512,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Share</TooltipContent>
+            <TooltipContent>{t('mainToolbar.share')}</TooltipContent>
           </Tooltip>
           {/* Room panel toggle — live presence + management, only while in a room. */}
           {collabRoomId && (
@@ -603,7 +523,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                   size="icon-sm"
                   onClick={() => useViewerStore.getState().toggleWorkspacePanel('collab')}
                   className="relative"
-                  aria-label="Room"
+                  aria-label={t('mainToolbar.room')}
                   aria-pressed={collabPanelVisible}
                 >
                   <Users className="h-4 w-4" />
@@ -614,7 +534,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                   )}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Room</TooltipContent>
+              <TooltipContent>{t('mainToolbar.room')}</TooltipContent>
             </Tooltip>
           )}
         </>
@@ -628,85 +548,100 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               <Button
                 variant={activeWorkspacePanels.size > 0 ? 'default' : 'ghost'}
                 size="icon-sm"
-                aria-label={workspacePanelLabel ? `Panels: ${workspacePanelLabel}` : 'Panels'}
+                aria-label={workspacePanelLabel ? t('mainToolbar.panelsWithLabel', { label: workspacePanelLabel }) : t('mainToolbar.panels')}
                 className={cn(activeWorkspacePanels.size > 0 && 'bg-primary text-primary-foreground')}
               >
                 <Layout className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
-          <TooltipContent>{workspacePanelLabel ? `Panels: ${workspacePanelLabel}` : 'Panels'}</TooltipContent>
+          <TooltipContent>{workspacePanelLabel ? t('mainToolbar.panelsWithLabel', { label: workspacePanelLabel }) : t('mainToolbar.panels')}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="start" className="w-56">
-          <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Workspace
-          </DropdownMenuLabel>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('script')}
-            onCheckedChange={() => handleToggleBottomPanel('script')}
-          >
-            <FileCode2 className="h-4 w-4 mr-2" />
-            Script Editor
-          </DropdownMenuCheckboxItem>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('list')}
-            onCheckedChange={() => handleToggleBottomPanel('list')}
-          >
-            <FileSpreadsheet className="h-4 w-4 mr-2" />
-            Lists
-          </DropdownMenuCheckboxItem>
-          <DropdownMenuCheckboxItem
-            checked={activeWorkspacePanels.has('gantt')}
-            onCheckedChange={() => handleToggleBottomPanel('gantt')}
-          >
-            <CalendarClock className="h-4 w-4 mr-2" />
-            Schedule (Gantt)
-          </DropdownMenuCheckboxItem>
+          <BottomPanelMenuItems active={activeWorkspacePanels} onToggle={handleToggleBottomPanel} />
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Inspect & validate
+            {t('mainToolbar.inspectValidate')}
           </DropdownMenuLabel>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('bcf')}
             onCheckedChange={() => handleToggleRightPanel('bcf')}
           >
             <MessageSquare className="h-4 w-4 mr-2" />
-            BCF Issues
+            {t('mainToolbar.bcfTopics')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('ids')}
             onCheckedChange={() => handleToggleRightPanel('ids')}
           >
             <ClipboardCheck className="h-4 w-4 mr-2" />
-            IDS Validation
+            {t('mainToolbar.idsValidation')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('lens')}
             onCheckedChange={() => handleToggleRightPanel('lens')}
           >
             <Palette className="h-4 w-4 mr-2" />
-            Lens Rules
+            {t('mainToolbar.lensRules')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('clash')}
             onCheckedChange={() => handleToggleRightPanel('clash')}
           >
             <Crosshair className="h-4 w-4 mr-2" />
-            Clash Detection
+            {t('mainToolbar.clashDetection')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('compare')}
             onCheckedChange={() => handleToggleRightPanel('compare')}
           >
             <GitCompareArrows className="h-4 w-4 mr-2" />
-            Compare Models
+            {t('mainToolbar.compareModels')}
+          </DropdownMenuCheckboxItem>
+          {/* Cloud sources (CDE integrations): the ActivityBar rail was its
+              only entry point, exactly as Location Zones was before #2508.
+              The ribbon files it under File, where models come from. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('sources')}
+            onCheckedChange={() => handleToggleRightPanel('sources')}
+          >
+            <Cloud className="h-4 w-4 mr-2" />
+            {t('mainToolbar.cloudSources')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuCheckboxItem
             checked={activeWorkspacePanels.has('layers')}
             onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('layers')}
           >
             <Layers className="h-4 w-4 mr-2" />
-            Layer Stack
+            {t('mainToolbar.layerStack')}
+          </DropdownMenuCheckboxItem>
+          {/* Location zones (#1810), reachable from a toolbar for the first
+              time (#2508): the ActivityBar rail was its only entry point. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('zones')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('zones')}
+          >
+            <Box className="h-4 w-4 mr-2" />
+            {t('mainToolbar.locationZones')}
+          </DropdownMenuCheckboxItem>
+          {/* Per-model load report (#3927): reachable from a toolbar for the
+              first time — it shipped ribbon-only, the ActivityBar rail was
+              classic's only entry point. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('loadReport')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('loadReport')}
+          >
+            <FileWarning className="h-4 w-4 mr-2" />
+            {t('mainToolbar.loadReport')}
+          </DropdownMenuCheckboxItem>
+          {/* IFC 5D cost inspector (#4858): reachable from a toolbar for the
+              first time — the ActivityBar rail was its only entry point. */}
+          <DropdownMenuCheckboxItem
+            checked={activeWorkspacePanels.has('cost')}
+            onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('cost')}
+          >
+            <Coins className="h-4 w-4 mr-2" />
+            {t('mainToolbar.cost')}
           </DropdownMenuCheckboxItem>
           {collabEnabled && (
             <DropdownMenuCheckboxItem
@@ -714,10 +649,11 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               onCheckedChange={() => useViewerStore.getState().toggleWorkspacePanel('collab')}
             >
               <Users className="h-4 w-4 mr-2" />
-              Collaboration Room
+              {t('mainToolbar.collaborationRoom')}
             </DropdownMenuCheckboxItem>
           )}
           <DropdownMenuSeparator />
+<<<<<<< HEAD
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
             Author
           </DropdownMenuLabel>
@@ -746,11 +682,14 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             Drawing Underlays
           </DropdownMenuCheckboxItem>
           {/* <<< AIM-FORK */}
+=======
+          <AuthorPanelMenuItems active={activeWorkspacePanels} canEdit={canEditInSession} onToggle={handleToggleRightPanel} />
+>>>>>>> upstream/main
           {(rightAnalysisExtensions.length > 0 || bottomAnalysisExtensions.length > 0) && (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                Analysis extensions
+                {t('mainToolbar.analysisExtensions')}
               </DropdownMenuLabel>
               {rightAnalysisExtensions.map((extension) => {
                 const Icon = extension.icon;
@@ -791,8 +730,8 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       <Separator orientation="vertical" className="h-6 mx-1" />
 
       {/* ── Navigation Tools ── */}
-      <ToolButton tool="select" icon={MousePointer2} label="Select" shortcut="V" activeTool={activeTool} onToolChange={setActiveTool} />
-      <ToolButton tool="walk" icon={PersonStanding} label="Walk Mode" shortcut="C" activeTool={activeTool} onToolChange={setActiveTool} />
+      <ToolButton tool="select" icon={MousePointer2} label={t('mainToolbar.toolSelect')} shortcut="V" activeTool={activeTool} onToolChange={setActiveTool} />
+      <ToolButton tool="walk" icon={PersonStanding} label={t('mainToolbar.toolWalk')} shortcut="C" activeTool={activeTool} onToolChange={setActiveTool} />
 
       {/* ── Edit Mode pill ──
           Single global switch that unlocks every authoring affordance
@@ -807,7 +746,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             variant={editEnabled ? 'default' : 'ghost'}
             size="icon-sm"
             disabled={!canEditInSession}
-            aria-label={editEnabled ? 'Exit edit mode' : 'Enter edit mode'}
+            aria-label={editEnabled ? t('mainToolbar.editModeExitAriaLabel') : t('mainToolbar.editModeEnterAriaLabel')}
             aria-pressed={editEnabled}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
@@ -821,10 +760,10 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         <TooltipContent>
           {canEditInSession ? (
             <>
-              {editEnabled ? 'Exit Edit Mode' : 'Edit Mode'} <span className="opacity-50">E</span>
+              {editEnabled ? t('mainToolbar.editModeExitTooltip') : t('mainToolbar.editModeEnterTooltip')} <span className="opacity-50">{t('mainToolbar.editModeShortcutHint')}</span>
             </>
           ) : (
-            'Editing requires editor access in this shared session'
+            t('mainToolbar.editModeLocked')
           )}
         </TooltipContent>
       </Tooltip>
@@ -845,7 +784,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         <ToolButton
           tool="spaceSketch"
           icon={DraftingCompass}
-          label="Space Sketch"
+          label={t('mainToolbar.spaceSketch')}
           activeTool={activeTool}
           onToolChange={setActiveTool}
           activeAccentClass="bg-purple-600 text-white hover:bg-purple-700"
@@ -865,12 +804,12 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       <Separator orientation="vertical" className="h-6 mx-1" />
 
       {/* ── Measurement & Section ── */}
-      <ToolButton tool="measure" icon={Ruler} label="Measure" shortcut="M" activeTool={activeTool} onToolChange={setActiveTool} />
-      <ToolButton tool="section" icon={Scissors} label="Section" shortcut="X" activeTool={activeTool} onToolChange={setActiveTool} />
+      <ToolButton tool="measure" icon={Ruler} label={t('mainToolbar.toolMeasure')} shortcut="M" activeTool={activeTool} onToolChange={setActiveTool} />
+      <ToolButton tool="section" icon={Scissors} label={t('mainToolbar.toolSection')} shortcut="X" activeTool={activeTool} onToolChange={setActiveTool} />
       <ToolButton
         tool="annotate"
         icon={StickyNote}
-        label="Annotate"
+        label={t('mainToolbar.toolAnnotate')}
         shortcut="P"
         activeTool={activeTool}
         onToolChange={setActiveTool}
@@ -891,7 +830,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant={basketPresentationVisible ? 'default' : 'ghost'}
             size="icon-sm"
-            aria-label={basketPresentationVisible ? 'Hide Presentation dock' : 'Show Presentation dock'}
+            aria-label={basketPresentationVisible ? t('mainToolbar.presentationHide') : t('mainToolbar.presentationShow')}
             aria-pressed={basketPresentationVisible}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
@@ -911,7 +850,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          Basket Presentation Dock (Views: {basketViewCount}, Entities: {pinboardEntities.size})
+          {t('mainToolbar.presentationTooltip', { views: basketViewCount, entities: pinboardEntities.size })}
         </TooltipContent>
       </Tooltip>
 
@@ -920,7 +859,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         sense with a selection, so they don't get to live in the
         toolbar chrome at rest. When a user selects anything, the
         slot opens with a "N selected" pill + the three actions next
-        to it. Hotkeys (Del / F / I / =) keep working regardless of
+        to it. Hotkeys (Del / F / I) keep working regardless of
         whether the chip is rendered, so power users feel no change.
 
         The chip lives in the same separator zone the buttons used to
@@ -930,27 +869,27 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         <div
           className="flex items-center gap-0.5 pl-1.5 pr-0.5 rounded-md border border-primary/30 bg-primary/5 transition-opacity duration-150"
           role="group"
-          aria-label={`Selection actions — ${selectionCount} selected`}
+          aria-label={t('mainToolbar.selectionActionsAriaLabel', { count: selectionCount })}
         >
           <span
             className="text-[10px] font-semibold tabular-nums text-primary uppercase tracking-wide whitespace-nowrap pr-1.5"
             aria-hidden="true"
           >
-            {selectionCount} sel
+            {t('mainToolbar.selectionCountBadge', { count: selectionCount })}
           </span>
-          <ActionButton icon={Equal} label="Isolate Selection (Set Basket)" onClick={handleIsolate} shortcut="I / =" />
-          <ActionButton icon={EyeOff} label="Hide Selection" onClick={handleHide} shortcut="Del / Space" />
+          <ActionButton icon={Equal} label={t('mainToolbar.isolateSelection')} onClick={handleIsolate} shortcut="I" />
+          <ActionButton icon={EyeOff} label={t('mainToolbar.hideSelection')} onClick={handleHide} shortcut="Del / Space" />
           <ActionButton
             icon={Crosshair}
-            label="Frame Selection"
+            label={t('mainToolbar.frameSelection')}
             onClick={() => cameraCallbacks.frameSelection?.()}
             shortcut="F"
           />
         </div>
       )}
 
-      <ActionButton icon={Eye} label="Show All (Reset Filters)" onClick={handleShowAll} shortcut="A" />
-      <ActionButton icon={Maximize2} label="Fit All" onClick={() => cameraCallbacks.fitAll?.()} shortcut="Z" />
+      <ActionButton icon={Eye} label={t('mainToolbar.showAll')} onClick={handleShowAll} shortcut="A" />
+      <ActionButton icon={Maximize2} label={t('mainToolbar.fitAll')} onClick={() => cameraCallbacks.fitAll?.()} shortcut="Z" />
 
       <DropdownMenu>
         <Tooltip>
@@ -964,7 +903,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 // Walls) that the user should be able to set BEFORE
                 // opening a file. The class toggles are persisted
                 // preferences, so they always render too.
-                aria-label={mergeLayers ? 'Visibility (Merge Multilayer Walls is on)' : 'Visibility'}
+                aria-label={mergeLayers ? t('mainToolbar.visibilityMerged') : t('mainToolbar.visibility')}
                 className="relative"
               >
                 <Filter className="h-4 w-4" />
@@ -981,7 +920,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             </DropdownMenuTrigger>
           </TooltipTrigger>
           <TooltipContent>
-            {mergeLayers ? 'Visibility · Merge Multilayer Walls is on' : 'Visibility'}
+            {mergeLayers ? t('mainToolbar.visibilityMergedTooltip') : t('mainToolbar.visibility')}
           </TooltipContent>
         </Tooltip>
         {/* Body shared with the ribbon's View tab — class toggles,
@@ -992,7 +931,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       <Separator orientation="vertical" className="h-6 mx-1" />
 
       {/* ── Camera & View ── */}
-      <ActionButton icon={Home} label="Home (Isometric + Reset Visibility)" onClick={handleHome} shortcut="H" />
+      <ActionButton icon={Home} label={t('mainToolbar.home')} onClick={handleHome} shortcut="H" />
 
       {/*
         Cesium 3D World Context — sits next to Home as a raw button so
@@ -1008,7 +947,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               <Button
                 variant={cesiumEnabled ? 'default' : 'ghost'}
                 size="icon-sm"
-                aria-label={cesiumEnabled ? 'Hide 3D World Context (Cesium)' : 'Show 3D World Context (Cesium)'}
+                aria-label={cesiumEnabled ? t('mainToolbar.cesiumHide') : t('mainToolbar.cesiumShow')}
                 aria-pressed={cesiumEnabled}
                 onClick={(e) => {
                   (e.currentTarget as HTMLButtonElement).blur();
@@ -1024,7 +963,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               </Button>
             </TooltipTrigger>
             <TooltipContent>
-              {cesiumEnabled ? 'Hide' : 'Show'} 3D World Context (Cesium)
+              {cesiumEnabled ? t('mainToolbar.cesiumHide') : t('mainToolbar.cesiumShow')}
             </TooltipContent>
           </Tooltip>
           {cesiumEnabled && (
@@ -1033,7 +972,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 <Button
                   variant={cesiumPlacementEditMode ? 'default' : 'ghost'}
                   size="icon-sm"
-                  aria-label={cesiumPlacementEditMode ? 'Stop moving georeference' : 'Move georeference in Cesium'}
+                  aria-label={cesiumPlacementEditMode ? t('mainToolbar.moveGeorefStop') : t('mainToolbar.moveGeorefAriaLabel')}
                   aria-pressed={cesiumPlacementEditMode}
                   onClick={(e) => {
                     (e.currentTarget as HTMLButtonElement).blur();
@@ -1047,7 +986,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {cesiumPlacementEditMode ? 'Stop moving georeference' : 'Move georeference'}
+                {cesiumPlacementEditMode ? t('mainToolbar.moveGeorefStop') : t('mainToolbar.moveGeorefTooltip')}
               </TooltipContent>
             </Tooltip>
           )}
@@ -1061,7 +1000,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant={envPanelOpen ? 'default' : 'ghost'}
             size="icon-sm"
-            aria-label={envPanelOpen ? 'Close Sun & Sky panel' : 'Open Sun & Sky panel'}
+            aria-label={envPanelOpen ? t('mainToolbar.sunSkyClose') : t('mainToolbar.sunSkyOpen')}
             aria-pressed={envPanelOpen}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
@@ -1075,7 +1014,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <Sun className="h-4 w-4" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>Sun &amp; sky</TooltipContent>
+        <TooltipContent>{t('mainToolbar.sunSkyTooltip')}</TooltipContent>
       </Tooltip>
 
       {/* SpaceMouse panel — connect a 3Dconnexion 3D mouse over WebHID and
@@ -1085,7 +1024,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant={spaceMousePanelOpen ? 'default' : 'ghost'}
             size="icon-sm"
-            aria-label={spaceMousePanelOpen ? 'Close SpaceMouse panel' : 'Open SpaceMouse panel'}
+            aria-label={spaceMousePanelOpen ? t('mainToolbar.spaceMouseClose') : t('mainToolbar.spaceMouseOpen')}
             aria-pressed={spaceMousePanelOpen}
             onClick={(e) => {
               (e.currentTarget as HTMLButtonElement).blur();
@@ -1099,7 +1038,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <Move3d className="h-4 w-4" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>SpaceMouse</TooltipContent>
+        <TooltipContent>{t('mainToolbar.spaceMouseTooltip')}</TooltipContent>
       </Tooltip>
 
       {/* >>> AIM-FORK: D-075 workspace view mode: 3D | 2D | Split + storey picker. */}
@@ -1121,65 +1060,45 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               <Button
                 variant={(projectionMode === 'orthographic' || hoverTooltipsEnabled) ? 'default' : 'ghost'}
                 size="icon-sm"
-                aria-label="View options"
+                aria-label={t('mainToolbar.viewOptions')}
                 className={cn((projectionMode === 'orthographic' || hoverTooltipsEnabled) && 'bg-primary text-primary-foreground')}
               >
                 <Grid3x3 className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
-          <TooltipContent>View options</TooltipContent>
+          <TooltipContent>{t('mainToolbar.viewOptions')}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="end" className="w-56">
-          <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Preset views
-          </DropdownMenuLabel>
-          <DropdownMenuItem onClick={handleHome}>
-            <Box className="h-4 w-4 mr-2" /> Isometric <span className="ml-auto text-xs opacity-60">H</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('top')}>
-            <ArrowUp className="h-4 w-4 mr-2" /> Top <span className="ml-auto text-xs opacity-60">1</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('bottom')}>
-            <ArrowDown className="h-4 w-4 mr-2" /> Bottom <span className="ml-auto text-xs opacity-60">2</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('front')}>
-            <ArrowRight className="h-4 w-4 mr-2" /> Front <span className="ml-auto text-xs opacity-60">3</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('back')}>
-            <ArrowLeft className="h-4 w-4 mr-2" /> Back <span className="ml-auto text-xs opacity-60">4</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('left')}>
-            <ArrowLeft className="h-4 w-4 mr-2" /> Left <span className="ml-auto text-xs opacity-60">5</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => cameraCallbacks.setPresetView?.('right')}>
-            <ArrowRight className="h-4 w-4 mr-2" /> Right <span className="ml-auto text-xs opacity-60">6</span>
-          </DropdownMenuItem>
+          {/* Camera, preset views and the 90° rotations — rendered from the
+              shared command list so this menu can't fall behind the ribbon's
+              View tab (it did: rotate was ribbon-only, see CameraCommands). */}
+          <CameraCommandMenuItems />
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Projection
+            {t('mainToolbar.projection')}
           </DropdownMenuLabel>
           <DropdownMenuCheckboxItem
             checked={projectionMode === 'orthographic'}
             onCheckedChange={() => toggleProjectionMode()}
           >
             <Orbit className="h-4 w-4 mr-2" />
-            Orthographic
+            {t('mainToolbar.orthographic')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Helpers
+            {t('mainToolbar.helpers')}
           </DropdownMenuLabel>
           <DropdownMenuCheckboxItem
             checked={hoverTooltipsEnabled}
             onCheckedChange={() => toggleHoverTooltips()}
           >
             <Info className="h-4 w-4 mr-2" />
-            Hover tooltips
+            {t('mainToolbar.hoverTooltips')}
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
           <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
-            Toolbar
+            {t('mainToolbar.toolbarLabel')}
           </DropdownMenuLabel>
           {/* Issue #1686: jump to the tabbed, IFCFlux-style ribbon. This
               menu only renders in the classic style, so the box is never
@@ -1189,7 +1108,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             onCheckedChange={() => setToolbarStyle('ribbon')}
           >
             <PanelTop className="h-4 w-4 mr-2" />
-            Ribbon toolbar
+            {t('mainToolbar.ribbonToolbarMenuItem')}
           </DropdownMenuCheckboxItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -1235,7 +1154,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               <ThemeSwitch />
             </div>
           </TooltipTrigger>
-          <TooltipContent>Toggle theme (Shift+click for secret mode)</TooltipContent>
+          <TooltipContent>{t('mainToolbar.themeTooltip')}</TooltipContent>
         </Tooltip>
 
         <Tooltip>
@@ -1244,13 +1163,13 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
               variant="ghost"
               size="icon"
               className="rounded-full"
-              aria-label="Info and keyboard shortcuts"
+              aria-label={t('mainToolbar.infoAriaLabel')}
               onClick={() => onShowShortcuts?.()}
             >
               <HelpCircle className="!h-[22px] !w-[22px]" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Info (?)</TooltipContent>
+          <TooltipContent>{t('mainToolbar.infoTooltip')}</TooltipContent>
         </Tooltip>
       </div>
 

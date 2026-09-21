@@ -59,7 +59,7 @@ export function getModelForRef(state: ViewerState, modelId: string): ModelLike |
  * List all model entries — from the multi-model Map or the legacy state.
  * Returns [modelId, model][] pairs.
  */
-export function getAllModelEntries(state: ViewerState): [string, ModelLike][] {
+export function getAllModelEntries(state: Pick<ViewerState, 'models' | 'ifcDataStore'>): [string, ModelLike][] {
   if (state.models.size > 0) {
     return [...state.models.entries()];
   }
@@ -70,6 +70,31 @@ export function getAllModelEntries(state: ViewerState): [string, ModelLike][] {
   }
 
   return [];
+}
+
+/**
+ * The model an SDK call means when it names none — `bim.export.ifc()` with no
+ * ref list (#4738). The user's active selection wins when that id still
+ * resolves to an entry, then the first entry of the unified list, which is the
+ * legacy single-model store when the federated Map is empty. `undefined` when
+ * nothing is loaded.
+ *
+ * "Resolves to an entry" is not "has parsed data": a metadata-only entry (Tauri
+ * native load, `ifcDataStore: null`) is returned like any other, and the caller
+ * reports it cannot export that model rather than silently exporting a
+ * different one.
+ *
+ * Three neighbours answer the same question with their own precedence and are
+ * deliberately NOT changed here: `model-adapter.ts`'s `activeId` (does not
+ * check the id resolves), and `schedule-adapter.ts` / `structural-adapter.ts`'s
+ * `resolveStore` (legacy store before the active selection). Aligning them
+ * would move which model those namespaces read in a federated session, which
+ * is a behaviour change of its own.
+ */
+export function getDefaultModelId(state: ViewerState): string | undefined {
+  const active = state.activeModelId;
+  if (active && getModelForRef(state, active)) return active;
+  return getAllModelEntries(state)[0]?.[0];
 }
 
 function buildLegacyModel(dataStore: IfcDataStore): ModelLike {

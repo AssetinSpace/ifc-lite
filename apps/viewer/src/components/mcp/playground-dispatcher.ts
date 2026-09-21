@@ -30,6 +30,7 @@
 import { IfcParser, type IfcDataStore, extractLengthUnitScale, extractProjectUnits } from '@ifc-lite/parser';
 import { QuantityType } from '@ifc-lite/data';
 import { formatQuantityUnit } from '@/lib/units/display';
+import { lensMaterialNames } from '@/lib/lens-material-names';
 import {
   BsddNamespace,
   createBimContext,
@@ -41,6 +42,7 @@ import {
   HeadlessLikeBackend,
   ToolErrorCode,
   ToolExecutionError,
+  firstNonBlank,
 } from '@ifc-lite/mcp/browser';
 import {
   addCommentToTopic,
@@ -55,7 +57,10 @@ import {
   type BCFTopic,
 } from '@ifc-lite/bcf';
 import { parseIDS, validateIDS, type IDSDocument } from '@ifc-lite/ids';
-import { GeometryProcessor, type MeshData } from '@ifc-lite/geometry';
+import { GeometryProcessor, type CoordinateInfo, type MeshData } from '@ifc-lite/geometry';
+import { renderFrameWorldOffset } from '@ifc-lite/geometry/world-frame';
+import type { UseTranslationResult } from '@/i18n/useTranslation';
+import type { TranslationKey } from '@/i18n';
 import {
   createClashEngine,
   disciplineMatrixRules,
@@ -68,12 +73,21 @@ import {
 } from '@ifc-lite/clash';
 import { elementsFromStep } from '@ifc-lite/clash/step';
 import { createBCFFromClashResult } from '@ifc-lite/clash/bcf';
-import { CATALOG, paramsFor } from './data';
-import type { CatalogTool } from './types';
-import type { ViewerController, ColorTuple } from './PlaygroundViewer';
+import { CATALOG } from './data';
+import type { ViewerController, ColorTuple } from './playground-viewer-types';
+import {
+  createAnthropicToolDefinitions,
+  type AnthropicToolDef,
+} from './playground-tool-definitions';
+export type { AnthropicInputSchema, AnthropicToolDef } from './playground-tool-definitions';
+// Value import, but a deliberately cheap one: `three-webgl-support` pulls in
+// neither three.js nor React (see its header), so reading the latched verdict
+// costs the dispatcher nothing at import time.
+import { getThreeWebglVerdict } from './three-webgl-support';
 import { playgroundFiles } from './playground-files';
 import { playgroundUploads } from './playground-uploads';
 import { sanitizeFilename } from '../../lib/export/download';
+import { playgroundCostTools } from './playground-cost';
 
 // ── loaded-model handle ────────────────────────────────────────────────────
 
@@ -125,10 +139,13 @@ export async function parsePlaygroundModel(
  */
 export interface ToolDispatchResult {
   text: string;
+  /** Re-resolved by the transcript renderer after a live locale switch. */
+  textKey?: TranslationKey;
   structured: unknown;
   isError: boolean;
   errorCode?: string;
   hint?: string;
+  hintKey?: TranslationKey;
   download?: {
     fileId: string;
     filename: string;
@@ -151,6 +168,8 @@ export interface DispatchContext {
    *  primary `model` argument to dispatch() is reachable; diff tools that
    *  need two models use `model_id` to look the second one up. */
   registry?: Map<string, LoadedPlaygroundModel>;
+  /** Resolve user-visible tool results in the viewer's active locale. */
+  translate?: UseTranslationResult['t'];
 }
 
 // ── BCF session state ─────────────────────────────────────────────────────
@@ -181,7 +200,7 @@ async function autoStageBcfDownload(): Promise<NonNullable<ToolDispatchResult['d
   const blob = await writeBCF(project);
   // Drop the previous staged copy so the panel only ever shows the latest.
   if (stagedBcfFileId) playgroundFiles.remove(stagedBcfFileId);
-  const filename = coerceFilename(undefined, 'bcfzip', 'issues');
+  const filename = coerceFilename(undefined, 'bcfzip', 'topics');
   const file = playgroundFiles.add({
     filename,
     mimeType: 'application/zip',
@@ -210,12 +229,81 @@ async function autoStageBcfDownload(): Promise<NonNullable<ToolDispatchResult['d
  */
 type ToolImplResult = {
   text: string;
+  textKey?: TranslationKey;
   structured: unknown;
   download?: ToolDispatchResult['download'];
 };
 type ToolImpl = (model: LoadedPlaygroundModel, args: Record<string, unknown>, ctx: DispatchContext) => Promise<ToolImplResult>;
 
+/**
+ * The single agent-facing answer for a device that refuses WebGL (#2412).
+ *
+ * `isLoaded()` is false in two very different situations — geometry is still
+ * processing, or the canvas never mounted at all — and every viewer answer
+ * used to describe only the first. On a GPU-less device that produced a loop
+ * with no exit: `viewer_open` said "call viewer_status in a moment",
+ * `viewer_status` said "mounted but no geometry yet", and every other viewer
+ * tool said "call viewer_open first".
+ *
+ * So this text is deliberately terminal: no "shortly", no "try again", no
+ * reload hint. The verdict behind `webglUnavailable` is latched for the
+ * session (`lib/webgl-capability.ts`) and the refusal is a property of the
+ * device, so any retry wording would just relocate the loop.
+ */
+const NO_WEBGL_MESSAGE =
+  'This device cannot provide a WebGL context, so the inline 3D viewer never mounts. '
+  + 'Every viewer_* tool is unavailable for the rest of this session. '
+  + 'Parsing, queries, validation, BCF and export are unaffected.';
+
+const NO_WEBGL_HINT = 'Answer with the non-viewer tools; no 3D tool can succeed on this device.';
+
+function noWebglMessage(ctx: DispatchContext): string {
+  return ctx.translate?.('mcp.playgroundDispatcher.webglUnavailable') ?? NO_WEBGL_MESSAGE;
+}
+
+function noWebglHint(ctx: DispatchContext): string {
+  return ctx.translate?.('mcp.playgroundDispatcher.webglUnavailableHint') ?? NO_WEBGL_HINT;
+}
+
+/**
+ * Has three.js given up on WebGL for this session?
+ *
+ * Two sources, because neither alone covers the loop:
+ *
+ *   - the session latch (`getThreeWebglVerdict`) answers even when no viewer
+ *     is attached. That case is not hypothetical and is the second live
+ *     instance of this defect: `McpPlayground` unmounts `PlaygroundViewer`
+ *     whenever the panel collapses, which nulls the controller ref. Without
+ *     the latch, collapsing the panel after a failed mount would put every
+ *     viewer tool back on "Call viewer_open first" — the same loop, one user
+ *     click later. The latch is module-scope and never re-probes, so it
+ *     survives that remount by design.
+ *   - the mounted controller's `webglUnavailable`, which is the component's
+ *     own truth and what `viewer_status` reports in its structured payload.
+ *
+ * A `null` verdict with no viewer is deliberately NOT this state: it means
+ * nothing has tried yet, and `viewer_open` legitimately still has work to do.
+ * Nothing here probes; a probe would burn one of the page's ~16 context slots
+ * and, worse, latch the verdict before `useThreeScene` ever runs — which is
+ * exactly what suppresses that hook's once-per-session report to error
+ * tracking (`startThreeScene` omits `error` when the latch already knew). The
+ * dispatcher reads the verdict; it never manufactures one.
+ */
+function isWebglUnavailable(ctx: DispatchContext): boolean {
+  const latched = getThreeWebglVerdict();
+  if (latched && !latched.supported) return true;
+  return ctx.viewer?.status().webglUnavailable === true;
+}
+
 function requireViewer(ctx: DispatchContext): ViewerController {
+  if (isWebglUnavailable(ctx)) {
+    throw new ToolExecutionError({
+      code: ToolErrorCode.UNSUPPORTED_OPERATION,
+      message: noWebglMessage(ctx),
+      details: { webglUnavailable: true },
+      hint: noWebglHint(ctx),
+    });
+  }
   if (!ctx.viewer || !ctx.viewer.isLoaded()) {
     throw new ToolExecutionError({
       code: ToolErrorCode.UNSUPPORTED_OPERATION,
@@ -298,15 +386,21 @@ const CLASH_MESH_CACHE_MAX = 3;
  * alone: the playground reuses a filename-slug id, so an edited re-upload would
  * otherwise hit a stale mesh — folding in the byte length forces a re-mesh when
  * the bytes change. Bounded to CLASH_MESH_CACHE_MAX entries with LRU eviction.
+ * The frame travels with the meshes: clash bounds are in the mesher's shifted
+ * frame, and BCF export needs it to write world coordinates (#4879).
  */
-const clashMeshCache = new Map<string, MeshData[]>();
+interface ClashMeshes {
+  meshes: MeshData[];
+  coordinateInfo: CoordinateInfo | undefined;
+}
+const clashMeshCache = new Map<string, ClashMeshes>();
 
 function meshCacheKey(m: LoadedPlaygroundModel): string {
   return `${m.id}:${m.fileSize}`;
 }
 
 /** LRU get: a hit refreshes recency so the active model survives eviction. */
-function getCachedMeshes(key: string): MeshData[] | undefined {
+function getCachedMeshes(key: string): ClashMeshes | undefined {
   const hit = clashMeshCache.get(key);
   if (hit) {
     clashMeshCache.delete(key);
@@ -316,8 +410,8 @@ function getCachedMeshes(key: string): MeshData[] | undefined {
 }
 
 /** LRU set: insert then evict the least-recently-used entries past the bound. */
-function setCachedMeshes(key: string, meshes: MeshData[]): void {
-  clashMeshCache.set(key, meshes);
+function setCachedMeshes(key: string, meshed: ClashMeshes): void {
+  clashMeshCache.set(key, meshed);
   while (clashMeshCache.size > CLASH_MESH_CACHE_MAX) {
     const oldest = clashMeshCache.keys().next().value;
     if (oldest === undefined) break;
@@ -328,28 +422,41 @@ function setCachedMeshes(key: string, meshes: MeshData[]): void {
 /** Mesh the whole model once (in-browser, same path as PlaygroundViewer) and
  *  cache it. Throws UNSUPPORTED_OPERATION when the model carries no drawable
  *  geometry — clash needs tessellated solids, not quantity sets. */
-async function meshForClash(m: LoadedPlaygroundModel): Promise<MeshData[]> {
+async function meshForClash(m: LoadedPlaygroundModel): Promise<ClashMeshes> {
   const key = meshCacheKey(m);
   const cached = getCachedMeshes(key);
   if (cached) return cached;
 
+  // Construction can't throw synchronously here (no wasm work happens until
+  // init()), so once we're past this line `processor` is a real object the
+  // finally below must dispose — on every exit, including the throw for
+  // empty meshes below.
   const processor = new GeometryProcessor({ preferNative: false });
-  await processor.init();
-  // Use our owning byte snapshot — store.source can be a detached sub-view.
-  const result = await processor.process(
-    m.bytes,
-    m.store.entityIndex.byId as unknown as Map<number, unknown>,
-  );
-  const meshes = result.meshes ?? [];
-  if (meshes.length === 0) {
-    throw new ToolExecutionError({
-      code: ToolErrorCode.UNSUPPORTED_OPERATION,
-      message: 'No mesh geometry could be produced for this model; clash detection needs tessellated solids.',
-      hint: 'Confirm the model carries explicit geometry (not schema/quantity-only data).',
-    });
+  try {
+    await processor.init();
+    // Use our owning byte snapshot — store.source can be a detached sub-view.
+    const result = await processor.process(
+      m.bytes,
+      m.store.entityIndex.byId as unknown as Map<number, unknown>,
+    );
+    const meshes = result.meshes ?? [];
+    if (meshes.length === 0) {
+      throw new ToolExecutionError({
+        code: ToolErrorCode.UNSUPPORTED_OPERATION,
+        message: 'No mesh geometry could be produced for this model; clash detection needs tessellated solids.',
+        hint: 'Confirm the model carries explicit geometry (not schema/quantity-only data).',
+      });
+    }
+    const meshed = { meshes, coordinateInfo: result.coordinateInfo };
+    setCachedMeshes(key, meshed);
+    return meshed;
+  } finally {
+    // `result.meshes` is already copied out into plain JS MeshData — nothing
+    // downstream (the mesh cache, the clash engine) holds onto the WASM
+    // handle, so freeing it here is safe on every path above, including the
+    // throw.
+    processor.dispose();
   }
-  setCachedMeshes(key, meshes);
-  return meshes;
 }
 
 /**
@@ -359,15 +466,15 @@ async function meshForClash(m: LoadedPlaygroundModel): Promise<MeshData[]> {
  * as the mesh cache — keying by `m.id` alone would serve a stale result after an
  * edited re-upload (same filename slug) even though the meshes re-compute.
  */
-const lastClashResult = new Map<string, ClashResult>();
+const lastClashResult = new Map<string, { result: ClashResult; coordinateInfo: CoordinateInfo | undefined }>();
 
 /** Run a rule set against a model's meshes, returning (and caching) the result. */
 async function runClashRules(m: LoadedPlaygroundModel, rules: ClashRule[]): Promise<ClashResult> {
-  const meshes = await meshForClash(m);
+  const { meshes, coordinateInfo } = await meshForClash(m);
   const { elements, exclusions } = elementsFromStep({ store: m.store, meshes, modelId: m.id });
   const engine = createClashEngine({ backend: 'ts' });
   const result = await engine.run(elements, rules, { exclusions, maxCandidatePairs: CLASH_MAX_CANDIDATE_PAIRS });
-  lastClashResult.set(meshCacheKey(m), result);
+  lastClashResult.set(meshCacheKey(m), { result, coordinateInfo });
   return result;
 }
 
@@ -388,7 +495,8 @@ function clashCapNote(result: ClashResult): string {
  * burying them past the cap; clearance gaps are positive, so the same order
  * surfaces the tightest gaps first.
  */
-function topClashRows(clashes: Clash[], cap: number): {
+/** Exported for direct unit testing (see playground-dispatcher.test.ts distanceKind coverage). */
+export function topClashRows(clashes: Clash[], cap: number): {
   rows: Record<string, unknown>[];
   truncated: { shown: number; dropped: number; total: number } | null;
 } {
@@ -400,6 +508,9 @@ function topClashRows(clashes: Clash[], cap: number): {
     status: c.status,
     severity: c.severity,
     distance: c.distance,
+    // See Clash.distanceKind: absent or 'estimate' means `distance` is a box
+    // dimension read off the AABBs, not a mesh measurement.
+    distanceKind: c.distanceKind,
     point: c.point,
     a: { key: c.a.key, ref: c.a.ref, tag: c.a.tag, name: c.a.name },
     b: { key: c.b.key, ref: c.b.ref, tag: c.b.tag, name: c.b.name },
@@ -409,8 +520,7 @@ function topClashRows(clashes: Clash[], cap: number): {
     : null;
   return { rows, truncated };
 }
-
-const IMPLS: Record<string, ToolImpl> = {
+const IMPLS: Record<string, ToolImpl> = { ...playgroundCostTools,
   // ── Discovery ───────────────────────────────────────────────────────────
   async model_info(m) {
     // entityIndex.byType keys are raw STEP storage names (IFCWALL, …) —
@@ -493,25 +603,26 @@ const IMPLS: Record<string, ToolImpl> = {
 
   async count_entities(m, args) {
     const groupBy = (args.group_by as string | undefined) ?? 'type';
+    const typeFilter = args.type as string | undefined; // narrows the universe first, like the Node MCP server
+    const universe = () => (typeFilter ? m.bim.query().byType(typeFilter) : m.bim.query()).toArray();
     const counts = new Map<string, number>();
     if (groupBy === 'type') {
-      // Same PascalCase normalization as model_info — keep user-facing
-      // type counts aligned with the rest of the surface.
-      for (const [storageType, ids] of m.store.entityIndex.byType) {
-        const pretty = (ids.length > 0 ? m.store.entities.getTypeName(ids[0]) : null) ?? storageType;
-        counts.set(pretty, ids.length);
+      // BIM products only (#3765): `entityIndex.byType` is every raw STEP record.
+      for (const e of universe()) {
+        const key = e.type || '(unknown)';
+        counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     } else if (groupBy === 'storey') {
-      for (const e of m.bim.query().toArray()) {
+      for (const e of universe()) {
         const node = new EntityNode(m.store, e.ref.expressId);
         const storey = node.storey();
-        const key = storey?.name ?? '(no storey)';
+        const key = firstNonBlank(storey?.name) ?? '(no storey)';
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     } else if (groupBy === 'material') {
-      for (const e of m.bim.query().toArray()) {
+      for (const e of universe()) {
         const mat = m.bim.materials(e.ref);
-        const key = mat?.name ?? '(no material)';
+        const key = lensMaterialNames(mat)[0] ?? '(no material)';
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     }
@@ -534,7 +645,7 @@ const IMPLS: Record<string, ToolImpl> = {
       });
     }
     return {
-      text: `${data.type} '${data.name ?? '(unnamed)'}' (#${data.ref.expressId})`,
+      text: `${data.type} '${firstNonBlank(data.name) ?? '(unnamed)'}' (#${data.ref.expressId})`,
       structured: data,
     };
   },
@@ -621,7 +732,7 @@ const IMPLS: Record<string, ToolImpl> = {
     for (const e of m.bim.query().toArray()) {
       const mat = m.bim.materials(e.ref);
       if (!mat) continue;
-      const key = mat.name ?? '(unnamed)';
+      const key = lensMaterialNames(mat)[0] ?? '(unnamed)';
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     const list = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
@@ -766,10 +877,10 @@ const IMPLS: Record<string, ToolImpl> = {
 
     // Reuse the last clash run for this model; if there is none, run a default
     // all-vs-all hard self-clash so the tool works standalone (and caches it).
-    let result = lastClashResult.get(meshCacheKey(m));
-    if (!result) {
-      result = await runClashRules(m, [{ id: 'clash_check', name: 'all elements (self-clash)', a: '*', mode: 'hard' }]);
-    }
+    const result = lastClashResult.get(meshCacheKey(m))?.result
+      ?? await runClashRules(m, [{ id: 'clash_check', name: 'all elements (self-clash)', a: '*', mode: 'hard' }]);
+    // The frame of the run above, recorded next to its result.
+    const coordinateInfo = lastClashResult.get(meshCacheKey(m))?.coordinateInfo;
     if (result.summary.total === 0) {
       return {
         text: 'No clashes to export — the last clash run found 0. Run clash_check first (omit a and b for every element vs every other).',
@@ -788,6 +899,8 @@ const IMPLS: Record<string, ToolImpl> = {
       projectName: 'Clash report',
       // Resolve the (single) model id to its file name for the BCF Header (#1591).
       modelNameOf: (id) => (id === m.id ? m.name : id),
+      // Clash bounds are in the mesher's shifted frame; BCF is world (#4879).
+      worldOffset: renderFrameWorldOffset(coordinateInfo),
       ...(status ? { status } : {}),
       ...(maxTopics != null ? { maxTopics } : {}),
     });
@@ -937,7 +1050,7 @@ const IMPLS: Record<string, ToolImpl> = {
     // extensions based on prior context; we ignore them.
     const filename = coerceFilename(args.file_path as string | undefined, 'ifc', m.id);
     const schema = (args.schema as 'IFC2X3' | 'IFC4' | 'IFC4X3' | undefined) ?? (m.store.schemaVersion as 'IFC2X3' | 'IFC4' | 'IFC4X3');
-    const content = m.bim.export.ifc([], { schema });
+    const content = m.bim.export.ifc(undefined, { schema }); // no ref list: whole model (#4738)
     const text = typeof content === 'string' ? content : new TextDecoder().decode(content);
     const blob = new Blob([text], { type: 'application/x-step' });
     const file = playgroundFiles.add({
@@ -1038,7 +1151,7 @@ const IMPLS: Record<string, ToolImpl> = {
   },
   async bcf_export(_m, args) {
     const project = getBcfProject();
-    const filename = coerceFilename(args.file_path as string | undefined, 'bcfzip', 'issues');
+    const filename = coerceFilename(args.file_path as string | undefined, 'bcfzip', 'topics');
     const blob = await writeBCF(project);
     const file = playgroundFiles.add({
       filename, mimeType: 'application/zip', size: blob.size, blob,
@@ -1113,17 +1226,17 @@ const IMPLS: Record<string, ToolImpl> = {
   async export_ifc(m, args) {
     const filename = coerceFilename(args.file_path as string | undefined, 'ifc', m.id);
     const schema = (args.schema as 'IFC2X3' | 'IFC4' | 'IFC4X3' | undefined) ?? (m.store.schemaVersion as 'IFC2X3' | 'IFC4' | 'IFC4X3');
-    let refs: EntityRef[] = [];
-    if (Array.isArray(args.global_ids)) {
-      const wanted = new Set(args.global_ids as string[]);
-      for (const e of m.bim.query().toArray()) if (wanted.has(e.globalId)) refs.push(e.ref);
-    }
+    // No `global_ids` omits the ref list; a matched-nothing allowlist stays EMPTY, which `export.ifc` refuses rather than widening to the whole model (#4738). The refusal is repeated below only to answer with the stdio tool's error code and wording.
+    const wanted = Array.isArray(args.global_ids) ? new Set(args.global_ids as string[]) : undefined;
+    const refs = wanted ? m.bim.query().toArray().filter((e) => wanted.has(e.globalId)).map((e) => e.ref) : undefined;
+    if (refs?.length === 0) throw new ToolExecutionError({ code: ToolErrorCode.ENTITY_NOT_FOUND, message: `No entity matches any of the ${wanted?.size ?? 0} requested global_ids, so there is nothing to export. Refusing to write the whole model instead.` });
+    const exported = refs?.length ?? m.store.entityCount;
     const content = m.bim.export.ifc(refs, { schema });
     const text = typeof content === 'string' ? content : new TextDecoder().decode(content);
     const blob = new Blob([text], { type: 'application/x-step' });
     const file = playgroundFiles.add({
       filename, mimeType: 'application/x-step', size: blob.size, blob,
-      source: 'export_ifc', description: `${refs.length || m.store.entityCount} entit${(refs.length || m.store.entityCount) === 1 ? 'y' : 'ies'}`,
+      source: 'export_ifc', description: `${exported} entit${exported === 1 ? 'y' : 'ies'}`,
     });
     return {
       text: `Wrote ${filename} (${formatBytes(blob.size)}).`,
@@ -1170,6 +1283,17 @@ const IMPLS: Record<string, ToolImpl> = {
 
   // ── Diff (needs two loaded models — uses ctx.registry) ────────────────
   async model_diff(m, args, ctx) {
+    if (args.by_content === true) {
+      // The stdio/HTTP server runs the @ifc-lite/diff engine here (#1891). The
+      // playground's dispatcher is a separate browser reimplementation that
+      // does not, and silently ignoring the flag would hand the agent a
+      // GlobalId set intersection labelled as a content diff.
+      throw new ToolExecutionError({
+        code: ToolErrorCode.UNSUPPORTED_OPERATION,
+        message: 'by_content is not available in the browser playground; the type/GlobalId diff is.',
+        hint: 'Run the MCP server locally (npx @ifc-lite/mcp) for content-keyed matching.',
+      });
+    }
     const { left, right } = resolveDiffModels(m, args, ctx);
     const types1 = new Map<string, number>();
     const types2 = new Map<string, number>();
@@ -1203,7 +1327,12 @@ const IMPLS: Record<string, ToolImpl> = {
   },
 
   // ── Viewer (drives the inline Three.js panel) ──────────────────────────
-  async viewer_ask(_m, args) {
+  async viewer_ask(_m, args, ctx) {
+    // Asking the user for permission to open a panel that cannot exist spends
+    // a turn and then lands on viewer_open's refusal anyway.
+    if (isWebglUnavailable(ctx)) {
+      return { text: noWebglMessage(ctx), textKey: 'mcp.playgroundDispatcher.webglUnavailable', structured: { suggestedTool: null, webglUnavailable: true } };
+    }
     const reason = String(args.reason ?? '');
     return {
       text: `Ask the user: "I'd like to open the inline 3D viewer${reason ? ` to ${reason}` : ''}. May I?" If they agree, call viewer_open.`,
@@ -1212,6 +1341,13 @@ const IMPLS: Record<string, ToolImpl> = {
   },
 
   async viewer_open(_m, _args, ctx) {
+    // Checked before the panel is poked. Opening it again on a device that has
+    // already refused a context just re-renders the same fallback, and the
+    // optimistic "geometry is processing" text below is what sent the agent
+    // round the loop in the first place.
+    if (isWebglUnavailable(ctx)) {
+      return { text: noWebglMessage(ctx), textKey: 'mcp.playgroundDispatcher.webglUnavailable', structured: { open: false, pending: false, webglUnavailable: true } };
+    }
     if (ctx.openViewerPanel) ctx.openViewerPanel();
     if (ctx.viewer && ctx.viewer.isLoaded()) {
       const status = ctx.viewer.status();
@@ -1230,14 +1366,38 @@ const IMPLS: Record<string, ToolImpl> = {
     // The panel-collapse in this v1 isn't agent-controllable (the user owns
     // chrome). We surface a friendly status instead of pretending we
     // dismantled the canvas.
+    //
+    // Deliberately NOT given the #2412 treatment, unlike every other viewer
+    // tool. Three facts decide it: this answer is a constant (it reads no
+    // viewer state at all), it never claims success (`closed: false`), and it
+    // routes the agent to the USER rather than to another viewer tool — so it
+    // cannot be an arm of the loop. And the action it describes still works on
+    // a GPU-less device: `ViewerPanel` renders its toggle button OUTSIDE the
+    // `open &&` branch, so the chevron is there with or without a context, and
+    // collapsing a panel that is showing the degraded fallback is a real thing
+    // the user may want. Answering "this device cannot do WebGL" to a request
+    // about hiding a panel would be the one place where the terminal message
+    // refused something that is still available.
     void ctx;
-    return { text: 'Inline viewer panel is user-controlled in the playground; toggle it from the chevron above the canvas.', structured: { closed: false, note: 'user-toggle' } };
+    return { text: 'Inline viewer panel is user-controlled in the playground; toggle it from the chevron above the 3D viewer panel.', structured: { closed: false, note: 'user-toggle' } };
   },
 
   async viewer_status(_m, _args, ctx) {
-    const v = ctx.viewer;
-    if (!v) return { text: 'No viewer attached.', structured: { open: false } };
-    const s = v.status();
+    const s = ctx.viewer?.status() ?? null;
+    // The third arm of the #2412 loop, and the one `viewer_open` sends the
+    // agent to: "mounted but no geometry yet" is literally true but reads as
+    // "wait", and here the wait never ends.
+    //
+    // Ahead of the null check, not after it, because "No viewer attached." is
+    // the answer a COLLAPSED panel gives — and once the panel has collapsed the
+    // session latch is the only thing left that remembers why re-opening it
+    // cannot help. One check covers both, since `isWebglUnavailable` already
+    // reads the controller flag; a second branch on `s.webglUnavailable` below
+    // would be unreachable, which a mutation run confirmed.
+    if (isWebglUnavailable(ctx)) {
+      return { text: noWebglMessage(ctx), textKey: 'mcp.playgroundDispatcher.webglUnavailable', structured: s ?? { open: false, loaded: false, webglUnavailable: true } };
+    }
+    if (!s) return { text: 'No viewer attached.', structured: { open: false } };
     return {
       text: s.loaded ? `Viewer open · ${s.meshCount} meshes · ${s.selection.length} picked.` : 'Viewer panel mounted but no geometry yet.',
       structured: s,
@@ -1307,15 +1467,14 @@ const IMPLS: Record<string, ToolImpl> = {
   async viewer_set_section(_m, args, ctx) {
     const v = requireViewer(ctx);
     const axis = String(args.axis ?? '').toLowerCase();
-    if (axis !== 'x' && axis !== 'y' && axis !== 'z') {
-      throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'axis must be "x", "y", or "z".' });
-    }
+    if (axis !== 'x' && axis !== 'y' && axis !== 'z') throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'axis must be "x", "y", or "z".' });
     const position = Number(args.position ?? 0);
-    if (!Number.isFinite(position)) {
-      throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'position must be a number.' });
-    }
-    v.setSection({ axis: axis as 'x' | 'y' | 'z', position });
-    return { text: `Section ${axis} = ${position.toFixed(2)}.`, structured: { axis, position } };
+    if (!Number.isFinite(position)) throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'position must be a number.' });
+    const flipped = args.flipped === true;
+    const enabled = args.enabled !== false;
+    v.setSection({ axis: axis as 'x' | 'y' | 'z', position, flipped, enabled });
+    const suffix = `${flipped ? ' (flipped)' : ''}${enabled ? '' : ' (disabled)'}`;
+    return { text: `Section ${axis} = ${position.toFixed(2)}${suffix}.`, structured: { axis, position, flipped, enabled } };
   },
 
   async viewer_clear_section(_m, _args, ctx) {
@@ -1342,12 +1501,15 @@ const IMPLS: Record<string, ToolImpl> = {
       type,
       pset: psetName,
       property: propName,
+      missingColor: parseColorArg(args.missing_color ?? 'gray'),
       sample: (expressId) => {
         const ref: EntityRef = { modelId: m.id, expressId };
         return m.bim.property(ref, psetName, propName);
       },
     });
-    const lines = out.legend.map((l) => `  • ${l.value} — ${l.count}`);
+    // Spell the noun out: the count is entities, not submeshes (#2455), and a
+    // bare number in a histogram invites the agent to guess which (#2452).
+    const lines = out.legend.map((l) => `  • ${l.value} — ${l.count} entit${l.count === 1 ? 'y' : 'ies'}`);
     return { text: `Coloured ${type} by ${psetName}.${propName} — ${out.legend.length} bucket(s):\n${lines.join('\n')}`, structured: out };
   },
 
@@ -1395,7 +1557,7 @@ const IMPLS: Record<string, ToolImpl> = {
     const lines: string[] = [head];
     for (const e of enriched) {
       const data = e.entity as { type?: string; name?: string; globalId?: string } | null;
-      lines.push(`• ${data?.type ?? '?'} #${e.expressId} '${data?.name ?? '(unnamed)'}'`);
+      lines.push(`• ${data?.type ?? '?'} #${e.expressId} '${firstNonBlank(data?.name) ?? '(unnamed)'}'`);
       if (data?.globalId) lines.push(`  GlobalId: ${data.globalId}`);
       if (e.properties && e.properties.length > 0) {
         const psets = e.properties.map((p) => `${p.name} (${p.properties.length})`);
@@ -1524,8 +1686,7 @@ const IMPLS: Record<string, ToolImpl> = {
     const t0 = Date.now();
     const initial = v.getSelection();
     if (initial.length > 0) {
-      // Already something selected — return immediately so the agent
-      // doesn't pointlessly stall.
+      // Already something selected — return immediately so the agent doesn't pointlessly stall.
       return {
         text: `Already selected ${initial.length} entit${initial.length === 1 ? 'y' : 'ies'}.`,
         structured: { selection: initial, waitedMs: 0, timedOut: false },
@@ -1534,7 +1695,7 @@ const IMPLS: Record<string, ToolImpl> = {
     // Use the multi-subscriber API so we don't replace whichever handler
     // the panel registered (which would silently kill live selection
     // updates everywhere else after the first wait_for_selection call).
-    const hits: import('./PlaygroundViewer').SelectionHit[] = await new Promise((resolve) => {
+    const hits: import('./playground-viewer-types').SelectionHit[] = await new Promise((resolve) => {
       let unsubscribe: (() => void) | null = null;
       const timer = window.setTimeout(() => {
         unsubscribe?.();
@@ -1636,7 +1797,7 @@ function resolveIdsXml(args: Record<string, unknown>): string | null {
  *
  *   coerceFilename('wall_fire_rating.ids', 'ifc')   → 'wall_fire_rating.ifc'
  *   coerceFilename('/tmp/foo.bar/baz.csv', 'json')  → 'baz.json'
- *   coerceFilename(undefined, 'bcfzip', 'issues')   → 'issues.bcfzip'
+ *   coerceFilename(undefined, 'bcfzip', 'topics')   → 'topics.bcfzip'
  */
 function coerceFilename(
   raw: string | undefined,
@@ -1740,21 +1901,19 @@ function makeIdsAccessor(m: LoadedPlaygroundModel): import('@ifc-lite/ids').IFCD
       }));
     },
     getClassifications(id) {
+      // Forward `unresolved` (#3948/#3951) — else a classified-but-unresolved entity reads as a fabricated empty match.
       return m.bim.classifications(ref(id)).map((c) => ({
         system: c.system ?? '',
         value: c.identification ?? c.name ?? '',
         name: c.name,
+        unresolved: c.unresolved,
       }));
     },
     getMaterials(id) {
-      const mat = m.bim.materials(ref(id));
-      if (!mat) return [];
-      const layers = (mat as { layers?: Array<{ materialName?: string; name?: string }>; name?: string });
-      if (Array.isArray(layers.layers) && layers.layers.length > 0) {
-        return layers.layers.map((l) => ({ name: l.materialName ?? l.name ?? '' }));
-      }
-      if (layers.name) return [{ name: layers.name }];
-      return [];
+      // Every variant via the same #1366 lens collector the material filter/list panels use.
+      // Previously only `mat.layers`/top-level `mat.name` were checked, so a profile set,
+      // constituent set, or material list was invisible to IDS material requirements.
+      return lensMaterialNames(m.bim.materials(ref(id))).map((name) => ({ name }));
     },
     getParent(id) {
       try {
@@ -1821,64 +1980,11 @@ export function supportedToolNames(): string[] {
   return Object.keys(IMPLS);
 }
 
-/** Anthropic-compatible JSON schema for a single tool's input. */
-export interface AnthropicInputSchema {
-  type: 'object';
-  properties: Record<string, { type: string; description?: string }>;
-  required?: string[];
-}
-export interface AnthropicToolDef {
-  name: string;
-  description: string;
-  input_schema: AnthropicInputSchema;
-}
-
 /** Build the `tools` array Anthropic expects, derived from CATALOG +
  *  supportedToolNames(). Always returns the literal-typed shape Anthropic's
  *  SDK demands (input_schema.type === 'object'). */
 export function anthropicToolDefinitions(): AnthropicToolDef[] {
-  const supported = new Set(supportedToolNames());
-  return CATALOG.tools
-    .filter((t: CatalogTool) => supported.has(t.name))
-    .map((t) => ({
-      name: t.name,
-      description: t.description,
-      input_schema: ensureObjectSchema(t),
-    }));
-}
-
-/** Anthropic requires every tool's input_schema.type === 'object'. Some catalog
- *  schemas are missing `properties` — fill in a minimal one from paramsFor(). */
-function ensureObjectSchema(tool: CatalogTool): AnthropicInputSchema {
-  const raw = tool.inputSchema as { type?: string; properties?: Record<string, { type?: string; description?: string }>; required?: string[] } | undefined;
-  if (raw && raw.type === 'object' && raw.properties && Object.keys(raw.properties).length > 0) {
-    const properties: AnthropicInputSchema['properties'] = {};
-    for (const [k, v] of Object.entries(raw.properties)) {
-      properties[k] = { type: typeof v?.type === 'string' ? v.type : 'string', ...(v?.description ? { description: v.description } : {}) };
-    }
-    return {
-      type: 'object',
-      properties,
-      ...(Array.isArray(raw.required) && raw.required.length > 0 ? { required: raw.required } : {}),
-    };
-  }
-  const params = paramsFor(tool);
-  const properties: AnthropicInputSchema['properties'] = {};
-  const required: string[] = [];
-  for (const p of params) {
-    properties[p.name] = { type: jsonSchemaType(p.type), ...(p.description ? { description: p.description } : {}) };
-    if (p.required) required.push(p.name);
-  }
-  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) };
-}
-
-function jsonSchemaType(t: string): string {
-  if (t.startsWith('integer')) return 'integer';
-  if (t.startsWith('number')) return 'number';
-  if (t.startsWith('boolean')) return 'boolean';
-  if (t.endsWith('[]') || t.startsWith('Array<')) return 'array';
-  if (t.startsWith('{') || t.startsWith('object')) return 'object';
-  return 'string';
+  return createAnthropicToolDefinitions(supportedToolNames());
 }
 
 /**
@@ -1921,15 +2027,18 @@ export async function dispatch(
   }
   try {
     const out = await impl(model, args, ctx);
-    return { text: out.text, structured: out.structured, isError: false, download: out.download };
+    return { text: out.text, textKey: out.textKey, structured: out.structured, isError: false, download: out.download };
   } catch (err) {
     if (err instanceof ToolExecutionError) {
+      const webglUnavailable = err.details?.webglUnavailable === true;
       return {
         text: err.message,
+        textKey: webglUnavailable ? 'mcp.playgroundDispatcher.webglUnavailable' : undefined,
         structured: err.details ?? null,
         isError: true,
         errorCode: err.code,
         hint: err.hint,
+        hintKey: webglUnavailable ? 'mcp.playgroundDispatcher.webglUnavailableHint' : undefined,
       };
     }
     return {

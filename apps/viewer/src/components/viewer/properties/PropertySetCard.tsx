@@ -12,11 +12,13 @@ import { PropertyEditor, type PropertyEditScope } from '../PropertyEditor';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Badge } from '@/components/ui/badge';
-import { decodeIfcString, parsePropertyValue } from './encodingUtils';
+import { parsePropertyValue } from './encodingUtils';
 import type { PropertySet } from './encodingUtils';
+import { setDisplayName } from './setDisplayName';
 import { PropertyValueType } from '@ifc-lite/data';
 import type { ProjectUnits } from '@ifc-lite/parser';
 import { resolveMeasureDisplay, formatConverted } from '@/lib/units/display';
+import { useTranslation } from '@/i18n';
 
 export interface PropertySetCardProps {
   pset: PropertySet;
@@ -40,6 +42,7 @@ export interface PropertySetCardProps {
 }
 
 export function PropertySetCard({ pset, modelId, entityId, enableEditing, isTypeProperty, typeEditScope, focusedPropKey, projectUnits, unitDisplayOverrides }: PropertySetCardProps) {
+  const { t } = useTranslation();
   // Check if any property in this set is mutated
   const hasMutations = pset.properties.some(p => p.isMutated);
   const isNewPset = pset.isNewPset;
@@ -82,7 +85,7 @@ export function PropertySetCard({ pset, modelId, entityId, enableEditing, isType
             <TooltipTrigger asChild>
               <Sparkles className="h-3.5 w-3.5 text-amber-500 shrink-0" />
             </TooltipTrigger>
-            <TooltipContent>New property set (not in original model)</TooltipContent>
+            <TooltipContent>{t('properties.propertySetCard.newPsetTooltip')}</TooltipContent>
           </Tooltip>
         )}
         {hasMutations && !isNewPset && (
@@ -90,7 +93,7 @@ export function PropertySetCard({ pset, modelId, entityId, enableEditing, isType
             <TooltipTrigger asChild>
               <PenLine className="h-3.5 w-3.5 text-purple-500 shrink-0" />
             </TooltipTrigger>
-            <TooltipContent>Has modified properties</TooltipContent>
+            <TooltipContent>{t('properties.propertySetCard.hasMutationsTooltip')}</TooltipContent>
           </Tooltip>
         )}
         {isTypeProperty && !isNewPset && !hasMutations && (
@@ -98,17 +101,19 @@ export function PropertySetCard({ pset, modelId, entityId, enableEditing, isType
             <TooltipTrigger asChild>
               <Building2 className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
             </TooltipTrigger>
-            <TooltipContent>Inherited from type — edits apply to all instances of this type</TooltipContent>
+            <TooltipContent>{t('properties.propertySetCard.inheritedFromTypeTooltip')}</TooltipContent>
           </Tooltip>
         )}
-        <span className="font-bold text-xs text-zinc-900 dark:text-zinc-100 truncate flex-1 min-w-0">{decodeIfcString(pset.name)}</span>
+        <span className="font-bold text-xs text-zinc-900 dark:text-zinc-100 truncate flex-1 min-w-0">{setDisplayName(pset.name, t('properties.propertySet.unnamed'))}</span>
         <span className="text-[10px] font-mono bg-zinc-100 dark:bg-zinc-900 px-1.5 py-0.5 border border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 shrink-0">{pset.properties.length}</span>
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="border-t-2 border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-900">
-          {pset.properties.map((prop: { name: string; value: unknown; isMutated?: boolean; type?: number; dataType?: string }) => {
+          {pset.properties.map((prop: { name: string; value: unknown; isMutated?: boolean; type?: number; dataType?: string }, index: number) => {
             const parsed = parsePropertyValue(prop.value);
-            const decodedName = decodeIfcString(prop.name);
+            // Names render VERBATIM: the parse path already decoded them (see
+            // the note on `parsePropertyValue`), and decoding a second time
+            // collapses `\\` twice.
             const isMutated = prop.isMutated;
             const propKey = keyFor(prop.name);
             const isFocused = focusedPropKey != null && focusedPropKey === propKey;
@@ -117,7 +122,10 @@ export function PropertySetCard({ pset, modelId, entityId, enableEditing, isType
 
             return (
               <div
-                key={prop.name}
+                // A property set's own property list may repeat a name (the same
+                // slack the pset-name uniqueness comment above documents, one
+                // level down); index disambiguates the React key.
+                key={`${prop.name}-${index}`}
                 data-prop-key={propKey}
                 className={`flex items-start justify-between gap-2 px-3 py-2 text-xs group/prop transition-colors ${
                   isFocused
@@ -134,28 +142,29 @@ export function PropertySetCard({ pset, modelId, entityId, enableEditing, isType
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Badge variant="secondary" className="h-4 px-1 text-[9px] bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-700">
-                            edited
+                            {t('properties.propertySetCard.editedBadge')}
                           </Badge>
                         </TooltipTrigger>
-                        <TooltipContent>This property has been modified</TooltipContent>
+                        <TooltipContent>{t('properties.propertySetCard.propertyModifiedTooltip')}</TooltipContent>
                       </Tooltip>
                     )}
                     {parsed.ifcType ? (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <span className={`font-medium cursor-help break-words ${isMutated ? 'text-purple-600 dark:text-purple-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
-                            {decodedName}
+                            {prop.name}
                           </span>
                         </TooltipTrigger>
                         <TooltipContent side="top" className="text-[10px]">
-                          {/* bg-primary tooltip: derive from primary-foreground so it
-                              reads on the blue/purple surface and in dark mode (#1218) */}
-                          <span className="text-primary-foreground/80">{parsed.ifcType}</span>
+                          {/* TooltipContent uses the neutral popover surface (#4767);
+                              secondary text uses its semantic muted token instead
+                              of a hardcoded primary-foreground opacity tier. */}
+                          <span className="text-muted-foreground">{parsed.ifcType}</span>
                         </TooltipContent>
                       </Tooltip>
                     ) : (
                       <span className={`font-medium break-words ${isMutated ? 'text-purple-600 dark:text-purple-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
-                        {decodedName}
+                        {prop.name}
                       </span>
                     )}
                   </div>

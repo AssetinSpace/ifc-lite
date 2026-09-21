@@ -29,6 +29,9 @@ import {
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
+import { resolveChatViewportScreenshot } from './chatViewportCapture.js';
+import { formatArg, levelPrefix, captureCompressedCanvasImage } from './executableCodeBlockHelpers';
 import { useSandbox } from '@/hooks/useSandbox';
 import { useViewerStore } from '@/store';
 import type { CodeBlock, CodeExecResult } from '@/lib/llm/types';
@@ -41,56 +44,13 @@ interface ExecutableCodeBlockProps {
   onFixError?: (code: string, error: string) => void;
 }
 
-/** Format a log arg for display */
-function formatArg(a: unknown): string {
-  if (typeof a === 'object' && a !== null) {
-    try {
-      return JSON.stringify(a, null, 2);
-    } catch {
-      return String(a);
-    }
-  }
-  return String(a);
-}
-
-/** Level prefix for console lines */
-function levelPrefix(level: string): string {
-  switch (level) {
-    case 'error': return '✕';
-    case 'warn': return '⚠';
-    case 'info': return 'ℹ';
-    default: return '›';
-  }
-}
-
-function captureCompressedCanvasImage(canvas: HTMLCanvasElement): string {
-  const maxSide = 1400;
-  const srcW = canvas.width || canvas.clientWidth || 0;
-  const srcH = canvas.height || canvas.clientHeight || 0;
-  if (srcW <= 0 || srcH <= 0) {
-    return canvas.toDataURL('image/jpeg', 0.72);
-  }
-
-  const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
-  const outW = Math.max(1, Math.round(srcW * scale));
-  const outH = Math.max(1, Math.round(srcH * scale));
-  const out = document.createElement('canvas');
-  out.width = outW;
-  out.height = outH;
-  const ctx = out.getContext('2d');
-  if (!ctx) {
-    return canvas.toDataURL('image/jpeg', 0.72);
-  }
-  ctx.drawImage(canvas, 0, 0, outW, outH);
-  return out.toDataURL('image/jpeg', 0.72);
-}
-
 export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
   block,
   messageId,
   result,
   onFixError,
 }: ExecutableCodeBlockProps) {
+  const { t } = useTranslation();
   const { execute } = useSandbox();
   const setCodeExecResult = useViewerStore((s) => s.setCodeExecResult);
   const setScriptError = useViewerStore((s) => s.setScriptError);
@@ -117,13 +77,14 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
         if (block.code.includes('loadIfc') || block.code.includes('bim.create') || block.code.includes('colorize')) {
           // Small delay to let the renderer finish presenting the frame
           setTimeout(() => {
-            try {
-              const canvas = document.querySelector('canvas');
-              if (canvas) {
-                const dataUrl = captureCompressedCanvasImage(canvas as HTMLCanvasElement);
-                useViewerStore.getState().setChatViewportScreenshot(dataUrl);
-              }
-            } catch { /* screenshot capture failed — non-critical */ }
+            // Always WRITE the slot, including on failure: it is only cleared
+            // when the user sends, so skipping the write would leave the
+            // previous run's screenshot attached to a message about this one.
+            // See resolveChatViewportScreenshot.
+            const canvas = document.querySelector('canvas') as HTMLCanvasElement | null;
+            useViewerStore.getState().setChatViewportScreenshot(
+              resolveChatViewportScreenshot(canvas, captureCompressedCanvasImage),
+            );
           }, 500);
         }
       } else {
@@ -238,7 +199,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
       {/* Code header with action buttons */}
       <div className="flex items-center gap-1 px-2 py-1 bg-muted/50 border-b">
         <span className="text-[10px] font-mono text-muted-foreground uppercase">
-          {block.language || 'js'}
+          {block.language || t('chat.codeBlock.languageFallback')}
         </span>
         <div className="flex-1" />
         <Tooltip>
@@ -247,7 +208,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               {copied ? <CheckCircle2 className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Copy code</TooltipContent>
+          <TooltipContent>{t('chat.codeBlock.copyCode')}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -255,15 +216,15 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               <FileCode2 className="h-3 w-3" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Apply to selection</TooltipContent>
+          <TooltipContent>{t('chat.codeBlock.applyToSelection')}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
             <Button variant="ghost" size="icon-xs" onClick={handleReplaceAllInEditor}>
-              All
+              {t('chat.codeBlock.replaceAll')}
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Replace entire script</TooltipContent>
+          <TooltipContent>{t('chat.codeBlock.replaceEntireScript')}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -279,10 +240,10 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               ) : (
                 <Play className="h-3 w-3" />
               )}
-              {isRunning ? 'Running...' : 'Run'}
+              {isRunning ? t('chat.codeBlock.running') : t('chat.codeBlock.run')}
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Execute in sandbox</TooltipContent>
+          <TooltipContent>{t('chat.codeBlock.executeInSandbox')}</TooltipContent>
         </Tooltip>
       </div>
 
@@ -305,7 +266,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               <ChevronRight className="h-3 w-3 shrink-0" />
             )}
             <Terminal className="h-3 w-3 shrink-0" />
-            <span className="text-[10px] font-mono uppercase tracking-wider">Console</span>
+            <span className="text-[10px] font-mono uppercase tracking-wider">{t('chat.codeBlock.console')}</span>
             {isRunning && (
               <Loader2 className="h-3 w-3 animate-spin ml-1 text-blue-500" />
             )}
@@ -316,8 +277,8 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               <AlertCircle className="h-3 w-3 ml-1 text-destructive" />
             )}
             {result?.durationMs !== undefined && result.status !== 'running' && (
-              <span className="text-[10px] font-mono text-muted-foreground/60 ml-auto">
-                {result.durationMs}ms
+              <span className="text-[10px] font-mono text-muted-foreground ml-auto">
+                {t('chat.codeBlock.durationBadge', { ms: result.durationMs })}
               </span>
             )}
           </button>
@@ -329,7 +290,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               {isRunning && (!hasLogs) && (
                 <div className="flex items-center gap-1.5 text-blue-500 py-0.5">
                   <Loader2 className="h-3 w-3 animate-spin" />
-                  <span>Executing script...</span>
+                  <span>{t('chat.codeBlock.executingScript')}</span>
                 </div>
               )}
 
@@ -376,7 +337,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
               {result?.status === 'success' && (
                 <div className="flex items-center gap-1 text-emerald-500 border-t border-border mt-1 pt-1">
                   <CheckCircle2 className="h-3 w-3" />
-                  <span>Done{result.durationMs !== undefined ? ` in ${result.durationMs}ms` : ''}</span>
+                  <span>{result.durationMs !== undefined ? t('chat.codeBlock.doneWithDuration', { ms: result.durationMs }) : t('chat.codeBlock.done')}</span>
                 </div>
               )}
 
@@ -395,7 +356,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
                   className="gap-1 h-6 px-2 text-xs text-destructive border-destructive/30 hover:bg-destructive/10 bg-transparent"
                 >
                   <RefreshCw className="h-3 w-3" />
-                  Fix this
+                  {t('chat.codeBlock.fixThis')}
                 </Button>
               )}
               <Button
@@ -405,7 +366,7 @@ export const ExecutableCodeBlock = memo(function ExecutableCodeBlock({
                 className="gap-1 h-6 px-2 text-xs bg-transparent"
               >
                 <Play className="h-3 w-3" />
-                Re-run
+                {t('chat.codeBlock.rerun')}
               </Button>
             </div>
           )}

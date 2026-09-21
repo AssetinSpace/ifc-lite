@@ -16,25 +16,38 @@ impl IfcAPI {
     /// is genuinely needed.
     ///
     /// `schema` is the FILE_SCHEMA label to write (empty ⇒ preserve the source schema).
-    /// `included` is an express-id allowlist (empty ⇒ whole model); when set, the forward
-    /// `#`-reference closure is added so the subset never dangles a reference.
+    ///
+    /// `included` is an express-id allowlist carrying the same null-vs-empty
+    /// distinction as `exportObj` / `exportGlb`: omit it (`undefined`) for "no
+    /// isolation filter" (whole model); pass an empty `Uint32Array` for "isolation
+    /// is ACTIVE and currently matches nothing", which writes a header-only file
+    /// with an empty `DATA;` section. Collapsing the two — as a bare `Uint32Array`
+    /// parameter would force a caller to do — silently exported the whole model
+    /// when a filter matched nothing (#4659, the STEP twin of #4483/#4484). When
+    /// set, the forward `#`-reference closure is added so the subset never dangles
+    /// a reference.
     /// `mutations_json` carries `MutablePropertyView` edits (attribute updates +
     /// property-set synthesis); empty ⇒ none. See `export_step_json` for the shape.
+    /// A non-empty but malformed `mutations_json` throws rather than silently
+    /// exporting the model with none of the caller's edits applied — mirrors
+    /// `exportGlb`'s and `exportMerged`'s fail-closed contract on this same API.
     #[wasm_bindgen(js_name = exportStep)]
     pub fn export_step(
         &self,
         content: &[u8],
         schema: String,
-        included: &[u32],
+        included: Option<Vec<u32>>,
         mutations_json: String,
     ) -> Vec<u8> {
-        ifc_lite_export::export_step_json(
+        match ifc_lite_export::export_step_json(
             content,
             if schema.is_empty() { None } else { Some(schema) },
-            if included.is_empty() { None } else { Some(included.to_vec()) },
+            included,
             &mutations_json,
-        )
-        .into_bytes()
+        ) {
+            Ok(step) => step.into_bytes(),
+            Err(msg) => wasm_bindgen::throw_str(&format!("exportStep: {msg}")),
+        }
     }
 
     /// Merge several IFC models into one STEP/IFC UTF-8 byte buffer (`Uint8Array`).

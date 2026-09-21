@@ -4,31 +4,72 @@
 
 //! Shared advanced face processing logic.
 //!
-//! Handles IfcAdvancedFace with B-spline, planar, and cylindrical surface types.
-//! Used by both AdvancedBrepProcessor and ShellBasedSurfaceModelProcessor/FaceBasedSurfaceModelProcessor
-//! when shells contain IfcAdvancedFace entities (common in CATIA exports).
+//! Handles `IfcAdvancedFace` and `IfcFaceSurface` with B-spline, planar, and
+//! cylindrical surface types. Used by B-rep processors and structural
+//! reference topology.
 
 use crate::{Error, Result, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder};
 
+pub(super) mod bounds;
 mod bspline;
+mod bspline_budget;
+mod bspline_parse;
 mod conics;
 mod curves;
-mod edge_loop;
+pub(super) mod edge_loop;
 mod polyline;
 mod revolution;
 mod surfaces;
 
 // Re-exported so sibling processors that reference
 // `super::advanced_face::{parse_rational_weights, process_bspline_face}` keep resolving.
-pub(super) use bspline::parse_rational_weights;
+pub(super) use bspline_parse::parse_rational_weights;
 pub(super) use surfaces::process_bspline_face;
+
+// Re-exported crate-wide: the router (a sibling top-level module, not a
+// descendant of `processors`) drains this once per representation item to
+// report a capped B-spline curve edge (#4901); see `bspline_budget.rs`.
+pub(crate) use bspline_budget::take_curve_capped;
 
 use revolution::process_surface_of_revolution_face;
 use surfaces::{process_cylindrical_face, process_planar_face};
 
-/// Process a single IfcAdvancedFace entity, dispatching to the appropriate
-/// surface handler based on FaceSurface type.
+pub(super) fn process_planar_face_with_rtc(
+    face: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+    rtc_file_units: (f64, f64, f64),
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    apply_same_sense(
+        face,
+        surfaces::process_planar_face_rebased(face, decoder, quality, Some(rtc_file_units)),
+    )
+}
+
+fn apply_same_sense(
+    face: &DecodedEntity,
+    result: Result<(Vec<f32>, Vec<u32>)>,
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    let same_sense = face
+        .get(2)
+        .and_then(|a| a.as_enum())
+        .map(|e| e == "T" || e == "TRUE")
+        .unwrap_or(true);
+    if same_sense {
+        result
+    } else {
+        result.map(|(positions, mut indices)| {
+            for tri in indices.chunks_exact_mut(3) {
+                tri.swap(0, 2);
+            }
+            (positions, indices)
+        })
+    }
+}
+
+/// Process a single `IfcAdvancedFace` or `IfcFaceSurface`, dispatching to the
+/// appropriate surface handler based on `FaceSurface` type.
 ///
 /// Returns (positions, indices) for the tessellated face.
 pub(super) fn process_advanced_face(
@@ -36,14 +77,14 @@ pub(super) fn process_advanced_face(
     decoder: &mut EntityDecoder,
     quality: TessellationQuality,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
-    // IfcAdvancedFace has:
+    // IfcAdvancedFace and IfcFaceSurface have:
     // 0: Bounds (list of FaceBound)
     // 1: FaceSurface (IfcSurface - Plane, BSplineSurface, CylindricalSurface, etc.)
     // 2: SameSense (boolean)
 
     let surface_attr = face
         .get(1)
-        .ok_or_else(|| Error::geometry("AdvancedFace missing FaceSurface".to_string()))?;
+        .ok_or_else(|| Error::geometry("FaceSurface missing FaceSurface".to_string()))?;
 
     let surface = decoder
         .resolve_ref(surface_attr)?
@@ -52,12 +93,6 @@ pub(super) fn process_advanced_face(
     let surface_type = surface.ifc_type.as_str().to_uppercase();
 
     // Read SameSense (attribute 2) - when false, triangle winding must be flipped
-    let same_sense = face
-        .get(2)
-        .and_then(|a| a.as_enum())
-        .map(|e| e == "T" || e == "TRUE")
-        .unwrap_or(true);
-
     let result = if surface_type == "IFCPLANE" {
         process_planar_face(face, decoder, quality)
     } else if surface_type == "IFCBSPLINESURFACEWITHKNOTS" {
@@ -116,15 +151,6 @@ pub(super) fn process_advanced_face(
         }
     }
 
-    // When SameSense is false, flip triangle winding to correct face orientation
-    if !same_sense {
-        result.map(|(positions, mut indices)| {
-            for tri in indices.chunks_exact_mut(3) {
-                tri.swap(0, 2);
-            }
-            (positions, indices)
-        })
-    } else {
-        result
-    }
+    // When SameSense is false, flip triangle winding to correct face orientation.
+    apply_same_sense(face, result)
 }

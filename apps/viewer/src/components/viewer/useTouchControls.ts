@@ -11,7 +11,13 @@ import { useEffect, type MutableRefObject, type RefObject } from 'react';
 import type { Renderer, PickResult } from '@ifc-lite/renderer';
 import type { MeshData } from '@ifc-lite/geometry';
 import type { SectionPlane } from '@/store';
+import { invalidateSelectionPick, markTouchSelection, selectViewportTarget } from './referenceSelection.js';
 import { isPivotRaycastTooExpensive } from './orbitPivotCensus.js';
+import { focusedClashOrbitPivot, sceneAnchorOrbitPivot } from './orbitPivot.js';
+import { useViewerStore } from '@/store';
+import { toast } from '@/components/ui/toast';
+import { pickViewportAppearanceFace, viewportFacePickError } from './appearance/face-mask/viewport-face-picker.js';
+import { resolve as translate } from '@/i18n/registry';
 
 /** Locked gesture mode for 2-finger interactions */
 type TwoFingerGesture = 'none' | 'pinch' | 'pan';
@@ -60,13 +66,8 @@ export function useTouchControls(params: UseTouchControlsParams): void {
     activeToolRef,
     hiddenEntitiesRef,
     isolatedEntitiesRef,
-    selectedEntityIdRef,
-    selectedModelIndexRef,
-    clearColorRef,
-    sectionPlaneRef,
-    sectionRangeRef,
-    geometryRef,
     isInteractingRef,
+    selectedEntityIdRef,
     handlePickForSelection,
     getPickOptions,
   } = params;
@@ -84,6 +85,12 @@ export function useTouchControls(params: UseTouchControlsParams): void {
     // at current view distance — never to a selected entity's center, which
     // would pivot far from the user's touch and feel disconnected.
     const anchorOrbitPivotUnderFinger = (touch: Touch) => {
+      // A focused clash with nothing selected orbits around the clashing pair (#4806).
+      const clashPivot = focusedClashOrbitPivot(useViewerStore.getState(), selectedEntityIdRef.current);
+      if (clashPivot) {
+        camera.setOrbitCenter(clashPivot);
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
       const tx = touch.clientX - rect.left;
       const ty = touch.clientY - rect.top;
@@ -108,40 +115,11 @@ export function useTouchControls(params: UseTouchControlsParams): void {
       // Anchor to the scene centre (stable) rather than the drifting camera
       // target, projected onto the finger ray (issue #1107, item 3). Matches
       // the mouse orbit fallback in useMouseControls.
-      const anchorBounds = camera.getOrbitAnchorBounds();
-      const bounds = anchorBounds ?? camera.getSceneBounds();
-      const anchor = bounds
-        ? {
-            x: (bounds.min.x + bounds.max.x) / 2,
-            y: (bounds.min.y + bounds.max.y) / 2,
-            z: (bounds.min.z + bounds.max.z) / 2,
-          }
-        : camera.getTarget();
-      if (anchorBounds) {
-        // Outlier model (issue #1394): orbit around the robust model centre
-        // directly. Projecting onto the finger ray would place the pivot in the
-        // empty space beside the sparse model and swing it out of frame.
-        camera.setOrbitCenter(anchor);
-      } else {
-        const ray = camera.unprojectToRay(tx, ty, canvas.width, canvas.height);
-        const toAnchor = {
-          x: anchor.x - ray.origin.x,
-          y: anchor.y - ray.origin.y,
-          z: anchor.z - ray.origin.z,
-        };
-        const d = Math.max(
-          1,
-          toAnchor.x * ray.direction.x + toAnchor.y * ray.direction.y + toAnchor.z * ray.direction.z,
-        );
-        camera.setOrbitCenter({
-          x: ray.origin.x + ray.direction.x * d,
-          y: ray.origin.y + ray.direction.y * d,
-          z: ray.origin.z + ray.direction.z * d,
-        });
-      }
+      camera.setOrbitCenter(sceneAnchorOrbitPivot(camera, tx, ty, canvas.width, canvas.height));
     };
 
     const handleTouchStart = async (e: TouchEvent) => {
+      invalidateSelectionPick(canvas);
       e.preventDefault();
       touchState.touches = Array.from(e.touches);
 
@@ -299,8 +277,22 @@ export function useTouchControls(params: UseTouchControlsParams): void {
           const x = touchState.tapStartPos.x - rect.left;
           const y = touchState.tapStartPos.y - rect.top;
 
-          const pickResult = await renderer.pick(x, y, getPickOptions());
-          handlePickForSelection(pickResult);
+          if (tool === 'appearance-face') {
+            // Touchend owns this tap. Record it before routing the exact hit so
+            // the browser's compatibility click cannot toggle the same face a
+            // second time through handleSelectionClick (#4555).
+            markTouchSelection(canvas, x, y);
+            const message = viewportFacePickError(pickViewportAppearanceFace(
+              renderer.raycastScene(x, y, getPickOptions())?.intersection ?? null,
+            ));
+            if (message) toast.error(translate(message));
+          } else if (tool === 'select') {
+            markTouchSelection(canvas, x, y);
+            await selectViewportTarget({ canvas, renderer, x, y, getTool: () => activeToolRef.current,
+              getPickOptions, onIfc: handlePickForSelection });
+          } else {
+            handlePickForSelection(await renderer.pick(x, y, getPickOptions()));
+          }
         }
 
         // Reset multi-touch and gesture lock when all touches end
@@ -314,6 +306,7 @@ export function useTouchControls(params: UseTouchControlsParams): void {
     // Also reset interaction on touchcancel — mobile browsers can cancel
     // gestures (system gestures, tab switch, lost focus) without touchend.
     const handleTouchCancel = () => {
+      invalidateSelectionPick(canvas);
       if (isInteractingRef.current) {
         isInteractingRef.current = false;
         renderer.requestRender();
@@ -338,6 +331,7 @@ export function useTouchControls(params: UseTouchControlsParams): void {
     document.addEventListener('touchmove', preventOverscroll, { passive: false });
 
     return () => {
+      invalidateSelectionPick(canvas);
       canvas.removeEventListener('touchstart', handleTouchStart);
       canvas.removeEventListener('touchmove', handleTouchMove);
       canvas.removeEventListener('touchend', handleTouchEnd);

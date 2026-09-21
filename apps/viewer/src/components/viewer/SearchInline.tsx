@@ -27,13 +27,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Search, Clock, X, SlidersHorizontal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
+import { selectorYieldsRules } from '@/lib/search/selector-to-rules';
 import { Input } from '@/components/ui/input';
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 import { runTier0Scan, type SearchResult, type ScanModel } from '@/lib/search/tier0-scan';
 import { queryTier1Indexes, type Tier1Index } from '@/lib/search/tier1-index';
-import { useSearchIndex } from '@/hooks/useSearchIndex';
 import {
   loadRecentSearches,
   pushRecentSearch,
@@ -56,6 +57,7 @@ function isEditableFocused(): boolean {
 }
 
 export function SearchInline() {
+  const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Tracks the latest scheduled `frameSelection` timer so back-to-back
@@ -81,10 +83,11 @@ export function SearchInline() {
     setSearchModalOpen,
     setSearchModalTab,
     activeRuleCount,
-    clearFilterRules,
+    clearAllFilterGroups,
     models,
     setSelectedEntity,
     setSelectedEntityId,
+    setSelectedEntityIds,
     toggleEntitySelection,
     cameraCallbacks,
   } = useViewerStore(
@@ -103,18 +106,16 @@ export function SearchInline() {
       stepVimCycle: s.stepVimCycle,
       setSearchModalOpen: s.setSearchModalOpen,
       setSearchModalTab: s.setSearchModalTab,
-      activeRuleCount: s.searchFilter.rules.length,
-      clearFilterRules: s.clearFilterRules,
+      activeRuleCount: s.searchFilter.groups.reduce((n, g) => n + g.rules.length, 0),
+      clearAllFilterGroups: s.clearAllFilterGroups,
       models: s.models,
       setSelectedEntity: s.setSelectedEntity,
       setSelectedEntityId: s.setSelectedEntityId,
+      setSelectedEntityIds: s.setSelectedEntityIds,
       toggleEntitySelection: s.toggleEntitySelection,
       cameraCallbacks: s.cameraCallbacks,
     })),
   );
-
-  // Kick off lazy Tier-1 index builds for any loaded model.
-  useSearchIndex();
 
   // Recents list — loaded on mount, refreshed after each Enter commit.
   const [recents, setRecents] = useState<string[]>(() => loadRecentSearches());
@@ -232,6 +233,8 @@ export function SearchInline() {
         return;
       }
 
+      // Clear multi-selection first (setSelectedEntityIds([]) resets selectedEntityId)
+      setSelectedEntityIds([]);
       setSelectedEntityId(globalId);
       setSelectedEntity(ref);
       if (cameraCallbacks.frameSelection) {
@@ -247,6 +250,7 @@ export function SearchInline() {
       models,
       setSelectedEntity,
       setSelectedEntityId,
+      setSelectedEntityIds,
       toggleEntitySelection,
     ],
   );
@@ -446,7 +450,7 @@ export function SearchInline() {
       <Input
         ref={inputRef}
         type="text"
-        placeholder="Search GUID, name, type… ( / )"
+        placeholder={t('searchModal.inline.searchPlaceholder')}
         value={searchQuery}
         leftIcon={<Search className="h-4 w-4" />}
         onChange={(e) => {
@@ -456,7 +460,7 @@ export function SearchInline() {
         onFocus={() => setSearchOpen(true)}
         onKeyDown={handleInputKeyDown}
         className={cn(hasFilters ? 'pr-[4.5rem]' : 'pr-9')}
-        aria-label="Search entities"
+        aria-label={t('searchModal.inline.searchAriaLabel')}
         aria-autocomplete="list"
         aria-expanded={showPopover}
         aria-controls="search-inline-popover"
@@ -468,11 +472,11 @@ export function SearchInline() {
         {hasFilters && (
           <button
             type="button"
-            aria-label="Clear filters"
-            title="Clear filters"
+            aria-label={t('searchModal.inline.clearFiltersAriaLabel')}
+            title={t('searchModal.inline.clearFiltersAriaLabel')}
             onMouseDown={(e) => {
               e.preventDefault();
-              clearFilterRules();
+              clearAllFilterGroups();
             }}
             className="rounded p-1 text-muted-foreground transition-colors hover:bg-zinc-100 hover:text-foreground dark:hover:bg-zinc-800"
           >
@@ -481,9 +485,9 @@ export function SearchInline() {
         )}
         <button
           type="button"
-          aria-label={hasFilters ? `Advanced filter — ${activeRuleCount} active` : 'Advanced filter'}
+          aria-label={hasFilters ? t('searchModal.inline.advancedFilterActiveAriaLabel', { count: activeRuleCount }) : t('searchModal.inline.advancedFilter')}
           aria-pressed={hasFilters}
-          title="Advanced filter (⌘⇧F)"
+          title={t('searchModal.inline.advancedFilterTitle')}
           onMouseDown={(e) => {
             e.preventDefault();
             openAdvancedFilter();
@@ -504,12 +508,7 @@ export function SearchInline() {
       {/* Vim cycle hint — shows below the input whenever a cycle is active
           and the popover is closed. Clicking it exits the cycle. */}
       {searchVimCycle && !showPopover && (
-        <VimCycleHint
-          query={searchVimCycle.query}
-          index={searchVimCycle.index}
-          total={searchVimCycle.results.length}
-          onExit={exitVimCycle}
-        />
+        <VimCycleHint query={searchVimCycle.query} index={searchVimCycle.index} total={searchVimCycle.results.length} onExit={exitVimCycle} />
       )}
       {showPopover && showRecents && (
         <RecentsPopover
@@ -527,6 +526,7 @@ export function SearchInline() {
       {showPopover && !showRecents && (
         <SearchPopover
           results={results}
+          query={searchQuery}
           highlightIndex={searchHighlightIndex}
           modelsCount={models.size}
           indexingCount={indexingCount}
@@ -551,6 +551,7 @@ interface VimCycleHintProps {
 }
 
 function VimCycleHint({ query, index, total, onExit }: VimCycleHintProps) {
+  const { t } = useTranslation();
   return (
     <div
       className="absolute left-0 right-0 top-full mt-1 flex items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 py-1.5 text-[11px] text-muted-foreground shadow-sm dark:border-zinc-800 dark:bg-zinc-950 z-40"
@@ -561,17 +562,17 @@ function VimCycleHint({ query, index, total, onExit }: VimCycleHintProps) {
         {index + 1} / {total}
       </span>
       <span className="truncate">
-        <span className="opacity-70">cycling </span>
+        <span className="opacity-70">{t('searchModal.inline.cyclingPrefix')}</span>
         <span className="font-mono">&quot;{query}&quot;</span>
-        <span className="opacity-70"> — press </span>
-        <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px] dark:border-zinc-700 dark:bg-zinc-900">n</kbd>
+        <span className="opacity-70">{t('searchModal.inline.cyclingPressHint')}</span>
+        <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px] dark:border-zinc-700 dark:bg-zinc-900">{t('searchModal.inline.cycleNextKey')}</kbd>
         <span className="opacity-70"> / </span>
-        <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px] dark:border-zinc-700 dark:bg-zinc-900">N</kbd>
+        <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px] dark:border-zinc-700 dark:bg-zinc-900">{t('searchModal.inline.cyclePrevKey')}</kbd>
       </span>
       <button
         type="button"
         className="ml-auto rounded p-0.5 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-        aria-label="Exit cycle"
+        aria-label={t('searchModal.inline.exitCycleAriaLabel')}
         onMouseDown={(e) => {
           e.preventDefault();
           onExit();
@@ -590,6 +591,7 @@ interface RecentsPopoverProps {
 }
 
 function RecentsPopover({ recents, onPick, onClear }: RecentsPopoverProps) {
+  const { t } = useTranslation();
   return (
     <div
       id="search-inline-popover"
@@ -599,7 +601,7 @@ function RecentsPopover({ recents, onPick, onClear }: RecentsPopoverProps) {
       <div className="flex items-center justify-between px-3 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
         <span className="flex items-center gap-1">
           <Clock className="h-3 w-3" />
-          Recent searches
+          {t('searchModal.inline.recentSearches')}
         </span>
         <button
           type="button"
@@ -609,7 +611,7 @@ function RecentsPopover({ recents, onPick, onClear }: RecentsPopoverProps) {
             onClear();
           }}
         >
-          Clear
+          {t('searchModal.inline.clearRecents')}
         </button>
       </div>
       {recents.map((q) => (
@@ -634,6 +636,7 @@ function RecentsPopover({ recents, onPick, onClear }: RecentsPopoverProps) {
 
 interface SearchPopoverProps {
   results: SearchResult[];
+  query: string;
   highlightIndex: number;
   modelsCount: number;
   indexingCount: number;
@@ -644,6 +647,7 @@ interface SearchPopoverProps {
 
 function SearchPopover({
   results,
+  query,
   highlightIndex,
   modelsCount,
   indexingCount,
@@ -651,6 +655,7 @@ function SearchPopover({
   onHover,
   onOpenAdvanced,
 }: SearchPopoverProps) {
+  const { t } = useTranslation();
   if (results.length === 0) {
     return (
       <div
@@ -659,8 +664,8 @@ function SearchPopover({
         className="absolute left-0 right-0 top-full mt-1 rounded-md border border-zinc-200 bg-white px-3 py-4 text-xs text-muted-foreground shadow-lg dark:border-zinc-800 dark:bg-zinc-950 z-50"
       >
         {indexingCount > 0
-          ? `Indexing ${indexingCount} model${indexingCount === 1 ? '' : 's'}… results appear as rows become searchable.`
-          : 'No results — try a name, IFC type, or full GlobalId.'}
+          ? t('searchModal.inline.indexingHint', { count: indexingCount })
+          : selectorYieldsRules(query) ? t('searchModal.inline.selectorSyntaxHint') : t('searchModal.inline.noResultsHint')}
       </div>
     );
   }
@@ -694,7 +699,7 @@ function SearchPopover({
             {r.typeName}
           </span>
           <span className="min-w-0 flex-1 truncate font-medium">
-            {r.name || <span className="italic text-muted-foreground">unnamed</span>}
+            {r.name || <span className="italic text-muted-foreground">{t('searchModal.inline.unnamed')}</span>}
           </span>
           {r.globalId && (
             <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
@@ -710,8 +715,8 @@ function SearchPopover({
       ))}
       <div className="flex items-center gap-2 border-t border-zinc-200 px-3 py-1 text-[10px] text-muted-foreground dark:border-zinc-800">
         <span>
-          {results.length} result{results.length === 1 ? '' : 's'} · ↑↓ · ↵ · ⇧↵ · Esc
-          {indexingCount > 0 && <span className="ml-2 opacity-80">· indexing {indexingCount}…</span>}
+          {t('searchModal.inline.resultCountHint', { count: results.length })}
+          {indexingCount > 0 && <span className="ml-2 opacity-80">{t('searchModal.inline.indexingCountHint', { count: indexingCount })}</span>}
         </span>
         <button
           type="button"
@@ -721,7 +726,7 @@ function SearchPopover({
             onOpenAdvanced();
           }}
         >
-          Advanced <kbd className="ml-0.5 rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[9px] dark:border-zinc-700 dark:bg-zinc-900">⌘↵</kbd>
+          {t('searchModal.inline.advanced')} <kbd className="ml-0.5 rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[9px] dark:border-zinc-700 dark:bg-zinc-900">⌘↵</kbd>
         </button>
       </div>
     </div>

@@ -5,7 +5,7 @@
 //! Void (opening) subtraction: 3D CSG, AABB clipping, and triangle-box intersection.
 
 use super::GeometryRouter;
-use crate::csg::ClippingProcessor;
+use crate::csg::{ClippingProcessor, GroupCut};
 use crate::mesh::{SubMesh, SubMeshCollection};
 use crate::{Mesh, Point3, Result, TessellationQuality, Vector3};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
@@ -15,22 +15,33 @@ use rustc_hash::FxHashMap;
 mod aabb_clip;
 mod bool2d_path;
 mod coaxial_union;
-mod geom;
+pub(crate) mod geom;
+mod malformed_opening_repair;
+mod local_frame;
 pub(crate) mod prism_cut;
 mod probe;
+mod representation;
+mod staged;
 mod synthesis;
-
 pub use bool2d_path::take_bool2d_stats;
 pub use prism_cut::{take_prism_defers, take_prism_stats};
 #[cfg(test)]
 mod reveal_tests;
 
 use geom::*;
-use sweep::{cut_changed_mesh, drop_faces_outside_host};
+use malformed_opening_repair::{
+    cutter_is_closed_manifold, opening_obb_if_malformed, recut_malformed_openings,
+    translate_cutter_mesh, world_host_bounds, OpeningBox,
+};
+use local_frame::vertical_depth_wall_frame;
+use sweep::{drop_faces_outside_host, mesh_to_keep};
 mod sweep;
 
 /// Epsilon for normalizing direction vectors (guards against zero-length).
 const NORMALIZE_EPSILON: f64 = 1e-12;
+/// |cos| above which an authored cutter depth counts as the wall normal itself
+/// (matches the vertical selector's 0.98 axis tolerance in `local_frame.rs`).
+const WALL_NORMAL_DEPTH_COS: f64 = 0.98;
 /// Minimum opening volume (m³) below which CSG is skipped (degenerate-void filter).
 /// 0.0001 m³ ≈ 0.1 litre — filters artefacts while allowing small real openings (e.g. sleeves).
 const MIN_OPENING_VOLUME: f64 = 0.0001;
@@ -40,6 +51,11 @@ const MIN_OPENING_VOLUME: f64 = 0.0001;
 const CSG_TRIANGLE_RETENTION_DIVISOR: usize = 4;
 /// Minimum triangle count for a valid CSG result.
 const MIN_VALID_TRIANGLES: usize = 4;
+/// A mixed 2D + residual composition may inherit a small number of imperfect
+/// IFC seams, but a large absolute increase signals that the second route tore
+/// the re-extruded host. Below this floor the relative comparison still rules.
+const MIXED_ROUTE_DEFECT_FLOOR: usize = 64;
+const MIXED_ROUTE_DEFECT_GROWTH: usize = 4;
 /// Maximum wrapper depth when drilling through mapped/boolean items to find an extrusion.
 const MAX_EXTRUSION_EXTRACT_DEPTH: usize = 32;
 /// Per-axis AABB engulf slack shared by the batched, host-consumed, and
@@ -72,6 +88,7 @@ struct OpeningFrame {
     depth: Vector3<f64>,
     cross_a: Vector3<f64>,
     cross_b: Vector3<f64>,
+    depth_is_authored: bool,
 }
 
 impl OpeningFrame {
@@ -88,6 +105,7 @@ impl OpeningFrame {
             depth,
             cross_a,
             cross_b,
+            depth_is_authored: true,
         })
     }
 
@@ -128,6 +146,16 @@ pub(super) struct VoidContext {
 impl VoidContext {
     fn is_noop(&self) -> bool {
         self.openings.is_empty()
+    }
+
+    /// Rectangular openings in the merged set: what every cut path records as
+    /// `HostOpeningDiagnostic::rect_boxes_processed`, so the silent-no-op
+    /// detector reads one quantity whichever path cut the host.
+    fn rect_opening_count(&self) -> usize {
+        self.merged_openings
+            .iter()
+            .filter(|o| matches!(o, OpeningType::Rectangular(..)))
+            .count()
     }
 
     /// True iff every cutter mesh is already in world coords (`origin == 0`). When
@@ -184,331 +212,17 @@ impl VoidContext {
     }
 }
 
-/// An oriented box: world centre, orthonormal axes, half-extents along each.
-struct OpeningBox {
-    center: Vector3<f64>,
-    axes: [Vector3<f64>; 3],
-    half: [f64; 3],
-}
-
-impl OpeningBox {
-    /// The thinnest axis — the through-wall / penetration direction.
-    fn thin_axis(&self) -> usize {
-        (0..3)
-            .min_by(|&i, &j| self.half[i].partial_cmp(&self.half[j]).unwrap())
-            .unwrap()
-    }
-
-    /// A watertight box mesh for the real opening, EXTENDED by `extend` along the
-    /// thin (through-wall) axis so it fully penetrates the host, with positions
-    /// in the frame whose origin is `origin` (i.e. world − origin). Subtracting
-    /// this from the host carves a clean through-opening — see
-    /// [`recut_malformed_openings`].
-    fn extended_box_mesh(&self, origin: [f64; 3], extend: f64) -> Mesh {
-        let thin = self.thin_axis();
-        let mut half = self.half;
-        half[thin] += extend;
-        let corner = |sx: f64, sy: f64, sz: f64| -> Point3<f64> {
-            let w = self.center
-                + self.axes[0] * (sx * half[0])
-                + self.axes[1] * (sy * half[1])
-                + self.axes[2] * (sz * half[2]);
-            Point3::new(w.x - origin[0], w.y - origin[1], w.z - origin[2])
-        };
-        // `make_obb_mesh`'s canonical corner order (bit k -> axis k sign).
-        let c = [
-            corner(-1.0, -1.0, -1.0),
-            corner(1.0, -1.0, -1.0),
-            corner(1.0, 1.0, -1.0),
-            corner(-1.0, 1.0, -1.0),
-            corner(-1.0, -1.0, 1.0),
-            corner(1.0, -1.0, 1.0),
-            corner(1.0, 1.0, 1.0),
-            corner(-1.0, 1.0, 1.0),
-        ];
-        make_obb_mesh(&c)
-    }
-}
-
-/// Build a watertight box mesh from 8 corners in the canonical order (bit k ->
-/// axis k sign). Face winding mirrors `GeometryRouter::make_box_mesh`; normals
-/// are derived from the (oriented) geometry rather than hardcoded axes.
-fn make_obb_mesh(corners: &[Point3<f64>; 8]) -> Mesh {
-    let faces: [[usize; 4]; 6] = [
-        [0, 3, 2, 1],
-        [4, 5, 6, 7],
-        [0, 1, 5, 4],
-        [2, 3, 7, 6],
-        [0, 4, 7, 3],
-        [1, 2, 6, 5],
-    ];
-    let mut m = Mesh::with_capacity(24, 36);
-    for idx in &faces {
-        let a = corners[idx[0]];
-        let b = corners[idx[1]];
-        let cc = corners[idx[2]];
-        let nrm = (b - a)
-            .cross(&(cc - a))
-            .try_normalize(1.0e-12)
-            .unwrap_or_else(|| Vector3::new(0.0, 0.0, 1.0));
-        let base = m.vertex_count() as u32;
-        m.add_vertex(corners[idx[0]], nrm);
-        m.add_vertex(corners[idx[1]], nrm);
-        m.add_vertex(corners[idx[2]], nrm);
-        m.add_vertex(corners[idx[3]], nrm);
-        m.add_triangle(base, base + 1, base + 2);
-        m.add_triangle(base, base + 2, base + 3);
-    }
-    m
-}
-
-/// True if `m` welds (by position) to a CLOSED 2-manifold: every edge is shared
-/// by exactly two triangles — the topological signature of a valid solid. A
-/// clean opening box AND a watertight roof/gable prism (a tall cutter reaching
-/// hundreds of metres up to clip a wall to the roofline) both pass; only a
-/// self-intersecting / fin-laden GARBAGE cutter (the #1007 family) leaves
-/// boundary or non-manifold edges and fails. Conservative: a cutter with too
-/// few faces to bound a solid (e.g. a stray point cloud) is NOT closed, so it
-/// stays eligible for the malformed-cutter repair.
-fn cutter_is_closed_manifold(m: &Mesh) -> bool {
-    // A closed solid needs >= 4 triangles (a tetrahedron).
-    if m.indices.len() < 12 {
-        return false;
-    }
-    // Weld duplicated per-face vertices back together so shared edges are
-    // detectable; 10 µm is far below any real opening feature.
-    let w = m.welded_by_position(1.0e-5);
-    if w.indices.len() < 12 {
-        return false;
-    }
-    let mut edge_uses: FxHashMap<(u32, u32), u32> = FxHashMap::default();
-    for t in w.indices.chunks_exact(3) {
-        if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
-            return false; // a degenerate triangle survived welding
-        }
-        for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-            let key = if a < b { (a, b) } else { (b, a) };
-            *edge_uses.entry(key).or_insert(0) += 1;
-        }
-    }
-    edge_uses.values().all(|&c| c == 2)
-}
-
-/// Compute the clean oriented box of a cutter's REAL opening iff the cutter is
-/// MALFORMED (a far-flung garbage-vertex cluster). `None` for a well-formed
-/// cutter — clean hosts are never reshaped.
-///
-/// The real opening is a TIGHT vertex cluster; garbage "fins" sit far away (and
-/// a fin running ALONG a long wall stays inside the host AABB, so we cluster
-/// INTRINSICALLY, not by host containment). Robust per-axis median centre
-/// (garbage is a minority, so the median lands in the real box), sort vertices
-/// by distance, cut at the largest RATIO gap in the upper half. No clear gap ->
-/// not malformed -> `None`. Principal axes via covariance eigendecomposition
-/// (for a box the eigenvectors align with the edges).
-fn opening_obb_if_malformed(m: &Mesh) -> Option<OpeningBox> {
-    // A cutter that welds to a closed solid is well-formed by construction — its
-    // far vertices are STRUCTURAL (a watertight roof prism, not stray garbage),
-    // so the far-cluster heuristic below must never reshape it. This is what
-    // separates a legitimate gable/roof cut (whose top can sit ~900 m up) from
-    // the self-intersecting tessellated voids the repair targets.
-    if cutter_is_closed_manifold(m) {
-        return None;
-    }
-    let all: Vec<Vector3<f64>> = m
-        .positions
-        .chunks_exact(3)
-        .map(|p| {
-            Vector3::new(
-                p[0] as f64 + m.origin[0],
-                p[1] as f64 + m.origin[1],
-                p[2] as f64 + m.origin[2],
-            )
-        })
-        .collect();
-    if all.len() < 8 {
-        return None;
-    }
-    // Bail on any non-finite vertex so the partial_cmp sorts below cannot panic;
-    // a garbage cutter is not worth reshaping (file filters non-finite elsewhere).
-    if all.iter().any(|v| v.iter().any(|c| !c.is_finite())) {
-        return None;
-    }
-    let median_axis = |axis: usize| -> f64 {
-        let mut vals: Vec<f64> = all.iter().map(|v| v[axis]).collect();
-        vals.sort_by(f64::total_cmp);
-        vals[vals.len() / 2]
-    };
-    let med = Vector3::new(median_axis(0), median_axis(1), median_axis(2));
-    let mut dist: Vec<(f64, usize)> = all
-        .iter()
-        .enumerate()
-        .map(|(i, v)| ((v - med).norm(), i))
-        .collect();
-    dist.sort_by(|a, b| a.0.total_cmp(&b.0));
-    // The garbage "fins" of these broken cutters sit METRES from the opening
-    // (≈9 m here), far beyond any legitimate opening vertex (even a big garage
-    // door is ≲3 m). Detect malformity ONLY by an ABSOLUTE far cluster — a
-    // vertex `FAR_M` beyond the near cluster AND past a big jump. A clean opening
-    // (every vertex within its own footprint, distances uniformly close) never
-    // trips this, so it is never reshaped. Anything tighter risks over-cutting a
-    // well-formed opening, which is far worse than leaving a rare flap.
-    const FAR_M: f64 = 4.0;
-    let near_radius = dist[dist.len() / 2].0; // 50th-percentile distance
-    let mut split_at = dist.len();
-    let mut found = false;
-    for i in (dist.len() / 2)..(dist.len() - 1) {
-        let gap = dist[i + 1].0 - dist[i].0;
-        // a clear gap that lands the far points beyond FAR_M and >3x the near
-        // cluster — the bimodal near-opening / far-garbage signature.
-        if dist[i + 1].0 > FAR_M
-            && dist[i + 1].0 > 3.0 * near_radius.max(1.0e-3)
-            && gap > dist[i].0
-        {
-            split_at = i + 1;
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        return None;
-    }
-    let inliers: Vec<Vector3<f64>> = dist[..split_at].iter().map(|(_, i)| all[*i]).collect();
-    if inliers.len() < 8 {
-        return None;
-    }
-    let n = inliers.len() as f64;
-    let mut c = Vector3::zeros();
-    for v in &inliers {
-        c += v;
-    }
-    c /= n;
-    let mut cov = Matrix3::zeros();
-    for v in &inliers {
-        let d = v - c;
-        cov += d * d.transpose();
-    }
-    cov /= n;
-    let eig = cov.symmetric_eigen();
-    let a0 = eig.eigenvectors.column(0).into_owned().try_normalize(1.0e-9)?;
-    let a1 = eig.eigenvectors.column(1).into_owned().try_normalize(1.0e-9)?;
-    let a2 = a0.cross(&a1).try_normalize(1.0e-9)?;
-    let axes = [a0, a1, a2];
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    for v in &inliers {
-        for k in 0..3 {
-            let t = v.dot(&axes[k]);
-            lo[k] = lo[k].min(t);
-            hi[k] = hi[k].max(t);
-        }
-    }
-    let half = [
-        (hi[0] - lo[0]) * 0.5,
-        (hi[1] - lo[1]) * 0.5,
-        (hi[2] - lo[2]) * 0.5,
-    ];
-    if half.iter().any(|&h| h < 1.0e-3) {
-        return None;
-    }
-    let mid = [
-        (hi[0] + lo[0]) * 0.5,
-        (hi[1] + lo[1]) * 0.5,
-        (hi[2] + lo[2]) * 0.5,
-    ];
-    let center = axes[0] * mid[0] + axes[1] * mid[1] + axes[2] * mid[2];
-    Some(OpeningBox { center, axes, half })
-}
-
-/// Repair the kernel's UNDER-cut of malformed (self-intersecting) void cutters —
-/// the #1007 "flap" where a wall triangle bridges the opening — by RE-CUTTING
-/// each malformed opening with a clean box.
-///
-/// The self-intersecting cutter leaves the host's original large wall-face
-/// triangles spanning the opening (and extending out to the wall edges). The
-/// correct repair is to subtract a clean box of the real opening: the exact
-/// kernel removes only the opening prism — taking the flap with it — while
-/// splitting and re-triangulating the wall AROUND the hole and forming the
-/// reveal faces. (A plain triangle drop would also delete the legitimate wall
-/// above/below the opening, since those large triangles merely overlap it.)
-///
-/// World-framed boxes are folded into the result's frame. `subtract_mesh`'s
-/// budget guard returns the host un-cut on any failure, so a hard case degrades
-/// to "flap remains", never an over-cut. A no-op when `boxes` is empty (every
-/// cutter well-formed) — clean hosts are untouched.
-fn recut_malformed_openings(result: &mut Mesh, boxes: &[OpeningBox]) {
-    if boxes.is_empty() || result.indices.is_empty() {
-        return;
-    }
-    let clipper = ClippingProcessor::new();
-    for bx in boxes {
-        // Extend 2 m past the opening along the thin axis so the box fully
-        // penetrates any normal wall (the subtract only removes box ∩ host).
-        let box_mesh = bx.extended_box_mesh(result.origin, 2.0);
-        if let Ok(cut) = clipper.subtract_mesh(result, &box_mesh) {
-            // A clean box can only remove the opening prism, so it never empties
-            // a real wall; ignore a degenerate empty result defensively.
-            if !cut.is_empty() {
-                let origin = result.origin;
-                *result = cut;
-                result.origin = origin;
-            }
-        }
-    }
-}
-
-/// Express a cutter mesh in the host's local frame: `result = position +
-/// mesh.origin - host_origin`, folded in f64 before the f32 store, with the
-/// result origin zeroed (the mesh now lives in the shared host frame).
-///
-/// Honouring the cutter's OWN `origin` keeps a per-element local-frame opening
-/// (the wasm default: small positions relative to the opening's AABB centre)
-/// PRECISE — it is never first rounded to absolute world f32 and then brought
-/// back near the host, so detail openings far from the global origin can't
-/// collapse on the coarse world grid (#1310 review). A world-framed cutter
-/// (`origin == 0` — the native and ≤100-vertex default) reduces to the plain
-/// `position - host_origin` and stays byte-identical.
-/// World-space AABB of a host mesh: its local `bounds()` with `mesh.origin`
-/// folded back in (world = origin + position). Folded in f64 so a
-/// georeferenced host (large origin) keeps as much precision as the f32
-/// diagnostic surface allows, rather than reporting near-zero local coords.
-fn world_host_bounds(mesh: &Mesh) -> ((f32, f32, f32), (f32, f32, f32)) {
-    let o = mesh.origin;
-    let (mn, mx) = mesh.bounds();
-    (
-        (
-            (mn.x as f64 + o[0]) as f32,
-            (mn.y as f64 + o[1]) as f32,
-            (mn.z as f64 + o[2]) as f32,
-        ),
-        (
-            (mx.x as f64 + o[0]) as f32,
-            (mx.y as f64 + o[1]) as f32,
-            (mx.z as f64 + o[2]) as f32,
-        ),
-    )
-}
-
-fn translate_cutter_mesh(mesh: &Mesh, host_origin: [f64; 3]) -> Mesh {
-    let o = mesh.origin;
-    let mut positions = Vec::with_capacity(mesh.positions.len());
-    for c in mesh.positions.chunks_exact(3) {
-        positions.push((c[0] as f64 + o[0] - host_origin[0]) as f32);
-        positions.push((c[1] as f64 + o[1] - host_origin[1]) as f32);
-        positions.push((c[2] as f64 + o[2] - host_origin[2]) as f32);
-    }
-    Mesh {
-        positions,
-        normals: mesh.normals.clone(),
-        indices: mesh.indices.clone(),
-        rtc_applied: mesh.rtc_applied,
-        origin: [0.0; 3],
-        instance_meta: None,
-        local_bounds: None,
-        local_to_world: None,
-    }
-}
-
 impl OpeningType {
+    /// The cutter mesh and its extrusion direction, for the two mesh-carrying
+    /// kinds; `None` for `Rectangular`, which has no mesh until synthesised.
+    fn mesh_cutter(&self) -> Option<(&Mesh, Option<Vector3<f64>>)> {
+        match self {
+            OpeningType::Rectangular(..) => None,
+            OpeningType::DiagonalRectangular(m, f) => Some((m, Some(f.depth))),
+            OpeningType::NonRectangular(m, _, _, d) => Some((m, *d)),
+        }
+    }
+
     /// Return a copy translated by `-origin` (world → host-local frame). Bounds
     /// (`Point3`) shift; direction vectors and the oriented `OpeningFrame` are
     /// translation-invariant and pass through unchanged.
@@ -563,6 +277,26 @@ impl GeometryRouter {
         }
     }
 
+    /// A batch-group cutter: the opening extended through `host`, welded (1 µm)
+    /// to bit-identical, and kept only if it is then exactly closed (#2176: only
+    /// per-component-watertight solids may join a group). The weld lets a
+    /// geometrically-watertight cutter whose shared-edge f32 coords differ in
+    /// bits after the placement transform pass the bit-exact gate (#098).
+    /// Admission and the re-extension after a host cut both call this, so a
+    /// cutter admitted because of the weld is not refused at cut time.
+    fn batch_cutter(
+        opening_mesh: &Mesh,
+        extrusion_dir: Option<Vector3<f64>>,
+        host: &Mesh,
+    ) -> Option<Mesh> {
+        let depth_dir = extrusion_dir
+            .filter(|d| d.norm() > NORMALIZE_EPSILON)
+            .unwrap_or_else(|| opening_mesh_thinnest_axis_dir(opening_mesh));
+        let ext = Self::extend_opening_mesh_through_host(opening_mesh, host, depth_dir)
+            .welded_by_position(1.0e-6);
+        mesh_is_closed_exact(&ext).then_some(ext)
+    }
+
     /// Process element with void subtraction (openings)
     /// Process element with voids using optimized plane clipping
     ///
@@ -602,12 +336,7 @@ impl GeometryRouter {
             }
         };
 
-        let wall_mesh = match self.process_element(element, decoder) {
-            Ok(m) => m,
-            Err(_) => {
-                return self.process_element(element, decoder);
-            }
-        };
+        let wall_mesh = self.process_element(element, decoder)?;
 
         let mut voided = self.apply_voids_to_mesh(wall_mesh, element, opening_ids, decoder);
         // Clean slivers the CSG cut can introduce at opening seams — same
@@ -932,16 +661,8 @@ impl GeometryRouter {
         // reconciles against the real host mesh, whatever `mesh.origin`). Any miss
         // falls through to the exact kernel below unchanged.
         if let Some(cut) = ctx.bool2d.as_ref() {
-            if let Some(holed) = self.try_bool2d_cut(&mesh, cut) {
-                // Eligible openings are now subtracted. Any residual (ineligible)
-                // openings — perpendicular sleeves, partial-depth recesses — are
-                // cut by the exact kernel on the re-extruded host (origin 0, world
-                // frame; residual cutters are world-framed), so a single
-                // ineligible opening no longer forfeits its host's cheap ones.
-                return match self.bool2d_residual(cut) {
-                    None => holed,
-                    Some(residual) => self.apply_void_context(holed, residual, element_id),
-                };
+            if let Some(candidate) = self.try_staged_bool2d(&mesh, cut, element_id) {
+                return candidate;
             }
         }
 
@@ -964,10 +685,6 @@ impl GeometryRouter {
             let prism_bounds = world_host_bounds(&mesh);
             let prism_tris_before = mesh.triangle_count();
             if let Some((cut, residual)) = self.try_prism_cut(&mesh, ctx) {
-                // Two host faces sharing an edge compute the same new crossing
-                // point through different arithmetic; unify them at ulp scale so
-                // the split face's halves share their seam.
-                let cut = prism_cut::dedup_cut_vertices(&cut, &mesh);
                 return match residual {
                     None => {
                         // Same per-host cut-effect snapshot the exact path
@@ -977,7 +694,7 @@ impl GeometryRouter {
                             element_id,
                             prism_tris_before,
                             cut.triangle_count(),
-                            ctx.merged_openings.len(),
+                            ctx.rect_opening_count(),
                             prism_bounds,
                         );
                         cut
@@ -1004,7 +721,7 @@ impl GeometryRouter {
         let origin = mesh.origin;
         if origin == [0.0, 0.0, 0.0] && ctx.all_cutters_world_framed() {
             // Legacy/world frame on host AND cutters: no relativization needed.
-            return self.apply_void_context_inner(mesh, ctx, element_id, host_world_bounds);
+            return self.apply_void_context_inner(mesh, ctx, element_id, host_world_bounds, true);
         }
         // Work entirely in the host's local frame (origin 0 on every operand).
         // `relativized_by` folds each cutter's OWN origin and subtracts the host
@@ -1014,8 +731,9 @@ impl GeometryRouter {
         mesh.origin = [0.0, 0.0, 0.0];
         let local_ctx = ctx.relativized_by(origin);
         let mut result =
-            self.apply_void_context_inner(mesh, &local_ctx, element_id, host_world_bounds);
-        result.origin = origin;
+            self.apply_void_context_inner(mesh, &local_ctx, element_id, host_world_bounds, true);
+        // Keep an inner local-frame cut's translation when restoring this frame.
+        result.origin = std::array::from_fn(|i| result.origin[i] + origin[i]);
         result
     }
 
@@ -1066,10 +784,8 @@ impl GeometryRouter {
     /// straight wall enjoys — clean-box openings even reclassify to the
     /// watertight `rect_fast` path. Curved / brep openings keep their mesh and
     /// are subtracted there too. The result is rotated back; the orthonormal,
-    /// origin-centred round-trip is identity for untouched geometry. Recursing
-    /// into [`Self::apply_void_context_inner`] is safe: in the frame every
-    /// opening's depth is +Z (axis-aligned), so this guard returns `None` on the
-    /// inner call.
+    /// origin-centred round-trip is identity for untouched geometry. Recurses
+    /// into [`Self::apply_void_context_inner`] with `allow_local_frame: false` (#3641).
     fn try_cut_wall_local_frame(
         &self,
         mesh: &Mesh,
@@ -1090,23 +806,22 @@ impl GeometryRouter {
         // Define the wall frame from the first opening whose depth is a
         // genuinely rotated, ~horizontal axis. Axis-aligned walls find none and
         // keep their (unchanged) world path.
-        let axes = ctx
+        let horizontal_axes = ctx
             .merged_openings
             .iter()
             .filter_map(depth_of)
             .find(|d| !is_axis_aligned_direction(d) && d.z.abs() <= 0.2)
-            .and_then(wall_frame_from_depth)?;
+            .and_then(wall_frame_from_depth);
+        let axes = match horizontal_axes {
+            Some(axes) => axes,
+            None => vertical_depth_wall_frame(mesh, &ctx.merged_openings)?,
+        };
 
         // AABB-only `Rectangular` openings can't be rotated into the frame; a
         // plan-rotated wall never has them (they'd be diagonal), so bail.
-        if ctx
-            .merged_openings
-            .iter()
-            .any(|op| matches!(op, OpeningType::Rectangular(..)))
-        {
+        if ctx.merged_openings.iter().any(|op| matches!(op, OpeningType::Rectangular(..))) {
             return None;
         }
-
         let (mn, mx) = mesh.bounds();
         let center = Vector3::new(
             ((mn.x + mx.x) * 0.5) as f64,
@@ -1154,7 +869,25 @@ impl GeometryRouter {
                 _ => false,
             };
             if frame_aligned {
-                local_openings.push(OpeningType::Rectangular(lmn, lmx, Some(z)));
+                // Preserve THIS cutter's authored penetration axis. The new
+                // #3977 selector also admits vertically extruded strips, whose
+                // local depth is +Y rather than the wall normal (+Z). Extending
+                // those along +Z would turn a partial-thickness vertical slot
+                // into a full-through cut. An inferred box axis carries no such
+                // intent and must retain the established wall-normal fallback.
+                // A cutter authored along the wall normal itself keeps +Z too:
+                // handing the rectangular cut an antiparallel (-Z) depth flips
+                // its cap extension and tears the host (rvt01 #10191 census).
+                let rect_depth = match op {
+                    OpeningType::DiagonalRectangular(_, frame)
+                        if frame.depth_is_authored
+                            && frame_depth.is_some_and(|d| d.z.abs() < WALL_NORMAL_DEPTH_COS) =>
+                    {
+                        frame_depth
+                    }
+                    _ => Some(z),
+                };
+                local_openings.push(OpeningType::Rectangular(lmn, lmx, rect_depth));
             } else {
                 let mesh_local = mesh_to_frame(cutter, &axes, center);
                 // Keep this cutter's true depth in the frame; fall back to the
@@ -1176,20 +909,23 @@ impl GeometryRouter {
 
         // Forward the WORLD host bounds captured before this rotation so the
         // diagnostic reports world coords, not wall-frame (rotated/centred) ones.
-        let result_local =
-            self.apply_void_context_inner(host_local, &local_ctx, element_id, host_world_bounds);
-        Some(mesh_from_frame(&result_local, &axes, center))
+        let result_local = self
+            .apply_void_context_inner(host_local, &local_ctx, element_id, host_world_bounds, false);
+        let frame = Matrix3::from_columns(&axes);
+        // Rotation-only positions retain the far centre in `Mesh::origin`.
+        Some(rotate_mesh_from_frame(&result_local, &frame, &Point3::from(center)))
     }
 
-    // `host_mutated` is set just before an early `break`, so the final write is
-    // intentionally never read back; keep the flag for readability of the branch.
-    #[allow(unused_assignments)]
+    // `host_mutated` is set just before an early `break` (final write unread; kept
+    // for readability). `allow_local_frame` (#3641) caps local-frame recursion.
+    #[allow(unused_assignments, clippy::too_many_arguments)]
     fn apply_void_context_inner(
         &self,
         mesh: Mesh,
         ctx: &VoidContext,
         element_id: u32,
         host_bounds_capture: ((f32, f32, f32), (f32, f32, f32)),
+        allow_local_frame: bool,
     ) -> Mesh {
         // Capture the input triangle count so the per-host diagnostic can flag
         // the "cuts attempted but produced no change" case — the silent-no-op
@@ -1208,10 +944,11 @@ impl GeometryRouter {
         // subtract is clean and f32-precise — then the result is rotated back.
         // The world-space tilted cut at large coordinates over-cuts and
         // fragments badly. Scoped to plan-rotated walls; everything else falls
-        // through to the world path unchanged.
-        if let Some(cut) = self.try_cut_wall_local_frame(&mesh, ctx, element_id, host_bounds_capture)
-        {
-            return cut;
+        // through to the world path unchanged. Gated on `allow_local_frame`.
+        if allow_local_frame {
+            if let Some(cut) = self.try_cut_wall_local_frame(&mesh, ctx, element_id, host_bounds_capture) {
+                return cut;
+            }
         }
 
         let clipper = ClippingProcessor::new();
@@ -1226,7 +963,11 @@ impl GeometryRouter {
         // real roof pitch) to a single least-squares plane makes the slope
         // EXACTLY coplanar, so the cut emits one CDT-refined region (rim sliver
         // gone) with a clean opening hole. Deterministic + watertight + grid-
-        // snapped; a no-op for already-planar extrusion hosts.
+        // snapped; a no-op for already-planar extrusion hosts. The ordinary
+        // router has already removed sub-grid SOURCE triangles before placement;
+        // this whole-position-buffer weld does not replace that hygiene step or
+        // promise clean output. Fresh cut candidates require path-specific
+        // downstream handling (#4797).
         let mut result = crate::facet_weld::weld_near_coplanar_facets(&mesh);
 
         // ANALYTIC FAST PATH: an axis-aligned box host whose openings are ALL
@@ -1245,7 +986,7 @@ impl GeometryRouter {
                     element_id,
                     tris_before,
                     fast.triangle_count(),
-                    ctx.merged_openings.len(),
+                    ctx.rect_opening_count(),
                     host_bounds_capture,
                 );
                 return fast;
@@ -1436,12 +1177,7 @@ impl GeometryRouter {
                 if batch_consumed[idx] {
                     continue;
                 }
-                let norm: Option<(&Mesh, Option<Vector3<f64>>)> = match **opening {
-                    OpeningType::Rectangular(..) => None,
-                    OpeningType::DiagonalRectangular(ref m, ref f) => Some((m, Some(f.depth))),
-                    OpeningType::NonRectangular(ref m, _, _, ref d) => Some((m, *d)),
-                };
-                let Some((opening_mesh, extrusion_dir)) = norm else { continue };
+                let Some((opening_mesh, extrusion_dir)) = opening.mesh_cutter() else { continue };
                 // Same admission guards as the sequential loop.
                 let opening_valid = !opening_mesh.is_empty()
                     && opening_mesh.positions.iter().all(|&v| v.is_finite())
@@ -1466,19 +1202,9 @@ impl GeometryRouter {
                 if open_vol < Self::min_opening_volume(self.tessellation_quality) {
                     continue;
                 }
-                let depth_dir = extrusion_dir
-                    .filter(|d| d.norm() > NORMALIZE_EPSILON)
-                    .unwrap_or_else(|| opening_mesh_thinnest_axis_dir(opening_mesh));
-                // Weld (1 µm) to bit-identical so a geometrically-watertight cutter
-                // whose shared-edge f32 coords differ in bits after the placement
-                // transform still passes the bit-exact closure gate below and can
-                // join a batch instead of re-jittering through sequential cuts (#098).
-                let ext = Self::extend_opening_mesh_through_host(opening_mesh, &result, depth_dir)
-                    .welded_by_position(1.0e-6);
-                // #2176: only per-component-watertight solids may join a group.
-                if !mesh_is_closed_exact(&ext) {
+                let Some(ext) = Self::batch_cutter(opening_mesh, extrusion_dir, &result) else {
                     continue;
-                }
+                };
                 let (lo, hi) = ext.bounds();
                 // Engulf-class exclusion: a cutter whose extended AABB covers
                 // the whole host on EVERY axis (3% slack, the sequential
@@ -1571,48 +1297,28 @@ impl GeometryRouter {
                         extended = members;
                     } else {
                         for &(m_idx, _) in &members {
-                            let norm: Option<(&Mesh, Option<Vector3<f64>>)> =
-                                match *all_openings[m_idx] {
-                                    OpeningType::Rectangular(..) => None,
-                                    OpeningType::DiagonalRectangular(ref m, ref f) => {
-                                        Some((m, Some(f.depth)))
-                                    }
-                                    OpeningType::NonRectangular(ref m, _, _, ref d) => {
-                                        Some((m, *d))
-                                    }
-                                };
-                            let Some((opening_mesh, extrusion_dir)) = norm else {
+                            let ext = all_openings[m_idx]
+                                .mesh_cutter()
+                                .and_then(|(m, dir)| Self::batch_cutter(m, dir, &result));
+                            let Some(ext) = ext else {
                                 admissible = false;
                                 break;
                             };
-                            let depth_dir = extrusion_dir
-                                .filter(|d| d.norm() > NORMALIZE_EPSILON)
-                                .unwrap_or_else(|| opening_mesh_thinnest_axis_dir(opening_mesh));
-                            let ext = Self::extend_opening_mesh_through_host(
-                                opening_mesh,
-                                &result,
-                                depth_dir,
-                            );
-                            // the re-extended cutter must stay watertight (#2176)
-                            if !mesh_is_closed_exact(&ext) {
-                                admissible = false;
-                                break;
-                            }
                             extended.push((m_idx, ext));
                         }
                     }
                     if admissible {
                         let cutters: Vec<&Mesh> = extended.iter().map(|(_, m)| m).collect();
                         let tri_before = result.triangle_count();
-                        let vol_before = mesh_signed_volume(&result);
-                        if let Ok(csg_result) = clipper.subtract_mesh_many(&result, &cutters) {
+                        // `Cut` already says the kernel removed host volume; a
+                        // `Rejected` group (any `GroupReject`) leaves every member
+                        // to the sequential loop below.
+                        if let GroupCut::Cut(csg_result) =
+                            clipper.subtract_mesh_many(&result, &cutters)
+                        {
                             let min_tris = (tri_before / CSG_TRIANGLE_RETENTION_DIVISOR)
                                 .max(MIN_VALID_TRIANGLES);
-                            let changed = cut_changed_mesh(&csg_result, tri_before, vol_before);
-                            if !csg_result.is_empty()
-                                && csg_result.triangle_count() >= min_tris
-                                && changed
-                            {
+                            if !csg_result.is_empty() && csg_result.triangle_count() >= min_tris {
                                 result = csg_result;
                                 host_mutated = true;
                                 for &(m_idx, _) in &extended {
@@ -1726,10 +1432,6 @@ impl GeometryRouter {
                     let tri_before = result.triangle_count();
                     let failures_before = clipper.failure_count();
                     let mut csg_succeeded = false;
-                    // Tracks whether CSG returned the host *unchanged* (the kernel
-                    // either found no real intersection, or errored on a grazing/
-                    // coplanar cutter and returned the un-cut host).
-                    let mut csg_unchanged = false;
                     // PENETRATING CUTTER (PART A): push the opening's caps a hair
                     // PAST the host along its depth axis so a flush cap becomes a
                     // clean transversal crossing — the exact kernel then cuts the
@@ -1746,16 +1448,14 @@ impl GeometryRouter {
                         depth_dir,
                     );
                     let cutter = &extended_opening;
-                    let vol_before = mesh_signed_volume(&result);
-                    if let Ok(csg_result) = clipper.subtract_mesh(&result, cutter) {
+                    let kept = mesh_to_keep(clipper.subtract_mesh(&result, cutter), &result);
+                    // The host is still un-cut: the kernel found no real
+                    // intersection, or bailed on a grazing/coplanar cutter.
+                    let csg_unchanged = kept.is_none();
+                    if let Some(csg_result) = kept {
                         let min_tris = (tri_before / CSG_TRIANGLE_RETENTION_DIVISOR)
                             .max(MIN_VALID_TRIANGLES);
-                        let changed = cut_changed_mesh(&csg_result, tri_before, vol_before);
-                        csg_unchanged = !changed;
-                        if !csg_result.is_empty()
-                            && csg_result.triangle_count() >= min_tris
-                            && changed
-                        {
+                        if !csg_result.is_empty() && csg_result.triangle_count() >= min_tris {
                             result = csg_result;
                             host_mutated = true;
                             csg_succeeded = true;
@@ -1937,6 +1637,9 @@ impl GeometryRouter {
         // ⇒ cut volume is preserved exactly. A no-op on clean cuts (no triangle
         // exceeds 8:1), so it does not perturb the frozen corpus. Only runs when
         // a cut was actually attempted (`!ctx.is_noop()` guarantees this path).
+        // This canonicalizer is likewise not a hygiene boundary: fresh sub-grid
+        // candidates require handling by the remaining repair/clip/sweep path,
+        // independently of the router's earlier source cleanup (#4797).
         let mut result = crate::facet_weld::refine_high_aspect_slivers(&result);
 
         // UNDER-CUT REPAIR: a self-intersecting tessellated cutter (garbage
@@ -1978,7 +1681,7 @@ impl GeometryRouter {
             element_id,
             tris_before,
             result.triangle_count(),
-            synth_rect.len(),
+            ctx.rect_opening_count(),
             host_bounds_capture,
         );
 
@@ -2031,7 +1734,15 @@ impl GeometryRouter {
         // path targets (multi-layer walls with windows).
         let ctx = self.build_void_context(element, &opening_ids, decoder);
 
-        let mut voided = SubMeshCollection::new();
+        // INHERIT the discriminator rather than assuming rep-item ids. This path
+        // is reached only when `try_layered_sub_meshes` declined above, so the
+        // flag is false today -- but hard-coding that would make a future
+        // layered producer silently relabel material ids as representation
+        // items, which is the exact confusion #3199 removes.
+        let mut voided = SubMeshCollection {
+            sub_meshes: Vec::new(),
+            ids_are_materials: sub_meshes.ids_are_materials,
+        };
         for sub in sub_meshes.sub_meshes {
             let geometry_id = sub.geometry_id;
             let mut voided_mesh = self.apply_void_context(sub.mesh, &ctx, element.id);
@@ -2050,3 +1761,9 @@ impl GeometryRouter {
 
 #[cfg(test)]
 mod flap_clip_tests;
+#[cfg(test)]
+mod batch_cutter_tests;
+#[cfg(test)]
+mod cut_effect_count_tests;
+#[cfg(test)]
+mod single_cut_outcome_tests;

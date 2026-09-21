@@ -10,13 +10,14 @@
  * cut distance, click commits via `MutationSlice.splitWallAtDistance`.
  *
  * Bigger surface (slab cut-line, multi-element plane split, beam /
- * column / member) is in `docs/design/element-splitting.md` and
+ * column / member) is in `docs/architecture/element-splitting.md` and
  * arrives in subsequent phases. The slice is shaped to grow without
  * a breaking rename — `splitMode` covers the future modes;
  * `splitHoverPoint` and `splitTargetExpressId` will be reused.
  */
 
 import type { StateCreator } from 'zustand';
+import { defineSliceTeardown } from '../teardown.js';
 
 /**
  * Split-tool state machine:
@@ -111,20 +112,32 @@ export const createSplitToolSlice: StateCreator<SplitToolSlice, [], [], SplitToo
   slabCutStoreyElevation: null,
 
   setSplitTarget: (modelId, expressId) =>
-    set((s) => ({
-      splitTargetModelId: modelId,
-      splitTargetExpressId: expressId,
-      // Entering / leaving a target without a hover yet means we're
-      // back to 'idle' (unless we're mid-slab-cut, in which case
-      // we preserve the latched anchor — the user might re-enter
-      // the slab from outside).
-      splitMode: s.splitMode === 'first-anchor' ? 'first-anchor' : 'idle',
-      splitHoverPoint: null,
-      splitHoverDistance: null,
-      splitHoverLength: null,
-      splitHoverCutPoint: null,
-      splitHoverAxisDirection: null,
-    })),
+    set((s) => {
+      // Mid-slab-cut ('first-anchor'), we preserve the latched anchor only
+      // when the retarget is a no-op re-entry of the SAME element (the user
+      // re-triggering Split on the slab they're already cutting). A retarget
+      // to a genuinely different element — e.g. the Command Palette's
+      // "Split selected entity" firing after the user picked a different
+      // row in the Hierarchy panel while mid-anchor — must drop the stale
+      // anchor/footprint: they belong to the OLD target's coordinate space,
+      // and committing them against the new target would cut it along a
+      // meaningless line (#2802).
+      const sameTarget = s.splitTargetModelId === modelId && s.splitTargetExpressId === expressId;
+      const preserveAnchor = sameTarget && s.splitMode === 'first-anchor';
+      return {
+        splitTargetModelId: modelId,
+        splitTargetExpressId: expressId,
+        splitMode: preserveAnchor ? 'first-anchor' : 'idle',
+        splitHoverPoint: null,
+        splitHoverDistance: null,
+        splitHoverLength: null,
+        splitHoverCutPoint: null,
+        splitHoverAxisDirection: null,
+        ...(preserveAnchor
+          ? {}
+          : { slabCutAnchor: null, slabCutFootprint: null, slabCutStoreyElevation: null }),
+      };
+    }),
   setSplitHover: (hoverPoint, distance, length, cutPoint, axisDirection) =>
     set((s) => ({
       splitHoverPoint: hoverPoint,
@@ -163,3 +176,93 @@ export const createSplitToolSlice: StateCreator<SplitToolSlice, [], [], SplitToo
       slabCutStoreyElevation: null,
     }),
 });
+
+/**
+ * `splitToolSlice`'s contribution to the store-wide teardown seam
+ * (`store/teardown.ts`, composed in `store/teardown-registry.ts`).
+ *
+ * Every field here is either a pointer into a specific federated model
+ * (`splitTargetModelId` / `splitTargetExpressId`) or storey-local IFC
+ * coordinates that are meaningless once that model — or the whole
+ * federation — is gone (see the slice doc comment above). Left untended,
+ * `SplitOverlay.tsx` keeps reading `splitMode` / `splitTargetModelId` /
+ * `splitHoverAxisDirection` with no membership check against `state.models`
+ * and draws a stale cut-line preview for an element whose model no longer
+ * exists. `mutationSlice.splitWallAtDistance` itself is not at risk — its
+ * `resolveSplitContext` already refuses when the model id no longer
+ * resolves — this is purely about the tool staying visibly armed.
+ *
+ * `splitMode` is reset to `'idle'` in every arm below, not just the target
+ * fields: an `'aiming'` or `'first-anchor'` tool with its target already
+ * cleared is arguably worse than an idle one — the overlay's mode check
+ * still passes, so a null target has to be defended at every read site
+ * instead of the state simply saying "not armed". Resetting `splitMode`
+ * closes that off at the source, matching `setSplitTarget`'s existing
+ * "retarget to a different element drops the mode" behaviour above.
+ *
+ * `session-reset` (a new file load, per `store/index.ts`'s call site
+ * comment — models are NOT cleared there, `clearAllModels()` is a separate
+ * path) clears unconditionally, the same choice `hoverSlice.ts` makes for
+ * its own model-relative fields: the geometry a hover/target refers to does
+ * not survive a reload even when the model id happens to be reused.
+ */
+export const splitToolTeardown = defineSliceTeardown(
+  'splitToolSlice',
+  [
+    'splitMode',
+    'splitTargetModelId',
+    'splitTargetExpressId',
+    'splitHoverPoint',
+    'splitHoverDistance',
+    'splitHoverLength',
+    'splitHoverCutPoint',
+    'splitHoverAxisDirection',
+    'slabCutAnchor',
+    'slabCutFootprint',
+    'slabCutStoreyElevation',
+  ],
+  {
+    'session-reset': () => ({
+      splitMode: 'idle',
+      splitTargetModelId: null,
+      splitTargetExpressId: null,
+      splitHoverPoint: null,
+      splitHoverDistance: null,
+      splitHoverLength: null,
+      splitHoverCutPoint: null,
+      splitHoverAxisDirection: null,
+      slabCutAnchor: null,
+      slabCutFootprint: null,
+      slabCutStoreyElevation: null,
+    }),
+    'model-removed': (scope, state) => {
+      if (state.splitTargetModelId !== scope.modelId) return {};
+      return {
+        splitMode: 'idle',
+        splitTargetModelId: null,
+        splitTargetExpressId: null,
+        splitHoverPoint: null,
+        splitHoverDistance: null,
+        splitHoverLength: null,
+        splitHoverCutPoint: null,
+        splitHoverAxisDirection: null,
+        slabCutAnchor: null,
+        slabCutFootprint: null,
+        slabCutStoreyElevation: null,
+      };
+    },
+    'all-models-cleared': () => ({
+      splitMode: 'idle',
+      splitTargetModelId: null,
+      splitTargetExpressId: null,
+      splitHoverPoint: null,
+      splitHoverDistance: null,
+      splitHoverLength: null,
+      splitHoverCutPoint: null,
+      splitHoverAxisDirection: null,
+      slabCutAnchor: null,
+      slabCutFootprint: null,
+      slabCutStoreyElevation: null,
+    }),
+  },
+);

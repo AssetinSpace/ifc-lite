@@ -9,11 +9,13 @@
  * External tools (ifc-scripts, ifc-flow) depend on these types.
  */
 
-import type {
-  GenerateSpacesAllOptions,
-  GenerateSpacesAllResult,
-  StoreyInfo,
-} from '@ifc-lite/create';
+import type { StructuralBackendMethods } from './structural-types.js';
+// Re-exported below via `export * from './schedule-types.js'`; imported by name
+// too because `BimBackend` references it in this file's own scope.
+import type { ScheduleBackendMethods } from './schedule-types.js';
+import type { CostBackendMethods } from './cost-types.js';
+import type { SpacesBackendMethods, StyleBackendMethods } from './backend-extension-types.js';
+import type { CostStoreBackendMethods } from './store-cost-types.js';
 
 // ============================================================================
 // Entity References
@@ -28,16 +30,32 @@ export interface EntityRef {
 /** Serialized entity ref for transport (e.g., "arch:42") */
 export type EntityRefString = string;
 
+/** NOTE: `apps/viewer/src/store/types.ts` carries a second implementation of
+ *  `entityRefToString`/`stringToEntityRef` with a SENTINEL contract
+ *  (`{ modelId: '', expressId: -1 }`) and a FIRST-colon split. Deliberate,
+ *  not drift: the viewer decodes untrusted DOM/state strings on hot paths
+ *  and must not throw, whereas this is a published API where failing at the
+ *  corruption site is correct. Keep the two in step on *bugs*, not on
+ *  contract. */
 export function entityRefToString(ref: EntityRef): EntityRefString {
   return `${ref.modelId}:${ref.expressId}`;
 }
 
 export function stringToEntityRef(s: EntityRefString): EntityRef {
-  const idx = s.indexOf(':');
+  // Split on the LAST colon: expressId is always purely numeric, so it
+  // never contains a colon itself, while modelId may (e.g. "proj:arch:5").
+  // Splitting on the first colon would misparse such modelIds.
+  const idx = s.lastIndexOf(':');
   if (idx < 1) {
     throw new Error(`Invalid EntityRefString: "${s}" — expected "modelId:expressId"`);
   }
-  const expressId = Number(s.slice(idx + 1));
+  const idPart = s.slice(idx + 1);
+  // Reject empty/non-numeric expressId explicitly — Number('') is 0, which
+  // would otherwise silently decode a truncated ref like "arch:" to expressId 0.
+  if (!/^\d+$/.test(idPart)) {
+    throw new Error(`Invalid expressId in EntityRefString: "${s}"`);
+  }
+  const expressId = Number(idPart);
   if (!Number.isFinite(expressId) || expressId < 0) {
     throw new Error(`Invalid expressId in EntityRefString: "${s}"`);
   }
@@ -118,6 +136,7 @@ export interface ClassificationData {
   location?: string;
   description?: string;
   path?: string[];
+  unresolved?: boolean; // classified, attributes unreadable — other fields `undefined` (#3948)
 }
 
 export interface MaterialLayerData {
@@ -169,18 +188,47 @@ export interface DocumentData {
   confidentiality?: string;
 }
 
+/**
+ * The related **objects** of an entity's structural relationships — never the
+ * `IfcRel*` entities themselves:
+ *
+ * - `voids` — the `IfcOpeningElement`s that void this element
+ *   (`IfcRelVoidsElement`, host → opening).
+ * - `fills` — the `IfcOpeningElement` this element fills
+ *   (`IfcRelFillsElement`, filler → opening).
+ * - `groups` — the `IfcZone` / `IfcGroup` / `IfcSystem` it is assigned to.
+ * - `connections` — the elements it is joined to.
+ *
+ * The field names are deliberately not EXPRESS names, and #2422 resolved to
+ * keep them. IFC's own names for these traversals (`HasOpenings`, `FillsVoids`,
+ * `HasAssignments`, `ConnectedTo` / `ConnectedFrom`) are INVERSE attributes
+ * holding the `IfcRel*` entity, which is not what these arrays contain — so
+ * "use the exact EXPRESS name" has no name to offer here. Renaming `voids` to
+ * `openings` is not a fix either: `voids` **and** `fills` both hold
+ * `IfcOpeningElement`s, and only the voids/fills pair — buildingSMART's own
+ * vocabulary for the two directions — tells them apart. Pinned by
+ * `packages/parser/test/relationship-field-semantics-2422.test.ts`.
+ */
 export interface EntityRelationshipsData {
   voids: Array<{ id: number; name?: string; type: string }>;
   fills: Array<{ id: number; name?: string; type: string }>;
-  groups: Array<{ id: number; name?: string }>;
+  groups: Array<{ id: number; name?: string; type?: string }>;
   connections: Array<{ id: number; name?: string; type: string }>;
+  /** Every graph edge touching the entity, preserving its exact IfcRel* class.
+   * Optional for third-party backends compiled against the pre-#4205 shape. */
+  relations?: Array<{
+    relationshipId: number;
+    relationshipType: string;
+    direction: 'forward' | 'inverse';
+    entity: { id: number; name?: string; type: string };
+  }>;
 }
 
 // ============================================================================
 // Query Types
 // ============================================================================
 
-export type ComparisonOp = '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'exists';
+export type ComparisonOp = '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'exists' | 'matches'; // kept in step with FilterComparisonOp in @ifc-lite/query/filter-predicate.ts
 
 export interface QueryFilter {
   psetName: string;
@@ -313,9 +361,8 @@ export interface ModelBackendMethods {
 export interface QueryBackendMethods {
   entities(descriptor: QueryDescriptor): EntityData[];
   /**
-   * Entities matching the host's active advanced filter, or `null` when no
-   * filter is active (so callers can distinguish "no filter" from "filter with
-   * zero matches"). Host-specific; transport/headless backends may return null.
+   * Entities matching the host's active advanced filter, or `null` when no filter is
+   * active (distinguishes "no filter" from "filter with zero matches"). Host-specific.
    */
   entitiesMatchingActiveFilter(): EntityData[] | null;
   entityData(ref: EntityRef): EntityData | null;
@@ -341,16 +388,27 @@ export interface VisibilityBackendMethods {
   isolate(refs: EntityRef[]): void;
   reset(): void;
 }
-
 export interface ViewerBackendMethods {
   colorize(refs: EntityRef[], color: RGBAColor): void;
   colorizeAll(batches: Array<{ refs: EntityRef[]; color: RGBAColor }>): void;
+  /** Omitted refs reset all overrides; an explicit empty list is a no-op. */
   resetColors(refs?: EntityRef[]): void;
   flyTo(refs: EntityRef[]): void;
   setSection(section: SectionPlane | null): void;
   getSection(): SectionPlane | null;
   setCamera(state: Partial<CameraState>): void;
   getCamera(): CameraState;
+  /**
+   * Translation from the frame `getCamera()`/`setCamera()` work in to the
+   * IFC world coordinates of the loaded model(s), `[x, y, z]` in IFC Z-up
+   * metres. A viewer shifts large-coordinate (georeferenced) models towards
+   * the origin before drawing them, so its camera is not in world
+   * coordinates; `bim.bcf.createViewpoint()` adds this offset and
+   * `bim.bcf.extractViewpointState()` subtracts it, so BCF viewpoints are in
+   * world coordinates as the BCF standard requires (#4879). Optional: a
+   * backend without a shifted frame omits it, which means no offset.
+   */
+  getRenderFrameOffset?(): [number, number, number];
 }
 
 export interface MutateBackendMethods {
@@ -552,7 +610,7 @@ export interface AddMemberInStoreParams {
   Tag?: string;
 }
 
-export interface StoreBackendMethods {
+export interface StoreBackendMethods extends CostStoreBackendMethods {
   addEntity(modelId: string, def: { type: string; attributes: unknown[] }): EntityRef;
   removeEntity(ref: EntityRef): boolean;
   setPositionalAttribute(ref: EntityRef, index: number, value: unknown): void;
@@ -585,7 +643,7 @@ export interface SpatialBackendMethods {
 export interface ExportBackendMethods {
   csv(refs: unknown, options: unknown): string;
   json(refs: unknown, columns: unknown): Record<string, unknown>[];
-  ifc(refs: unknown, options: unknown): string | Uint8Array;
+  ifc(refs: EntityRef[] | undefined, options: unknown): string | Uint8Array; // `undefined` = no isolation filter (whole model); `[]` never arrives (#4738)
   download(content: string | Uint8Array, filename: string, mimeType: string): void;
   /**
    * Export the model's `IfcSpace` volumes as a Honeybee HBJSON energy/daylight model.
@@ -593,6 +651,11 @@ export interface ExportBackendMethods {
    * wasm engine); the data-only SDK never meshes, so it delegates here.
    */
   hbjson?(name?: string): Promise<string>;
+  /**
+   * Export the model's `IfcSpace` volumes as a Dragonfly DFJSON energy model (extruded
+   * `Room2D` plates). Optional — present only on geometry-capable backends.
+   */
+  dfjson?(name?: string): Promise<string>;
 }
 
 export interface LensBackendMethods {
@@ -617,98 +680,23 @@ export interface FilesBackendMethods {
 // layer stays serializable across the sandbox/transport boundary without
 // pulling the parser into consumer bundles.
 // ============================================================================
+export * from './schedule-types.js';
 
-export type ScheduleSequenceType =
-  | 'START_START' | 'START_FINISH' | 'FINISH_START' | 'FINISH_FINISH'
-  | 'USERDEFINED' | 'NOTDEFINED';
+// ============================================================================
+// Structural analysis — IfcStructuralAnalysisModel, IfcStructuralMember /
+// IfcStructuralConnection / IfcStructuralActivity subtypes, load groups and
+// result groups.
+//
+// Shapes mirror `@ifc-lite/parser`'s `StructuralExtraction` struct, for the
+// same reason as the schedule types above: the SDK layer stays serializable
+// across the sandbox/transport boundary without pulling the parser into
+// consumer bundles.
+// ============================================================================
 
-export type ScheduleTaskDurationType =
-  | 'WORKTIME' | 'ELAPSEDTIME' | 'NOTDEFINED';
-
-export interface ScheduleTaskTimeData {
-  scheduleStart?: string;
-  scheduleFinish?: string;
-  scheduleDuration?: string;
-  actualStart?: string;
-  actualFinish?: string;
-  actualDuration?: string;
-  earlyStart?: string;
-  earlyFinish?: string;
-  lateStart?: string;
-  lateFinish?: string;
-  freeFloat?: string;
-  totalFloat?: string;
-  remainingTime?: string;
-  statusTime?: string;
-  durationType?: ScheduleTaskDurationType;
-  isCritical?: boolean;
-  completion?: number;
-}
-
-export interface ScheduleTaskData {
-  expressId: number;
-  globalId: string;
-  name: string;
-  description?: string;
-  objectType?: string;
-  identification?: string;
-  longDescription?: string;
-  status?: string;
-  workMethod?: string;
-  isMilestone: boolean;
-  priority?: number;
-  predefinedType?: string;
-  taskTime?: ScheduleTaskTimeData;
-  parentGlobalId?: string;
-  childGlobalIds: string[];
-  productExpressIds: number[];
-  productGlobalIds: string[];
-  controllingScheduleGlobalIds: string[];
-}
-
-export interface ScheduleSequenceData {
-  globalId: string;
-  relatingTaskGlobalId: string;
-  relatedTaskGlobalId: string;
-  sequenceType: ScheduleSequenceType;
-  userDefinedSequenceType?: string;
-  timeLagSeconds?: number;
-  timeLagDuration?: string;
-}
-
-export interface WorkScheduleData {
-  expressId: number;
-  globalId: string;
-  kind: 'WorkSchedule' | 'WorkPlan';
-  name: string;
-  description?: string;
-  identification?: string;
-  creationDate?: string;
-  purpose?: string;
-  duration?: string;
-  startTime?: string;
-  finishTime?: string;
-  predefinedType?: string;
-  taskGlobalIds: string[];
-}
-
-export interface ScheduleExtractionData {
-  workSchedules: WorkScheduleData[];
-  tasks: ScheduleTaskData[];
-  sequences: ScheduleSequenceData[];
-  hasSchedule: boolean;
-}
-
-export interface ScheduleBackendMethods {
-  /** Extract the full schedule graph from the active or specified model. */
-  data(modelId?: string): ScheduleExtractionData;
-  /** Convenience — just the task list. */
-  tasks(modelId?: string): ScheduleTaskData[];
-  /** Convenience — just the work schedules / work plans. */
-  workSchedules(modelId?: string): WorkScheduleData[];
-  /** Convenience — just the task dependency edges. */
-  sequences(modelId?: string): ScheduleSequenceData[];
-}
+/** Why one `Values` slot of a load configuration carries no nested load. */
+export * from './structural-types.js';
+export * from './cost-types.js';
+export * from './backend-extension-types.js';
 
 // ============================================================================
 // Backend Interface (implemented by local store or remote proxy)
@@ -723,21 +711,6 @@ export interface ScheduleBackendMethods {
  * BimHost (wire protocol) uses dispatchToBackend() to route string-based
  * SdkRequests to the typed namespace methods.
  */
-/**
- * Derive IfcSpace from a model's walls/slabs/roofs. Optional on the backend:
- * local backends with direct store access implement it; remote backends (whose
- * store lives server-side) leave it undefined.
- */
-export interface SpacesBackendMethods {
-  /** Every IfcBuildingStorey (id, name, elevation), low → high. */
-  listStoreys(): StoreyInfo[];
-  /**
-   * Derive IfcSpace across the selected storeys, writing them to the backend's
-   * mutation overlay. Persist with `bim.export.toStep()`.
-   */
-  generate(options?: GenerateSpacesAllOptions): GenerateSpacesAllResult;
-}
-
 export interface BimBackend {
   readonly model: ModelBackendMethods;
   readonly query: QueryBackendMethods;
@@ -751,8 +724,14 @@ export interface BimBackend {
   readonly lens: LensBackendMethods;
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
+  /** IFC 5D cost reads, when the backend retains loaded source bytes. */
+  readonly cost?: CostBackendMethods;
+  /** Structural analysis reads, when supported by the backend. */
+  readonly structural?: StructuralBackendMethods;
   /** Space derivation — present only on local backends with store access. */
   readonly spaces?: SpacesBackendMethods;
+  /** Persistent colouring — present only on local backends with store access. */
+  readonly style?: StyleBackendMethods;
 
   /** Subscribe to viewer events */
   subscribe(event: BimEventType, handler: (data: unknown) => void): () => void;

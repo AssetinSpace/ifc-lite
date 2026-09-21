@@ -20,8 +20,9 @@ import {
   Save,
   Trash2,
   CopyPlus,
+  ShieldQuestion,
 } from 'lucide-react';
-import { useViewerStore, resolveEntityRef, resolveGlobalId } from '@/store';
+import { useViewerStore, resolveEntityRef, resolveGlobalId, toGlobalIdFromModels } from '@/store';
 import type { DuplicateDirection } from '@/store/slices/mutationSlice';
 import { resetVisibilityForHomeFromStore } from '@/store/homeView';
 import {
@@ -37,6 +38,7 @@ import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { evaluateWhen, parseWhen, type CommandContribution, type ResolvedContextMenuContribution } from '@ifc-lite/extensions';
 import { resolveExtensionIcon } from '@/components/extensions/icon-registry';
 import { describeRunCommandError } from '@/services/extensions/runtime-errors';
+import { useTranslation } from '@/i18n';
 
 export function EntityContextMenu() {
   const contextMenu = useViewerStore((s) => s.contextMenu);
@@ -44,6 +46,7 @@ export function EntityContextMenu() {
   const hideEntity = useViewerStore((s) => s.hideEntity);
   const setSelectedEntityId = useViewerStore((s) => s.setSelectedEntityId);
   const setSelectedEntityIds = useViewerStore((s) => s.setSelectedEntityIds);
+  const setAnonymizedExportRequested = useViewerStore((s) => s.setAnonymizedExportRequested);
   const cameraCallbacks = useViewerStore((s) => s.cameraCallbacks);
   // Store-level mutations
   const removeEntity = useViewerStore((s) => s.removeEntity);
@@ -53,8 +56,7 @@ export function EntityContextMenu() {
   const menuRef = useRef<HTMLDivElement>(null);
   const { ifcDataStore, models } = useIfc();
 
-  // Resolve contextMenu.entityId (globalId) to original expressId and model
-  // This is needed because IfcDataStore uses original expressIds, not globalIds
+  // Resolve contextMenu.entityId (globalId) to original expressId/model (IfcDataStore uses original expressIds, not globalIds).
   const { resolvedExpressId, activeDataStore, contextEntityRef } = useMemo(() => {
     if (!contextMenu.entityId) {
       return { resolvedExpressId: null, activeDataStore: ifcDataStore, contextEntityRef: null };
@@ -78,13 +80,11 @@ export function EntityContextMenu() {
     };
   }, [contextMenu.entityId, models, ifcDataStore]);
 
-  // Close menu when clicking/tapping outside.
-  //
-  // Listen on `pointerdown` (with capture) rather than `mousedown`:
-  // the canvas calls `e.preventDefault()` on its own pointerdown
-  // handler, which in some browsers suppresses the compatibility
-  // `mousedown` event — so a plain `mousedown` listener never fires
-  // when the user clicks the 3D viewport to dismiss the menu.
+  // Close menu when clicking/tapping outside. Listen on `pointerdown` (with
+  // capture) rather than `mousedown`: the canvas calls `e.preventDefault()`
+  // on its own pointerdown handler, which in some browsers suppresses the
+  // compatibility `mousedown` event — so a plain `mousedown` listener never
+  // fires when the user clicks the 3D viewport to dismiss the menu.
   useEffect(() => {
     if (!contextMenu.isOpen) return;
     const handlePointerOutside = (e: PointerEvent) => {
@@ -186,20 +186,20 @@ export function EntityContextMenu() {
       }
     }
 
-    if (entityType) {
-      // Select all entities of the same type
-      // NOTE: These are original expressIds - for multi-model, should transform to globalIds
+    if (entityType && contextEntityRef) {
+      // `entity.expressId` is model-space — resolve through the model
+      // offset before it reaches `selectedEntityIds` (renderer-space).
       const sameTypeIds: number[] = [];
       for (let i = 0; i < entity.count; i++) {
         if (entity.getTypeName(entity.expressId[i]) === entityType) {
-          sameTypeIds.push(entity.expressId[i]);
+          sameTypeIds.push(toGlobalIdFromModels(models, contextEntityRef.modelId, entity.expressId[i]));
         }
       }
       setSelectedEntityIds(sameTypeIds);
     }
 
     closeContextMenu();
-  }, [resolvedExpressId, activeDataStore, setSelectedEntityIds, closeContextMenu]);
+  }, [resolvedExpressId, activeDataStore, contextEntityRef, models, setSelectedEntityIds, closeContextMenu]);
 
   const handleSelectSameStorey = useCallback(() => {
     // Use resolvedExpressId (original ID) for IfcDataStore lookups
@@ -209,16 +209,34 @@ export function EntityContextMenu() {
     }
 
     const storeyId = activeDataStore.spatialHierarchy.elementToStorey.get(resolvedExpressId);
-    if (storeyId) {
+    if (storeyId && contextEntityRef) {
       const storeyElements = activeDataStore.spatialHierarchy.byStorey.get(storeyId);
       if (storeyElements) {
-        // NOTE: These are original expressIds - for multi-model, should transform to globalIds
-        setSelectedEntityIds(Array.from(storeyElements));
+        // Same model-space -> renderer-space resolution as above.
+        setSelectedEntityIds(
+          Array.from(storeyElements, (id) => toGlobalIdFromModels(models, contextEntityRef.modelId, id)),
+        );
       }
     }
 
     closeContextMenu();
-  }, [resolvedExpressId, activeDataStore, setSelectedEntityIds, closeContextMenu]);
+  }, [resolvedExpressId, activeDataStore, contextEntityRef, models, setSelectedEntityIds, closeContextMenu]);
+
+  // "Export anonymized…" (#2934): seed `AnonymizedExportDialog` — whose
+  // `useAnonymizedExportSet` reads `selectedEntityIds`, the multi-select
+  // GLOBAL-id set, not the scalar (AGENTS.md "Selection has two channels") —
+  // then flip the store flag the dialog (mounted trigger-less in
+  // ViewerLayout.tsx) watches. Right-clicking inside an existing
+  // multi-selection keeps it as the seed set (like `handleSetBasket`);
+  // outside it, replace the selection with just this entity, as a left-click would.
+  const handleExportAnonymized = useCallback(() => {
+    const id = contextMenu.entityId;
+    if (id !== null && !useViewerStore.getState().selectedEntityIds.has(id)) {
+      setSelectedEntityIds([id]);
+    }
+    setAnonymizedExportRequested(true);
+    closeContextMenu();
+  }, [contextMenu.entityId, setSelectedEntityIds, setAnonymizedExportRequested, closeContextMenu]);
 
   const handleCopyId = useCallback(() => {
     if (contextMenu.entityId !== null) {
@@ -234,8 +252,7 @@ export function EntityContextMenu() {
     return activeDataStore.entities.getTypeName(resolvedExpressId) || '';
   }, [resolvedExpressId, activeDataStore]);
 
-  // Mutation view is required to drive bim.store.* — native-metadata-only
-  // models don't have one, so the Delete option stays hidden there.
+  // Mutation view is required to drive bim.store.* — native-metadata-only models don't have one, so Delete stays hidden there.
   const canEdit = useMemo(() => {
     if (!contextEntityRef) return false;
     return getMutationView(contextEntityRef.modelId) !== null;
@@ -251,9 +268,8 @@ export function EntityContextMenu() {
       if ('error' in result) {
         toast.error(`Couldn't duplicate: ${result.error}`);
       } else {
-        // Move selection onto the new entity so the property panel
-        // refreshes and the user can keep iterating (Cmd+D again
-        // duplicates the duplicate, like a stamp tool).
+        // Move selection onto the new entity so the property panel refreshes
+        // and the user can keep iterating (Cmd+D again duplicates the duplicate, like a stamp tool).
         setSelectedEntityId(result.globalId);
         toast.success(`Duplicated as #${result.expressId} (${direction}) — undo to remove`);
       }
@@ -269,14 +285,11 @@ export function EntityContextMenu() {
     }
     const ok = removeEntity(contextEntityRef.modelId, contextEntityRef.expressId);
     if (ok) {
-      // Tombstoning only affects export — the rendered mesh is still
-      // in the GPU buffers. Hide it via the existing visibility system
-      // so the entity disappears from the scene and stops being
-      // pickable. `Show all` from the empty-space menu restores it
-      // (along with re-running undo to bring back the overlay).
+      // Tombstoning only affects export — the mesh is still in the GPU buffers.
+      // Hide it via the existing visibility system so it disappears from the scene
+      // and stops being pickable. `Show all` (empty-space menu) restores it, with undo bringing back the overlay.
       hideEntity(contextMenu.entityId);
-      // Drop the selection so the right panel doesn't cling to a
-      // tombstoned id.
+      // Drop the selection so the right panel doesn't cling to a tombstoned id.
       setSelectedEntityId(null);
       toast.success(`${contextEntityType || 'Entity'} #${contextEntityRef.expressId} deleted — undo to restore`);
     } else {
@@ -285,11 +298,10 @@ export function EntityContextMenu() {
     closeContextMenu();
   }, [contextEntityRef, canEdit, contextEntityType, contextMenu.entityId, removeEntity, hideEntity, setSelectedEntityId, closeContextMenu]);
 
-  // Viewport-constrained placement (mirrors OS context-menu behaviour):
-  // flip up/left when the menu would overflow the bottom/right edges,
-  // then clamp against the opposite edge so it never crosses any side
-  // of the viewport. Two-pass render: invisible first, then measure and
-  // reposition before the browser paints (useLayoutEffect is sync).
+  // Viewport-constrained placement (mirrors OS context-menu behaviour): flip
+  // up/left when the menu would overflow the bottom/right edges, then clamp
+  // against the opposite edge so it never crosses a viewport side. Two-pass
+  // render: invisible first, then measure/reposition before paint (useLayoutEffect is sync).
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
 
   useLayoutEffect(() => {
@@ -306,8 +318,7 @@ export function EntityContextMenu() {
     const anchorX = contextMenu.screenX;
     const anchorY = contextMenu.screenY;
 
-    // Horizontal: prefer right of cursor, flip to left if it would
-    // overflow the right edge, then clamp.
+    // Horizontal: prefer right of cursor, flip left on overflow, then clamp.
     let left = anchorX;
     if (left + rect.width + margin > vw) {
       const flipped = anchorX - rect.width;
@@ -315,8 +326,7 @@ export function EntityContextMenu() {
     }
     if (left < margin) left = margin;
 
-    // Vertical: prefer below cursor, flip above if it would overflow
-    // the bottom edge, then clamp.
+    // Vertical: prefer below cursor, flip above on overflow, then clamp.
     let top = anchorY;
     if (top + rect.height + margin > vh) {
       const flipped = anchorY - rect.height;
@@ -331,8 +341,7 @@ export function EntityContextMenu() {
     return null;
   }
 
-  // Get entity info for display
-  // Use resolvedExpressId (original ID) for IfcDataStore lookups
+  // Get entity info for display (resolvedExpressId is the original ID for IfcDataStore lookups)
   let entityName = '';
   let entityType = '';
   if (resolvedExpressId && activeDataStore) {
@@ -347,9 +356,8 @@ export function EntityContextMenu() {
       style={{
         left: position?.left ?? contextMenu.screenX,
         top: position?.top ?? contextMenu.screenY,
-        // Hide the first render: we need a measured rect to compute the
-        // constrained position. `useLayoutEffect` resolves this before
-        // paint, so the user never sees the unclamped flash.
+        // Hide the first render: we need a measured rect to compute the constrained
+        // position. `useLayoutEffect` resolves this before paint, so the user never sees the unclamped flash.
         visibility: position ? 'visible' : 'hidden',
       }}
     >
@@ -382,6 +390,7 @@ export function EntityContextMenu() {
           <div className="h-px bg-border my-1" />
 
           <MenuItem icon={Copy} label="Copy GlobalId" onClick={handleCopyId} />
+          <MenuItem icon={ShieldQuestion} label="Export anonymized…" onClick={handleExportAnonymized} />
 
           {/* Store-level mutations (bim.store.*). Only surfaced when there's
               a live mutation view on the model — otherwise these would
@@ -416,9 +425,9 @@ export function EntityContextMenu() {
 }
 
 /**
- * Renders extension-contributed entries for the entity or canvas
- * context-menu slot. Each contribution is `when`-filtered; clicking
- * dispatches the contributed command through the extension host.
+ * Renders extension-contributed entries for the entity or canvas context-menu
+ * slot. Each contribution is `when`-filtered; clicking dispatches the
+ * contributed command through the extension host.
  */
 function ExtensionContextItems({
   slot,
@@ -427,9 +436,8 @@ function ExtensionContextItems({
   slot: 'contextMenu.entity' | 'contextMenu.canvas';
   hasEntity: boolean;
 }) {
-  // Loader enriches the contextMenu payload with icon + title from
-  // the linked command (see manifestToContributions). Fall back to
-  // the commandPalette lookup for title if a manifest somehow omits it.
+  // Loader enriches the contextMenu payload with icon + title from the linked command
+  // (see manifestToContributions); fall back to the commandPalette lookup if a manifest omits it.
   const contributions = useSlotContributions<ResolvedContextMenuContribution>(slot);
   const commandPalette = useSlotContributions<CommandContribution>('commandPalette');
   const host = useOptionalExtensionHost();
@@ -464,10 +472,9 @@ function ExtensionContextItems({
             label={titleFor(c.payload)}
             onClick={() => {
               closeContextMenu();
-              // Pinned to `c.extensionId` — the same owner the React key
-              // above uses. Command ids are namespaced by convention only,
-              // so an unscoped run could pick a different installed
-              // extension that declares the same id.
+              // Pinned to `c.extensionId` (same owner as the React key above)
+              // — command ids are namespaced by convention only, so an
+              // unscoped run could pick a different extension with the same id.
               host?.runCommand(c.payload.command, c.extensionId).catch((err) => {
                 toast.error(describeRunCommandError(c.payload.command, err));
               });
@@ -488,36 +495,29 @@ interface MenuItemProps {
   disabled?: boolean;
   /** Right-aligned keyboard hint (e.g. `'⌘D'`). */
   shortcut?: string;
-  /**
-   * Visual tone:
-   * - `default`     muted icon, neutral hover
-   * - `destructive` red-toned icon and red-tinted hover (Delete entity)
-   */
+  /** Visual tone: `default` muted icon/neutral hover, `destructive`
+   *  red-toned icon and red-tinted hover (Delete entity). */
   tone?: MenuItemTone;
 }
 
 /**
- * Inline directional duplicate row — primary label on the left
- * (clickable, fires the default +X duplicate), six axis chips on
- * the right for explicit direction control. Mirrors the column
- * placement axes the user already sees on the Raw STEP tab.
- *
- * Why six chips and not a sub-menu: a flyout for six options is
- * wasted real estate, and the chip arrows let the user "see and
- * pick" in one motion.
+ * Inline directional duplicate row — primary label on the left (clickable,
+ * fires the default +X duplicate), six axis chips on the right for explicit
+ * direction control, mirroring the placement axes on the Raw STEP tab. Six
+ * chips beat a sub-menu: a flyout for six options wastes real estate, and
+ * the chip arrows let the user "see and pick" in one motion.
  */
 function DuplicateRow({ onDuplicate }: { onDuplicate: (dir: DuplicateDirection) => void }) {
+  const { t } = useTranslation();
   return (
     <div className="px-3 py-1.5 flex items-center gap-2 hover:bg-muted/40">
       <button
-        type="button"
-        onClick={() => onDuplicate('+X')}
+        type="button" onClick={() => onDuplicate('+X')}
         className="flex items-center gap-2 text-sm text-left flex-1 min-w-0 hover:text-foreground"
-        title="Duplicate one bbox-width along +X (default)"
+        title={t('entityContextMenu.duplicateDefaultTitle')}
       >
-        <CopyPlus className="h-4 w-4 text-muted-foreground" />
-        <span>Duplicate</span>
-        <span className="ml-auto text-[10px] font-mono text-muted-foreground/70">⌘D</span>
+        <CopyPlus className="h-4 w-4 text-muted-foreground" /><span>{t('entityContextMenu.duplicateLabel')}</span>
+        <span className="ml-auto text-[10px] font-mono text-muted-foreground">⌘D</span>
       </button>
       <div className="flex items-center gap-0.5 shrink-0 border-l border-border/60 pl-2">
         <DirectionChip dir="+X" label="→" tooltip="Duplicate +X (east)" onClick={() => onDuplicate('+X')} />
@@ -574,7 +574,7 @@ function MenuItem({ icon: Icon, label, onClick, disabled, shortcut, tone = 'defa
       <Icon className={iconClass} />
       <span className="flex-1 min-w-0">{label}</span>
       {shortcut && (
-        <span className="text-[10px] font-mono text-muted-foreground/70 shrink-0">
+        <span className="text-[10px] font-mono text-muted-foreground shrink-0">
           {shortcut}
         </span>
       )}

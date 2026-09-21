@@ -26,47 +26,57 @@ import type {
   WallDoorParams, WallWindowParams, DoorParams, WindowParams, RampParams, RailingParams,
   PlateParams, MemberParams, FootingParams, PileParams,
   SpaceParams, CurtainWallParams, FurnishingParams, ProxyParams,
-  ProjectParams, SiteParams, BuildingParams, StoreyParams,
-  PropertySetDef, PropertyDef, QuantitySetDef, QuantityDef,
-  MaterialDef, MaterialLayerDef,
+  ProjectParams, StoreyParams,
+  PropertySetDef, QuantitySetDef,
+  MaterialDef,
   WorkScheduleParams, WorkPlanParams, TaskParams, SequenceParams,
+  WorkCalendarParams,
   CreatedEntity, CreateResult,
 } from './types.js';
 
+import type {
+  CostItemParams, CostQuantityParams, CostScheduleParams, CostTypedValue,
+  CostValueParams, SIUnitParams,
+} from './types-cost.js';
 import {
   esc, stepLine, num, vecLen, vecNorm, vecCross,
-  NON_ELEMENT_TYPES,
+  optStr, optEnum,
+  NON_ELEMENT_TYPES, assertPositiveFinite, assertFinitePoint3,
 } from './ifc-creator-math.js';
+import { emitWorkCalendar, emitTaskTime } from './ifc-creator-scheduling.js';
+import {
+  assertCostSchema, emitCostItem, emitCostSchedule, emitCostValue,
+  emitMeasureWithUnit, emitMonetaryUnit, emitPhysicalQuantity,
+  emitRelAssignsToProduct, emitSIUnit,
+} from './ifc-creator-cost.js';
+import { emitElementQuantity, emitPropertySet, type DefinitionContext } from './ifc-creator-definitions.js';
 import { generateIfcGuid, isValidIfcGuid } from '@ifc-lite/encoding';
-
-// ============================================================================
-// STEP attribute helpers (scheduling — optional strings / enums / numbers)
-// ============================================================================
-
-/** Emit an optional STEP string: `'value'` when present, `$` otherwise. */
-function optStr(v: string | undefined | null): string {
-  return v === undefined || v === null || v === '' ? '$' : `'${esc(v)}'`;
-}
-
-/** Emit an optional STEP enum: `.VALUE.` when present, `$` otherwise. */
-function optEnum(v: string | undefined | null): string {
-  return v === undefined || v === null || v === '' ? '$' : `.${v}.`;
-}
-
-/** Emit an optional STEP boolean: `.T.`/`.F.`/`$`. */
-function optBool(v: boolean | undefined | null): string {
-  return v === undefined || v === null ? '$' : v ? '.T.' : '.F.';
-}
-
-/** Emit an optional STEP real number; `$` when absent. */
-function optReal(v: number | undefined | null): string {
-  return v === undefined || v === null || !Number.isFinite(v) ? '$' : num(v);
-}
 
 // ============================================================================
 // IfcCreator
 // ============================================================================
 
+/**
+ * PLACEMENT CONTRACT
+ *
+ * Every `addIfcXxx(storeyId, …)` / `addElement(storeyId, …)` method takes the
+ * storey as its first argument and emits an `IfcRelContainedInSpatialStructure`
+ * putting the product in that storey. The product's `IfcLocalPlacement` is
+ * therefore chained to the STOREY's placement, never to the world: the
+ * placement hierarchy has to agree with the containment hierarchy, or moving a
+ * storey leaves its own contents behind.
+ *
+ * Consequence for callers: **coordinates passed to these methods are
+ * storey-relative.** `IfcBuildingStorey.Elevation` is applied exactly once, by
+ * the storey's own placement (`[0, 0, Elevation]`, the only placement in this
+ * class that is chained to the world). A wall whose floor sits on a storey at
+ * `Elevation: 3` is created with `Z = 0`, not `Z = 3`.
+ *
+ * Before 2.0.0 only `addIfcWall`, `addIfcSlab`, `addIfcColumn`, `addIfcBeam`,
+ * `addIfcStair`, `addIfcRoof` and `addIfcGableRoof` behaved this way; the other
+ * 21 constructors chained to the world, so a caller mixing them on a storey
+ * with a non-zero elevation got two different datums in one model.
+ */
 export class IfcCreator {
   private nextId = 1;
   private lines: string[] = [];
@@ -192,9 +202,22 @@ export class IfcCreator {
     return id;
   }
 
-  /** Get the IfcLocalPlacement for a storey (falls back to world if unknown) */
+  /**
+   * The `IfcLocalPlacement` every product of this storey chains to.
+   *
+   * Throws on an unknown storey rather than falling back to the world
+   * placement: the fallback silently produced a product on a different datum
+   * from its siblings, which is the exact failure this parent is here to make
+   * impossible. `trackElement` rejects the same id a few lines later anyway,
+   * so failing here only means the half-built placement entities are never
+   * emitted.
+   */
   private getStoreyPlacement(storeyId: number): number {
-    return this.storeyPlacements.get(storeyId) ?? this.worldPlacementId;
+    const placementId = this.storeyPlacements.get(storeyId);
+    if (placementId === undefined) {
+      throw new Error(`Unknown storeyId #${storeyId} — call addIfcBuildingStorey() first`);
+    }
+    return placementId;
   }
 
   // ============================================================================
@@ -209,6 +232,8 @@ export class IfcCreator {
    * upward by Height.
    */
   addIfcWall(storeyId: number, params: WallParams): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcWall');
+    assertPositiveFinite({ Thickness: params.Thickness, Height: params.Height }, 'addIfcWall');
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
@@ -239,7 +264,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(wallId, 'IFCWALL',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.STANDARD.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.STANDARD.')}`);
 
     this.elementSolids.set(wallId, [solidId]);
     this.trackElement(storeyId, wallId);
@@ -262,6 +287,9 @@ export class IfcCreator {
    * Width along +X, Depth along +Y, Thickness extruded along +Z.
    */
   addIfcSlab(storeyId: number, params: SlabParams): number {
+    assertPositiveFinite({ Thickness: params.Thickness }, 'addIfcSlab');
+    if (params.Width !== undefined) assertPositiveFinite({ Width: params.Width }, 'addIfcSlab');
+    if (params.Depth !== undefined) assertPositiveFinite({ Depth: params.Depth }, 'addIfcSlab');
     const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
@@ -308,6 +336,31 @@ export class IfcCreator {
    * Cross-section centered, extruded upward by Height.
    */
   addIfcColumn(storeyId: number, params: ColumnParams): number {
+    assertPositiveFinite({ Width: params.Width, Depth: params.Depth, Height: params.Height }, 'addIfcColumn');
+    return this.buildIfcColumn(storeyId, params);
+  }
+
+  /**
+   * Build a column WITHOUT validating dimensions.
+   *
+   * `IfcExtrudedAreaSolid.Depth` is typed `IfcPositiveLengthMeasure` in the
+   * IFC schema, so a zero (or negative) `Height` is spec-invalid — exactly
+   * what `addIfcColumn`'s guard exists to reject for ordinary callers.
+   *
+   * Corruption-injection tooling (tools/world-gym's `degenerate-geometry`
+   * defect) needs the opposite: it deliberately builds a spec-invalid,
+   * zero-height column to verify the geometry pipeline drops it (no mesh
+   * emitted) instead of crashing, and that requires a path that produces
+   * exactly the malformed entity it asks for. Routing that through the
+   * validated public constructor would make it impossible to construct the
+   * fixture it exists to test. This method is that deliberately-unvalidated
+   * seam — for adversarial test fixtures ONLY, never for application code.
+   */
+  addIfcColumnUnvalidated(storeyId: number, params: ColumnParams): number {
+    return this.buildIfcColumn(storeyId, params);
+  }
+
+  private buildIfcColumn(storeyId: number, params: ColumnParams): number {
     const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
@@ -326,7 +379,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -339,6 +392,8 @@ export class IfcCreator {
    * Cross-section (Width × Height) centered on the beam axis.
    */
   addIfcBeam(storeyId: number, params: BeamParams): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcBeam');
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcBeam');
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
@@ -367,7 +422,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -381,12 +436,15 @@ export class IfcCreator {
    * (rotated into world space by Direction). Width extends along local +Y.
    */
   addIfcStair(storeyId: number, params: StairParams): number {
-    if (params.NumberOfRisers <= 0) throw new Error('addStair: NumberOfRisers must be > 0');
-    if (params.RiserHeight <= 0) throw new Error('addStair: RiserHeight must be > 0');
-    if (params.TreadLength <= 0) throw new Error('addStair: TreadLength must be > 0');
-    if (params.Width <= 0) throw new Error('addStair: Width must be > 0');
+    assertPositiveFinite({
+      NumberOfRisers: params.NumberOfRisers,
+      RiserHeight: params.RiserHeight,
+      TreadLength: params.TreadLength,
+      Width: params.Width,
+    }, 'addStair');
 
     const direction = params.Direction ?? 0;
+    if (!Number.isFinite(direction)) throw new Error('addStair: Direction must be a finite number');
     // Use LocalPlacement rotation so both step positions AND profiles rotate together
     const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
@@ -440,8 +498,9 @@ export class IfcCreator {
    * Optional Slope is in radians and creates a single slope along +X.
    */
   addIfcRoof(storeyId: number, params: RoofParams): number {
+    assertPositiveFinite({ Width: params.Width, Depth: params.Depth, Thickness: params.Thickness }, 'addIfcRoof');
     const slope = params.Slope ?? 0;
-    if (slope < 0 || slope >= Math.PI / 2) {
+    if (!Number.isFinite(slope) || slope < 0 || slope >= Math.PI / 2) {
       throw new Error('addIfcRoof: Slope must be in radians between 0 and π/2 (e.g. Math.PI / 12 for 15°)');
     }
 
@@ -488,15 +547,13 @@ export class IfcCreator {
    * The ridge runs along the longer footprint dimension to keep the roof height reasonable.
    */
   addIfcGableRoof(storeyId: number, params: GableRoofParams): number {
-    if (params.Width <= 0) throw new Error('addIfcGableRoof: Width must be > 0');
-    if (params.Depth <= 0) throw new Error('addIfcGableRoof: Depth must be > 0');
-    if (params.Thickness <= 0) throw new Error('addIfcGableRoof: Thickness must be > 0');
-    if (params.Slope <= 0 || params.Slope >= Math.PI / 2) {
+    assertPositiveFinite({ Width: params.Width, Depth: params.Depth, Thickness: params.Thickness }, 'addIfcGableRoof');
+    if (!Number.isFinite(params.Slope) || params.Slope <= 0 || params.Slope >= Math.PI / 2) {
       throw new Error('addIfcGableRoof: Slope must be in radians between 0 and π/2 (e.g. Math.PI / 12 for 15°)');
     }
 
     const overhang = params.Overhang ?? 0;
-    if (overhang < 0) throw new Error('addIfcGableRoof: Overhang must be >= 0');
+    if (!Number.isFinite(overhang) || overhang < 0) throw new Error('addIfcGableRoof: Overhang must be a finite number >= 0');
 
     const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
@@ -574,9 +631,10 @@ export class IfcCreator {
    * Position is wall-local: [distance_along_wall, 0, base_height].
    */
   addIfcWallDoor(wallId: number, params: WallDoorParams): number {
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcWallDoor');
     const { storeyId, placementId, wallThickness } = this.getHostedWallInfo(wallId);
     const thickness = params.Thickness ?? wallThickness;
-    if (thickness <= 0) throw new Error('addIfcWallDoor: Thickness must be > 0');
+    assertPositiveFinite({ Thickness: thickness }, 'addIfcWallDoor');
 
     const openingId = this.addWallOpening(wallId, placementId, {
       Name: params.Name ? `${params.Name} Opening` : 'Door Opening',
@@ -615,9 +673,10 @@ export class IfcCreator {
    * Position is wall-local: [distance_along_wall, 0, sill_height].
    */
   addIfcWallWindow(wallId: number, params: WallWindowParams): number {
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcWallWindow');
     const { storeyId, placementId, wallThickness } = this.getHostedWallInfo(wallId);
     const thickness = params.Thickness ?? wallThickness;
-    if (thickness <= 0) throw new Error('addIfcWallWindow: Thickness must be > 0');
+    assertPositiveFinite({ Thickness: thickness }, 'addIfcWallWindow');
 
     const openingId = this.addWallOpening(wallId, placementId, {
       Name: params.Name ? `${params.Name} Opening` : 'Window Opening',
@@ -654,11 +713,13 @@ export class IfcCreator {
    * Create a door element. Width × Height × Thickness panel.
    */
   addIfcDoor(storeyId: number, params: DoorParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcDoor');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
     const thickness = params.Thickness ?? 0.05;
+    assertPositiveFinite({ Thickness: thickness }, 'addIfcDoor');
     const profileId = this.addRectangleProfile(params.Width, thickness);
     const solidId = this.addExtrudedAreaSolid(profileId, params.Height);
     const shapeId = this.addShapeRepresentation('Body', [solidId]);
@@ -686,11 +747,13 @@ export class IfcCreator {
    * Create a window element. Width × Height × Thickness frame.
    */
   addIfcWindow(storeyId: number, params: WindowParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcWindow');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
     const thickness = params.Thickness ?? 0.05;
+    assertPositiveFinite({ Thickness: thickness }, 'addIfcWindow');
     const profileId = this.addRectangleProfile(params.Width, thickness);
     const solidId = this.addExtrudedAreaSolid(profileId, params.Height);
     const shapeId = this.addShapeRepresentation('Body', [solidId]);
@@ -718,7 +781,9 @@ export class IfcCreator {
    * Width along +Y, Length along +X, Rise optionally inclines the ramp.
    */
   addIfcRamp(storeyId: number, params: RampParams): number {
+    assertPositiveFinite({ Width: params.Width, Length: params.Length, Thickness: params.Thickness }, 'addIfcRamp');
     const rise = params.Rise ?? 0;
+    if (!Number.isFinite(rise)) throw new Error('addIfcRamp: Rise must be a finite number');
     let axis: Point3D = [0, 0, 1];
     let refDir: Point3D = [1, 0, 0];
     if (rise > 0) {
@@ -727,7 +792,7 @@ export class IfcCreator {
       refDir = [Math.cos(slopeAngle), 0, -Math.sin(slopeAngle)];
     }
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
       Axis: axis,
       RefDirection: refDir,
@@ -761,6 +826,8 @@ export class IfcCreator {
    * Create a railing from Start to End with given Height.
    */
   addIfcRailing(storeyId: number, params: RailingParams): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcRailing');
+    assertPositiveFinite({ Height: params.Height }, 'addIfcRailing');
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
@@ -768,11 +835,12 @@ export class IfcCreator {
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
     // Use identity orientation so posts can extrude vertically along world Z
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
     });
 
     const railWidth = params.Width ?? 0.05;
+    assertPositiveFinite({ Width: railWidth }, 'addIfcRailing');
 
     // Rail solid — extrude along the rail direction (dir) at rail Height
     const railProfileId = this.addRectangleProfile(railWidth, railWidth);
@@ -831,7 +899,8 @@ export class IfcCreator {
    * Create a plate (thin flat element, e.g. steel plate).
    */
   addIfcPlate(storeyId: number, params: PlateParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Thickness: params.Thickness }, 'addIfcPlate');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
@@ -839,6 +908,7 @@ export class IfcCreator {
     if (params.Profile && params.Profile.length >= 3) {
       profileId = this.addArbitraryProfile(params.Profile);
     } else {
+      assertPositiveFinite({ Width: params.Width, Depth: params.Depth }, 'addIfcPlate');
       profileId = this.addRectangleProfile(params.Width, params.Depth, [params.Width / 2, params.Depth / 2]);
     }
 
@@ -866,13 +936,15 @@ export class IfcCreator {
    * Create a structural member (brace, strut, etc.) from Start to End.
    */
   addIfcMember(storeyId: number, params: MemberParams): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcMember');
+    assertPositiveFinite({ Width: params.Width, Height: params.Height }, 'addIfcMember');
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const memberLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -903,8 +975,9 @@ export class IfcCreator {
    * Create a footing (foundation). Position is top centre, Height extends downward.
    */
   addIfcFooting(storeyId: number, params: FootingParams): number {
+    assertPositiveFinite({ Width: params.Width, Depth: params.Depth, Height: params.Height }, 'addIfcFooting');
     // Offset placement downward so extrusion starts at bottom
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: [params.Position[0], params.Position[1], params.Position[2] - params.Height],
     });
 
@@ -935,7 +1008,11 @@ export class IfcCreator {
    * Uses circular cross-section by default, rectangular if IsRectangular is set.
    */
   addIfcPile(storeyId: number, params: PileParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Length: params.Length, Diameter: params.Diameter }, 'addIfcPile');
+    if (params.RectangularDepth !== undefined) {
+      assertPositiveFinite({ RectangularDepth: params.RectangularDepth }, 'addIfcPile');
+    }
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: [params.Position[0], params.Position[1], params.Position[2] - params.Length],
     });
 
@@ -971,7 +1048,8 @@ export class IfcCreator {
    * Create a space (room volume).
    */
   addIfcSpace(storeyId: number, params: SpaceParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Height: params.Height }, 'addIfcSpace');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
@@ -979,6 +1057,7 @@ export class IfcCreator {
     if (params.Profile && params.Profile.length >= 3) {
       profileId = this.addArbitraryProfile(params.Profile);
     } else {
+      assertPositiveFinite({ Width: params.Width, Depth: params.Depth }, 'addIfcSpace');
       profileId = this.addRectangleProfile(params.Width, params.Depth, [params.Width / 2, params.Depth / 2]);
     }
 
@@ -991,7 +1070,6 @@ export class IfcCreator {
     const name = params.Name ?? 'Space';
     const desc = params.Description ? `'${esc(params.Description)}'` : '$';
     const objType = params.ObjectType ? `'${esc(params.ObjectType)}'` : '$';
-    const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
     const longName = params.LongName ? `'${esc(params.LongName)}'` : '$';
 
     this.line(spaceId, 'IFCSPACE',
@@ -1007,14 +1085,17 @@ export class IfcCreator {
    * Create a curtain wall. Thin panel from Start to End, extruded by Height.
    */
   addIfcCurtainWall(storeyId: number, params: CurtainWallParams): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcCurtainWall');
+    assertPositiveFinite({ Height: params.Height }, 'addIfcCurtainWall');
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const wallLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
     const thickness = params.Thickness ?? 0.05;
+    assertPositiveFinite({ Thickness: thickness }, 'addIfcCurtainWall');
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       RefDirection: dir,
     });
@@ -1044,8 +1125,10 @@ export class IfcCreator {
    * Create a furnishing element (furniture/equipment bounding box).
    */
   addIfcFurnishingElement(storeyId: number, params: FurnishingParams): number {
+    assertPositiveFinite({ Width: params.Width, Depth: params.Depth, Height: params.Height }, 'addIfcFurnishingElement');
     const direction = params.Direction ?? 0;
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    if (!Number.isFinite(direction)) throw new Error('addIfcFurnishingElement: Direction must be a finite number');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
       RefDirection: direction !== 0 ? [Math.cos(direction), Math.sin(direction), 0] : undefined,
     });
@@ -1075,7 +1158,8 @@ export class IfcCreator {
    * Create a proxy element (generic element for custom/unclassified objects).
    */
   addIfcBuildingElementProxy(storeyId: number, params: ProxyParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Height: params.Height }, 'addIfcBuildingElementProxy');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
@@ -1083,6 +1167,7 @@ export class IfcCreator {
     if (params.Profile && params.Profile.length >= 3) {
       profileId = this.addArbitraryProfile(params.Profile);
     } else {
+      assertPositiveFinite({ Width: params.Width, Depth: params.Depth }, 'addIfcBuildingElementProxy');
       profileId = this.addRectangleProfile(params.Width, params.Depth, [params.Width / 2, params.Depth / 2]);
     }
 
@@ -1119,7 +1204,8 @@ export class IfcCreator {
     Radius: number;
     Height: number;
   } & ElementAttributes): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Radius: params.Radius, Height: params.Height }, 'addIfcCircularColumn');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
@@ -1136,7 +1222,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -1156,13 +1242,21 @@ export class IfcCreator {
     FlangeThickness: number;
     FilletRadius?: number;
   } & ElementAttributes): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcIShapeBeam');
+    assertPositiveFinite({
+      OverallWidth: params.OverallWidth, OverallDepth: params.OverallDepth,
+      WebThickness: params.WebThickness, FlangeThickness: params.FlangeThickness,
+    }, 'addIfcIShapeBeam');
+    if (params.FilletRadius !== undefined) {
+      assertPositiveFinite({ FilletRadius: params.FilletRadius }, 'addIfcIShapeBeam');
+    }
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const beamLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -1185,7 +1279,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -1204,13 +1298,18 @@ export class IfcCreator {
     Thickness: number;
     FilletRadius?: number;
   } & ElementAttributes): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcLShapeMember');
+    assertPositiveFinite({ Depth: params.Depth, Width: params.Width, Thickness: params.Thickness }, 'addIfcLShapeMember');
+    if (params.FilletRadius !== undefined) {
+      assertPositiveFinite({ FilletRadius: params.FilletRadius }, 'addIfcLShapeMember');
+    }
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const memberLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -1249,13 +1348,21 @@ export class IfcCreator {
     FlangeThickness: number;
     FilletRadius?: number;
   } & ElementAttributes): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcTShapeMember');
+    assertPositiveFinite({
+      FlangeWidth: params.FlangeWidth, Depth: params.Depth,
+      WebThickness: params.WebThickness, FlangeThickness: params.FlangeThickness,
+    }, 'addIfcTShapeMember');
+    if (params.FilletRadius !== undefined) {
+      assertPositiveFinite({ FilletRadius: params.FilletRadius }, 'addIfcTShapeMember');
+    }
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const memberLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -1298,13 +1405,21 @@ export class IfcCreator {
     FlangeThickness: number;
     FilletRadius?: number;
   } & ElementAttributes): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcUShapeMember');
+    assertPositiveFinite({
+      Depth: params.Depth, FlangeWidth: params.FlangeWidth,
+      WebThickness: params.WebThickness, FlangeThickness: params.FlangeThickness,
+    }, 'addIfcUShapeMember');
+    if (params.FilletRadius !== undefined) {
+      assertPositiveFinite({ FilletRadius: params.FilletRadius }, 'addIfcUShapeMember');
+    }
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const memberLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -1344,7 +1459,8 @@ export class IfcCreator {
     WallThickness: number;
     Height: number;
   } & ElementAttributes): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    assertPositiveFinite({ Radius: params.Radius, WallThickness: params.WallThickness, Height: params.Height }, 'addIfcHollowCircularColumn');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Position,
     });
 
@@ -1361,7 +1477,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -1381,13 +1497,21 @@ export class IfcCreator {
     InnerFilletRadius?: number;
     OuterFilletRadius?: number;
   } & ElementAttributes): number {
+    assertFinitePoint3({ Start: params.Start, End: params.End }, 'addIfcRectangleHollowBeam');
+    assertPositiveFinite({ XDim: params.XDim, YDim: params.YDim, WallThickness: params.WallThickness }, 'addIfcRectangleHollowBeam');
+    if (params.InnerFilletRadius !== undefined) {
+      assertPositiveFinite({ InnerFilletRadius: params.InnerFilletRadius }, 'addIfcRectangleHollowBeam');
+    }
+    if (params.OuterFilletRadius !== undefined) {
+      assertPositiveFinite({ OuterFilletRadius: params.OuterFilletRadius }, 'addIfcRectangleHollowBeam');
+    }
     const dx = params.End[0] - params.Start[0];
     const dy = params.End[1] - params.Start[1];
     const dz = params.End[2] - params.Start[2];
     const beamLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const dir: Point3D = vecNorm([dx, dy, dz]);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,
       RefDirection: this.computeRefDirection(dir),
@@ -1409,7 +1533,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -1423,54 +1547,18 @@ export class IfcCreator {
 
   /** Attach a property set to an element */
   addIfcPropertySet(elementId: number, pset: PropertySetDef): number {
-    const propIds: number[] = [];
-
-    for (const prop of pset.Properties) {
-      const propId = this.id();
-      const valueStr = this.serializePropertyValue(prop);
-      this.line(propId, 'IFCPROPERTYSINGLEVALUE',
-        `'${esc(prop.Name)}',$,${valueStr},$`);
-      propIds.push(propId);
-    }
-
-    const psetId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = propIds.map(id => `#${id}`).join(',');
-    this.line(psetId, 'IFCPROPERTYSET',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(pset.Name)}',$,(${refs})`);
-
-    const relId = this.id();
-    const relGlobalId = this.newGlobalId();
-    this.line(relId, 'IFCRELDEFINESBYPROPERTIES',
-      `'${relGlobalId}',#${this.ownerHistoryId},$,$,(#${elementId}),#${psetId}`);
-
-    return psetId;
+    return emitPropertySet(elementId, pset, this.definitionContext());
   }
 
   /** Attach element quantities to an element */
   addIfcElementQuantity(elementId: number, qset: QuantitySetDef): number {
-    const qtyIds: number[] = [];
+    return emitElementQuantity(elementId, qset, this.definitionContext());
+  }
 
-    for (const qty of qset.Quantities) {
-      const qtyId = this.id();
-      const valueField = this.quantityValueField(qty);
-      this.line(qtyId, qty.Kind.toUpperCase(),
-        `'${esc(qty.Name)}',$,${valueField}`);
-      qtyIds.push(qtyId);
-    }
-
-    const qsetId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = qtyIds.map(id => `#${id}`).join(',');
-    this.line(qsetId, 'IFCELEMENTQUANTITY',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(qset.Name)}',$,$,(${refs})`);
-
-    const relId = this.id();
-    const relGlobalId = this.newGlobalId();
-    this.line(relId, 'IFCRELDEFINESBYPROPERTIES',
-      `'${relGlobalId}',#${this.ownerHistoryId},$,$,(#${elementId}),#${qsetId}`);
-
-    return qsetId;
+  /** The creator hooks `ifc-creator-definitions.ts`'s emitters need. */
+  private definitionContext(): DefinitionContext {
+    return { emit: this.emitEntity, newGlobalId: () => this.newGlobalId(),
+      ownerRef: `#${this.ownerHistoryId}`, ifc4Only: (v: string) => this.ifc4Only(v) };
   }
 
   // ============================================================================
@@ -1531,7 +1619,7 @@ export class IfcCreator {
   }
 
   // ============================================================================
-  // Public API — Scheduling / 4D  (IfcWorkSchedule, IfcTask, IfcRelSequence)
+  // Public API — Scheduling / 4D  (IfcWorkSchedule, IfcTask, IfcRelSequence, IfcWorkCalendar)
   // ============================================================================
 
   /**
@@ -1549,6 +1637,34 @@ export class IfcCreator {
   addIfcWorkPlan(params: WorkPlanParams): number {
     return this.buildWorkControl('IFCWORKPLAN', params);
   }
+
+  /**
+   * Create an IfcWorkCalendar — the working / non-working time calendar an
+   * IfcTask or IfcWorkSchedule can be assigned to. `WorkingTimes` /
+   * `ExceptionTimes` entries become nested IfcWorkTime entities (with their
+   * IfcRecurrencePattern / IfcTimePeriod when the entry carries a
+   * recurrence), the same way `addIfcTask` emits its IfcTaskTime. Assign it
+   * with `assignCalendarToTasks`. Returns the calendar expressId.
+   */
+  addIfcWorkCalendar(params: WorkCalendarParams): number {
+    if (this.schema === 'IFC2X3') {
+      throw new Error('addIfcWorkCalendar is not supported for IFC2X3');
+    }
+    const id = emitWorkCalendar(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcWorkCalendar', Name: params.Name });
+    return id;
+  }
+
+  /**
+   * Allocate an express id, write its STEP line, and hand the id back — the
+   * one hook `ifc-creator-scheduling.ts`'s emitters need from the creator.
+   * An arrow property so it can be passed by reference without binding.
+   */
+  private emitEntity = (type: string, attrs: string): number => {
+    const entityId = this.id();
+    this.line(entityId, type, attrs);
+    return entityId;
+  };
 
   /**
    * Create an IfcTask. If any Schedule/Actual/Early/Late time field, IsCritical,
@@ -1575,7 +1691,7 @@ export class IfcCreator {
       params.DurationType !== undefined ||
       params.Completion !== undefined;
 
-    const taskTimeId = hasTaskTime ? this.addIfcTaskTime(params) : 0;
+    const taskTimeId = hasTaskTime ? emitTaskTime(params, this.emitEntity) : 0;
     const taskId = this.id();
     const globalId = this.newGlobalId();
     const name = params.Name;
@@ -1595,44 +1711,6 @@ export class IfcCreator {
 
     this.entities.push({ expressId: taskId, type: 'IfcTask', Name: name });
     return taskId;
-  }
-
-  /**
-   * Build an IfcTaskTime from the task params (internal helper — prefer
-   * setting the time fields on the task itself via `addIfcTask`).
-   */
-  private addIfcTaskTime(params: TaskParams): number {
-    const ttId = this.id();
-    // [0] Name, [1] DataOrigin, [2] UserDefinedDataOrigin,
-    // [3] DurationType, [4] ScheduleDuration, [5] ScheduleStart, [6] ScheduleFinish,
-    // [7..10] Early/Late Start/Finish, [11] FreeFloat, [12] TotalFloat,
-    // [13] IsCritical, [14] StatusTime,
-    // [15] ActualDuration, [16] ActualStart, [17] ActualFinish,
-    // [18] RemainingTime, [19] Completion
-    const attrs: string[] = [
-      '$',                                      // Name
-      '$',                                      // DataOrigin
-      '$',                                      // UserDefinedDataOrigin
-      optEnum(params.DurationType),             // DurationType
-      optStr(params.ScheduleDuration),          // ScheduleDuration
-      optStr(params.ScheduleStart),             // ScheduleStart
-      optStr(params.ScheduleFinish),            // ScheduleFinish
-      optStr(params.EarlyStart),                // EarlyStart
-      optStr(params.EarlyFinish),               // EarlyFinish
-      optStr(params.LateStart),                 // LateStart
-      optStr(params.LateFinish),                // LateFinish
-      optStr(params.FreeFloat),                 // FreeFloat
-      optStr(params.TotalFloat),                // TotalFloat
-      optBool(params.IsCritical),               // IsCritical
-      optStr(params.StatusTime),                // StatusTime
-      optStr(params.ActualDuration),            // ActualDuration
-      optStr(params.ActualStart),               // ActualStart
-      optStr(params.ActualFinish),              // ActualFinish
-      optStr(params.RemainingTime),             // RemainingTime
-      optReal(params.Completion),               // Completion
-    ];
-    this.line(ttId, 'IFCTASKTIME', attrs.join(','));
-    return ttId;
   }
 
   /**
@@ -1661,7 +1739,7 @@ export class IfcCreator {
     }
 
     this.line(relId, 'IFCRELSEQUENCE',
-      `'${globalId}',#${this.ownerHistoryId},$,$,#${predecessorTaskId},#${successorTaskId},${lagRef},${seqType},${userDef}`);
+      `'${globalId}',#${this.ownerHistoryId},$,$,#${predecessorTaskId},#${successorTaskId},${lagRef},${seqType}${this.ifc4Only(userDef)}`);
     return relId;
   }
 
@@ -1694,6 +1772,16 @@ export class IfcCreator {
    */
   assignSchedulesToWorkPlan(planId: number, scheduleIds: number[]): number {
     return this.addIfcRelAssignsToControl(planId, scheduleIds);
+  }
+
+  /**
+   * Ergonomic alias — assign an IfcWorkCalendar to tasks (or work
+   * schedules; same relation either way). Delegates to
+   * {@link addIfcRelAssignsToControl}, which accepts a calendar because
+   * IfcWorkCalendar is an IfcControl.
+   */
+  assignCalendarToTasks(calendarId: number, taskIds: number[]): number {
+    return this.addIfcRelAssignsToControl(calendarId, taskIds);
   }
 
   /**
@@ -1733,6 +1821,81 @@ export class IfcCreator {
   /** Ergonomic alias — delegates to {@link addIfcRelNests}. */
   nestTasks(parentTaskId: number, childTaskIds: number[]): number {
     return this.addIfcRelNests(parentTaskId, childTaskIds);
+  }
+
+  // Public API — Cost / 5D. Every method delegates to `ifc-creator-cost.ts` and refuses
+  // IFC2X3 by name (its cost entity layout differs, so IFC4 records would parse and mislead).
+  /** Create an IfcCostSchedule (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostSchedule(params: CostScheduleParams): number {
+    assertCostSchema(this.schema, 'addIfcCostSchedule');
+    const id = emitCostSchedule(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostSchedule', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcCostItem (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostItem(params: CostItemParams): number {
+    assertCostSchema(this.schema, 'addIfcCostItem');
+    const id = emitCostItem(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostItem', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcCostValue (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostValue(params: CostValueParams): number {
+    assertCostSchema(this.schema, 'addIfcCostValue');
+    const id = emitCostValue(params, this.schema, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostValue', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcMonetaryUnit for `currency`. No default — omit it to leave the currency unstated. */
+  addIfcMonetaryUnit(currency: string): number {
+    assertCostSchema(this.schema, 'addIfcMonetaryUnit');
+    return emitMonetaryUnit(currency, this.emitEntity);
+  }
+
+  /** Create an IfcSIUnit, for use as an IfcMeasureWithUnit or quantity unit. */
+  addIfcSIUnit(params: SIUnitParams): number {
+    assertCostSchema(this.schema, 'addIfcSIUnit');
+    return emitSIUnit(params, this.emitEntity);
+  }
+
+  /** Create an IfcMeasureWithUnit — what a UnitBasis or entity-valued AppliedValue points at. */
+  addIfcMeasureWithUnit(value: CostTypedValue, unitId: number): number {
+    assertCostSchema(this.schema, 'addIfcMeasureWithUnit');
+    return emitMeasureWithUnit(value, unitId, this.schema, this.emitEntity);
+  }
+
+  /** Create a standalone IfcPhysicalSimpleQuantity for IfcCostItem.CostQuantities. */
+  addIfcPhysicalQuantity(params: CostQuantityParams): number {
+    assertCostSchema(this.schema, 'addIfcPhysicalQuantity');
+    return emitPhysicalQuantity(params, this.schema, this.emitEntity);
+  }
+
+  /** Emit an IfcRelAssignsToProduct — see {@link emitRelAssignsToProduct} for the direction rule. */
+  addIfcRelAssignsToProduct(relatingProductId: number, relatedObjectIds: number[]): number {
+    return emitRelAssignsToProduct(relatingProductId, relatedObjectIds,
+      () => this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+  }
+
+  // Ergonomic aliases over the canonical relationships: cost items under a
+  // schedule, cost items pricing a product, tasks bound to a cost item (an
+  // IfcCostItem is an IfcControl), and the cost breakdown hierarchy.
+  assignCostItemsToSchedule(scheduleId: number, costItemIds: number[]): number {
+    return this.addIfcRelAssignsToControl(scheduleId, costItemIds);
+  }
+
+  assignCostItemsToProduct(productId: number, costItemIds: number[]): number {
+    return this.addIfcRelAssignsToProduct(productId, costItemIds);
+  }
+
+  assignTasksToCostItem(costItemId: number, taskIds: number[]): number {
+    return this.addIfcRelAssignsToControl(costItemId, taskIds);
+  }
+
+  nestCostItems(parentCostItemId: number, childCostItemIds: number[]): number {
+    return this.addIfcRelNests(parentCostItemId, childCostItemIds);
   }
 
   /**
@@ -1797,7 +1960,7 @@ export class IfcCreator {
   }
 
   private buildHeader(): string {
-    const now = new Date(this.nowMs()).toISOString().replace(/[-:]/g, '').split('.')[0];
+    const now = new Date(this.nowMs()).toISOString().replace(/\.\d{3}Z$/, ''); // ISO 8601 time_stamp: keep '-'/':', drop only ms+'Z'
     const desc = 'Created by ifc-lite';
     const author = this.projectParams.Author ?? '';
     const org = this.projectParams.Organization ?? '';
@@ -1861,7 +2024,7 @@ ENDSEC;
       `$,'Axis',*,*,*,*,#${this.contextId},$,.GRAPH_VIEW.,$`);
 
     // Units
-    this.unitAssignmentId = this.buildUnits(params.LengthUnit ?? 'METRE');
+    this.unitAssignmentId = this.buildUnits(params.LengthUnit ?? 'METRE', params.Currency);
 
     // Default surface style — light grey with some specularity
     this.defaultStyleId = this.buildDefaultStyle();
@@ -1890,7 +2053,7 @@ ENDSEC;
     this.entities.push({ expressId: this.buildingId, type: 'IfcBuilding', Name: 'Building' });
   }
 
-  private buildUnits(lengthUnit: string): number {
+  private buildUnits(lengthUnit: string, currency?: string): number {
     const dimExpId = this.id();
     this.line(dimExpId, 'IFCDIMENSIONALEXPONENTS', '0,0,0,0,0,0,0');
 
@@ -1913,9 +2076,16 @@ ENDSEC;
     const siAngleId = this.id();
     this.line(siAngleId, 'IFCSIUNIT', `*,.PLANEANGLEUNIT.,$,.RADIAN.`);
 
+    // Absent currency stays absent: no IfcMonetaryUnit is written at all, so
+    // the cost read model reports no project currency rather than a guess.
+    const units = [lengthUnitId, siAreaId, siVolumeId, siAngleId];
+    if (currency !== undefined) {
+      assertCostSchema(this.schema, 'ProjectParams.Currency'); // IFC2X3 Currency is an enum
+      units.push(emitMonetaryUnit(currency, this.emitEntity));
+    }
+
     const assignmentId = this.id();
-    this.line(assignmentId, 'IFCUNITASSIGNMENT',
-      `(#${lengthUnitId},#${siAreaId},#${siVolumeId},#${siAngleId})`);
+    this.line(assignmentId, 'IFCUNITASSIGNMENT', `(${units.map(id => `#${id}`).join(',')})`);
 
     return assignmentId;
   }
@@ -2372,7 +2542,7 @@ ENDSEC;
    * ```
    */
   addElement(storeyId: number, params: GenericElementParams): number {
-    const placementId = this.addLocalPlacement(this.worldPlacementId, params.Placement);
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), params.Placement);
     const profileId = this.createProfile(params.Profile);
 
     // Handle custom extrusion direction
@@ -2452,7 +2622,7 @@ ENDSEC;
     }
     perp = vecNorm(perp);
 
-    const placementId = this.addLocalPlacement(this.worldPlacementId, {
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), {
       Location: params.Start,
       Axis: dir,           // local Z = along axis (extrusion direction)
       RefDirection: perp,  // local X = perpendicular to axis
@@ -2573,42 +2743,8 @@ ENDSEC;
     return openingId;
   }
 
-  // ============================================================================
-  // Internal — Property/quantity serialization
-  // ============================================================================
-
-  private serializePropertyValue(prop: PropertyDef): string {
-    const val = prop.NominalValue;
-    if (typeof val === 'string') {
-      const typeName = prop.Type ?? 'IfcLabel';
-      return `${typeName.toUpperCase()}('${esc(val)}')`;
-    }
-    if (typeof val === 'number') {
-      const typeName = prop.Type ?? (Number.isInteger(val) ? 'IfcInteger' : 'IfcReal');
-      if (typeName === 'IfcInteger') {
-        return `IFCINTEGER(${Math.round(val)})`;
-      }
-      return `IFCREAL(${num(val)})`;
-    }
-    if (typeof val === 'boolean') {
-      return `IFCBOOLEAN(${val ? '.T.' : '.F.'})`;
-    }
-    return '$';
-  }
-
-  private quantityValueField(qty: QuantityDef): string {
-    switch (qty.Kind) {
-      case 'IfcQuantityLength':
-      case 'IfcQuantityArea':
-      case 'IfcQuantityVolume':
-      case 'IfcQuantityWeight':
-        return `$,${num(qty.Value)}`;
-      case 'IfcQuantityCount':
-        return `$,${Math.round(qty.Value)}`;
-      default:
-        return `$,${num(qty.Value)}`;
-    }
-  }
+  // `serializePropertyValue` / `quantityValueField` moved to `ifc-creator-math.ts`.
+  private ifc4Only(v: string): string { return this.schema === 'IFC2X3' ? '' : `,${v}`; } // trailing IFC4/4X3-only attribute
 
   // ============================================================================
   // Internal — Relationship finalization

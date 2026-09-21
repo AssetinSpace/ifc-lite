@@ -3,11 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Reload-to-apply banner for the "Fast / Exact geometry" load-time mode,
- * mirroring {@link MergeLayersBanner}. The user flips the mode in the Visibility
- * dropdown; when a model is already loaded the store sets
+ * Reload-to-apply banner for the load-time geometry inputs, mirroring
+ * {@link MergeLayersBanner}. The user changes one in the Visibility dropdown
+ * (the Fast/Exact mode switch, or clearing a pinned `?geomTier=` detail
+ * override); when a model is already loaded the store sets
  * `geometryModePendingReload` and we surface this non-modal banner above the
- * canvas asking the user to reload (re-tessellating with the new mode).
+ * canvas asking the user to reload (re-tessellating with the new input).
+ * `geometryReloadReason` picks the headline so the prompt names the change the
+ * user actually made — one banner, two inputs.
  *
  * Anchored slightly below the merge-layers banner so the two don't overlap if
  * both are pending at once.
@@ -17,6 +20,7 @@ import { Zap, RefreshCw, X } from 'lucide-react';
 import { useViewerStore } from '@/store';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 
 export interface GeometryModeBannerProps {
   /**
@@ -27,8 +31,10 @@ export interface GeometryModeBannerProps {
 }
 
 export function GeometryModeBanner({ onReload }: GeometryModeBannerProps) {
+  const { t } = useTranslation();
   const pending = useViewerStore((s) => s.geometryModePendingReload);
   const mode = useViewerStore((s) => s.geometryMode);
+  const reason = useViewerStore((s) => s.geometryReloadReason);
   const dismiss = useViewerStore((s) => s.clearGeometryModePendingReload);
 
   const handleReload = useCallback(() => {
@@ -62,10 +68,14 @@ export function GeometryModeBanner({ onReload }: GeometryModeBannerProps) {
         </div>
         <div className="flex flex-col leading-tight min-w-0">
           <span className="text-xs font-semibold text-foreground">
-            {mode === 'fast' ? 'Fast geometry enabled' : 'Exact geometry enabled'}
+            {reason === 'tier'
+              ? t('geometryModeBanner.detailPinRemoved')
+              : mode === 'fast'
+                ? t('geometryModeBanner.fastEnabled')
+                : t('geometryModeBanner.exactEnabled')}
           </span>
           <span className="text-[11px] text-muted-foreground truncate">
-            Reload model to apply the new setting.
+            {t('geometryModeBanner.reloadHint')}
           </span>
         </div>
         <div className="flex items-center gap-1.5 ml-2">
@@ -76,14 +86,14 @@ export function GeometryModeBanner({ onReload }: GeometryModeBannerProps) {
             onClick={handleReload}
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            Reload
+            {t('geometryModeBanner.reloadButton')}
           </Button>
           <Button
             size="icon-sm"
             variant="ghost"
             className="h-7 w-7"
             onClick={dismiss}
-            aria-label="Dismiss reload reminder"
+            aria-label={t('geometryModeBanner.dismissAriaLabel')}
           >
             <X className="h-3.5 w-3.5" />
           </Button>

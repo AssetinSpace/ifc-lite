@@ -6,6 +6,7 @@ import posthogClient from 'posthog-js';
 import { scrubEvent } from './analytics-scrub.js';
 import { shouldSuppressWasmSkewNoise } from './wasm-version-skew.js';
 import { shouldSuppressChunkSkewNoise } from './chunk-version-skew.js';
+import { shouldSuppressForeignScriptNoise } from './foreign-script-noise.js';
 
 // `before_send` gate: drop the noise from an auto-recovered version skew - the
 // tab reloads onto fresh assets, so the captured exception describes a failure
@@ -13,20 +14,88 @@ import { shouldSuppressChunkSkewNoise } from './chunk-version-skew.js';
 // detected differently: the wasm one by the error's own signature
 // (shouldSuppressWasmSkewNoise), the JS/CSS chunk one by the reload we have
 // already committed to (shouldSuppressChunkSkewNoise) - a failed chunk's
-// collateral shares no vocabulary with its cause. Then run the privacy/tagging
+// collateral shares no vocabulary with its cause. A third gate drops what was
+// never ours at all: a throw whose every frame belongs to an injected
+// extension / user script (shouldSuppressForeignScriptNoise). Then run the privacy/tagging
 // scrub on everything that remains. Kept here rather than inside scrubEvent so
 // analytics-scrub.ts stays dependency-free (no @ifc-lite/geometry import) and
 // independently unit-testable.
-// Exported for ./analytics.test.ts. Both gates are unit-tested in isolation, but
-// only a test of THIS function can catch the gate being disconnected from the
-// pipeline, which is the failure that would silently restore the noise.
+// Exported for ./analytics.test.ts and ./foreign-script-noise.test.ts. Only a
+// test of THIS function can catch a gate being disconnected from the pipeline,
+// which is the failure that would silently restore the noise.
+//
+// The three gates are NOT tested the same way, and the difference is
+// deliberate. The two skew gates have isolated unit tests of their own
+// (./wasm-skew-noise.test.ts, ./chunk-version-skew.test.ts) plus wiring tests
+// here. The foreign-script gate is observed ONLY through this function, and
+// adding an isolated test that imports ./foreign-script-noise.js directly would
+// break something: `scripts/check-test-revert-oracle.mjs` reverts the
+// production change and requires the changed tests to fail BY ASSERTION, and
+// the #4939 fix ADDS that module - so a test importing it dies with
+// ERR_MODULE_NOT_FOUND under the revert, no assertion runs, and the oracle
+// reports REVERT-BROKE-BUILD. This file is modified rather than added, so under
+// the revert it still loads with the gate absent and the assertions fail
+// properly. Please do not "fix" that test by importing the module.
 export const beforeSend = <
   T extends { event?: string; properties?: Record<string, unknown> } | null,
 >(event: T): T | null => {
   if (shouldSuppressWasmSkewNoise(event)) return null;
   if (shouldSuppressChunkSkewNoise(event)) return null;
+  // A third sibling gate, on attribution rather than on a message or a reload:
+  // an injected extension / user script throwing on our `window` is not ours to
+  // fix (#4939). Lives in its own module for the same reason as the other two.
+  if (shouldSuppressForeignScriptNoise(event)) return null;
   return scrubEvent(event);
 };
+
+// PostHog's own `DOMExceptionCoercer` (posthog-js -> @posthog/core) does
+// exactly this before an exception ever leaves the browser:
+//
+//   const hasStack = isString(err.stack);
+//   return { ..., stack: hasStack ? err.stack : undefined, ... };
+//
+// — verified by reading @posthog/core's dom-exception-coercer.js. So any
+// DOMException reaching `captureException` with no `.stack` is symbolicated
+// as zero frames, full stop; no amount of sourcemap upload changes that,
+// because there is nothing for PostHog to resolve.
+//
+// And a JS-constructed `DOMException` commonly HAS no `.stack`: confirmed by
+// probing real engines with Playwright (both WebKit 26.5 and Chromium) —
+// `new DOMException(msg, name)` is `instanceof Error` but `'stack' in err` is
+// false in both. Contrast a DOMException the browser itself throws as part of
+// a native binding failure (e.g. `structuredClone`'s `DataCloneError`), which
+// DOES get a stack in both engines. Which path `GPUDevice.createTexture`'s
+// `InvalidStateError` takes isn't independently verifiable without a live
+// WebGPU device, but the fix below is correct either way: it only touches
+// errors that already have no usable stack, so it can only add frames PostHog
+// would otherwise have dropped, never disturb a real one.
+//
+// This is the root cause behind issues #2229/#2230 ("payload carries no
+// stacktrace") for any call site whose caught value is a DOMException (GPU
+// upload failures, WebGL context loss, AbortError-shaped cancellations, …).
+//
+// The fix: at the capture boundary, if the value handed to `captureException`
+// is an `Error` (DOMException included — it's `instanceof Error`) with no
+// usable `.stack`, synthesize one by throwing/catching fresh right here. That
+// can't recover the original throw site, but every call site that reaches
+// this (gpu-upload-guard.ts, useIfcLoader.ts, LocationMap.tsx, …) reports
+// synchronously from inside its own catch block, so the synthesized frames
+// are the same call chain minus the innermost native frame — real,
+// sourcemap-resolvable file/line/column instead of the zero frames PostHog's
+// coercer would otherwise emit. See ./analytics.test.ts for the RED/GREEN
+// pair pinning this against posthog-js's actual coercer behavior.
+export function ensureCapturableStack(err: unknown): unknown {
+  if (!(err instanceof Error)) return err;
+  if (typeof err.stack === 'string' && err.stack.length > 0) return err;
+  const withStack = new Error(err.message);
+  withStack.name = err.name;
+  // V8 only: drops this function's own frame so the top of the synthesized
+  // stack is the real caller. A no-op (and harmless) everywhere else — those
+  // engines already excluded native-call frames from `new Error()`'s capture.
+  const capture = (Error as unknown as { captureStackTrace?: (target: object, ctor: unknown) => void }).captureStackTrace;
+  if (typeof capture === 'function') capture(withStack, ensureCapturableStack);
+  return withStack;
+}
 
 // `import.meta.env` is undefined under the Node test runner (no Vite define
 // plugin), and this module is loaded transitively by most viewer tests. The
@@ -73,7 +142,13 @@ if (enabled) {
       app_version: typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'dev',
       app_build_sha: typeof __BUILD_SHA__ === 'string' ? __BUILD_SHA__ : 'dev',
     });
-    client = posthogClient;
+    client = {
+      capture: posthogClient.capture.bind(posthogClient),
+      // Normalize away the DOMException-with-no-.stack case (see
+      // ensureCapturableStack above) before it reaches posthog-js's coercer.
+      captureException: (err, additionalProperties) =>
+        posthogClient.captureException(ensureCapturableStack(err), additionalProperties),
+    };
   } catch (err) {
     console.warn('[analytics] PostHog init failed; analytics disabled', err);
   }

@@ -26,17 +26,23 @@ import {
   Upload,
   MousePointerClick,
   Pencil,
+  Scissors,
   X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 import { downloadFile, sanitizeFilename } from '@/lib/export/download';
 import { toast } from '@/components/ui/toast';
 import { generateZonesFromStoreys } from '@/hooks/useZoneStoreyGeneration';
 import { selectElementsInZone } from '@/hooks/useZoneSelection';
+import { useZoneGeometrySplit } from '@/hooks/useZoneGeometrySplit';
 import type { Zone } from '@/lib/zones';
+import { ZoneApportionSummary } from './ZoneApportionSummary';
+import { ZoneWriteBackControl } from './ZoneWriteBackControl';
 
 interface ZonesPanelProps {
   onClose?: () => void;
@@ -92,16 +98,25 @@ function NumberField({
 }
 
 function ZoneRow({
-  setId, zone, editing, onEdit, onUpdate, onRemove, onSelect,
+  setId, zone, editing, exporting, exportProgress, onEdit, onUpdate, onRemove, onSelect, onExportGeometry,
 }: {
   setId: string;
   zone: Zone;
   editing: boolean;
+  /** A geometry export for THIS zone is running: the control is disabled and
+   *  says so, because the cut takes hundreds of milliseconds per element. */
+  exporting: boolean;
+  /** Elements cut so far, while `exporting`. Worth rendering only because the
+   *  cutting moved to a worker: on the main thread nothing could repaint
+   *  between the first element and the last. */
+  exportProgress?: { done: number; total: number } | null;
   onEdit: () => void;
   onUpdate: (patch: Partial<Omit<Zone, 'id'>>) => void;
   onRemove: () => void;
   onSelect: () => void;
+  onExportGeometry: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className={`rounded-md border p-2 text-xs space-y-1.5 ${editing ? 'border-amber-500 bg-amber-500/5' : 'border-border/60'}`}>
       <div className="flex items-center gap-1.5">
@@ -110,26 +125,82 @@ function ZoneRow({
           onChange={(e) => onUpdate({ name: e.target.value })}
           className="h-6 flex-1 px-1.5 text-xs font-medium"
         />
-        <Button
-          variant={editing ? 'default' : 'ghost'}
-          size="icon"
-          className="h-6 w-6"
-          title={editing ? 'Stop editing in 3D' : 'Edit in 3D (move / resize / rotate handles)'}
-          onClick={onEdit}
-        >
-          <Pencil className="h-3 w-3" />
-        </Button>
-        <Button variant="ghost" size="icon" className="h-6 w-6" title="Select elements in this zone" onClick={onSelect}>
+        {/* Hidden for a prism: the 3D gizmo edits the box fields, which a
+            prism derives from its footprint, so the handles would move nothing
+            (see `ZoneOverlay`). A control that does nothing is worse than no
+            control. */}
+        {!zone.footprint && (
+          <Button
+            variant={editing ? 'default' : 'ghost'}
+            size="icon"
+            className="h-6 w-6"
+            title={editing ? t('zonesPanel.zoneRow.stopEditingTitle') : t('zonesPanel.zoneRow.editIn3dTitle')}
+            onClick={onEdit}
+          >
+            <Pencil className="h-3 w-3" />
+          </Button>
+        )}
+        <Button variant="ghost" size="icon" className="h-6 w-6" title={t('zonesPanel.zoneRow.selectTitle')} onClick={onSelect}>
           <MousePointerClick className="h-3 w-3" />
         </Button>
-        <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive" title="Delete zone" onClick={onRemove}>
+        {/* The geometry half of #2508: elements wholly in this zone plus the
+            CUT pieces of the straddlers, as one model of this section. */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6"
+          title={exporting ? t('zonesPanel.zoneRow.exportingTitle') : t('zonesPanel.zoneRow.exportGeometryTitle')}
+          aria-label={t('zonesPanel.zoneRow.exportGeometryAriaLabel', { name: zone.name })}
+          disabled={exporting}
+          onClick={onExportGeometry}
+        >
+          <Scissors className={`h-3 w-3${exporting ? ' animate-pulse' : ''}`} />
+        </Button>
+        {exporting && exportProgress && (
+          <span className="text-[10px] tabular-nums text-muted-foreground" role="status" aria-live="polite">
+            {t('zonesPanel.zoneRow.cuttingProgress', { done: exportProgress.done, total: exportProgress.total })}
+          </span>
+        )}
+        <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive" title={t('zonesPanel.zoneRow.deleteZoneTitle')} onClick={onRemove}>
           <Trash2 className="h-3 w-3" />
         </Button>
       </div>
+      {/* A PRISM zone (#2508 item 4) owns only its vertical extent: its X/Z
+          centre, size and rotation are DERIVED from the footprint, so offering
+          them as editable fields would show numbers that snap back on the next
+          import and change nothing in between. */}
+      {zone.footprint ? (
+        <div className="grid grid-cols-3 gap-1">
+          <label className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t('zonesPanel.zoneRow.baseYLabel')}</span>
+            <NumberField
+              value={zone.center[1] - zone.size[1] / 2}
+              onCommit={(v) => onUpdate({ center: [zone.center[0], v + zone.size[1] / 2, zone.center[2]] })}
+            />
+          </label>
+          <label className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t('zonesPanel.zoneRow.prismHeightLabel')}</span>
+            <NumberField
+              value={zone.size[1]}
+              onCommit={(v) => {
+                const height = Math.max(0.05, v);
+                const base = zone.center[1] - zone.size[1] / 2;
+                onUpdate({
+                  size: [zone.size[0], height, zone.size[2]],
+                  center: [zone.center[0], base + height / 2, zone.center[2]],
+                });
+              }}
+            />
+          </label>
+          <span className="self-end text-[10px] text-muted-foreground truncate" title={t('zonesPanel.zoneRow.footprintTitle')}>
+            {t('zonesPanel.zoneRow.prismPts', { count: zone.footprint.length })}
+          </span>
+        </div>
+      ) : (
       <div className="grid grid-cols-3 gap-1">
-        {(['Center X', 'Center Y', 'Center Z'] as const).map((label, i) => (
-          <label key={label} className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">{label}</span>
+        {(['zonesPanel.zoneRow.centerXLabel', 'zonesPanel.zoneRow.centerYLabel', 'zonesPanel.zoneRow.centerZLabel'] as const).map((labelKey, i) => (
+          <label key={labelKey} className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t(labelKey)}</span>
             <NumberField
               value={zone.center[i]}
               onCommit={(v) => {
@@ -140,9 +211,9 @@ function ZoneRow({
             />
           </label>
         ))}
-        {(['Width (X)', 'Height (Y)', 'Depth (Z)'] as const).map((label, i) => (
-          <label key={label} className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">{label}</span>
+        {(['zonesPanel.zoneRow.widthLabel', 'zonesPanel.zoneRow.heightLabel', 'zonesPanel.zoneRow.depthLabel'] as const).map((labelKey, i) => (
+          <label key={labelKey} className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t(labelKey)}</span>
             <NumberField
               value={zone.size[i]}
               onCommit={(v) => {
@@ -154,15 +225,17 @@ function ZoneRow({
           </label>
         ))}
         <label className="flex flex-col gap-0.5">
-          <span className="text-muted-foreground">Rotation (°)</span>
+          <span className="text-muted-foreground">{t('zonesPanel.zoneRow.rotationLabel')}</span>
           <NumberField value={toDeg(zone.rotationY)} onCommit={(v) => onUpdate({ rotationY: fromDeg(v) })} />
         </label>
       </div>
+      )}
     </div>
   );
 }
 
 export function ZonesPanel({ onClose }: ZonesPanelProps) {
+  const { t } = useTranslation();
   const zoneSets = useViewerStore((s) => s.zoneSets);
   const editingZone = useViewerStore((s) => s.editingZone);
   const zoneAssignmentTiming = useViewerStore((s) => s.zoneAssignmentTiming);
@@ -177,6 +250,15 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
   const replaceZonesInSet = useViewerStore((s) => s.replaceZonesInSet);
   const exportZoneSetsJSON = useViewerStore((s) => s.exportZoneSetsJSON);
   const importZoneSetsJSON = useViewerStore((s) => s.importZoneSetsJSON);
+  const { exportZone } = useZoneGeometrySplit();
+  // Which zone's geometry export is running, for the disabled state, plus a ref
+  // so a second click is refused in the same tick the first one starts (state
+  // has not re-rendered yet at that point).
+  const [exportingZoneId, setExportingZoneId] = useState<string | null>(null);
+  const exportingRef = useRef(false);
+  // How far the cut has got. Only meaningful while a worker is doing the work:
+  // before this, the main thread was blocked and nothing could have painted it.
+  const [exportProgress, setExportProgress] = useState<{ done: number; total: number } | null>(null);
 
   const [newSetName, setNewSetName] = useState('');
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -204,13 +286,13 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
   const handleGenerateFromStoreys = useCallback(() => {
     const result = generateZonesFromStoreys();
     if (!result.ok) {
-      toast.error(`Could not generate zones from storeys: ${result.error}`);
+      toast.error(t('zonesPanel.generateFromStoreysError', { error: result.error }));
       return;
     }
     const id = createZoneSet('Storeys');
     replaceZonesInSet(id, result.zones);
-    toast.success(`Generated ${result.zones.length} zone(s) from storeys`);
-  }, [createZoneSet, replaceZonesInSet]);
+    toast.success(t('zonesPanel.generateFromStoreysSuccess', { count: result.zones.length }));
+  }, [createZoneSet, replaceZonesInSet, t]);
 
   const handleExport = useCallback(() => {
     const json = exportZoneSetsJSON();
@@ -223,22 +305,22 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
       const text = await file.text();
       const result = importZoneSetsJSON(text);
       if (!result.ok) {
-        toast.error(`Import failed: ${result.error}`);
+        toast.error(t('zonesPanel.importFailed', { error: result.error }));
       } else {
-        toast.success('Zone sets imported');
+        toast.success(t('zonesPanel.importSuccess'));
       }
     } catch (error) {
-      toast.error(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
+      toast.error(t('zonesPanel.importFailed', { error: error instanceof Error ? error.message : String(error) }));
     } finally {
       if (importInputRef.current) importInputRef.current.value = '';
     }
-  }, [importZoneSetsJSON]);
+  }, [importZoneSetsJSON, t]);
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b p-3">
         <Box className="h-4 w-4 text-amber-600" />
-        <span className="font-medium text-sm flex-1">Location zones</span>
+        <span className="font-medium text-sm flex-1">{t('zonesPanel.header.title')}</span>
         {onClose && (
           <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleClose}>
             <X className="h-3.5 w-3.5" />
@@ -250,29 +332,23 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
         <Input
           value={newSetName}
           onChange={(e) => setNewSetName(e.target.value)}
-          placeholder="New zone set name…"
+          placeholder={t('zonesPanel.header.newSetPlaceholder')}
           className="h-7 flex-1 text-xs"
           onKeyDown={(e) => { if (e.key === 'Enter') handleAddSet(); }}
         />
         <Button size="sm" className="h-7" onClick={handleAddSet}>
-          <Plus className="h-3.5 w-3.5" /> Set
+          <Plus className="h-3.5 w-3.5" /> {t('zonesPanel.header.addSetButton')}
         </Button>
       </div>
 
       <div className="flex items-center gap-1.5 border-b p-2">
         <Button variant="outline" size="sm" className="h-7 flex-1" onClick={handleGenerateFromStoreys}>
-          <Layers3 className="h-3.5 w-3.5" /> Generate from storeys
+          <Layers3 className="h-3.5 w-3.5" /> {t('zonesPanel.header.generateFromStoreysButton')}
         </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" title="Export zone sets as JSON" onClick={handleExport}>
+        <Button variant="ghost" size="icon" className="h-7 w-7" title={t('zonesPanel.header.exportSetsTitle')} onClick={handleExport}>
           <Download className="h-3.5 w-3.5" />
         </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-7 w-7"
-          title="Import zone sets from JSON"
-          onClick={() => importInputRef.current?.click()}
-        >
+        <Button variant="ghost" size="icon" className="h-7 w-7" title={t('zonesPanel.header.importSetsTitle')} onClick={() => importInputRef.current?.click()}>
           <Upload className="h-3.5 w-3.5" />
         </Button>
         <input
@@ -286,22 +362,20 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
 
       <div className="flex-1 overflow-y-auto p-2 space-y-2">
         {zoneSets.length === 0 && (
-          <p className="p-3 text-xs text-muted-foreground">
-            No zone sets yet. Create one above, or generate one from the model&apos;s storeys.
-          </p>
+          <p className="p-3 text-xs text-muted-foreground">{t('zonesPanel.emptyState')}</p>
         )}
         {zoneSets.map((zs) => (
           <Collapsible key={zs.id} defaultOpen className="rounded-md border">
             <div className="flex items-center gap-1 p-1.5">
               <CollapsibleTrigger className="flex-1 flex items-center gap-1.5 px-1 py-0.5 text-left">
                 <span className="font-medium text-xs">{zs.name}</span>
-                <span className="text-[10px] text-muted-foreground">{zs.zones.length} zone{zs.zones.length === 1 ? '' : 's'}</span>
+                <span className="text-[10px] text-muted-foreground">{t('zonesPanel.zoneCount', { count: zs.zones.length })}</span>
               </CollapsibleTrigger>
               <Button
                 variant="ghost"
                 size="icon"
                 className="h-6 w-6"
-                title={zs.visible ? 'Hide in 3D view' : 'Show in 3D view'}
+                title={zs.visible ? t('zonesPanel.hideIn3dTitle') : t('zonesPanel.showIn3dTitle')}
                 onClick={() => setZoneSetVisible(zs.id, !zs.visible)}
               >
                 {zs.visible ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
@@ -310,7 +384,7 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                 variant="ghost"
                 size="icon"
                 className="h-6 w-6"
-                title="Add zone"
+                title={t('zonesPanel.addZoneTitle')}
                 onClick={() => addZone(zs.id, { name: `Zone ${zs.zones.length + 1}` })}
               >
                 <Plus className="h-3.5 w-3.5" />
@@ -319,7 +393,7 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                 variant="ghost"
                 size="icon"
                 className="h-6 w-6 text-destructive"
-                title="Delete zone set"
+                title={t('zonesPanel.deleteZoneSetTitle')}
                 onClick={() => removeZoneSet(zs.id)}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -330,7 +404,7 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                 value={zs.name}
                 onChange={(e) => renameZoneSet(zs.id, e.target.value)}
                 className="h-6 text-[11px] text-muted-foreground"
-                placeholder="Set name"
+                placeholder={t('zonesPanel.setNamePlaceholder')}
               />
               {zs.zones.map((zone) => (
                 <ZoneRow
@@ -347,11 +421,75 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                   onRemove={() => removeZone(zs.id, zone.id)}
                   onSelect={() => {
                     const count = selectElementsInZone(zs.id, zone.id);
-                    if (count > 0) toast.success(`Selected ${count} element(s)`);
-                    else toast.info('No elements in this zone');
+                    if (count > 0) toast.success(t('zonesPanel.selectedElements', { count }));
+                    else toast.info(t('zonesPanel.noElementsInZone'));
+                  }}
+                  exporting={exportingZoneId === zone.id}
+                  exportProgress={exportProgress}
+                  onExportGeometry={async () => {
+                    // The split is seconds of synchronous work (~357 ms per cut
+                    // element, measured), so three things have to happen before
+                    // it starts: mark the zone busy, let the browser PAINT that
+                    // (a state change alone does not, since the handler blocks
+                    // the same frame), and refuse a second click. Without the
+                    // last one a queued click starts a whole second run the
+                    // moment the first returns.
+                    if (exportingRef.current) return;
+                    exportingRef.current = true;
+                    setExportingZoneId(zone.id);
+                    setExportProgress(null);
+                    let result: Awaited<ReturnType<typeof exportZone>>;
+                    try {
+                      // The cutting runs in a worker now, so this await yields
+                      // to the event loop rather than blocking it: the disabled
+                      // state paints, the progress below updates, and the model
+                      // can still be orbited while a section is being cut.
+                      result = await exportZone(
+                        zs,
+                        zs.zones.indexOf(zone),
+                        (done, total) => setExportProgress({ done, total }),
+                      );
+                    } catch (error) {
+                      // The kernel, the GLB build and the download can each
+                      // throw. Inside an ASYNC handler a throw becomes an
+                      // unhandled rejection, so the user would sit in front of
+                      // a control that reset itself and said nothing.
+                      console.error('[zones] geometry export failed', error);
+                      const message = error instanceof Error ? error.message : 'unknown error';
+                      toast.error(t('zonesPanel.exportZoneError', { name: zone.name, message }));
+                      return;
+                    } finally {
+                      exportingRef.current = false;
+                      setExportingZoneId(null);
+                      setExportProgress(null);
+                    }
+                    if (!result.ok) {
+                      toast.error(result.reason === 'no-binding'
+                        ? t('zonesPanel.exportNoBinding')
+                        : result.reason === 'busy'
+                          // Reachable by closing the panel mid-export and
+                          // reopening it: this component's own guard resets,
+                          // the run behind it does not.
+                          ? t('zonesPanel.exportBusy')
+                          : t('zonesPanel.exportNothingToExport'));
+                      return;
+                    }
+                    const { whole, cut, refused, noGeometry, elapsedMs } = result.summary;
+                    const elapsed = (elapsedMs / 1000).toFixed(1);
+                    const successKey: TranslationKey = refused > 0 && noGeometry > 0
+                      ? 'zonesPanel.exportGeometrySuccessBoth'
+                      : refused > 0 ? 'zonesPanel.exportGeometrySuccessRefusedOnly'
+                        : noGeometry > 0 ? 'zonesPanel.exportGeometrySuccessNoGeometryOnly'
+                          : 'zonesPanel.exportGeometrySuccessPlain';
+                    toast.success(t(successKey, { whole, cut, elapsed, refused, noGeometry }));
                   }}
                 />
               ))}
+              {/* Volume apportionment for this set's straddlers (#2508). On
+                  demand only — never part of load. */}
+              {zs.zones.length > 0 && <ZoneApportionSummary zoneSet={zs} />}
+              {/* ...and the way that result leaves the viewer (#2508 item 3). */}
+              {zs.zones.length > 0 && <ZoneWriteBackControl zoneSet={zs} />}
             </CollapsibleContent>
           </Collapsible>
         ))}
@@ -359,8 +497,10 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
 
       {zoneAssignmentTiming && (
         <div className="border-t p-2 text-[10px] text-muted-foreground">
-          Last assignment: {zoneAssignmentTiming.elementCount.toLocaleString()} element(s) x{' '}
-          {zoneAssignmentTiming.zoneSetCount} set(s) in {zoneAssignmentTiming.elapsedMs.toFixed(1)}ms
+          {t('zonesPanel.assignmentTimingLine', {
+            elementCount: zoneAssignmentTiming.elementCount.toLocaleString(),
+            zoneSetCount: zoneAssignmentTiming.zoneSetCount, elapsedMs: zoneAssignmentTiming.elapsedMs.toFixed(1),
+          })}
         </div>
       )}
     </div>

@@ -17,7 +17,7 @@
  *                 of CRDT docs; concurrent parent edits LWW-merge with
  *                 the branch's edits per Yjs semantics.
  *   - `'layer'` : extract the branch contents as an IFCX layer and
- *                 re-seed the parent with parent + branch composed.
+ *                 apply it over the parent as a layer of opinions.
  *                 Useful when the branch was edited by tools that only
  *                 speak IFCX, not the live Y.Doc.
  *
@@ -32,9 +32,9 @@ import {
   type CollabSession,
   type CollabSessionOptions,
 } from '../session.js';
-import { metaMap } from '../doc/schema.js';
+import { entitiesMap, metaMap } from '../doc/schema.js';
 import { snapshotToIfcx } from '../snapshot/to-ifcx.js';
-import { seedFromIfcx } from '../snapshot/from-ifcx.js';
+import { applyIfcxOverlay } from '../snapshot/from-ifcx.js';
 
 export interface ForkOptions {
   /** New room id for the branch. Defaults to `<parent.roomId>/branches/<name>`. */
@@ -61,6 +61,16 @@ const META_PARENT = 'branch.parentRoomId';
 const META_NAME = 'branch.name';
 const META_FORKED_AT = 'branch.forkedAt';
 
+/**
+ * Entity ids present at fork time, keyed by the branch's Y.Doc. Used by
+ * `mergeBranch(..., 'layer')` to tell "the branch deleted this entity"
+ * apart from "the parent created this entity after the fork and the
+ * branch never had it" — both look like "missing from the branch doc"
+ * with no other signal available. A WeakMap keyed on the doc instance so
+ * entries are collected once a branch's doc is no longer referenced.
+ */
+const forkEntitySnapshots = new WeakMap<Y.Doc, ReadonlySet<string>>();
+
 export async function forkSession(
   parent: CollabSession,
   opts: ForkOptions,
@@ -85,6 +95,7 @@ export async function forkSession(
 
   // 3. Seed the branch doc with the parent state, then stamp branch metadata.
   Y.applyUpdate(branch.doc, update, { source: 'fork', parentRoomId: parent.roomId });
+  forkEntitySnapshots.set(branch.doc, new Set(entitiesMap(branch.doc).keys()));
   branch.transact(() => {
     const meta = metaMap(branch.doc);
     meta.set(META_PARENT, parent.roomId);
@@ -107,6 +118,17 @@ export interface MergeReport {
   bytes: number;
   /** ISO timestamp of when the merge transaction landed on `parent`. */
   mergedAt: string;
+  /**
+   * Count of entities the `'layer'` strategy could not remove from
+   * `parent` even though `branch` deleted them before merge. An IFCX
+   * snapshot of the branch (see below) emits only what an entity has, so
+   * a branch-side deletion is indistinguishable on the wire from "no
+   * opinion" — `applyIfcxOverlay` therefore leaves the parent's copy of
+   * that entity untouched. Always `0` for the `'ops'` strategy, which
+   * applies the branch's Y update directly and propagates deletions like
+   * any other Yjs change.
+   */
+  droppedDeletions: number;
 }
 
 /**
@@ -131,21 +153,50 @@ export function mergeBranch(
       strategy,
       bytes: update.byteLength,
       mergedAt: new Date().toISOString(),
+      droppedDeletions: 0,
     };
   }
 
-  // 'layer' strategy: snapshot the branch as IFCX, then re-seed the
-  // parent with reset:false so existing parent state is preserved and
-  // branch nodes overlay (composition is left to the caller's IFCX
-  // layer stack — for now we fall back to "set everything we have").
+  // 'layer' strategy: snapshot the branch as IFCX, then apply it to the
+  // parent as a layer of opinions. `seedFromIfcx` cannot do this job —
+  // its `createEntity` no-ops on a path the doc already has, and since a
+  // branch forks from its parent, essentially every entity the branch
+  // *modified* is already there, so seeding landed only the branch's
+  // brand-new entities and dropped every edit. Regression coverage lives
+  // in test/branch-merge-layer-overlay.test.ts.
+  //
+  // `applyIfcxOverlay` creates what is missing and writes the branch's
+  // opinions on top of what is not, leaving parent state the branch
+  // snapshot says nothing about untouched. Deletions made on the branch
+  // still do not propagate: an IFCX snapshot emits only what an entity
+  // has, so a removal is indistinguishable from "no opinion" on the wire.
+  // Diagnostic only (not a fix): count entities the branch deleted that
+  // this merge cannot remove from `parent`, so the caller can at least
+  // detect the drop. An entity counts only if it existed on the branch
+  // at fork time (`forkEntitySnapshots`) — that rules out entities the
+  // parent created *after* the fork, which are also absent from the
+  // branch doc but were never "deleted" by anything.
+  const forkIds = forkEntitySnapshots.get(branch.session.doc);
+  const parentEntitiesBefore = entitiesMap(parent.doc);
+  const branchEntitiesNow = entitiesMap(branch.session.doc);
+  let droppedDeletions = 0;
+  if (forkIds) {
+    for (const id of forkIds) {
+      if (!branchEntitiesNow.has(id) && parentEntitiesBefore.has(id)) {
+        droppedDeletions++;
+      }
+    }
+  }
+
   const ifcx = snapshotToIfcx(branch.session.doc);
   const before = Y.encodeStateAsUpdate(parent.doc);
-  seedFromIfcx(parent.doc, ifcx, { reset: false });
+  applyIfcxOverlay(parent.doc, ifcx);
   const after = Y.encodeStateAsUpdate(parent.doc);
   return {
     strategy,
     bytes: Math.max(0, after.byteLength - before.byteLength),
     mergedAt: new Date().toISOString(),
+    droppedDeletions,
   };
 }
 

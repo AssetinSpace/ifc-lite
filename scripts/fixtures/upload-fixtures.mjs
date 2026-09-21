@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 // One-time / on-demand uploader for fixture assets.
 //
 // Usage:
@@ -32,6 +36,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { validateManifest } from './manifest-validation.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 const MODELS_DIR = resolve(ROOT, 'tests/models');
@@ -42,12 +47,12 @@ if (!manifest || typeof manifest !== 'object') {
   console.error(`error: ${MANIFEST_PATH} is not a JSON object`);
   process.exit(2);
 }
+const manifestErrors = validateManifest(manifest);
 if (typeof manifest.release_tag !== 'string' || manifest.release_tag.length === 0) {
-  console.error(`error: ${MANIFEST_PATH} is missing a non-empty "release_tag"`);
-  process.exit(2);
+  manifestErrors.push('manifest.release_tag: must be a non-empty string for upload');
 }
-if (!Array.isArray(manifest.files)) {
-  console.error(`error: ${MANIFEST_PATH} is missing a "files" array`);
+if (manifestErrors.length) {
+  for (const error of manifestErrors) console.error(`error: ${MANIFEST_PATH}: ${error}`);
   process.exit(2);
 }
 const TAG = manifest.release_tag;
@@ -161,7 +166,12 @@ let cleanedUp = false;
 function cleanupStaging() {
   if (cleanedUp) return;
   cleanedUp = true;
-  try { rmSync(staging, { recursive: true, force: true }); } catch {}
+  try {
+    rmSync(staging, { recursive: true, force: true });
+  } catch (err) {
+    // Best-effort: the tempdir is the OS's to reap. Say where it was left.
+    console.error(`  warning: could not remove staging dir ${staging}: ${err.message}`);
+  }
 }
 process.on('exit', cleanupStaging);
 process.on('SIGINT', () => { cleanupStaging(); process.exit(130); });
@@ -199,7 +209,12 @@ try {
       failed.push({ entry, err });
       console.error(`    FAILED: ${err.message}`);
     } finally {
-      try { unlinkSync(stagedPath); } catch {}
+      try {
+        unlinkSync(stagedPath);
+      } catch (err) {
+        // Best-effort: cleanupStaging() removes the whole dir at exit anyway.
+        console.error(`    warning: could not unlink staged ${assetName}: ${err.message}`);
+      }
     }
   }
 } finally {
