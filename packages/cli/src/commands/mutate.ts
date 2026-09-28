@@ -14,8 +14,14 @@ import { loadIfcFile, createHeadlessContext } from '../loader.js';
 import { getFlag, getAllFlags, hasFlag, fatal, printJson } from '../output.js';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import { StepExporter } from '@ifc-lite/export';
-import { extractPropertiesOnDemand } from '@ifc-lite/parser';
-import { PropertyValueType } from '@ifc-lite/data';
+import { extractPropertiesOnDemand, extractQuantitiesOnDemand } from '@ifc-lite/parser';
+import { PropertyValueType, findAttribute, type IfcSchemaVersion } from '@ifc-lite/data';
+import { ATTRIBUTE_INDEX, applyAttributeMutations, type SkippedAttributeMutation } from './mutate-step-record.js';
+
+// Re-exported so `mutate.test.ts` keeps importing these straight from
+// `./mutate.js`; the implementation lives in the sibling module above.
+export { ATTRIBUTE_INDEX, applyAttributeMutations };
+export type { SkippedAttributeMutation };
 
 /**
  * Parse a --where filter string.
@@ -108,6 +114,16 @@ export function matchesFilter(actual: any, operator: string, expected?: string):
   }
 }
 
+/** How many attribute mutations were requested per entity. */
+function countBy(mutations: { entity: { ref: { expressId: number } } }[]): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const m of mutations) {
+    const id = m.entity.ref.expressId;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+}
+
 export async function mutateCommand(args: string[]): Promise<void> {
   const filePath = args.find(a => !a.startsWith('-'));
   if (!filePath) fatal('Usage: ifc-lite mutate <file.ifc> --id <N> --set PsetName.PropName=Value --out output.ifc');
@@ -188,6 +204,16 @@ export async function mutateCommand(args: string[]): Promise<void> {
   mutationView.setOnDemandExtractor((entityId: number) => {
     return extractPropertiesOnDemand(store, entityId);
   });
+  // The quantity half of the same base, for parity with the property one
+  // (#2487). Without it the overlay has nothing under it and
+  // `getQuantitiesForEntity` reports only what this run edited. No CURRENT path
+  // through this command records a quantity mutation - `--set` always routes to
+  // `setProperty`, even for a `Qto_*` name - so this changes no output today;
+  // it is here so the first quantity op added to this command does not have to
+  // rediscover why an export lost the siblings.
+  mutationView.setQuantityExtractor((entityId: number) => {
+    return extractQuantitiesOnDemand(store, entityId);
+  });
 
   // Apply mutations via the real mutation system
   let mutatedCount = 0;
@@ -220,10 +246,27 @@ export async function mutateCommand(args: string[]): Promise<void> {
   });
 
   // Apply attribute mutations via STEP text post-processing
+  let skippedAttributes: SkippedAttributeMutation[] = [];
   if (attributeMutations.length > 0) {
     const textContent = new TextDecoder().decode(result.content);
-    const outputContent = applyAttributeMutations(textContent, attributeMutations);
-    await writeFile(outPath, outputContent, 'utf-8');
+    const attributeResult = applyAttributeMutations(
+      textContent,
+      attributeMutations,
+      await entitiesWithObjectType(schema),
+    );
+    skippedAttributes = attributeResult.skipped;
+    // An entity whose every requested attribute was refused was not mutated,
+    // whatever the loop above counted. Reporting it as mutated is what let
+    // `--json` answer `mutated: 1, warnings: []` for an unchanged record.
+    const fullySkipped = new Set<number>();
+    for (const [expressId, requested] of countBy(attributeMutations)) {
+      const refused = skippedAttributes.filter((s) => s.expressId === expressId).length;
+      if (refused >= requested) fullySkipped.add(expressId);
+    }
+    for (const entity of targets) {
+      if (fullySkipped.has(entity.ref.expressId)) mutatedCount--;
+    }
+    await writeFile(outPath, attributeResult.content, 'utf-8');
   } else {
     await writeFile(outPath, result.content);
   }
@@ -234,6 +277,7 @@ export async function mutateCommand(args: string[]): Promise<void> {
   if (jsonOutput) {
     printJson({
       mutated: mutatedCount,
+      skipped: skippedAttributes,
       properties: mutationDescs.map((desc, i) => ({
         property: desc,
         value: mutations[i].coerced,
@@ -251,123 +295,26 @@ export async function mutateCommand(args: string[]): Promise<void> {
 }
 
 /**
- * IFC entity attribute indices (0-based positions in STEP argument list).
- * Standard for all IfcRoot subtypes: GlobalId(0), OwnerHistory(1), Name(2), Description(3).
- * IfcObject subtypes add ObjectType(4). Tag varies by entity type.
+ * IFC types that define an ObjectType attribute, read from the bundled
+ * buildingSMART schema for the file's own version.
+ *
+ * This used to be a hand-written list of 29 type names. Every entry in it was
+ * correct, but IFC4 declares ObjectType on **218** entities, so 189 were
+ * missing — `--set ObjectType=...` on an IfcFurniture, IfcStairFlight,
+ * IfcPipeSegment or IfcSanitaryTerminal was refused with a "not applicable"
+ * warning that was simply wrong. Deriving the set means it cannot fall behind
+ * the schema again, and it is schema-aware: IFC2X3 and IFC4 do not declare
+ * ObjectType on the same entities.
  */
-const ATTRIBUTE_INDEX: Record<string, number> = {
-  name: 2,
-  description: 3,
-  objecttype: 4,
-};
-
-/**
- * IFC types that have an ObjectType attribute at index 4.
- * Only IfcObject subtypes (building elements, spatial elements) define ObjectType.
- * Relationship types (IfcRelAggregates, etc.) and type objects do NOT.
- */
-const OBJECTTYPE_TYPES = new Set([
-  'IFCWALL', 'IFCWALLSTANDARDCASE', 'IFCSLAB', 'IFCCOLUMN', 'IFCBEAM',
-  'IFCDOOR', 'IFCWINDOW', 'IFCROOF', 'IFCSTAIR', 'IFCRAILING', 'IFCMEMBER',
-  'IFCPLATE', 'IFCCOVERING', 'IFCFOOTING', 'IFCPILE', 'IFCCURTAINWALL',
-  'IFCRAMP', 'IFCSPACE', 'IFCBUILDINGELEMENTPROXY', 'IFCFURNISHINGELEMENT',
-  'IFCFLOWSEGMENT', 'IFCFLOWTERMINAL', 'IFCFLOWFITTING', 'IFCDISTRIBUTIONELEMENT',
-  'IFCOPENINGELEMENT', 'IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY', 'IFCPROJECT',
-]);
-
-/**
- * Apply attribute mutations to STEP content via text replacement.
- * For each target entity, finds its STEP line and replaces the attribute at the known index.
- */
-function applyAttributeMutations(
-  content: string,
-  mutations: { entity: any; propName: string; value: string }[],
-): string {
-  // Group mutations by expressId for efficient single-pass replacement
-  const mutationsByEntity = new Map<number, { propName: string; value: string }[]>();
-  for (const m of mutations) {
-    const id = m.entity.ref.expressId;
-    const list = mutationsByEntity.get(id) ?? [];
-    list.push({ propName: m.propName, value: m.value });
-    mutationsByEntity.set(id, list);
-  }
-
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Match entity lines: #123=IFCTYPE(...);
-    const match = line.match(/^#(\d+)\s*=\s*(\w+)\s*\(/);
-    if (!match) continue;
-
-    const expressId = parseInt(match[1], 10);
-    const entityType = match[2].toUpperCase();
-    const entityMuts = mutationsByEntity.get(expressId);
-    if (!entityMuts) continue;
-
-    // Parse the STEP argument list (handle nested parens and quoted strings)
-    const argsStart = line.indexOf('(');
-    const argsEnd = line.lastIndexOf(')');
-    if (argsStart === -1 || argsEnd === -1) continue;
-
-    const args = splitStepArgs(line.slice(argsStart + 1, argsEnd));
-
-    for (const mut of entityMuts) {
-      const attrIdx = ATTRIBUTE_INDEX[mut.propName.toLowerCase()];
-      if (attrIdx !== undefined && attrIdx < args.length) {
-        // Validate ObjectType is only written to entities that define it
-        if (mut.propName.toLowerCase() === 'objecttype' && !OBJECTTYPE_TYPES.has(entityType)) {
-          process.stderr.write(`Warning: attribute "ObjectType" not applicable to ${entityType} #${expressId}, skipping\n`);
-          continue;
-        }
-        // Escape for STEP format and wrap in quotes
-        const escaped = mut.value.replace(/\\/g, '\\\\').replace(/'/g, "''");
-        args[attrIdx] = `'${escaped}'`;
-      } else {
-        process.stderr.write(`Warning: attribute "${mut.propName}" not recognized for entity #${expressId}\n`);
-      }
-    }
-
-    lines[i] = line.slice(0, argsStart + 1) + args.join(',') + line.slice(argsEnd);
-  }
-
-  return lines.join('\n');
+export async function entitiesWithObjectType(schema: string): Promise<ReadonlySet<string>> {
+  // `findAttribute` only knows the versions it has tables for; anything else
+  // (notably IFC5, which StepExporter accepts) falls back to IFC4 rather than
+  // throwing, which is what the hand-written list effectively did.
+  const known = new Set(['IFC2X3', 'IFC4', 'IFC4X3', 'IFC4X3_ADD2']);
+  const version = (known.has(schema) ? schema : 'IFC4') as IfcSchemaVersion;
+  const attr = await findAttribute(version, 'ObjectType');
+  // An attribute can be declared on an entity as a simple value or as part of
+  // a complex type; both mean the slot exists on that entity.
+  return new Set([...(attr?.simpleValueEntities ?? []), ...(attr?.complexEntities ?? [])]);
 }
 
-/**
- * Split a STEP argument string by commas, respecting nested parens and quoted strings.
- */
-export function splitStepArgs(argsStr: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let depth = 0;
-  let inString = false;
-
-  for (let i = 0; i < argsStr.length; i++) {
-    const ch = argsStr[i];
-    if (inString) {
-      current += ch;
-      if (ch === "'" && argsStr[i + 1] === "'") {
-        current += "'";
-        i++; // skip escaped quote
-      } else if (ch === "'") {
-        inString = false;
-      }
-    } else if (ch === "'") {
-      inString = true;
-      current += ch;
-    } else if (ch === '(') {
-      depth++;
-      current += ch;
-    } else if (ch === ')') {
-      depth--;
-      current += ch;
-    } else if (ch === ',' && depth === 0) {
-      result.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  if (current) result.push(current);
-  return result;
-}

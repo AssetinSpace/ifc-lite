@@ -12,23 +12,28 @@ export type {
   ColumnDefinition,
   PropertyCondition,
   ConditionOperator,
+  UnreadableListCondition,
   ListClassificationRef,
   ListGrouping,
   ListGroup,
   ListSummary,
   ListScheduleRow,
   DiscoveredColumns,
-  EntityAttribute,
 } from './types.js';
-export { ENTITY_ATTRIBUTES } from './types.js';
+export type { ListModelTagScope } from './model-tag-scope.js';
+export { ENTITY_ATTRIBUTES, type EntityAttribute } from './entity-attributes.js';
 
 // Engine
 export {
   executeList, listResultToCSV, summariseListRows, groupingColumnIds, groupPathKey, toScheduleRows,
+  ZONE_MODE_VOLUME, ZONE_MODE_BREAKDOWN, isZoneVolumeMode,
 } from './engine.js';
 
 // Name pattern matching (Bonsai-style `/regex/` set/property names)
 export { compileNameMatcher, isNamePattern } from './name-pattern.js';
+export { isSavedListShape, migrateLegacyListConditions, migrateLegacyListDefinition } from './legacy-condition-migration.js';
+export { listConditionMatcher } from './list-condition-matcher.js';
+export { listConditionValueKind, type ListConditionValueKind } from './condition-value-kind.js';
 
 // Column discovery
 export { discoverColumns } from './discovery.js';

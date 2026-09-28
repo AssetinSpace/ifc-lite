@@ -12,8 +12,10 @@
  */
 
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, toNativePoint2, toNativePoint3, type SpatialAnchor } from './anchor.js';
 import {
+  assertPositiveFinite,
   emitBodyRepresentation,
   emitExtrudedSolid,
   emitLocalPlacement,
@@ -35,6 +37,8 @@ export interface RoofRectangleParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface RoofPolygonParams {
@@ -46,6 +50,8 @@ export interface RoofPolygonParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface RoofBuildResult {
@@ -67,11 +73,15 @@ export function addRoofToStore(
   anchor: SpatialAnchor,
   params: RoofInStoreParams,
 ): RoofBuildResult {
-  if (params.Thickness <= 0) {
-    throw new Error('addRoofToStore: Thickness must be positive');
+  assertPositiveFinite([params.Thickness], 'addRoofToStore: Thickness must be positive');
+  if (params.Position !== undefined) {
+    assertFinitePoint3({ Position: params.Position }, 'addRoofToStore');
   }
-  if (!isPolygonParams(params) && (params.Width <= 0 || params.Depth <= 0)) {
-    throw new Error('addRoofToStore: Width and Depth must be positive');
+  if (!isPolygonParams(params)) {
+    assertPositiveFinite(
+      [params.Width, params.Depth],
+      'addRoofToStore: Width and Depth must be positive',
+    );
   }
   // Params are metres; convert dimensioned fields to the file's native
   // length unit before emit (see SpatialAnchor.lengthUnitScale). A new

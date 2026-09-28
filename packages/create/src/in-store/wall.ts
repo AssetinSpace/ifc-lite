@@ -19,10 +19,10 @@
 
 import { generateIfcGuid } from '@ifc-lite/encoding';
 import type { StoreEditor } from '@ifc-lite/mutations';
-import { vecNorm } from '../ifc-creator-math.js';
+import { vecNorm, assertFinitePoint3 } from '../ifc-creator-math.js';
 import type { Point3D } from '../types.js';
 import { toNativeLength, toNativePoint3, type SpatialAnchor } from './anchor.js';
-import { ownerHistoryRef } from './_emit-helpers.js';
+import { assertPositiveFinite, emitLocalPlacement, ownerHistoryRef, productGuid } from './_emit-helpers.js';
 
 export interface WallInStoreParams {
   /** Start of the wall axis, in storey-local coordinates (metres). */
@@ -37,6 +37,8 @@ export interface WallInStoreParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface WallBuildResult {
@@ -56,9 +58,14 @@ export function addWallToStore(
 ): WallBuildResult {
   const { ownerHistoryId, bodyContextId, storeyId, storeyPlacementId } = anchor;
 
-  if (params.Thickness <= 0 || params.Height <= 0) {
-    throw new Error('addWallToStore: Thickness and Height must be positive');
-  }
+  assertPositiveFinite(
+    [params.Thickness, params.Height],
+    'addWallToStore: Thickness and Height must be positive',
+  );
+  // A non-finite Start/End coordinate makes the derived wallLen NaN, and
+  // `NaN <= 0` is false, so the distinct-points check below never fires.
+  // Validate the source coordinates instead of trusting the derived value.
+  assertFinitePoint3({ Start: params.Start, End: params.End }, 'addWallToStore');
   // Params are metres; convert dimensioned fields to the file's native
   // length unit so the emitted STEP coordinates are correctly scaled
   // (see SpatialAnchor.lengthUnitScale). Directions normalise the scale
@@ -86,19 +93,9 @@ export function addWallToStore(
   }
   const dir: Point3D = vecNorm([dx, dy, 0]);
 
-  // Placement at Start with local X = wall direction. Z stays default
-  // (up); STEP's IfcAxis2Placement3D fills the missing axis from there.
-  const wallOriginPt = editor.addEntity('IfcCartesianPoint', [params.Start]).expressId;
-  const refDirVec = editor.addEntity('IfcDirection', [dir]).expressId;
-  const wallAxis = editor.addEntity('IfcAxis2Placement3D', [
-    `#${wallOriginPt}`,
-    null,
-    `#${refDirVec}`,
-  ]).expressId;
-  const placementId = editor.addEntity('IfcLocalPlacement', [
-    `#${storeyPlacementId}`,
-    `#${wallAxis}`,
-  ]).expressId;
+  // Placement at Start with local X = wall direction and local Z up. The
+  // Axis is written explicitly: IFC forbids a RefDirection without it (#5469).
+  const placementId = emitLocalPlacement(editor, storeyPlacementId, params.Start, undefined, dir);
 
   // Rectangle profile centred at (wallLen/2, 0) so the swept solid
   // spans 0..wallLen along local X and -thickness/2..+thickness/2 on Y.
@@ -137,7 +134,7 @@ export function addWallToStore(
 
   // `IfcWall.PredefinedType` only exists from IFC4 onward.
   const wallAttrs: Array<unknown> = [
-    generateIfcGuid(anchor.guidRandom),
+    productGuid(params, anchor.guidRandom),
     ownerHistoryRef(ownerHistoryId),
     params.Name ?? 'Wall',
     params.Description ?? null,

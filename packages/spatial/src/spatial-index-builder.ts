@@ -11,17 +11,27 @@ import type { AABB } from './aabb.js';
 import type { MeshData } from '@ifc-lite/geometry';
 
 function yieldToEventLoop(): Promise<void> {
-  const maybeScheduler = (globalThis as typeof globalThis & {
-    scheduler?: { yield?: () => Promise<void> };
-  }).scheduler;
-  if (typeof maybeScheduler?.yield === 'function') {
-    return maybeScheduler.yield();
+  // A timer task gives input, timers and the browser's paint step a chance to
+  // run. scheduler.yield() keeps its continuation at high priority and, in a
+  // real Holter probe, no animation frame ran until the BVH was complete.
+  // Hidden tabs heavily throttle timers, so use the existing task scheduler
+  // there; it need not permit paint while the tab is invisible.
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    const maybeScheduler = (globalThis as typeof globalThis & {
+      scheduler?: { yield?: () => Promise<void> };
+    }).scheduler;
+    if (typeof maybeScheduler?.yield === 'function') return maybeScheduler.yield();
+    return new Promise<void>(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        channel.port2.close();
+        resolve();
+      };
+      channel.port2.postMessage(null);
+    });
   }
-  return new Promise<void>((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => resolve();
-    channel.port2.postMessage(null);
-  });
+  return new Promise<void>(resolve => setTimeout(resolve, 0));
 }
 
 /**
@@ -45,13 +55,16 @@ export function buildSpatialIndex(meshes: MeshData[]): BVH {
  * so orbit/pan stays responsive during index construction.
  *
  * @param meshes  All mesh data
- * @param budgetMs  Max ms per chunk (default 4 — quarter of a 60fps frame)
+ * @param budgetMs  Max ms per chunk (finite and non-negative; default 4 — quarter of a 60fps frame)
  * @returns Promise that resolves to the BVH
  */
 export async function buildSpatialIndexAsync(
   meshes: MeshData[],
   budgetMs: number = 4,
 ): Promise<BVH> {
+  if (!Number.isFinite(budgetMs) || budgetMs < 0) {
+    throw new RangeError('budgetMs must be a finite, non-negative number');
+  }
   const meshesWithBounds: MeshWithBounds[] = new Array(meshes.length);
 
   // Phase 1: compute bounds in time-sliced chunks
@@ -71,8 +84,9 @@ export async function buildSpatialIndexAsync(
     }
   }
 
-  // Phase 2: BVH build (O(N log N) on pre-computed bounds — fast enough synchronously)
-  return BVH.build(meshesWithBounds);
+  // Phase 2 also yields: its index partition and tree construction scale with
+  // the number of meshes, even after the bounds pass is complete.
+  return BVH.buildAsync(meshesWithBounds, budgetMs, yieldToEventLoop);
 }
 
 /**
@@ -80,11 +94,21 @@ export async function buildSpatialIndexAsync(
  */
 function computeMeshBounds(mesh: MeshData): AABB {
   const positions = mesh.positions;
-  
+
+  // Positions are in the element's local frame (world = origin + position). The
+  // spatial index is queried in world space, so lift the AABB by the per-mesh
+  // origin. Origin is constant per mesh, so a single add to the final extents is
+  // exact and cheapest. No-op when origin is absent/[0,0,0]. Extracted once, above
+  // every return, so the empty-mesh path can't diverge from the general path.
+  const o = mesh.origin;
+  const ox = o ? o[0] : 0;
+  const oy = o ? o[1] : 0;
+  const oz = o ? o[2] : 0;
+
   if (positions.length === 0) {
     return {
-      min: [0, 0, 0],
-      max: [0, 0, 0],
+      min: [ox, oy, oz],
+      max: [ox, oy, oz],
     };
   }
 
@@ -108,15 +132,6 @@ function computeMeshBounds(mesh: MeshData): AABB {
     maxY = Math.max(maxY, y);
     maxZ = Math.max(maxZ, z);
   }
-
-  // Positions are in the element's local frame (world = origin + position). The
-  // spatial index is queried in world space, so lift the AABB by the per-mesh
-  // origin. Origin is constant per mesh, so a single add to the final extents is
-  // exact and cheapest. No-op when origin is absent/[0,0,0].
-  const o = mesh.origin;
-  const ox = o ? o[0] : 0;
-  const oy = o ? o[1] : 0;
-  const oz = o ? o[2] : 0;
 
   return {
     min: [minX + ox, minY + oy, minZ + oz],

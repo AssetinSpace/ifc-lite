@@ -12,8 +12,12 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { parseIDS, validateIDS, type IFCDataAccessor } from '@ifc-lite/ids';
-import { getInheritanceChainForEntity } from '@ifc-lite/parser';
+import { parseIDS, validateIDS, createTranslationService, type IDSValidationReport, type IFCDataAccessor, type SupportedLocale } from '@ifc-lite/ids';
+import { IFC_ENTITY_NAMES, iterateEffectiveEntities } from '@ifc-lite/data';
+import { getInheritanceChainAcrossSchemas } from '@ifc-lite/parser';
+import { foldedTypeCounts, pendingMutationsField, pendingOverlay, stepText } from '../overlay.js';
+import { effectiveSourceIds, pendingEntityMembership } from '../effective-entity-membership.js';
+import { isProductType } from '../backend-query.js';
 import { EntityNode } from '@ifc-lite/query';
 import type { Tool } from './types.js';
 import { okResult, resolveModel } from './util.js';
@@ -21,6 +25,7 @@ import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
 import type { ToolContext } from '../context.js';
 import { buildIdsAccessor } from './ids-accessor.js';
+import { buildDropCensusIssues, dropCensusJson } from './drop-census-issues.js';
 
 const idsValidate: Tool = {
   name: 'ids_validate',
@@ -41,18 +46,23 @@ const idsValidate: Tool = {
     const xml = await loadIdsXml(input, ctx);
 
     const idsDoc = parseIDS(xml);
-    const accessor = buildIdsAccessor(m.store) as IFCDataAccessor;
+    // `m.backend.getMutationView()` is null until the first `bim.mutate.*`
+    // call (built lazily, #4857's pattern); `buildIdsAccessor` passes
+    // `undefined` on to `createDataAccessor` for that same-shape null, which
+    // is the byte-identical no-visibility-view path (#5184).
+    const accessor = buildIdsAccessor(m.store, m.backend.getMutationView() ?? undefined) as IFCDataAccessor;
+    const locale = (input.locale as SupportedLocale | undefined) ?? 'en';
     const report = await validateIDS(
       idsDoc,
       accessor,
       { modelId: m.id, schemaVersion: m.store.schemaVersion, entityCount: m.store.entityCount },
       {
+        translator: createTranslationService(locale),
         onProgress: (p) => {
           ctx.progress.report(p.percentage / 100, `Validating ${p.phase} (${p.specificationIndex + 1}/${p.totalSpecifications})`, 100);
         },
       },
     );
-    void input.locale;
 
     const summary = summarizeIdsReport(report);
     return okResult(
@@ -84,36 +94,41 @@ async function loadIdsXml(
   });
 }
 
-function summarizeIdsReport(report: unknown): {
+/**
+ * Project the validator's own `report.summary` into the shape this tool
+ * has always returned, instead of re-deriving pass/fail counts from
+ * `specificationResults`.
+ *
+ * A prior version recomputed everything from `entityResults`, treated
+ * `report` as an `unknown` cast to a hand-written minimal interface, and
+ * used `entityResults.length > 0` as the pass condition for a
+ * specification — so a specification that legitimately passes while
+ * matching zero entities (`minOccurs="0"`, or a prohibited spec that
+ * correctly matches nothing) was reported as failed. Because the report
+ * is typed as the real `IDSValidationReport` here, `report.summary` is
+ * the only field this function can read for these numbers — there is no
+ * `entityResults` shape left to drift back onto.
+ */
+function summarizeIdsReport(report: IDSValidationReport): {
   totalSpecifications: number;
   passedSpecifications: number;
   failedSpecifications: number;
+  notApplicableSpecifications: number;
   totalEntities: number;
   passedEntities: number;
   failedEntities: number;
+  overallPassRate: number;
 } {
-  const r = report as { specificationResults?: Array<{ entityResults?: Array<{ passed: boolean }> }> };
-  const specs = r.specificationResults ?? [];
-  let totalEntities = 0;
-  let passedEntities = 0;
-  let passedSpecifications = 0;
-  for (const spec of specs) {
-    const ents = spec.entityResults ?? [];
-    let specPassed = ents.length > 0;
-    for (const e of ents) {
-      totalEntities++;
-      if (e.passed) passedEntities++;
-      else specPassed = false;
-    }
-    if (specPassed) passedSpecifications++;
-  }
+  const s = report.summary;
   return {
-    totalSpecifications: specs.length,
-    passedSpecifications,
-    failedSpecifications: specs.length - passedSpecifications,
-    totalEntities,
-    passedEntities,
-    failedEntities: totalEntities - passedEntities,
+    totalSpecifications: s.totalSpecifications,
+    passedSpecifications: s.passedSpecifications,
+    failedSpecifications: s.failedSpecifications,
+    notApplicableSpecifications: s.totalSpecifications - s.passedSpecifications - s.failedSpecifications,
+    totalEntities: s.totalEntitiesChecked,
+    passedEntities: s.totalEntitiesPassed,
+    failedEntities: s.totalEntitiesFailed,
+    overallPassRate: s.overallPassRate,
   };
 }
 
@@ -164,31 +179,93 @@ const modelAudit: Tool = {
   handler(input, ctx) {
     const m = resolveModel(ctx, input.model_id as string | undefined);
     const issues: Array<{ severity: 'error' | 'warning' | 'info'; category: string; rule: string; message: string; entityCount?: number }> = [];
+    // The audit answers about the session, not about the file as parsed (#2014).
+    // It is the tool an agent is most likely to trust, so scoring a model clean
+    // on identity while a queued `entity_create` has just duplicated a GlobalId
+    // is the same defect this rule's #2003 fix was about: a pass that was never
+    // earned. Counts come from the folded type table for the same reason.
+    const overlay = pendingOverlay(m);
+    const typeCounts = foldedTypeCounts(m.store, overlay);
 
     // 1. Required spatial entities
     for (const t of ['IFCPROJECT', 'IFCSITE', 'IFCBUILDING']) {
-      const ids = m.store.entityIndex.byType.get(t) ?? [];
-      if (ids.length === 0) {
-        issues.push({ severity: 'error', category: 'structure', rule: 'required-entity', message: `Missing required entity ${t}` });
-      } else if (t === 'IFCPROJECT' && ids.length > 1) {
-        issues.push({ severity: 'error', category: 'structure', rule: 'single-project', message: `Multiple IfcProject entities (${ids.length})` });
+      const count = typeCounts.get(t) ?? 0;
+      // STEP type names are stored UPPERCASE; a message an agent reads renders
+      // them in IfcPascalCase. `Missing required entity IFCSITE` sat next to
+      // `No IfcBuildingStorey entities` in the same payload.
+      const name = IFC_ENTITY_NAMES[t] ?? t;
+      if (count === 0) {
+        issues.push({ severity: 'error', category: 'structure', rule: 'required-entity', message: `Missing required entity ${name}` });
+      } else if (t === 'IFCPROJECT' && count > 1) {
+        issues.push({ severity: 'error', category: 'structure', rule: 'single-project', message: `Multiple ${name} entities (${count})` });
       }
     }
-    const storeyIds = m.store.entityIndex.byType.get('IFCBUILDINGSTOREY') ?? [];
-    if (storeyIds.length === 0) issues.push({ severity: 'warning', category: 'structure', rule: 'has-storeys', message: 'No IfcBuildingStorey entities' });
+    if ((typeCounts.get('IFCBUILDINGSTOREY') ?? 0) === 0) {
+      issues.push({ severity: 'warning', category: 'structure', rule: 'has-storeys', message: 'No IfcBuildingStorey entities' });
+    }
 
     // 2. GlobalId uniqueness (only IfcRoot subtypes)
+    //
+    // Cross-schema, not the parser's IFC4_ADD2_TC1 codegen pin (#2003): the pin
+    // answers an empty chain for 39 IFC2X3 `IfcRoot` classes, 80 IFC4X3 ones and
+    // 4 post-ADD2 IFC4 ones, and this rule skipped every one of them — so
+    // `model_audit` scored a file clean on identity without having looked at it.
+    // The test is `includes`, which is what makes the swap safe: the two
+    // functions return opposite orders, so any positional read of the chain
+    // would invert on 717 of the 776 pinned classes. Over those 776 the verdicts
+    // and leaf names are identical, so no IFC4 file changes — measured in
+    // `packages/parser/test/inheritance-chain-equivalence.test.ts`.
     const seen = new Map<string, number[]>();
-    for (const [type, ids] of m.store.entityIndex.byType) {
-      const chain = getInheritanceChainForEntity(type);
-      if (!chain.includes('IfcRoot')) continue;
-      for (const id of ids) {
-        const node = new EntityNode(m.store, id);
-        const gid = node.globalId;
-        if (!gid) continue;
-        const list = seen.get(gid) ?? [];
-        list.push(id);
-        seen.set(gid, list);
+    const addGid = (gid: string, id: number): void => {
+      if (!gid) return;
+      const list = seen.get(gid) ?? [];
+      list.push(id);
+      seen.set(gid, list);
+    };
+    // 3. Naming
+    let unnamed = 0;
+    let totalProducts = 0;
+    const countName = (name: string): void => {
+      totalProducts++;
+      if (!name || name.trim() === '') unnamed++;
+    };
+    // `isProductType`, not "anything that is not a relationship or a property".
+    // The old test let `IfcCartesianPoint`, `IfcLocalPlacement` and every other
+    // geometry primitive into the denominator — none of which carries a Name, so
+    // they all counted as unnamed and `dataQuality` scored the file on how much
+    // geometry it had rather than on how well its products were named. This is
+    // the same rule an untyped `query_entities` uses for "a product".
+    const edits = overlay?.attributesByEntity();
+    const classFlags = new Map<string, { root: boolean; product: boolean }>();
+    for (const { expressId, type, overlayCreated } of iterateEffectiveEntities(
+      m.store, pendingEntityMembership(overlay), undefined, effectiveSourceIds(m.store),
+    )) {
+      let flags = classFlags.get(type);
+      if (!flags) {
+        flags = { root: getInheritanceChainAcrossSchemas(type).includes('IfcRoot'), product: isProductType(type) };
+        classFlags.set(type, flags);
+      }
+      if (!flags.root && !flags.product) continue;
+
+      const created = overlayCreated ? overlay?.createdEntity(expressId) : null;
+      const edited = overlayCreated ? undefined : edits?.get(expressId);
+      const positional = overlayCreated ? undefined : overlay?.positionalAttributes(expressId);
+      let node: EntityNode | undefined;
+      const sourceNode = (): EntityNode => node ??= new EntityNode(m.store, expressId);
+
+      if (flags.root) {
+        const globalId = created ? created.globalId
+          : edited?.has('GlobalId') ? edited.get('GlobalId') ?? ''
+          : positional?.has(0) ? stepText(positional.get(0)) ?? ''
+          : sourceNode().globalId;
+        addGid(globalId, expressId);
+      }
+      if (flags.product) {
+        const name = created ? created.name ?? ''
+          : edited?.has('Name') ? edited.get('Name') ?? ''
+          : positional?.has(2) ? stepText(positional.get(2)) ?? ''
+          : sourceNode().name;
+        countName(name);
       }
     }
     let duplicates = 0;
@@ -198,26 +275,20 @@ const modelAudit: Tool = {
         issues.push({ severity: 'error', category: 'identity', rule: 'duplicate-globalid', message: `Duplicate GlobalId ${gid} on ${ids.length} entities` });
       }
     }
-
-    // 3. Naming
-    let unnamed = 0;
-    let totalProducts = 0;
-    for (const [type, ids] of m.store.entityIndex.byType) {
-      if (!type.startsWith('IFC')) continue;
-      if (type.startsWith('IFCREL')) continue;
-      if (type.startsWith('IFCPROPERTY')) continue;
-      for (const id of ids) {
-        totalProducts++;
-        const node = new EntityNode(m.store, id);
-        if (!node.name || node.name.trim() === '') unnamed++;
-      }
-    }
     if (unnamed > 0) {
       issues.push({
         severity: 'warning', category: 'data-quality', rule: 'has-name', entityCount: unnamed,
         message: `${unnamed.toLocaleString()} of ${totalProducts.toLocaleString()} entities have no Name attribute.`,
       });
     }
+
+    // 4. Semantic drop census (#4208): classes the loader silently skipped.
+    // dropCensus is only absent for a store built by a path that doesn't
+    // compute one (e.g. a cache-restored store) — surface that explicitly
+    // rather than rendering it the same as "nothing was dropped". Issue
+    // construction lives in drop-census-issues.ts (module-size split).
+    const dropCensus = m.store.dropCensus;
+    issues.push(...buildDropCensusIssues(dropCensus));
 
     // Lighthouse-style category scores: % of entities that pass each category check.
     const scores = {
@@ -228,7 +299,14 @@ const modelAudit: Tool = {
     const overall = Math.round((scores.structure + scores.identity + scores.dataQuality) / 3);
     return okResult(
       `Audit score: ${overall}/100 (${issues.length} issue${issues.length === 1 ? '' : 's'}).`,
-      { overall, scores, issues, totals: { products: totalProducts, unnamed, duplicateGlobalIds: duplicates } },
+      {
+        overall,
+        scores,
+        issues,
+        totals: { products: totalProducts, unnamed, duplicateGlobalIds: duplicates },
+        dropCensus: dropCensusJson(dropCensus),
+        ...pendingMutationsField(overlay),
+      },
     );
   },
 };

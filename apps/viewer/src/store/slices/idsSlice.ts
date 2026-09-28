@@ -3,21 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * IDS (Information Delivery Specification) state slice
- *
- * Manages IDS validation state, results, and viewer integration.
+ * IDS (Information Delivery Specification) state slice. Manages IDS
+ * validation state, results, and viewer integration.
  */
 
 import type { StateCreator } from 'zustand';
 import type {
   IDSAuditReport,
   IDSDocument,
-  IDSValidationReport,
-  IDSSpecificationResult,
-  IDSEntityResult,
+  ValidationReport,
+  SpecificationResult,
+  EntityResult,
   SupportedLocale,
   ValidationProgress,
 } from '@ifc-lite/ids';
+import type { IdsErrorState } from '../../hooks/ids/resolveValidationTarget.js';
+import {
+  endIdsRowFocusPresentation,
+  type IDSRowFocusPresentation,
+  type IDSFocusVisibilityOwnership,
+} from '../../lib/ids/visibility-ownership.js';
 
 // ============================================================================
 // Types
@@ -52,6 +57,21 @@ export type IDSIsolationScope = 'ids' | 'spec';
  */
 export type IDSIsolateMode = 'failed' | 'passed' | 'involved' | null;
 
+/**
+ * How the rest of the model is shown when a single IDS result ROW is activated
+ * (#2867) — the same three modes, the same names and the same persistence as
+ * the clash panel's `ClashFocusMode`, because it is the same action:
+ *
+ * - 'highlight': keep the whole model visible;
+ * - 'isolate':   hide everything except the activated element;
+ * - 'ghost':     fade the rest to translucent context (X-Ray).
+ *
+ * A workspace preference: it survives a report clear and a panel switch, like
+ * `clashFocusMode`, so the user picks how they review once rather than per
+ * row.
+ */
+export type IDSFocusMode = 'highlight' | 'isolate' | 'ghost';
+
 export interface IDSSliceState {
   /** Loaded IDS document */
   idsDocument: IDSDocument | null;
@@ -64,8 +84,10 @@ export interface IDSSliceState {
   idsAuditReport: IDSAuditReport | null;
   /** Whether the audit pipeline is currently running. */
   idsAuditing: boolean;
-  /** Validation report after running validation */
-  idsValidationReport: IDSValidationReport | null;
+  /** Validation report (#5138: generalised over its source; today always `source.kind === 'ids'`). */
+  idsValidationReport: ValidationReport | null;
+  /** `idsValidationReport.source.kind`, mirrored so consumers can gate without null-checking the report. */
+  validationSource: 'ids' | 'rules' | null;
   /** Currently active specification (for filtering results) */
   idsActiveSpecificationId: string | null;
   /** Currently selected entity in results */
@@ -76,8 +98,8 @@ export interface IDSSliceState {
   idsLoading: boolean;
   /** Validation progress */
   idsProgress: ValidationProgress | null;
-  /** Error message */
-  idsError: string | null;
+  /** Error message: a caught-exception string, or a catalogued resolver error. */
+  idsError: IdsErrorState | null;
   /** Current locale for translations */
   idsLocale: SupportedLocale;
   /** Display options */
@@ -93,6 +115,18 @@ export interface IDSSliceState {
   idsIsolationScope: IDSIsolationScope;
   /** Which isolate action is currently applied (drives toggle + active state) */
   idsIsolateMode: IDSIsolateMode;
+  /**
+   * How activating a single result row presents the rest of the model
+   * (#2867). Persistent user preference — see {@link IDSFocusMode}.
+   */
+  idsFocusMode: IDSFocusMode;
+  /**
+   * The CLAIM the row focus holds on the shared isolation/ghost channels —
+   * what it installed and where — so a teardown can release exactly that and
+   * nothing else. `null` means the row focus owns neither channel. See
+   * `lib/ids/visibility-ownership.ts`.
+   */
+  idsFocusVisibilityOwned: IDSFocusVisibilityOwnership;
   /** Cached set of failed entity IDs for efficient lookup */
   idsFailedEntityIds: Set<string>; // "modelId:expressId" format
   /** Cached set of passed entity IDs */
@@ -109,7 +143,7 @@ export interface IDSSlice extends IDSSliceState {
   setIdsAuditing: (auditing: boolean) => void;
 
   // Validation actions
-  setIdsValidationReport: (report: IDSValidationReport | null) => void;
+  setIdsValidationReport: (report: ValidationReport | null) => void;
   clearIdsValidationReport: () => void;
   setIdsProgress: (progress: ValidationProgress | null) => void;
 
@@ -121,18 +155,20 @@ export interface IDSSlice extends IDSSliceState {
   setIdsPanelVisible: (visible: boolean) => void;
   toggleIdsPanel: () => void;
   setIdsLoading: (loading: boolean) => void;
-  setIdsError: (error: string | null) => void;
+  setIdsError: (error: IdsErrorState | null) => void;
   setIdsLocale: (locale: SupportedLocale) => void;
   setIdsDisplayOptions: (options: Partial<IDSDisplayOptions>) => void;
   setIdsFilterMode: (mode: IDSFilterMode) => void;
   setIdsIsolationScope: (scope: IDSIsolationScope) => void;
   setIdsIsolateMode: (mode: IDSIsolateMode) => void;
+  setIdsFocusMode: (mode: IDSFocusMode) => void;
+  setIdsFocusVisibilityOwned: (owned: IDSFocusVisibilityOwnership) => void;
 
   // Utility getters
-  getActiveSpecificationResult: () => IDSSpecificationResult | null;
-  getFailedEntitiesForSpec: (specId: string) => IDSEntityResult[];
-  getPassedEntitiesForSpec: (specId: string) => IDSEntityResult[];
-  getEntityResultById: (modelId: string, expressId: number) => IDSEntityResult | null;
+  getActiveSpecificationResult: () => SpecificationResult | null;
+  getFailedEntitiesForSpec: (specId: string) => EntityResult[];
+  getPassedEntitiesForSpec: (specId: string) => EntityResult[];
+  getEntityResultById: (modelId: string, expressId: number) => EntityResult | null;
   isEntityFailed: (modelId: string, expressId: number) => boolean;
   isEntityPassed: (modelId: string, expressId: number) => boolean;
 }
@@ -167,7 +203,7 @@ const getDefaultLocale = (): SupportedLocale => {
  * Build cached entity ID sets from validation report
  */
 function buildEntityIdSets(
-  report: IDSValidationReport | null
+  report: ValidationReport | null
 ): { failed: Set<string>; passed: Set<string> } {
   const failed = new Set<string>();
   const passed = new Set<string>();
@@ -194,12 +230,31 @@ function buildEntityIdSets(
 // Slice Creator
 // ============================================================================
 
+/**
+ * End the per-row focus presentation (#2867) before a state change discards
+ * the report the focused row belonged to.
+ *
+ * ORDER is load-bearing, and it is the same order `endClashScenePresentation`
+ * documents: RELEASE the shared channel first, THEN let the caller's `set()`
+ * null the record. Nulling first leaves the release reading `null`, finding
+ * nothing to release, and leaving a row isolation standing over a report that
+ * no longer exists — `isEntityVisible` false for everything, with nothing on
+ * screen to explain it.
+ *
+ * The release is ownership-scoped, so a clash focus, a spaces X-ray or IDS's
+ * own set-level isolation occupying the channel instead is left alone.
+ */
+function endIdsRowFocus(get: () => IDSSlice): void {
+  endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
+}
+
 export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, get) => ({
   // Initial state
   idsDocument: null,
   idsAuditReport: null,
   idsAuditing: false,
   idsValidationReport: null,
+  validationSource: null,
   idsActiveSpecificationId: null,
   idsActiveEntityId: null,
   idsPanelVisible: false,
@@ -211,35 +266,73 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
   idsFilterMode: 'all',
   idsIsolationScope: 'ids',
   idsIsolateMode: null,
+  // Ghost by default, exactly as `clashFocusMode` is: the reported problem is
+  // that the activated element cannot be FOUND, and ghosting is the only mode
+  // that both removes the surrounding clutter and keeps enough of the building
+  // on screen to tell where in it you are landed. `isolate` answers the first
+  // half and loses the context; `highlight` answers neither on its own.
+  idsFocusMode: 'ghost',
+  idsFocusVisibilityOwned: null,
   idsFailedEntityIds: new Set(),
   idsPassedEntityIds: new Set(),
 
   // Document actions
-  setIdsDocument: (idsDocument) =>
+  setIdsDocument: (idsDocument) => {
+    // A new document invalidates the report the focused row came from, so the
+    // row focus's claim on the shared channels ends here too.
+    endIdsRowFocus(get);
     set({
       idsDocument,
       // Loading a new document invalidates any previous audit/validation
-      // results — they were tied to a specific document instance.
+      // results — they were tied to a specific document instance. That
+      // includes `idsIsolateMode`: it drives the isolate-button "pressed"
+      // state and the 3D isolation built from the now-discarded report, so
+      // it must be cleared here exactly like `clearIdsValidationReport`
+      // clears it — otherwise the panel keeps showing an isolate mode as
+      // active for a report that no longer exists.
       idsAuditReport: null,
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsError: null,
       idsFailedEntityIds: new Set(),
       idsPassedEntityIds: new Set(),
-    }),
+      idsIsolationScope: 'ids',
+      idsIsolateMode: null,
+      idsFocusVisibilityOwned: null,
+    });
+  },
 
-  clearIdsDocument: () =>
+  clearIdsDocument: () => {
+    // `useIDS.clearIDS` bumps `validationEpochRef` right before calling this,
+    // so a `runValidation()` still in flight sees `stillWantedValidation` go
+    // false and skips its OWN `finally` reset of `idsLoading`/`idsProgress`
+    // (by design — that call is no longer the current one and must not flip
+    // busy state out from under whatever superseded it). Nothing else then
+    // ever turns them off, so the clear itself has to (PR #2837 review):
+    // without this, a clear that lands mid-run leaves the UI showing a
+    // validation spinner that never resolves.
+    // `endIdsRowFocus` runs first for the same reason it does in
+    // `setIdsDocument`: the release must precede the record being nulled.
+    endIdsRowFocus(get);
     set({
       idsDocument: null,
       idsAuditReport: null,
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsError: null,
       idsFailedEntityIds: new Set(),
       idsPassedEntityIds: new Set(),
-    }),
+      idsLoading: false,
+      idsProgress: null,
+      idsIsolationScope: 'ids',
+      idsIsolateMode: null,
+      idsFocusVisibilityOwned: null,
+    });
+  },
 
   // Audit actions
   setIdsAuditReport: (idsAuditReport) => set({ idsAuditReport }),
@@ -248,26 +341,45 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
   // Validation actions
   setIdsValidationReport: (report) => {
     const { failed, passed } = buildEntityIdSets(report);
+    // A landing report replaces the one the focused row belonged to — its
+    // express ids may denote different entities now. Release before the
+    // record is nulled below.
+    endIdsRowFocus(get);
     set({
       idsValidationReport: report,
+      validationSource: report ? report.source.kind : null,
       idsFailedEntityIds: failed,
       idsPassedEntityIds: passed,
       idsIsolateMode: null,
+      idsFocusVisibilityOwned: null,
       idsError: null,
       idsProgress: null,
     });
   },
 
-  clearIdsValidationReport: () =>
+  clearIdsValidationReport: () => {
+    // Same reasoning as `clearIdsDocument` above: `useIDS.clearValidation`
+    // bumps the epoch first, which makes a still-in-flight `runValidation()`
+    // skip its own `idsLoading`/`idsProgress` reset on purpose — this is the
+    // only remaining writer for those fields once that happens (PR #2837
+    // review).
+    // And, as in `clearIdsDocument`, the row focus is released BEFORE its
+    // record is nulled — otherwise the isolation outlives the report.
+    endIdsRowFocus(get);
     set({
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsIsolationScope: 'ids',
       idsIsolateMode: null,
+      idsFocusVisibilityOwned: null,
       idsFailedEntityIds: new Set(),
       idsPassedEntityIds: new Set(),
-    }),
+      idsLoading: false,
+      idsProgress: null,
+    });
+  },
 
   setIdsProgress: (idsProgress) => set({ idsProgress }),
 
@@ -306,6 +418,10 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
   setIdsIsolationScope: (idsIsolationScope) => set({ idsIsolationScope }),
 
   setIdsIsolateMode: (idsIsolateMode) => set({ idsIsolateMode }),
+
+  setIdsFocusMode: (idsFocusMode) => set({ idsFocusMode }),
+
+  setIdsFocusVisibilityOwned: (idsFocusVisibilityOwned) => set({ idsFocusVisibilityOwned }),
 
   // Utility getters
   getActiveSpecificationResult: () => {

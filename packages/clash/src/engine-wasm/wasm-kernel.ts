@@ -3,10 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import type { ClashSession } from '@ifc-lite/wasm';
-import type { AABB, ClashElement, ClashRule, ClashStatus, Mat4, Vec3 } from '../types.js';
+import type { AABB, ClashDistanceKind, ClashElement, ClashRule, ClashStatus, Mat4, Vec3 } from '../types.js';
 import type { ClashKernel, NarrowRecord, RuleDetection } from '../engine-ts/kernel.js';
 
 const STATUS: ClashStatus[] = ['hard', 'clearance', 'touch'];
+/** Mirrors the Rust `DistanceKind` discriminants (`Mesh = 0`, `Estimate = 1`). */
+const DISTANCE_KIND: ClashDistanceKind[] = ['mesh', 'estimate'];
 
 /** Transform a point by a column-major 4x4 matrix. */
 function applyMat4(m: Mat4, x: number, y: number, z: number): Vec3 {
@@ -91,7 +93,13 @@ export class WasmKernel implements ClashKernel {
     const clearance = rule.clearance ?? 0;
     const reportTouch = rule.reportTouch ?? false;
     const groupA = Uint32Array.from(groupAIdx);
-    const groupB = groupBIdx ? Uint32Array.from(groupBIdx) : new Uint32Array(0);
+    // `null` (no B side) and `[]` (a B side that matched nothing) mean
+    // different things and must stay distinguishable across the FFI: the
+    // first is a self-clash, the second has no candidate pairs at all.
+    // Collapsing both to an empty Uint32Array is what made a two-sided rule
+    // whose B side matched nothing run as a self-clash of A (#5354), so
+    // `runRule` takes a nullable group B and an EMPTY array stays empty.
+    const groupB = groupBIdx === null ? undefined : Uint32Array.from(groupBIdx);
 
     const res = this.session.runRule(groupA, groupB, mode, tolerance, clearance, reportTouch);
     const records: NarrowRecord[] = [];
@@ -101,6 +109,8 @@ export class WasmKernel implements ClashKernel {
       const b = res.b;
       const status = res.status;
       const distance = res.distance;
+      const distanceKind = res.distanceKind;
+      const depthFloor = res.depthFloor;
       const points = res.points;
       const bounds = res.bounds;
       for (let k = 0; k < a.length; k += 1) {
@@ -113,6 +123,12 @@ export class WasmKernel implements ClashKernel {
           b: b[k],
           status: STATUS[status[k]] ?? 'hard',
           distance: distance[k],
+          // Defensive: an out-of-range byte would mean the kernel's encoding
+          // and this table had drifted apart. Fall back to the humbler label
+          // rather than claim a measurement the kernel may not have made.
+          distanceKind: DISTANCE_KIND[distanceKind[k]] ?? 'estimate',
+          // NaN is the kernel's "no floor" (every non-`hard` record).
+          ...(Number.isNaN(depthFloor[k]) ? {} : { depthFloor: depthFloor[k] }),
           point: [points[k * 3], points[k * 3 + 1], points[k * 3 + 2]],
           bounds: bnds,
         });

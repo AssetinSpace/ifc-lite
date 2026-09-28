@@ -14,6 +14,7 @@ import { IfcCreator } from '@ifc-lite/sdk';
 import type { MethodSchema, MethodSemanticContract } from './bridge-schema.js';
 import { creatorRegistry } from './creator-registry.js';
 import { buildScheduleMethods, SCHEDULE_SPECIAL_METHOD_NAMES } from './bridge-create-schedule.js';
+import { buildCostMethods, COST_SPECIAL_METHOD_NAMES } from './bridge-create-cost.js';
 
 // ============================================================================
 // Auto-discovery for bim.create (IfcCreator methods)
@@ -35,9 +36,8 @@ type MethodPattern = 'storey-params' | 'element-params' | 'single-dump' | 'no-ar
 /** Methods with non-standard signatures that need hand-written wiring */
 const SPECIAL_METHODS = new Set<string>([
   'constructor', 'toIfc', 'setColor',
-  // Scheduling lives in bridge-create-schedule.ts — exported list keeps the
-  // two files synchronised without duplicating the method names.
-  ...SCHEDULE_SPECIAL_METHOD_NAMES,
+  // Scheduling / cost live in their own bridge modules; the exported name lists keep them in sync.
+  ...SCHEDULE_SPECIAL_METHOD_NAMES, ...COST_SPECIAL_METHOD_NAMES,
 ]);
 
 /**
@@ -122,10 +122,63 @@ function methodDoc(name: string): string {
   return `Call ${name} on the creator.`;
 }
 
+/**
+ * Storey-relative constructors whose only LLM-relevant contract is their
+ * coordinate frame — no required-key list, no forbidden keys, no custom shape
+ * validation. They still need a `placement` tag for two reasons:
+ *
+ *  1. `buildPlacementSemanticsSection()` in the viewer system prompt lists the
+ *     storey-relative methods by name. A method with no contract was simply
+ *     absent from that list, so the model had no statement either way about
+ *     which datum its coordinates are in.
+ *  2. `validateStoreyElevationDoubling()` derives its coverage from this
+ *     metadata. Anything missing here is a constructor the elevation-doubling
+ *     preflight cannot see.
+ *
+ * `pointArity` here is inert for contract validation (rules are only built for
+ * methods that declare `requiredKeys`/`anyOfKeys`/`forbiddenKeys`); it names
+ * the coordinate keys the elevation check has to read.
+ */
+function storeyRelativeCoords(
+  frame: 'position' | 'axis',
+  entries: Record<string, string>,
+): Partial<Record<string, MethodSemanticContract>> {
+  const shape: Pick<MethodSemanticContract, 'pointArity' | 'axisPair'> = frame === 'position'
+    ? { pointArity: { Position: 3 } }
+    : { pointArity: { Start: 3, End: 3 }, axisPair: ['Start', 'End'] };
+
+  return Object.fromEntries(
+    Object.entries(entries).map(([name, useWhen]) => [name, {
+      taskTags: ['create', 'repair'],
+      placement: 'storey-relative',
+      ...shape,
+      useWhen,
+    } satisfies MethodSemanticContract]),
+  );
+}
+
 const CREATE_METHOD_SEMANTICS: Partial<Record<string, MethodSemanticContract>> = {
+  ...storeyRelativeCoords('position', {
+    addIfcRamp: 'Create a ramp from its low-end base position, with width, length and optional rise.',
+    addIfcFooting: 'Create a foundation footing whose Position is the top centre and whose Height extends downward.',
+    addIfcPile: 'Create a deep-foundation pile whose Position is the top and whose Length extends downward.',
+    addIfcSpace: 'Create a room volume on a storey.',
+    addIfcFurnishingElement: 'Create a furniture or equipment bounding box.',
+    addIfcBuildingElementProxy: 'Create a generic element for custom or unclassified objects.',
+    addIfcCircularColumn: 'Create a column with a circular cross-section.',
+    addIfcHollowCircularColumn: 'Create a column or pile with a hollow circular cross-section.',
+  }),
+  ...storeyRelativeCoords('axis', {
+    addIfcIShapeBeam: 'Create a beam with an I-shape (wide-flange) cross-section along an axis.',
+    addIfcLShapeMember: 'Create a member with an L-shape (angle) cross-section along an axis.',
+    addIfcTShapeMember: 'Create a member with a T-shape cross-section along an axis.',
+    addIfcUShapeMember: 'Create a member with a U-shape (channel) cross-section along an axis.',
+    addIfcRectangleHollowBeam: 'Create a beam or column with a hollow rectangular (tube) cross-section along an axis.',
+  }),
   project: {
     taskTags: ['create', 'repair'],
     useWhen: 'Start a new generated IFC model before creating storeys and elements.',
+    cautions: ['Set Currency only when the source states one — there is no default, and an absent currency must stay absent.'],
   },
   toIfc: {
     taskTags: ['create', 'export'],
@@ -178,19 +231,19 @@ const CREATE_METHOD_SEMANTICS: Partial<Record<string, MethodSemanticContract>> =
   },
   addIfcMember: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Start', 'End', 'Width', 'Height'],
     positiveKeys: ['Width', 'Height'],
     pointArity: { Start: 3, End: 3 },
     axisPair: ['Start', 'End'],
-    useWhen: 'Create mullions, braces, or facade members with explicit world coordinates.',
+    useWhen: 'Create mullions, braces, or facade members between two storey-relative points.',
     cautions: [
-      'Inside storey loops, include the current storey elevation in Start/End Z for facade members.',
+      'Inside storey loops, Start/End Z stay relative to the current storey — do NOT add its `Elevation`, the storey placement already applies it.',
     ],
   },
   addIfcPlate: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Position', 'Width', 'Depth', 'Thickness'],
     positiveKeys: ['Width', 'Depth', 'Thickness'],
     pointArity: { Position: 3 },
@@ -199,31 +252,31 @@ const CREATE_METHOD_SEMANTICS: Partial<Record<string, MethodSemanticContract>> =
       { key: 'Start', message: '`bim.create.addIfcPlate(...)` uses `Position`, not `Start`/`End`.' },
       { key: 'End', message: '`bim.create.addIfcPlate(...)` uses `Position`, not `Start`/`End`.' },
     ],
-    useWhen: 'Create thin world-placement panels or facade plates from a base point.',
+    useWhen: 'Create thin panels or facade plates from a storey-relative base point.',
     cautions: [
-      'Facade plates repeated by storey usually need absolute Z = elevation + localOffset.',
+      'Facade plates repeated by storey use the same local `Position` Z on every storey — never `elevation + localOffset`, which places them at twice the height.',
     ],
   },
   addIfcCurtainWall: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Start', 'End', 'Height'],
     positiveKeys: ['Height', 'Thickness'],
     pointArity: { Start: 3, End: 3 },
     axisPair: ['Start', 'End'],
-    useWhen: 'Create a world-placement curtain wall segment between two points.',
+    useWhen: 'Create a curtain wall segment between two storey-relative points.',
     cautions: [
-      'Inside storey loops, include the current storey elevation in Start/End Z.',
+      'Inside storey loops, Start/End Z stay relative to the current storey — do NOT add its `Elevation`, the storey placement already applies it.',
     ],
   },
   addIfcRailing: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Start', 'End', 'Height'],
     positiveKeys: ['Height', 'Width'],
     pointArity: { Start: 3, End: 3 },
     axisPair: ['Start', 'End'],
-    useWhen: 'Create a world-placement railing along an axis.',
+    useWhen: 'Create a railing along a storey-relative axis.',
   },
   addIfcStair: {
     taskTags: ['create', 'repair'],
@@ -305,40 +358,40 @@ const CREATE_METHOD_SEMANTICS: Partial<Record<string, MethodSemanticContract>> =
   },
   addIfcDoor: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Position', 'Width', 'Height'],
     positiveKeys: ['Width', 'Height', 'Thickness'],
     pointArity: { Position: 3 },
     forbiddenKeys: [
       { key: 'Start', message: '`bim.create.addIfcDoor(...)` uses `Position`, not `Start`/`End`.' },
       { key: 'End', message: '`bim.create.addIfcDoor(...)` uses `Position`, not `Start`/`End`.' },
-      { key: 'Direction', message: '`bim.create.addIfcDoor(...)` does not support wall-axis rotation. It creates a world-aligned standalone door element.' },
+      { key: 'Direction', message: '`bim.create.addIfcDoor(...)` does not support wall-axis rotation. It creates a standalone axis-aligned door element.' },
       { key: 'Rotation', message: '`bim.create.addIfcDoor(...)` does not support rotation. For wall-hosted inserts, use `bim.create.addIfcWallDoor(...)` or wall `Openings`.' },
       { key: 'Axis', message: '`bim.create.addIfcDoor(...)` does not accept `Axis`. It is not a generic placement API.' },
       { key: 'RefDirection', message: '`bim.create.addIfcDoor(...)` does not accept `RefDirection`. It is not auto-aligned to wall direction.' },
       { key: 'Placement', message: '`bim.create.addIfcDoor(...)` uses `Position`, not `Placement`.' },
     ],
-    useWhen: 'Create a standalone world-aligned door element.',
+    useWhen: 'Create a standalone axis-aligned door element (not hosted in a wall).',
     cautions: [
       'For wall-hosted inserts, use addIfcWallDoor or wall Openings instead.',
     ],
   },
   addIfcWindow: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['Position', 'Width', 'Height'],
     positiveKeys: ['Width', 'Height', 'Thickness'],
     pointArity: { Position: 3 },
     forbiddenKeys: [
       { key: 'Start', message: '`bim.create.addIfcWindow(...)` uses `Position`, not `Start`/`End`.' },
       { key: 'End', message: '`bim.create.addIfcWindow(...)` uses `Position`, not `Start`/`End`.' },
-      { key: 'Direction', message: '`bim.create.addIfcWindow(...)` does not support wall-axis rotation. It creates a world-aligned standalone window element.' },
+      { key: 'Direction', message: '`bim.create.addIfcWindow(...)` does not support wall-axis rotation. It creates a standalone axis-aligned window element.' },
       { key: 'Rotation', message: '`bim.create.addIfcWindow(...)` does not support rotation. For wall-hosted inserts, use `bim.create.addIfcWallWindow(...)` or wall `Openings`.' },
       { key: 'Axis', message: '`bim.create.addIfcWindow(...)` does not accept `Axis`. It is not a generic placement API.' },
       { key: 'RefDirection', message: '`bim.create.addIfcWindow(...)` does not accept `RefDirection`. It is not auto-aligned to wall direction.' },
       { key: 'Placement', message: '`bim.create.addIfcWindow(...)` uses `Position`, not `Placement`.' },
     ],
-    useWhen: 'Create a standalone world-aligned window element.',
+    useWhen: 'Create a standalone axis-aligned window element (not hosted in a wall).',
     cautions: [
       'For wall-hosted inserts, use addIfcWallWindow or wall Openings instead.',
     ],
@@ -350,10 +403,13 @@ const CREATE_METHOD_SEMANTICS: Partial<Record<string, MethodSemanticContract>> =
     positiveKeys: ['Depth'],
     customValidationId: 'generic-element',
     useWhen: 'Create advanced IFC entities only when no dedicated helper exists.',
+    cautions: [
+      '`Placement` is resolved against the storey you passed, not the world — `Location` Z is storey-relative and must not include the storey `Elevation`.',
+    ],
   },
   addAxisElement: {
     taskTags: ['create', 'repair'],
-    placement: 'world',
+    placement: 'storey-relative',
     requiredKeys: ['IfcType', 'Start', 'End', 'Profile'],
     pointArity: { Start: 3, End: 3 },
     axisPair: ['Start', 'End'],
@@ -375,7 +431,7 @@ export function buildCreateMethods(): MethodSchema[] {
     doc: 'Create a new IFC project. Returns a creator handle (number).',
     args: ['dump'],
     paramNames: ['params'],
-    tsParamTypes: ['{ Name?: string; Description?: string; Schema?: string; LengthUnit?: string; Author?: string; Organization?: string }'],
+    tsParamTypes: ['{ Name?: string; Description?: string; Schema?: string; LengthUnit?: string; Currency?: string; Author?: string; Organization?: string }'],
     tsReturn: 'number',
     call: (_sdk, args, context) => {
       const params = (args[0] ?? {}) as ConstructorParameters<typeof IfcCreator>[0];
@@ -421,11 +477,10 @@ export function buildCreateMethods(): MethodSchema[] {
     llmSemantics: CREATE_METHOD_SEMANTICS.setColor,
   });
 
-  // ── Scheduling / 4D ────────────────────────────────────────
-  // IfcTask / IfcWorkSchedule / IfcRelSequence chains live in a dedicated
-  // module so this file stays under the ~400-line guideline. Adding a new
-  // scheduling method = touch `bridge-create-schedule.ts` only.
-  methods.push(...buildScheduleMethods());
+  // ── Scheduling / 4D and Cost / 5D ──────────────────────────
+  // Both live in dedicated modules so this file stays inside its budget: adding
+  // a method means touching only `bridge-create-schedule.ts` / `-cost.ts`.
+  methods.push(...buildScheduleMethods(), ...buildCostMethods());
 
   // ── Auto-discover all other public methods from IfcCreator.prototype ──
   // Type-safe dynamic dispatch: methods are validated against ALLOWED_METHODS

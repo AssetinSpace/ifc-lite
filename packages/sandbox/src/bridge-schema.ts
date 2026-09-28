@@ -16,9 +16,13 @@
  */
 
 import type { QuickJSContext, QuickJSHandle } from 'quickjs-emscripten';
-import type { BimContext, EntityRef } from '@ifc-lite/sdk';
+import type { BimContext } from '@ifc-lite/sdk';
+import type { Capability } from '@ifc-lite/extensions';
 import type { SandboxPermissions } from './types.js';
+import type { ArgType } from './bridge-unmarshal.js';
 
+import { HostWorkQueue, isThenable } from './bridge-async.js';
+import { unmarshalArgs } from './bridge-unmarshal.js';
 import { creatorRegistry } from './creator-registry.js';
 import { buildModelNamespace } from './bridge-model.js';
 import { buildQueryNamespace } from './bridge-query.js';
@@ -29,20 +33,11 @@ import { buildCreateMethods } from './bridge-create.js';
 import { buildFilesNamespace } from './bridge-files.js';
 import { buildExportNamespace } from './bridge-export.js';
 import { buildScheduleNamespace } from './bridge-schedule.js';
+import { buildStructuralNamespace } from './bridge-structural.js';
 import { buildClashNamespace } from './bridge-clash.js';
-
-// ============================================================================
-// Schema Types
-// ============================================================================
-
-/** How to unmarshal a single argument from QuickJS */
-type ArgType =
-  | 'string'       // vm.getString(handle)
-  | 'number'       // vm.getNumber(handle)
-  | 'dump'         // vm.dump(handle) — generic JSON-like value
-  | 'entityRefs'   // vm.dump(handle) — array of entities, map to .ref
-  | '...strings'   // rest: collect all remaining args as strings
-
+import { buildCostNamespace } from './bridge-cost.js';
+import { buildNetworkNamespace } from './bridge-network.js';
+import type { FetchTransport } from './network-request.js';
 /** How to marshal the return value back to QuickJS */
 type ReturnType =
   | 'void'       // No return value
@@ -117,14 +112,25 @@ export interface NamespaceSchema {
   name: string;
   /** Human-readable description for editor completions */
   doc: string;
+  ambientDeclarations?: string[];
   /** Permission key — if false, this namespace is skipped */
   permission: keyof SandboxPermissions;
-  /** Methods in this namespace */
   methods: MethodSchema[];
 }
 
 export interface BridgeCallContext {
   sandboxSessionId: string;
+  /**
+   * Cancellation for host work this call starts (#2419), aborted when the run
+   * stops waiting (`timeoutMs`) and when the sandbox is disposed. An async
+   * `call:` that can take real time must forward it, or the work runs on to
+   * completion on the user's machine after the run that asked for it is gone.
+   *
+   * Optional because the bridge supplies it, not the caller: `buildBridge` gets
+   * the session-scoped half and `buildNamespace` adds the signal per call, so a
+   * `call:` invoked directly by a unit test can pass a context without one.
+   */
+  hostSignal?: AbortSignal;
 }
 
 // ============================================================================
@@ -183,11 +189,26 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
   // ── bim.schedule ───────────────────────────────────────────
   buildScheduleNamespace(),
 
+  // ── bim.structural ─────────────────────────────────────────
+  buildStructuralNamespace(),
+
+  // ── bim.cost ───────────────────────────────────────────────
+  buildCostNamespace(),
+
   // ── bim.clash ──────────────────────────────────────────────
   buildClashNamespace(),
 
   // ── bim.export ─────────────────────────────────────────────
   buildExportNamespace(),
+
+  // ── bim.network ────────────────────────────────────────────
+  // The empty grant list here is a placeholder for typegen/introspection
+  // consumers of this static table (`scripts/generate-bim-globals.mjs`,
+  // `bridge-schema.test.ts`) — it carries no real host allow-list.
+  // `buildSchemaNamespaces` below rebuilds this entry per sandbox with the
+  // graph's ACTUAL `network.fetch:<host>` grants; never used for runtime
+  // permission decisions as-is.
+  buildNetworkNamespace([]),
 ];
 
 // ============================================================================
@@ -197,6 +218,13 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
 /**
  * Build all schema-defined namespaces on the `bim` handle.
  * Skips namespaces whose permission is disabled.
+ *
+ * `networkGrants` builds `bim.network`'s schema fresh per sandbox (unlike
+ * every other namespace, which is a static entry in `NAMESPACE_SCHEMAS`):
+ * the allow-list it closes over is the actual `network.fetch:<host>`
+ * grants for the running graph, not something a static table can hold.
+ * Passing none is the same as passing an empty grant list — every host is
+ * refused, which matches the `network` permission defaulting to `false`.
  */
 export function buildSchemaNamespaces(
   vm: QuickJSContext,
@@ -204,10 +232,19 @@ export function buildSchemaNamespaces(
   sdk: BimContext,
   permissions: Required<SandboxPermissions>,
   context: BridgeCallContext,
+  hostWork: HostWorkQueue,
+  networkGrants: readonly Capability[] = [],
+  networkTransport?: FetchTransport,
 ): void {
-  for (const schema of NAMESPACE_SCHEMAS) {
+  // `NAMESPACE_SCHEMAS` carries a placeholder (empty-grant) `network` entry
+  // for typegen; swap in the real, grants-aware one built fresh for this
+  // sandbox — never build both (that would let a script see two `bim.network`
+  // registrations, the second silently winning via `vm.setProp`).
+  const realNetwork = buildNetworkNamespace(networkGrants, networkTransport);
+  const schemas = NAMESPACE_SCHEMAS.map((s) => (s.name === 'network' ? realNetwork : s));
+  for (const schema of schemas) {
     if (!permissions[schema.permission]) continue;
-    buildNamespace(vm, bimHandle, sdk, schema, context);
+    buildNamespace(vm, bimHandle, sdk, schema, context, hostWork);
   }
 }
 
@@ -217,6 +254,7 @@ function buildNamespace(
   sdk: BimContext,
   schema: NamespaceSchema,
   context: BridgeCallContext,
+  hostWork: HostWorkQueue,
 ): void {
   // try/finally, not a bare sequence: a throw anywhere in the registration
   // loop would otherwise orphan `nsHandle` (and the in-flight `fn`), and an
@@ -233,13 +271,41 @@ function buildNamespace(
         // the realm in a corrupt state: a subsequent handle access
         // throws "Lifetime not alive". Normalising to a plain Error
         // here keeps the failure a clean, catchable script exception.
+        const label = `bim.${schema.name}.${method.name}`;
         try {
           const nativeArgs = unmarshalArgs(vm, handles, method.args);
-          const result = method.call(sdk, nativeArgs, context);
+          // `hostWork.signal` is read here, per call, rather than captured when
+          // the namespace is built: the queue swaps in a fresh controller after
+          // a run gives up waiting, so a cached signal would hand every later
+          // run on this sandbox one that is already aborted.
+          const result = method.call(sdk, nativeArgs, { ...context, hostSignal: hostWork.signal });
+          // An async method's failure is a *rejection*, never a throw, so the
+          // catch below can never see it. Marshalling the promise as a value
+          // was worse than useless: `marshalValue` found no own properties on
+          // it and handed the script `{}`, so the call reported a clean pass
+          // carrying nothing while the rejection escaped as an unhandled host
+          // error and killed the page's run (#2305). Hand the realm a real
+          // promise instead — see bridge-async.ts.
+          if (isThenable(result)) {
+            // The resolved value goes through `marshalReturn` with this
+            // method's declared `returns`, exactly as the synchronous path
+            // does. Marshalling it with `marshalValue` instead would have made
+            // an async method's conversion silently diverge from its own
+            // schema: a `returns: 'string'` method would hand a number back as
+            // a number rather than the `vm.null` the contract promises.
+            return hostWork.adopt(vm, result, label, (ctx, value) =>
+              marshalReturn(ctx, value, method.returns) ?? ctx.undefined,
+            );
+          }
           return marshalReturn(vm, result, method.returns);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          throw new Error(`bim.${schema.name}.${method.name}: ${msg}`);
+          // Many `call:` implementations already name themselves in the message
+          // they throw (`bim.clash.run: elements must be an array…`), so an
+          // unconditional prefix rendered them as
+          // "bim.clash.run: bim.clash.run: …". Prefix only what is not already
+          // attributed.
+          throw new Error(msg.startsWith(`${label}:`) ? msg : `${label}: ${msg}`);
         }
       });
       try {
@@ -257,47 +323,6 @@ function buildNamespace(
 
 export function disposeSchemaNamespaceSession(context: BridgeCallContext): void {
   creatorRegistry.removeSession(context.sandboxSessionId);
-}
-
-/** Unmarshal QuickJS handles to native JS values based on arg schema */
-function unmarshalArgs(vm: QuickJSContext, handles: QuickJSHandle[], argTypes: ArgType[]): unknown[] {
-  const result: unknown[] = [];
-  for (let i = 0; i < argTypes.length; i++) {
-    switch (argTypes[i]) {
-      case 'string': {
-        const handle = handles[i];
-        result.push(handle ? vm.getString(handle) : undefined);
-        break;
-      }
-      case 'number': {
-        const handle = handles[i];
-        result.push(handle ? vm.getNumber(handle) : undefined);
-        break;
-      }
-      case 'dump': {
-        const handle = handles[i];
-        result.push(handle ? vm.dump(handle) : undefined);
-        break;
-      }
-      case 'entityRefs': {
-        const handle = handles[i];
-        if (!handle) { result.push([]); break; }
-        const raw = vm.dump(handle) as Array<{ ref?: EntityRef } & EntityRef>;
-        result.push(raw.map(r => r.ref ?? r));
-        break;
-      }
-      case '...strings': {
-        // Collect all remaining handles as strings
-        const rest: string[] = [];
-        for (let j = i; j < handles.length; j++) {
-          if (handles[j]) rest.push(vm.getString(handles[j]));
-        }
-        result.push(rest);
-        return result; // No more args after rest
-      }
-    }
-  }
-  return result;
 }
 
 /** Marshal a native JS value back to a QuickJS handle */
@@ -370,11 +395,56 @@ function marshalValueWithGuard(
   if (stack.has(obj)) return vm.null;
   stack.add(obj);
   try {
-    if (Array.isArray(value)) {
+    // A typed array's own enumerable properties are its numeric indices —
+    // walking one with `Object.entries` (the generic-object branch below)
+    // hands the script `{ "0": …, "1": … }` with no `.length`, not an array.
+    // `bim.export.ifc()` returns exactly this shape once STEP output exceeds
+    // V8's string-length limit and the SDK falls back to `Uint8Array` chunks
+    // (see step-exporter.ts), so a script that works on small models silently
+    // gets junk on large ones.
+    //
+    // Three view kinds are excluded and fall through to the generic branch,
+    // which marshals them as their actual own-property shape:
+    //  - `DataView`: a byte-range accessor, not a sequence of elements. It
+    //    has no index keys to mangle, and `Array.from` reads its absent
+    //    `length` as 0 and answers `[]` — "zero elements" instead of "not a
+    //    sequence". The generic branch gives `{}`.
+    //  - `BigInt64Array` / `BigUint64Array`: their elements are bigints,
+    //    which this marshaller has no representation for and turns into
+    //    `null`. As an array that reads back as `[null, null]` — correct
+    //    `.length`, `Array.isArray` true, indistinguishable from a genuine
+    //    array of nulls. `{ "0": null, "1": null }` loses exactly as much but
+    //    cannot be mistaken for a sequence of numbers the script can use.
+    // The tag test rather than `instanceof` so a view from another realm
+    // (a worker's structured clone) is classified the same as a local one.
+    const viewTag = ArrayBuffer.isView(value) ? Object.prototype.toString.call(value) : '';
+    const isElementView =
+      viewTag !== '' &&
+      viewTag !== '[object DataView]' &&
+      viewTag !== '[object BigInt64Array]' &&
+      viewTag !== '[object BigUint64Array]';
+    let arrayLikeValue: unknown[] | undefined;
+    if (isElementView) {
+      try {
+        arrayLikeValue = Array.from(value as unknown as ArrayLike<number>);
+      } catch {
+        // Every element read on a view whose `ArrayBuffer` has been detached
+        // throws, `Array.from` included — and detaching is what transferring
+        // the buffer to a worker does, i.e. the large-model export path this
+        // branch was added for. Letting that escape would fail the entire
+        // `bim.*` call over one value; degrade to the generic branch instead,
+        // which yields `{}` (a detached view has no own keys) exactly as this
+        // marshaller did before the typed-array branch existed.
+        arrayLikeValue = undefined;
+      }
+    } else if (Array.isArray(value)) {
+      arrayLikeValue = value;
+    }
+    if (arrayLikeValue) {
       const arr = vm.newArray();
       try {
-        for (let i = 0; i < value.length; i++) {
-          const item = marshalValueWithGuard(vm, value[i], depth + 1, stack);
+        for (let i = 0; i < arrayLikeValue.length; i++) {
+          const item = marshalValueWithGuard(vm, arrayLikeValue[i], depth + 1, stack);
           try {
             vm.setProp(arr, i, item);
           } finally {

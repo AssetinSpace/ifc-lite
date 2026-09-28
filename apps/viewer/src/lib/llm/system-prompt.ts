@@ -20,6 +20,7 @@ import type { FileAttachment } from './types.js';
 import type { ScriptEditorSelection } from './types.js';
 import { formatDiagnosticsForPrompt, type ScriptDiagnostic } from './script-diagnostics.js';
 import { buildAuthoringContract } from '@ifc-lite/extensions';
+import { buildStoreCheatSheet } from './system-prompt-store.js';
 
 const MAX_ATTACHMENT_ROWS_IN_PROMPT = 5;
 const MAX_ATTACHMENT_TEXT_PREVIEW_CHARS = 1200;
@@ -116,69 +117,6 @@ function buildIntentMethodSection(intent: LlmTaskIntent): string {
   return lines.join('\n');
 }
 
-function buildStoreCheatSheet(): string {
-  const storeNamespace = NAMESPACE_SCHEMAS.find((schema) => schema.name === 'store');
-  if (!storeNamespace) return '';
-
-  return [
-    '## BIM.STORE CHEAT SHEET',
-    '`bim.store.*` edits a parsed model in place — use it when the user already has',
-    'a model loaded and wants raw STEP-level edits, NOT when building a new model from',
-    'scratch (that\'s `bim.create`).',
-    '',
-    '- `addEntity(modelId, { type, attributes })` — inject a STEP entity. `attributes`',
-    '  follows EntityExtractor output: numbers → REAL/integer, `"#42"` → ref, `".AREA."` → enum,',
-    '  `null` → `$`, arrays → STEP list. Returns `{ modelId, expressId }`.',
-    '- `removeEntity(entity)` — tombstones existing source entities or forgets overlay-only ones.',
-    '- `setPositionalAttribute(entity, index, value)` — edit a non-IfcRoot attribute by',
-    '  zero-based STEP argument index. Use this for `IfcRectangleProfileDef.XDim` (index 3),',
-    '  `YDim` (index 4), `IfcCartesianPoint.Coordinates` (index 0), etc. Use `bim.mutate.setAttribute`',
-    '  for IfcRoot attributes (Name, Description, ObjectType, Tag).',
-    '- High-level builders anchor a new element to an existing IfcBuildingStorey:',
-    '    `addColumn(modelId, storeyId, { Position, Width, Depth, Height })`',
-    '    `addWall(modelId, storeyId, { Start, End, Thickness, Height })`',
-    '    `addBeam(modelId, storeyId, { Start, End, Width, Height })`',
-    '    `addSlab(modelId, storeyId, { Position, Width, Depth, Thickness })`             // rectangle',
-    '    `addSlab(modelId, storeyId, { Profile: "polygon", OuterCurve: [[x,y],…], Thickness })`',
-    '    `addRoof(modelId, storeyId, { … same shape as addSlab — emits .FLAT_ROOF. })`',
-    '    `addPlate(modelId, storeyId, { … same shape as addSlab — IfcPlate, PredefinedType? })`',
-    '    `addSpace(modelId, storeyId, { Position, Width, Depth, Height, LongName? })`     // room rectangle',
-    '    `addSpace(modelId, storeyId, { Profile: "polygon", OuterCurve, Height })`        // room polygon',
-    '    `addDoor(modelId, storeyId, { Position, Width, Height, FrameThickness?, OperationType? })`',
-    '    `addWindow(modelId, storeyId, { Position, Width, Height, FrameThickness?, PartitioningType? })`',
-    '    `addMember(modelId, storeyId, { Start, End, Width, Height, PredefinedType? })`   // brace/post/strut',
-    '  Each emits ~12 STEP entities (placement chain → profile → solid → representation +',
-    '  IfcRelContainedInSpatialStructure, except `addSpace` which uses IfcRelAggregates).',
-    '  Coords are storey-local metres. Polygon outlines need ≥3 points; the polyline is auto-closed.',
-    '- Edits accumulate in an overlay; they show up after `bim.export.ifc(bim.query.all())`',
-    '  or when the viewer next renders. Use `bim.mutate.undo(modelId)` to roll back.',
-    '',
-    'Canonical examples:',
-    '```js',
-    '// Resize a rectangular profile from 0.3×0.4 to 0.6×0.4',
-    'const profile = bim.query.byId("arch", 35);',
-    'bim.store.setPositionalAttribute(profile, 3, 0.6);   // XDim',
-    '',
-    '// Drop a wall on the first storey',
-    'const storeyId = bim.query.byType("IfcBuildingStorey")[0].ref.expressId;',
-    'bim.store.addWall("arch", storeyId, {',
-    '  Start: [0, 0, 0], End: [5, 0, 0],',
-    '  Thickness: 0.2, Height: 3, Name: "North Wall",',
-    '});',
-    '',
-    '// Add a custom IfcCartesianPoint, then reference it from another entity',
-    'const pt = bim.store.addEntity("arch", {',
-    '  type: "IfcCartesianPoint",',
-    '  attributes: [[1.0, 2.0, 0.0]],',
-    '});',
-    'console.log("Allocated", pt.expressId);',
-    '',
-    '// Drop an entity entirely',
-    'bim.store.removeEntity(unwantedRef);',
-    '```',
-  ].join('\n');
-}
-
 function buildCreateContractCheatSheet(): string {
   const createNamespace = NAMESPACE_SCHEMAS.find((schema) => schema.name === 'create');
   if (!createNamespace) return '## BIM.CREATE CONTRACT CHEAT SHEET';
@@ -215,7 +153,7 @@ function buildCreateContractCheatSheet(): string {
 
   lines.push('- Wall-hosted openings: use `Openings` inside `addIfcWall(...)` when you only need a void.');
   lines.push('- If the user asks for a house roof, pitched roof, or gable roof, default to `addIfcGableRoof`.');
-  lines.push('- `addIfcDoor` and `addIfcWindow`: these create standalone world-aligned elements.');
+  lines.push('- `addIfcDoor` and `addIfcWindow`: these create standalone axis-aligned elements, not wall-hosted inserts.');
   lines.push('- `addElement`: Use `IfcType`, `Placement: { Location: [...] }`, `Profile`, and `Depth`. Use `IfcType` not `Type`; use `Placement` not `Position`.');
   return lines.join('\n');
 }
@@ -240,11 +178,11 @@ function buildPlacementSemanticsSection(): string {
     '## PLACEMENT SEMANTICS',
     formatGroup('storey-relative', 'Common storey-relative methods'),
     formatGroup('wall-local', 'Hosted wall insert methods'),
-    formatGroup('world', 'Many advanced methods are world-placement based'),
+    formatGroup('world', 'World-placement methods'),
     formatGroup('explicit-placement', 'Explicit-placement generic methods'),
-    '- For world-placement methods, do NOT assume the storey elevation is automatically applied.',
-    '- Mixed multi-level scripts often combine both: storey-relative and world-placement helpers.',
-    '- If repeated world-placement elements are generated inside a storey loop, those calls should usually use `elevation` or `z` in their `Start`/`End`/`Position` Z coordinates.',
+    '- EVERY coordinate passed to `bim.create.addIfc*(h, storey, ...)` is relative to that storey. The storey placement carries `Elevation`, and the builder applies it exactly once.',
+    '- So do NOT add the storey elevation to an element Z inside a storey loop: adding it again puts the element at 2x the elevation.',
+    '- `Z = 0` means floor level of the storey you passed, whatever that storey\'s elevation is.',
   ].filter((line): line is string => Boolean(line)).join('\n');
 }
 
@@ -411,7 +349,7 @@ ${intentSection}
 2. Always call \`bim.model.loadIfc()\` after \`bim.create.toIfc()\` to display the model
 3. Use \`console.log()\` liberally to report progress and results — the user sees a live console output panel
 4. Keep scripts concise — avoid unnecessary abstractions
-5. Coordinates are in meters. Z is up. Do NOT assume every create method is storey-relative — use the method-specific placement rules below.
+5. Coordinates are in meters. Z is up. Every coordinate passed to a \`bim.create.addIfc*(h, storey, ...)\` method is relative to that storey — never world. The only exceptions are \`addIfcWallDoor\` / \`addIfcWallWindow\`, whose \`Position\` is relative to the host wall. See the placement rules below.
 6. For create or explicit rewrite turns, wrap runnable code in a \`\`\`js\`\`\` fence. For repair turns, return exactly one \`\`\`ifc-script-edits\`\`\` fence containing SEARCH/REPLACE blocks and no \`\`\`js\`\`\` fence.
 7. If the user asks to modify existing data, use \`bim.mutate\`, \`bim.store\`, or \`bim.query\` — NOT \`bim.create\`
    - Use \`bim.mutate.setAttribute(entity, "Description", "...")\` for root IFC attributes like \`Name\`, \`Description\`, \`ObjectType\`, or \`Tag\`
@@ -421,7 +359,7 @@ ${intentSection}
    - Distinguish occurrence vs type edits: occurrence/entity-specific changes belong on the occurrence; shared defaults and inherited type properties belong on the related \`Ifc...Type\` entity
    - If CURRENT MODEL STATE marks a selection as \`kind=type\`, treat it as a type object and avoid describing it as one physical placed occurrence
    - When an occurrence is selected, inspect \`bim.query.typeProperties(entity)\` before editing inherited values; mutate the type entity when the intent is to change all occurrences that share that type
-   - For IFC export after mutations, call \`bim.export.ifc(bim.query.all(), { filename: "updated.ifc" })\` or pass the exact entity list you want to export
+   - For IFC export after mutations, call \`bim.export.ifc(undefined, { filename: "updated.ifc" })\` for the whole model, or pass the exact entity list you want to isolate. An EMPTY list is refused (it means a filter that matched nothing), and \`bim.query.all()\` is an isolation filter, not "everything"
    - IFC export preserves edits to type-owned property sets when you export after applying mutations
    - Never fake IFC export with \`bim.export.download("", ...)\` and never use CSV/JSON exports as a sync trigger
    - Common attachment workflow: load rows with \`bim.files.csv(name)\`, build a lookup/map, apply mutations in one pass over \`bim.query.all()\`, then optionally export with \`bim.export.ifc(...)\`
@@ -445,8 +383,8 @@ ${createContractCheatSheet}
 ${storeCheatSheet}
 
 ${placementSemantics}
-- \`addIfcDoor\` and \`addIfcWindow\` do not infer host-wall orientation. If you place them next to angled walls, they will stay world-aligned unless you build the wall void another way.
-- For storey-relative methods, \`Z=0\` usually means floor level of that storey.
+- \`addIfcDoor\` and \`addIfcWindow\` do not infer host-wall orientation. If you place them next to angled walls, they stay axis-aligned unless you build the wall void another way.
+- \`Z=0\` means floor level of the storey you passed.
 - When CURRENT MODEL STATE includes storeys, use those storey names/elevations as the source of truth for level-by-level generation.
 
 Example:
@@ -458,10 +396,11 @@ for (let i = 0; i < storeyCount; i++) {
   // Storey-relative
   bim.create.addIfcSlab(h, storey, { Position: [0, 0, 0], Width: 30, Depth: 40, Thickness: 0.3 });
 
-  // World-placement facade members
+  // Facade members: storey-relative too, so Z stays 0. Writing \`elevation\`
+  // here would apply it a second time and put the panel at 2x the height.
   bim.create.addIfcCurtainWall(h, storey, {
-    Start: [0, -0.2, elevation],
-    End: [30, -0.2, elevation],
+    Start: [0, -0.2, 0],
+    End: [30, -0.2, 0],
     Height: storeyHeight,
     Thickness: 0.15,
   });
@@ -482,7 +421,7 @@ for (let i = 0; i < storeyCount; i++) {
 - If a roof pitch is written as a plain degree value like \`15\`, convert it to radians first (for example \`15 * Math.PI / 180\`) before calling \`addIfcRoof\` or \`addIfcGableRoof\`.
 - If doors or windows appear rotated 90° relative to a wall, you probably used standalone \`addIfcDoor\` / \`addIfcWindow\` where a wall \`Openings\` payload was needed.
 - If repeated elements appear only at one level, you probably reused one storey reference instead of iterating over the intended storeys.
-- If repeated world-placement elements stack at the base level, first check whether their Z coordinates include the current storey elevation.
+- If repeated elements sit at twice their expected height, their Z coordinates are repeating the storey elevation that the storey placement already applies. Use storey-relative Z (usually 0).
 
 ## SCHEDULING / 4D (IfcTask, IfcWorkSchedule, IfcRelSequence)
 - ifc-lite ships a Gantt panel in the lower workspace that plays a construction-sequence animation driven by IfcTask dates and the products each task controls.

@@ -41,19 +41,29 @@ import {
   type WallInStoreParams,
   type WindowInStoreParams,
 } from '@ifc-lite/create';
-import { EntityExtractor, type MapConversion, type ProjectedCRS } from '@ifc-lite/parser';
+import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { MeshData } from '@ifc-lite/geometry';
 import { getEntityBounds, getEntityCenter } from '@/utils/viewportUtils';
 import { toGlobalIdFromModels } from '../globalId.js';
-import { buildElementMesh, type ElementMeshPayload } from './addElementMeshes.js';
-import type { AddElementType } from './addElementSlice.js';
+import { meshesForOwningModel } from '../owningModelMeshes.js';
+import { modelRotationBaker } from '../../lib/model-placement/rotation-bake.js';
+import { buildElementMesh } from './addElementMeshes.js';
+import { authoredElementMeshPayloadOnStorey, type AuthoredElement } from './authoredElement.js';
+import { appendAuthoredMesh, authoredDataStore, syncAuthoredTreeEntry } from './authoredTreeEntry.js';
+import { ensureStoreyPlacement } from './storeyPlacement.js';
+import { effectiveStoreyId } from '@/lib/effective-storey';
+
+export type { AuthoredElement };
+import { createCostUndoMutations, type CostUndoMethods } from './mutation-cost-undo.js';
+import { stashAndPruneEntityMesh, pruneStashByModel, type RemovedMeshStash } from './mutation-mesh-stash.js';
+import { applyDuplicatePreAlignmentBaseline } from './mutation-duplicate-prealign.js';
+import { pruneMutationHistory } from './mutation-history-prune.js';
+import { invalidateHistoryPatch } from './mutation-redo-remote-guard.js';
 import type { TypeViewMode } from '../constants.js';
 import {
   resolvePlacementChain,
   resolveRotationState,
-  rotateProductYaw,
   resolveWallEditChain,
-  resizeRectangleWall,
   computeWallSplitGeometry,
   projectOntoWallAxis,
 } from '@/lib/placement-edit.js';
@@ -70,9 +80,15 @@ import {
   computeSlabSplitGeometry,
   type SlabLikeType,
 } from '@/lib/slab-edit.js';
-import { getModelLengthUnitScale } from '@/lib/length-unit-scale.js';
+import { getModelLengthUnitScale, pointToMetres, pointToNative } from '@/lib/length-unit-scale.js';
+import { readWallMetres, refreshWallMeshIn, resizeWallMetres } from './mutation-wall-resize.js';
 import type { Point2D } from '@/lib/polygon-clip.js';
 import { registerAuthoredElement } from '@/utils/spatialHierarchy.js';
+import { withMutationBatchTags } from './mutation-batch-tags.js';
+import { canMutate, mutationDenial } from '../mutation-permission.js';
+import { syncTypeOverride } from './mutation-history-apply.js';
+import { recordMutationBatch, replayHistory } from './mutation-history-replay.js';
+import { positionalMutations } from './mutation-positional-batch.js';
 
 /**
  * IFC-space directions for {@link MutationSlice.duplicateEntity}.
@@ -195,7 +211,7 @@ export interface GeorefMutationData {
   mapConversion?: Partial<MapConversion>;
 }
 
-export interface MutationSlice {
+export interface MutationSlice extends CostUndoMethods {
   // State
   /** Mutation views per model */
   mutationViews: Map<string, MutablePropertyView>;
@@ -207,6 +223,12 @@ export interface MutationSlice {
    * the same NewEntity record back into the view.
    */
   removedNewEntities: Map<string, NewEntity>;
+  /**
+   * Meshes pruned from `geometryResult` by DELETE_ENTITY / undoing a
+   * CREATE_ENTITY, keyed by `${modelId}:${expressId}`. The inverse
+   * mutation re-appends them — see `mutation-mesh-stash.ts` (#4925).
+   */
+  removedMeshes: Map<string, RemovedMeshStash>;
   /** All change sets */
   changeSets: Map<string, ChangeSet>;
   /** Active change set ID */
@@ -285,7 +307,7 @@ export interface MutationSlice {
     psetName: string,
     propName: string,
     value: PropertyValue,
-    valueType?: PropertyValueType
+    valueType?: PropertyValueType, dataType?: string
   ) => Mutation | null;
   /** Delete a property */
   deleteProperty: (
@@ -374,19 +396,43 @@ export interface MutationSlice {
    * Used by compound operations like `resizeWall` (4 coordinated
    * positional writes) so the user doesn't have to press Ctrl+Z
    * four times to undo one resize. Returns the batchId so callers
-   * can correlate; empty input is a no-op (returns null).
+   * can correlate; empty input is a no-op (returns null). Pass `batchId`
+   * to extend an earlier batch instead of starting one.
    */
   setPositionalAttributesBatch: (
     modelId: string,
     updates: Array<{ entityId: number; index: number; value: IfcAttributeValue }>,
+    batchId?: string,
   ) => string | null;
+  /** Tag already-recorded mutations as one undo batch (SDK `bim.mutate.batch`). */
+  tagMutationBatch: (mutationIds: readonly string[], batchId: string) => void;
+  /**
+   * Record mutations a bulk writer already applied to the model's view
+   * (Bulk editor, CSV import) as ONE undo step: one batch id, redo cleared,
+   * model marked dirty, one store update. Returns the batch id (null if empty); pass it back for a later chunk.
+   */
+  recordMutationBatch: (modelId: string, mutations: readonly Mutation[], batchId?: string) => string | null;
   /**
    * Tombstone an entity (existing source entity) or forget it (overlay-only).
    * Returns true if the entity was known to the store or overlay.
    */
   removeEntity: (modelId: string, expressId: number, opts?: { mirror?: boolean }) => boolean;
   /**
-   * Translate an IfcProduct by a storey-local delta (IFC Z-up). Walks
+   * Book an element another writer (the SDK `bim.store.add*` adapter) has
+   * already built into the overlay: spatial tree, 3D mesh, undo entry, dirty
+   * flag and `mutationVersion` — everything `addColumn` & co. do after their
+   * builder runs, minus collab mirroring, which that writer owns.
+   */
+  recordAuthoredElement: (modelId: string, storeyExpressId: number, entityId: number, element: AuthoredElement) => void;
+  /**
+   * Book a removal another writer (the SDK `bim.store.removeEntity` adapter)
+   * already applied: prune the mesh, stash the overlay record for undo, push
+   * the undo entry. Collab mirroring stays with that writer.
+   */
+  recordEntityRemoval: (modelId: string, expressId: number, overlayRecord: NewEntity | null | undefined) => void;
+  /**
+   * Translate an IfcProduct by a storey-local delta (IFC Z-up) in METRES,
+   * whatever the file's length unit (#6233). Walks
    * the placement chain to the terminal `IfcCartesianPoint` and writes
    * the new coordinates via `setPositionalAttribute` so the edit
    * stacks with other overlay mutations and undoes cleanly.
@@ -446,7 +492,7 @@ export interface MutationSlice {
     expressId: number,
   ) => { yawZ: number; refDirection: [number, number, number] } | null;
   /**
-   * Read the entity's storey-local placement coordinates. Returns
+   * Read the entity's storey-local placement coordinates in metres. Returns
    * null when the placement chain isn't a simple
    * `IfcLocalPlacement → IfcAxis2Placement3D → IfcCartesianPoint`
    * (i.e. when `translateEntity` / `setEntityPosition` wouldn't work
@@ -464,24 +510,32 @@ export interface MutationSlice {
   ) => [number, number, number] | null;
   /**
    * Resize a rectangular-profile wall by setting new start AND end
-   * points. Atomically updates the placement origin, RefDirection,
-   * profile length, and profile origin. Returns null for walls that
-   * don't follow the `addWallToStore` shape.
+   * points (storey-local metres). Updates the placement origin,
+   * RefDirection, profile length, and profile origin as ONE undo step;
+   * refuses walls that don't follow the `addWallToStore` shape.
+   *
+   * `batchId` joins an ongoing step: an endpoint drag passes one id for
+   * all its frames (as the move gizmo does with `translateEntity`), and
+   * then calls `refreshWallMesh` on release. Without it the local mesh
+   * is rebuilt straight away (see `mutation-wall-resize.ts`).
    */
   resizeWall: (
     modelId: string,
     expressId: number,
     newStart: [number, number, number],
     newEnd: [number, number, number],
+    batchId?: string,
   ) => { ok: true; newLength: number } | { ok: false; reason: string };
+  /** Rebuild a resized wall's mesh locally and for collaborators. */
+  refreshWallMesh: (modelId: string, expressId: number) => void;
   /**
-   * Read a wall's current start/end so the UI can render endpoint
-   * handles. Returns null for non-rectangle walls.
+   * Read a wall's current start/end (storey-local metres) so the UI can
+   * render endpoint handles. Returns null for non-rectangle walls.
    */
   readWallEndpoints: (
     modelId: string,
     expressId: number,
-  ) => { start: [number, number, number]; end: [number, number, number]; thickness: number } | null;
+  ) => { start: [number, number, number]; end: [number, number, number]; thickness: number; height: number } | null;
   /**
    * Split a rectangle-profile wall into two walls at `distance`
    * metres along its axis (measured from the wall's start). Produces
@@ -615,7 +669,9 @@ export interface MutationSlice {
   addSpace: (
     modelId: string,
     storeyExpressId: number,
-    params: SpaceInStoreParams
+    params: SpaceInStoreParams,
+    /** Plan outline for the 3D mirror — see `profileCornersFromParams`. */
+    previewCorners?: Array<[number, number]>
   ) => { expressId: number } | { error: string };
   /** Add an IfcRoof (flat roof) — slab-like rectangle or polygon. */
   addRoof: (
@@ -635,12 +691,8 @@ export interface MutationSlice {
     storeyExpressId: number,
     params: MemberInStoreParams
   ) => { expressId: number } | { error: string };
-  /**
-   * Auto-generate IfcSpace volumes for every enclosed area formed by
-   * the storey's walls (existing + overlay). When `dryRun: true` the
-   * detection runs but no IfcSpace is emitted — useful for live UI
-   * previews.
-   */
+  /** Auto-generate IfcSpace volumes for every enclosed area formed by the storey's walls
+   *  (existing + overlay). `dryRun: true` detects without emitting — for live UI previews. */
   generateSpacesFromWalls: (
     modelId: string,
     storeyExpressId: number,
@@ -672,6 +724,7 @@ export interface MutationSlice {
   canUndo: (modelId: string) => boolean;
   /** Check if redo is available */
   canRedo: (modelId: string) => boolean;
+  /** Clears history for a peer-edited entity (#5223). */ invalidateHistoryForEntity: (modelId: string, entityId: number) => void;
 
   // Actions - Change Sets
   /** Create a new change set */
@@ -700,30 +753,22 @@ export interface MutationSlice {
   clearAllMutations: () => void;
   /** Manually bump mutation version (for bulk operations that bypass store) */
   bumpMutationVersion: () => void;
+  /**
+   * Mark models as having unsaved changes, and bump the mutation version, in
+   * ONE update.
+   *
+   * For bulk writers that go straight to a model's `MutablePropertyView`
+   * (zone write-back, #2508). Those cannot drive the per-mutation actions
+   * above: each of them copies the model's whole undo stack, so calling one
+   * per element is quadratic. `bumpMutationVersion` alone is not enough  - 
+   * without the dirty flag the model reports no unsaved changes while its
+   * overlay holds thousands of them.
+   */
+  markModelsDirty: (modelIds: readonly string[]) => void;
 }
 
 function generateChangeSetId(): string {
   return `cs_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-}
-
-/**
- * Get-or-create the per-model `StoreEditor`. The editor pairs a parsed
- * `IfcDataStore` with a `MutablePropertyView`; both must already exist
- * (the data store comes from `models`, the view from PropertiesPanel's
- * lazy-init effect). Returns null if either is missing.
- */
-/**
- * Push the overlay's effective class for an entity into the model's
- * EntityTable as an additive display override, so a UI retype reflects
- * immediately in the inspector, hover, and the (mutationVersion-rebuilt)
- * hierarchy tree. Reads the current overlay, so it also clears the override
- * on undo (removeTypeMutation → null) and re-applies it on redo.
- */
-function syncTypeOverride(get: () => ViewerState, modelId: string, entityId: number): void {
-  const view = get().mutationViews.get(modelId);
-  const newType = view?.getEntityTypeMutation?.(entityId)?.newType ?? null;
-  const dataStore = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
-  dataStore?.entities?.setTypeOverride?.(entityId, newType);
 }
 
 function getOrCreateStoreEditor(
@@ -757,55 +802,6 @@ function getOrCreateStoreEditor(
 }
 
 /**
- * IfcBuildingStorey.ObjectPlacement is optional in the schema —
- * some authoring tools leave it null when the file was never
- * meant to host geometry. Authoring actions need a placement to
- * anchor their new entities against, so we materialise a default
- * IfcLocalPlacement at the storey's elevation when one's missing
- * and patch the storey's attribute via the overlay.
- *
- * Idempotent: if the storey already has a placement (number or
- * `#X` string ref), this is a no-op. Returns true when a
- * placement was created.
- */
-function ensureStoreyPlacement(
-  dataStore: import('@ifc-lite/parser').IfcDataStore,
-  editor: StoreEditor,
-  storeyExpressId: number,
-): boolean {
-  // Pull the storey's current attributes (overlay overrides + source).
-  const overlay = editor.getNewEntity(storeyExpressId);
-  let attrs: unknown[];
-  if (overlay) {
-    attrs = overlay.attributes.slice();
-  } else {
-    const ref = dataStore.entityIndex.byId.get(storeyExpressId);
-    if (!ref) return false;
-    const extractor = new EntityExtractor(dataStore.source);
-    const entity = extractor.extractEntity(ref);
-    if (!entity) return false;
-    attrs = entity.attributes.slice();
-  }
-
-  // IfcProduct.ObjectPlacement is at index 5 across IFC2X3 / IFC4.
-  // Accept both number refs and `#X` strings as "already present".
-  const existing = attrs[5];
-  if (typeof existing === 'number' && Number.isFinite(existing)) return false;
-  if (typeof existing === 'string' && existing.startsWith('#')) return false;
-
-  // Build a fresh placement at world origin. The storey's elevation
-  // (if any) carries through the geometry pipeline elsewhere; this
-  // placement gives the IFC graph what resolveSpatialAnchor needs.
-  const elevation = dataStore.spatialHierarchy?.storeyElevations?.get(storeyExpressId) ?? 0;
-  const originPt = editor.addEntity('IfcCartesianPoint', [[0, 0, elevation]]).expressId;
-  const axisPlacement = editor.addEntity('IfcAxis2Placement3D', [`#${originPt}`, null, null]).expressId;
-  const localPlacement = editor.addEntity('IfcLocalPlacement', [null, `#${axisPlacement}`]).expressId;
-
-  editor.setPositionalAttribute(storeyExpressId, 5, `#${localPlacement}`);
-  return true;
-}
-
-/**
  * Resolve the (view, editor, dataStore, storey) tuple that every
  * splitWall / splitLinearElement / splitSlab action needs. Returns
  * an error result with a stable message when any piece is missing
@@ -835,7 +831,7 @@ function resolveSplitContext(
   if (!editor) return { ok: false, reason: 'Failed to resolve store editor' };
   const dataStore = state.models.get(modelId)?.ifcDataStore;
   if (!dataStore) return { ok: false, reason: `No model loaded for id "${modelId}"` };
-  const storeyExpressId = dataStore.spatialHierarchy?.elementToStorey.get(expressId);
+  const storeyExpressId = effectiveStoreyId(dataStore, view, expressId);
   if (storeyExpressId === undefined) return { ok: false, reason: notInStoreyMessage };
   return { view, editor, dataStore, storeyExpressId };
 }
@@ -921,12 +917,11 @@ function runInStoreElementBuilder(
   set: (partial: Partial<ViewerState> | ((s: ViewerState) => Partial<ViewerState>)) => void,
   modelId: string,
   storeyExpressId: number,
-  ifcType: string,
-  errorContext: string,
+  element: AuthoredElement,
   build: (editor: StoreEditor, anchor: ReturnType<typeof resolveSpatialAnchor>) => number,
-  meshPayload?: ElementMeshPayload,
 ): { expressId: number } | { error: string } {
-  if (!get().canCollabEdit()) return { error: 'Editing is disabled for your role in this shared session' };
+  const denial = mutationDenial(get(), modelId);
+  if (denial) return { error: denial };
   const state = get();
   const model = state.models.get(modelId);
   const dataStore = model?.ifcDataStore;
@@ -949,11 +944,41 @@ function runInStoreElementBuilder(
 
   let entityId: number;
   try {
-    const anchor = resolveSpatialAnchor(dataStore, storeyExpressId);
+    const anchor = resolveSpatialAnchor(dataStore, storeyExpressId, view);
     entityId = build(editor, anchor);
   } catch (err) {
-    return { error: err instanceof Error ? err.message : `Failed to ${errorContext}` };
+    return { error: err instanceof Error ? err.message : `Failed to add ${element.kind}` };
   }
+
+  const createdMesh = recordAuthoredElementIn(get, set, modelId, dataStore, view, storeyExpressId, entityId, element);
+
+  // Mirror the new element to peers (entity + mesh blob). No-op outside collab.
+  const newGuid = readNewEntityGuid(editor, entityId);
+  get().mirrorEntityCreate(modelId, entityId, authoredIfcType(element), newGuid, createdMesh);
+
+  return { expressId: entityId };
+}
+
+const authoredIfcType = (element: AuthoredElement): string => `IFC${element.kind.toUpperCase()}`;
+
+/**
+ * Everything after an in-store builder ran, shared by the UI actions and by
+ * the SDK `bim.store.add*` adapter. The adapter used to stop at the builder,
+ * so a script's or flow's elements existed only in the export overlay: no
+ * mesh, no tree entry, no undo, and no `mutationVersion` bump to tell anything
+ * they were there. Returns the mesh it injected, for mirroring.
+ */
+function recordAuthoredElementIn(
+  get: () => ViewerState,
+  set: (partial: Partial<ViewerState> | ((s: ViewerState) => Partial<ViewerState>)) => void,
+  modelId: string,
+  dataStore: import('@ifc-lite/parser').IfcDataStore,
+  view: MutablePropertyView,
+  storeyExpressId: number,
+  entityId: number,
+  element: AuthoredElement,
+): MeshData | null {
+  const ifcType = authoredIfcType(element);
 
   // Make the authored element a first-class citizen immediately: register it in
   // the spatial hierarchy so it appears in the spatial tree under its storey and
@@ -966,7 +991,7 @@ function runInStoreElementBuilder(
     // Name lives on the overlay record (attrs[2] = Name for every IfcRoot
     // subtype), not the columnar parse, so the tree label reads the authored
     // name ("Space 1") rather than falling back to the type.
-    const rawName = editor.getNewEntity(entityId)?.attributes?.[2];
+    const rawName = view.getNewEntity(entityId)?.attributes?.[2];
     const name = typeof rawName === 'string' ? rawName : '';
     registerAuthoredElement(dataStore.spatialHierarchy, storeyExpressId, entityId, ifcType, name);
   }
@@ -974,25 +999,18 @@ function runInStoreElementBuilder(
   // Build a renderer-frame mesh for the new element so it appears in
   // 3D the moment the action commits — the ImportError-only behaviour
   // before this would only surface the change after an export+reparse.
-  let createdMesh: MeshData | null = null;
-  if (meshPayload) {
-    const storeyElevation =
-      dataStore.spatialHierarchy?.storeyElevations?.get(storeyExpressId) ?? 0;
-    const globalId = toGlobalIdFromModels(state.models, modelId, entityId);
-    const mesh = buildElementMesh({
-      type: meshPayload.type,
-      globalId,
-      storeyElevation,
-      payload: meshPayload,
-    });
-    if (mesh) {
-      createdMesh = mesh;
-      const cross = get() as unknown as {
-        appendGeometryBatch?: (batch: MeshData[]) => void;
-      };
-      cross.appendGeometryBatch?.([mesh]);
-      revealAddedGeometryInModelView(get);
-    }
+  const storeyElevation =
+    dataStore.spatialHierarchy?.storeyElevations?.get(storeyExpressId) ?? 0;
+  const globalId = toGlobalIdFromModels(get().models, modelId, entityId);
+  const createdMesh = buildElementMesh({
+    type: element.kind,
+    globalId,
+    storeyElevation,
+    payload: authoredElementMeshPayloadOnStorey(element, dataStore, storeyExpressId, get().models.get(modelId)?.geometryResult?.coordinateInfo),
+  });
+  if (createdMesh) {
+    appendAuthoredMesh(get(), modelId, createdMesh);
+    revealAddedGeometryInModelView(get);
   }
 
   set((s) => {
@@ -1022,11 +1040,62 @@ function runInStoreElementBuilder(
     };
   });
 
-  // Mirror the new element to peers (entity + mesh blob). No-op outside collab.
-  const newGuid = readNewEntityGuid(editor, entityId);
-  get().mirrorEntityCreate(modelId, entityId, ifcType, newGuid, createdMesh);
+  return createdMesh;
+}
 
-  return { expressId: entityId };
+/**
+ * Everything after an entity left the overlay: shared by `removeEntity` and
+ * the SDK `bim.store.removeEntity` adapter, which removes through its own
+ * editor and would otherwise leave the mesh on screen and nothing to undo.
+ */
+function recordEntityRemovalIn(
+  get: () => ViewerState,
+  set: (partial: Partial<ViewerState> | ((s: ViewerState) => Partial<ViewerState>)) => void,
+  modelId: string,
+  expressId: number,
+  overlayRecord: NewEntity | null | undefined,
+): void {
+  syncAuthoredTreeEntry(get(), modelId, expressId, overlayRecord, false);
+  // Drop the entity's mesh out of `geometryResult` (stashed first so
+  // undo can restore it) rather than only hiding it — #4925: a
+  // hide-only mesh desyncs from a split's separate hard removal.
+  // `hideEntities` is a fallback for entities with no mesh to prune.
+  const globalIdForMesh = toGlobalIdFromModels(get().models, modelId, expressId);
+  if (!stashAndPruneEntityMesh(get, set, modelId, expressId)) {
+    get().hideEntities([globalIdForMesh]);
+  }
+
+  set((state) => {
+    const newRemoved = new Map(state.removedNewEntities);
+    if (overlayRecord) {
+      newRemoved.set(`${modelId}:${expressId}`, overlayRecord);
+    }
+
+    const newUndoStacks = new Map(state.undoStacks);
+    const stack = newUndoStacks.get(modelId) || [];
+    const mutation: Mutation = {
+      id: `mut_del_${expressId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+      type: 'DELETE_ENTITY',
+      timestamp: Date.now(),
+      modelId,
+      entityId: expressId,
+    };
+    newUndoStacks.set(modelId, [...stack, mutation]);
+
+    const newRedoStacks = new Map(state.redoStacks);
+    newRedoStacks.set(modelId, []);
+
+    const newDirty = new Set(state.dirtyModels);
+    newDirty.add(modelId);
+
+    return {
+      removedNewEntities: newRemoved,
+      undoStacks: newUndoStacks,
+      redoStacks: newRedoStacks,
+      dirtyModels: newDirty,
+      mutationVersion: state.mutationVersion + 1,
+    };
+  });
 }
 
 /** Read a freshly-created overlay entity's IFC GlobalId (attribute 0 on IfcRoot). */
@@ -1035,50 +1104,18 @@ function readNewEntityGuid(editor: StoreEditor, expressId: number): string | nul
   return typeof raw === 'string' && raw.length > 0 ? raw : null;
 }
 
-/**
- * Build the polygon corner ring used by slab/roof/plate/space mesh
- * previews from a builder param object that may be in rectangle or
- * polygon mode. Rectangle = 4 corners CCW from `Position` +
- * Width/Depth; polygon = the `OuterCurve` lifted to 3D at z = 0.
- */
-function profileCornersFromParams(
-  params:
-    | { Profile?: 'rectangle'; Position: [number, number, number]; Width: number; Depth: number }
-    | { Profile: 'polygon'; OuterCurve: Array<[number, number]>; Position?: [number, number, number] },
-): Array<[number, number, number]> {
-  if ('Profile' in params && params.Profile === 'polygon') {
-    const z = params.Position?.[2] ?? 0;
-    return params.OuterCurve.map(([x, y]) => [x, y, z]);
-  }
-  const rect = params as {
-    Position: [number, number, number]; Width: number; Depth: number;
-  };
-  const [px, py, pz] = rect.Position;
-  return [
-    [px, py, pz],
-    [px + rect.Width, py, pz],
-    [px + rect.Width, py + rect.Depth, pz],
-    [px, py + rect.Depth, pz],
-  ];
-}
-
-/** Decode the `@N` form used to encode positional indices into Mutation.attributeName. */
-function positionalIndex(attributeName: string | undefined): number | null {
-  if (!attributeName || attributeName[0] !== '@') return null;
-  const n = Number(attributeName.slice(1));
-  return Number.isFinite(n) && n >= 0 && Number.isInteger(n) ? n : null;
-}
 
 export const createMutationSlice: StateCreator<
   ViewerState,
   [],
   [],
   MutationSlice
-> = (set, get) => ({
+> = (set, get, api) => ({
   // Initial state
   mutationViews: new Map(),
   storeEditors: new Map(),
   removedNewEntities: new Map(),
+  removedMeshes: new Map(),
   changeSets: new Map(),
   activeChangeSetId: null,
   undoStacks: new Map(),
@@ -1089,6 +1126,7 @@ export const createMutationSlice: StateCreator<
   mutationVersion: 0,
   georefMutations: new Map(),
 
+  ...createCostUndoMutations(set),
   // Georeferencing Mutations
   setGeorefField: (modelId, entity, field, value, oldValue) => {
     get().setGeorefFields(modelId, entity, [{ field, value, oldValue }]);
@@ -1096,10 +1134,11 @@ export const createMutationSlice: StateCreator<
 
   setGeorefFields: (modelId, entity, fields) => {
     if (fields.length === 0) return;
+    if (!canMutate(get(), modelId)) return;
     set((state) => {
       const newGeorefMuts = new Map(state.georefMutations);
-      const modelMuts = { ...(newGeorefMuts.get(modelId) || {}) };
-      const entityMuts = { ...(modelMuts[entity] || {}) } as Record<string, unknown>;
+      const modelMuts = { ...newGeorefMuts.get(modelId) };
+      const entityMuts = { ...modelMuts[entity] } as Record<string, unknown>;
       for (const entry of fields) {
         entityMuts[entry.field] = entry.value;
       }
@@ -1163,34 +1202,35 @@ export const createMutationSlice: StateCreator<
       newEditors.delete(modelId);
       const newDirty = new Set(state.dirtyModels);
       newDirty.delete(modelId);
-      // Drop any stashed undo payloads owned by this model so they don't
-      // leak into future mutation views with the same id.
-      const newRemoved = new Map(state.removedNewEntities);
-      const prefix = `${modelId}:`;
-      for (const key of [...newRemoved.keys()]) {
-        if (key.startsWith(prefix)) newRemoved.delete(key);
-      }
+      const newRemoved = pruneStashByModel(state.removedNewEntities, modelId);
+      const newRemovedMeshes = pruneStashByModel(state.removedMeshes, modelId);
+      const history = pruneMutationHistory(
+        modelId,
+        state.undoStacks,
+        state.redoStacks,
+        state.mutationBatchTags,
+        state.mutationMeshTranslations,
+      );
       return {
         mutationViews: newViews,
         storeEditors: newEditors,
         dirtyModels: newDirty,
         removedNewEntities: newRemoved,
+        removedMeshes: newRemovedMeshes,
+        ...history,
       };
     });
   },
 
   // Property Mutations
-  setProperty: (modelId, entityId, psetName, propName, value, valueType = PropertyValueType.String) => {
-    // Collab role gate BEFORE the local commit: in a shared session only
-    // editor/admin may write. Gating here (not just at the mirror) keeps the
-    // local view/undo/dirty state consistent with what actually syncs — a
-    // viewer-role user must not build up local-only edits that silently never
-    // reach the room. Single-user sessions (role === null) are unaffected.
-    if (!get().canCollabEdit()) return null;
+  setProperty: (modelId, entityId, psetName, propName, value, valueType = PropertyValueType.String, dataType) => {
+    // Apply the shared edit-mode, role, and model gate before touching the
+    // overlay, undo/redo, dirty state, or collaboration mirror (#5901).
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
-    const mutation = view.setProperty(entityId, psetName, propName, value, valueType);
+    const mutation = view.setProperty(entityId, psetName, propName, value, valueType, undefined, false, dataType);
 
     set((state) => {
       // Add to undo stack
@@ -1214,17 +1254,18 @@ export const createMutationSlice: StateCreator<
       };
     });
 
-    // Mirror into the collab CRDT (no-op without a session).
-    if (modelId === get().activeModelId) {
-      get().mirrorPropertyEdit(entityId, psetName, propName, value, valueType);
-    }
+    // Mirror into the collab CRDT (no-op without a session, and no-op unless
+    // `modelId` is the ROOM's model — the mirror gates itself on the modelId it
+    // is handed, so this call site cannot get the subject wrong. See
+    // `@/lib/collab/room-model-target`.)
+    get().mirrorPropertyEdit(modelId, entityId, psetName, propName, value, valueType);
 
     return mutation;
   },
 
   deleteProperty: (modelId, entityId, psetName, propName) => {
-    // Collab role gate before the local commit — see setProperty.
-    if (!get().canCollabEdit()) return null;
+    // Shared mutation gate before the local commit — see setProperty.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1250,19 +1291,18 @@ export const createMutationSlice: StateCreator<
       };
     });
 
-    // Mirror into the collab CRDT (no-op without a session).
-    if (modelId === get().activeModelId) {
-      get().mirrorPropertyDelete(entityId, psetName, propName);
-    }
+    // Mirror into the collab CRDT — room model only, gated in the callee. See
+    // the note in `setProperty`.
+    get().mirrorPropertyDelete(modelId, entityId, psetName, propName);
 
     return mutation;
   },
 
   createPropertySet: (modelId, entityId, psetName, properties) => {
-    // Collab role gate before the local commit — see setProperty. (Pset
+    // Shared mutation gate before the local commit — see setProperty. (Pset
     // creation isn't mirrored yet, which is all the more reason a read-only
     // role must not accumulate local-only psets in a shared session.)
-    if (!get().canCollabEdit()) return null;
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1291,6 +1331,11 @@ export const createMutationSlice: StateCreator<
   },
 
   deletePropertySet: (modelId, entityId, psetName) => {
+    // Shared mutation gate before the local commit — see setProperty. Removing a
+    // pset is no less of a write than creating one, and this arm was the one
+    // `createPropertySet` and `deleteProperty` were both given the gate and
+    // this one was not.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1320,6 +1365,19 @@ export const createMutationSlice: StateCreator<
 
   // Quantity Mutations
   setQuantity: (modelId, entityId, qsetName, quantName, value, quantityType = QuantityType.Count, unit) => {
+    // Same gate as setProperty/setAttribute/createPropertySet, for the reason
+    // spelled out there: a viewer-role user must not accumulate local-only
+    // edits that silently never reach the room. This was missing here, so a
+    // read-only participant's quantity edits committed locally, marked the
+    // model dirty and entered their undo stack.
+    //
+    // NOTE the sync half of that comment is NOT yet true for quantities even
+    // for an editor: there is no `mirrorQuantityEdit`, and `attachRemoteApply`
+    // has no `quantities` arm, so a quantity edit still reaches no peer. That
+    // is a separate, larger gap — see the tests below and the PR discussion.
+    // Gating here at least stops an unauthorised writer, and stops the local
+    // state diverging further than it already does.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1348,6 +1406,8 @@ export const createMutationSlice: StateCreator<
   },
 
   createQuantitySet: (modelId, entityId, qsetName, quantities) => {
+    // See setQuantity above — same omission, same reason.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1377,8 +1437,8 @@ export const createMutationSlice: StateCreator<
 
   // Attribute Mutations
   setAttribute: (modelId, entityId, attrName, value, oldValue) => {
-    // Collab role gate before the local commit — see setProperty.
-    if (!get().canCollabEdit()) return null;
+    // Shared mutation gate before the local commit — see setProperty.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1403,16 +1463,18 @@ export const createMutationSlice: StateCreator<
       };
     });
 
-    // Mirror into the collab CRDT (no-op without a session).
-    if (modelId === get().activeModelId) {
-      get().mirrorAttributeEdit(entityId, attrName, value);
-    }
+    // Mirror into the collab CRDT — room model only, gated in the callee. See
+    // the note in `setProperty`.
+    get().mirrorAttributeEdit(modelId, entityId, attrName, value);
 
     return mutation;
   },
 
   // Entity retype (reassign class)
   setEntityType: (modelId, entityId, newType, predefinedType) => {
+    // Shared mutation gate before the local commit — see setProperty. Reclassing an
+    // entity is an attribute write like any other, and `setAttribute` is gated.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1454,6 +1516,10 @@ export const createMutationSlice: StateCreator<
 
   // Store-Level Mutations
   setPositionalAttribute: (modelId, entityId, index, value) => {
+    // Shared mutation gate before the local commit — see setProperty. This is the
+    // rawest write in the slice (a direct STEP slot overwrite); every named
+    // mutation above it is gated, so leaving this one open gated nothing.
+    if (!canMutate(get(), modelId)) return null;
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
@@ -1501,29 +1567,24 @@ export const createMutationSlice: StateCreator<
     return stack ? stack[stack.length - 1] : null;
   },
 
-  setPositionalAttributesBatch: (modelId, updates) => {
-    if (updates.length === 0) return null;
-    // Generate the batch id once; every mutation created below
-    // gets tagged with it so the undo / redo handlers can group
-    // them. `crypto.randomUUID` is available in every browser the
-    // viewer supports and avoids the collision risk of
-    // Date.now() + Math.random concatenation.
-    const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    const tags = new Map(get().mutationBatchTags);
-    for (const { entityId, index, value } of updates) {
-      const mutation = get().setPositionalAttribute(modelId, entityId, index, value);
-      if (mutation) tags.set(mutation.id, batchId);
-    }
-    set({ mutationBatchTags: tags });
-    return batchId;
+  setPositionalAttributesBatch: (modelId, updates, continuing) => {
+    // Same gate as setPositionalAttribute; one store update for the whole batch.
+    if (updates.length === 0 || !canMutate(get(), modelId) || !get().mutationViews.get(modelId)) return null;
+    const editor = getOrCreateStoreEditor(get, set, modelId);
+    return editor ? recordMutationBatch(set, modelId, positionalMutations(editor, modelId, updates), continuing) : null;
+  },
+
+  recordMutationBatch: (modelId, mutations, batchId) => recordMutationBatch(set, modelId, mutations, batchId),
+
+  tagMutationBatch: (mutationIds, batchId) => {
+    if (mutationIds.length === 0) return;
+    set((s) => ({ mutationBatchTags: withMutationBatchTags(s.mutationBatchTags, mutationIds, batchId) }));
   },
 
   translateEntity: (modelId, expressId, delta, batchId) => {
-    // Collab role gate: in a shared session only editor/admin may move geometry
-    // (single-user sessions have role === null → allowed).
-    if (!get().canCollabEdit()) {
-      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
-    }
+    // Shared mutation gate also protects geometry writes.
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     // Read the existing placement chain WITHOUT committing the edit
     // yet — we'll route the actual write through `setPositionalAttribute`
     // below so undo/redo + dirty-tracking come for free.
@@ -1539,7 +1600,7 @@ export const createMutationSlice: StateCreator<
       // No STEP placement chain — e.g. a recipient's IFCX-reconstructed store.
       // Route the move through the collab doc (`usd::xformop`) instead, which
       // syncs to peers and moves the local mesh. Returns false outside a room.
-      if (get().collabTranslateEntity(expressId, delta)) {
+      if (get().collabTranslateEntity(modelId, expressId, delta)) {
         return { ok: true, newCoordinates: delta };
       }
       return {
@@ -1548,11 +1609,13 @@ export const createMutationSlice: StateCreator<
           'Entity placement is not a simple IfcLocalPlacement → IfcAxis2Placement3D → IfcCartesianPoint chain',
       };
     }
+    // `delta` is metres; the point holds the file's native unit (#6233).
     const [x, y, z] = chain.coordinates;
-    const next: [number, number, number] = [x + delta[0], y + delta[1], z + delta[2]];
+    const [nx, ny, nz] = pointToNative(dataStore, delta);
+    const nativeNext: [number, number, number] = [x + nx, y + ny, z + nz];
     // Go through the slice's own `setPositionalAttribute` action so
     // the mutation lands on the undo stack with the standard envelope.
-    const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, next);
+    const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, nativeNext);
 
     // Push the renderer-frame delta so the visible mesh follows
     // the IFC mutation. IFC is Z-up; renderer is Y-up. Conversion:
@@ -1584,13 +1647,12 @@ export const createMutationSlice: StateCreator<
     // (`usd::xformop`). No-op outside a collab session.
     get().mirrorPlacementEdit(modelId, expressId, delta);
 
-    return { ok: true, newCoordinates: next };
+    return { ok: true, newCoordinates: pointToMetres(dataStore, nativeNext) };
   },
 
   setEntityPosition: (modelId, expressId, position) => {
-    if (!get().canCollabEdit()) {
-      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
-    }
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const view = get().mutationViews.get(modelId);
     if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -1602,14 +1664,14 @@ export const createMutationSlice: StateCreator<
     if (!chain) {
       // No STEP chain (recipient/IFCX store): translate by the delta from the
       // current collab placement to the requested absolute position.
-      const current = get().readCollabPlacement(expressId);
+      const current = get().readCollabPlacement(modelId, expressId);
       if (current) {
         const delta: [number, number, number] = [
           position[0] - current.location[0],
           position[1] - current.location[1],
           position[2] - current.location[2],
         ];
-        if (get().collabTranslateEntity(expressId, delta)) {
+        if (get().collabTranslateEntity(modelId, expressId, delta)) {
           return { ok: true, newCoordinates: position };
         }
       }
@@ -1620,12 +1682,13 @@ export const createMutationSlice: StateCreator<
       };
     }
     // Push the IFC → renderer delta for the rendered mesh. Same
-    // Z-up → Y-up conversion as `translateEntity` above.
-    const [oldX, oldY, oldZ] = chain.coordinates;
+    // Z-up → Y-up conversion as `translateEntity` above. `position` is
+    // metres; the point holds the file's native unit (#6233).
+    const [oldX, oldY, oldZ] = pointToMetres(dataStore, chain.coordinates);
     const dx = position[0] - oldX;
     const dy = position[1] - oldY;
     const dz = position[2] - oldZ;
-    const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, position);
+    const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, pointToNative(dataStore, position));
     if (dx !== 0 || dy !== 0 || dz !== 0) {
       const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
       const rendererDelta: [number, number, number] = [dx, dz, -dy];
@@ -1644,9 +1707,8 @@ export const createMutationSlice: StateCreator<
   },
 
   rotateEntity: (modelId, expressId, deltaYaw) => {
-    if (!get().canCollabEdit()) {
-      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
-    }
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const view = get().mutationViews.get(modelId);
     const dataStore = get().models.get(modelId)?.ifcDataStore;
     if (view && dataStore) {
@@ -1674,8 +1736,7 @@ export const createMutationSlice: StateCreator<
         // Live-rotate the rendered mesh about its bbox centre (IFC yaw about Z
         // = renderer yaw about +Y, same angle).
         const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
-        const meshes =
-          get().models.get(modelId)?.geometryResult?.meshes ?? get().geometryResult?.meshes ?? null;
+        const meshes = meshesForOwningModel(get(), modelId);
         const c = getEntityCenter(meshes, globalId);
         if (c) {
           get().setPendingMeshRotations(
@@ -1689,7 +1750,7 @@ export const createMutationSlice: StateCreator<
     }
     // No STEP rotation chain (recipient's IFCX-reconstructed store): rotate via
     // the collab doc, which syncs + live-rotates the local mesh.
-    if (get().collabRotateEntity(expressId, deltaYaw)) {
+    if (get().collabRotateEntity(modelId, expressId, deltaYaw)) {
       return { ok: true, newYawZ: deltaYaw };
     }
     return {
@@ -1711,7 +1772,7 @@ export const createMutationSlice: StateCreator<
         if (state) return { yawZ: state.yawZ, refDirection: state.refDirection };
       }
     }
-    const placement = get().readCollabPlacement(expressId);
+    const placement = get().readCollabPlacement(modelId, expressId);
     if (placement) {
       const ref = (placement.refDirection ?? [1, 0, 0]) as [number, number, number];
       return { yawZ: Math.atan2(ref[1], ref[0]), refDirection: ref };
@@ -1738,82 +1799,32 @@ export const createMutationSlice: StateCreator<
       const editor = getOrCreateStoreEditor(get, set, modelId);
       if (editor) {
         const chain = resolvePlacementChain(dataStore, view, editor, expressId);
-        if (chain) return chain.coordinates;
+        if (chain) return pointToMetres(dataStore, chain.coordinates);
       }
     }
     // No STEP chain (recipient's IFCX-reconstructed store): fall back to the
     // collab placement so the move gizmo + geometry card still surface. The
     // gizmo's origin comes from the mesh bbox, so a [0,0,0] here is fine — this
     // is purely the "is this entity movable?" gate.
-    return get().readCollabPlacement(expressId)?.location ?? null;
+    return get().readCollabPlacement(modelId, expressId)?.location ?? null;
   },
 
-  resizeWall: (modelId, expressId, newStart, newEnd) => {
-    if (!get().canCollabEdit()) {
-      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
-    }
+  resizeWall: (modelId, expressId, newStart, newEnd, batchId) => {
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const view = get().mutationViews.get(modelId);
     if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
     const editor = getOrCreateStoreEditor(get, set, modelId);
     if (!editor) return { ok: false, reason: 'Failed to resolve store editor' };
     const dataStore = get().models.get(modelId)?.ifcDataStore;
     if (!dataStore) return { ok: false, reason: `No model loaded for id "${modelId}"` };
-
-    // resolveWallEditChain reads all four ids without mutating.
-    // The four writes are then committed as a single atomic batch
-    // via setPositionalAttributesBatch — one Ctrl+Z reverts the
-    // whole resize, no walking through inconsistent intermediate
-    // wall states.
-    const chain = resolveWallEditChain(dataStore, view, editor, expressId);
-    if (!chain) {
-      return {
-        ok: false,
-        reason:
-          'Wall does not have a simple IfcRectangleProfileDef → IfcExtrudedAreaSolid representation',
-      };
-    }
-    const dx = newEnd[0] - newStart[0];
-    const dy = newEnd[1] - newStart[1];
-    const dz = newEnd[2] - newStart[2];
-    const length = Math.hypot(dx, dy);
-    if (length < 1e-6) return { ok: false, reason: 'Wall length must be greater than zero' };
-    if (Math.abs(dz) > Math.max(1e-6 * length, 1e-9)) {
-      return { ok: false, reason: 'Start and end must lie on the same storey plane' };
-    }
-    const dir: [number, number, number] = [dx / length, dy / length, 0];
-
-    get().setPositionalAttributesBatch(modelId, [
-      { entityId: chain.startPointId, index: 0, value: newStart },
-      { entityId: chain.refDirectionId, index: 0, value: dir },
-      { entityId: chain.profileId, index: 3, value: length },
-      { entityId: chain.profileOriginPointId, index: 0, value: [length / 2, 0] },
-    ]);
-
-    // Mirror the resize to peers as a geometry replace: regenerate the wall mesh
-    // at the new dimensions (built at its current world position) and swap the
-    // entity's room blob. The owner's own mesh is unchanged here (resize is
-    // data-only locally today); peers re-hydrate the new blob. No-op off-collab.
-    if (Number.isFinite(chain.height) && chain.height > 0) {
-      const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
-      const meshes =
-        get().models.get(modelId)?.geometryResult?.meshes ?? get().geometryResult?.meshes ?? null;
-      const bounds = getEntityBounds(meshes, globalId);
-      const newMesh = buildElementMesh({
-        type: 'wall',
-        globalId,
-        storeyElevation: bounds?.min.y ?? 0, // renderer Y base = IFC Z storey elevation
-        payload: {
-          type: 'wall',
-          params: { Thickness: chain.thickness, Height: chain.height },
-          start: newStart,
-          end: newEnd,
-        },
-      });
-      if (newMesh) get().mirrorEntityGeometry(modelId, expressId, newMesh);
-    }
-
-    return { ok: true, newLength: length };
+    const result = resizeWallMetres(get, { dataStore, view, editor }, modelId, expressId, newStart, newEnd, batchId);
+    // A drag rebuilds the mesh once, on release; a one-off resize right away.
+    if (result.ok && batchId === undefined) get().refreshWallMesh(modelId, expressId);
+    return result;
   },
+
+  refreshWallMesh: (modelId, expressId) => refreshWallMeshIn(get, modelId, expressId, true),
 
   readWallEndpoints: (modelId, expressId) => {
     // Same lazy-create pattern as `readEntityRotation` /
@@ -1821,21 +1832,10 @@ export const createMutationSlice: StateCreator<
     // selection, not after an unrelated mutation has primed the
     // editor cache.
     const view = get().mutationViews.get(modelId);
-    if (!view) return null;
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return null;
+    const editor = view ? getOrCreateStoreEditor(get, set, modelId) : null;
     const dataStore = get().models.get(modelId)?.ifcDataStore;
-    if (!dataStore) return null;
-    const chain = resolveWallEditChain(dataStore, view, editor, expressId);
-    if (!chain) return null;
-    const [sx, sy, sz] = chain.startCoordinates;
-    const [dx, dy, dz] = chain.refDirection;
-    const end: [number, number, number] = [
-      sx + dx * chain.wallLength,
-      sy + dy * chain.wallLength,
-      sz + dz * chain.wallLength,
-    ];
-    return { start: [sx, sy, sz], end, thickness: chain.thickness };
+    const wall = view && editor && dataStore ? readWallMetres({ dataStore, view, editor }, expressId) : null;
+    return wall ? { start: wall.start, end: wall.end, thickness: wall.thickness, height: wall.height } : null;
   },
 
   readWallSplitProjection: (modelId, expressId, cursorStoreyLocal) => {
@@ -1862,6 +1862,9 @@ export const createMutationSlice: StateCreator<
   },
 
   splitWallAtDistance: (modelId, expressId, distanceFromStart) => {
+    // Shared mutation gate — same rule and return shape as `resizeWall`.
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const ctx = resolveSplitContext(get, set, modelId, expressId, 'Wall is not contained in a building storey');
     if ('ok' in ctx) return ctx;
     const { view, editor, dataStore, storeyExpressId } = ctx;
@@ -1967,15 +1970,9 @@ export const createMutationSlice: StateCreator<
       };
     }
 
-    // Drop the source's mesh from the rendered scene. The entity
-    // is tombstoned in the IFC overlay so it won't export; this
-    // also clears its GPU buffers and bounding-box entry so picks
-    // / bounds stop finding it. The two new walls already have
-    // their meshes in the geometry (addWall emits them via
-    // appendGeometryBatch).
-    const sourceGlobalId = toGlobalIdFromModels(state.models, modelId, expressId);
-    state.setPendingMeshRemovals(new Set([sourceGlobalId]));
-
+    // `removeEntity` above already dropped the source's mesh out of the
+    // geometry (stashed for undo) and queued the renderer-side removal.
+    // The two new walls already have their meshes via appendGeometryBatch.
     const leftGlobalId = toGlobalIdFromModels(state.models, modelId, left.expressId);
     const rightGlobalId = toGlobalIdFromModels(state.models, modelId, right.expressId);
 
@@ -2014,6 +2011,9 @@ export const createMutationSlice: StateCreator<
   },
 
   splitLinearElementAtDistance: (modelId, expressId, distanceFromStart) => {
+    // Shared mutation gate — same rule and return shape as `resizeWall`.
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const ctx = resolveSplitContext(get, set, modelId, expressId, 'Element is not contained in a building storey');
     if ('ok' in ctx) return ctx;
     const { view, editor, dataStore, storeyExpressId } = ctx;
@@ -2107,7 +2107,7 @@ export const createMutationSlice: StateCreator<
     if (!dataStore) return null;
     const chain = resolveSlabEditChain(dataStore, view, editor, expressId, getModelLengthUnitScale(dataStore));
     if (!chain) return null;
-    const storeyId = dataStore.spatialHierarchy?.elementToStorey.get(expressId);
+    const storeyId = effectiveStoreyId(dataStore, view, expressId);
     const storeyElevation =
       (storeyId !== undefined
         ? dataStore.spatialHierarchy?.storeyElevations?.get(storeyId)
@@ -2121,6 +2121,9 @@ export const createMutationSlice: StateCreator<
   },
 
   splitSlabByLine: (modelId, expressId, cutA, cutB) => {
+    // Shared mutation gate — same rule and return shape as `resizeWall`.
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { ok: false, reason: denial };
     const ctx = resolveSplitContext(get, set, modelId, expressId, 'Slab is not contained in a building storey');
     if ('ok' in ctx) return ctx;
     const { view, editor, dataStore, storeyExpressId } = ctx;
@@ -2215,14 +2218,9 @@ export const createMutationSlice: StateCreator<
       };
     }
 
-    // Hide source mesh so the user sees the cut take effect; the
-    // two new halves already have meshes via addSlab's
-    // appendGeometryBatch. The source's mesh is dropped from GPU
-    // buffers + bbox map via setPendingMeshRemovals — the
-    // streaming hook drains it on the next frame.
-    const sourceGlobalId = toGlobalIdFromModels(state.models, modelId, expressId);
-    state.setPendingMeshRemovals(new Set([sourceGlobalId]));
-
+    // `removeEntity` above already dropped the source's mesh out of the
+    // geometry (stashed for undo) and queued the renderer-side removal.
+    // The two new halves already have meshes via addSlab's appendGeometryBatch.
     const leftGlobalId = toGlobalIdFromModels(state.models, modelId, left.expressId);
     const rightGlobalId = toGlobalIdFromModels(state.models, modelId, right.expressId);
     return {
@@ -2233,7 +2231,7 @@ export const createMutationSlice: StateCreator<
   },
 
   removeEntity: (modelId, expressId, opts) => {
-    if (!get().canCollabEdit()) return false;
+    if (!canMutate(get(), modelId)) return false;
     const view = get().mutationViews.get(modelId);
     if (!view) return false;
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -2246,50 +2244,7 @@ export const createMutationSlice: StateCreator<
     const removed = editor.removeEntity(expressId);
     if (!removed) return false;
 
-    // Hide the entity's mesh — the IFC tombstone is what governs
-    // exports; the renderer just needs the visual gone. We use
-    // hideEntities (visibility set) rather than the harder
-    // pendingMeshRemovals path so the undo handler can flip
-    // visibility back without needing to re-materialise GPU
-    // buffers (the mesh data stays in memory + buckets).
-    //
-    // The split-source removal path also flows through here; on
-    // undo of a split, the source's mesh comes back via
-    // `showEntities` in the DELETE_ENTITY undo branch.
-    const globalIdForMesh = toGlobalIdFromModels(get().models, modelId, expressId);
-    get().hideEntities([globalIdForMesh]);
-
-    set((state) => {
-      const newRemoved = new Map(state.removedNewEntities);
-      if (overlayRecord) {
-        newRemoved.set(`${modelId}:${expressId}`, overlayRecord);
-      }
-
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      const mutation: Mutation = {
-        id: `mut_del_${expressId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-        type: 'DELETE_ENTITY',
-        timestamp: Date.now(),
-        modelId,
-        entityId: expressId,
-      };
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        removedNewEntities: newRemoved,
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    recordEntityRemovalIn(get, set, modelId, expressId, overlayRecord);
 
     // Mirror the tombstone to peers (no-op outside a collab session). Callers
     // whose create+delete pair isn't synced yet pass `{ mirror: false }` so
@@ -2299,150 +2254,72 @@ export const createMutationSlice: StateCreator<
     return true;
   },
 
-  addColumn: (modelId, storeyExpressId, params) => {
-    if (!get().canCollabEdit()) return { error: 'Editing is disabled for your role in this shared session' };
-    const state = get();
-    const model = state.models.get(modelId);
-    const dataStore = model?.ifcDataStore;
-    if (!dataStore) return { error: `No model loaded for id "${modelId}"` };
-
-    // The dialog passes the same modelId used by the model store; mutation
-    // views are keyed identically (no legacy normalization needed in the
-    // multi-model path the dialog operates in).
-    const view = state.mutationViews.get(modelId);
-    if (!view) return { error: 'Model has no editable mutation view yet' };
-
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return { error: 'Failed to create store editor' };
-
-    let columnId: number;
-    try {
-      const anchor = resolveSpatialAnchor(dataStore, storeyExpressId);
-      const result = addColumnToStore(editor, anchor, params);
-      columnId = result.columnId;
-    } catch (err) {
-      return { error: err instanceof Error ? err.message : 'Failed to add column' };
-    }
-
-    // Inject a renderer-frame box mesh so the column appears in 3D
-    // immediately. Same coordinate-frame plumbing as
-    // `runInStoreElementBuilder`, kept inline since this action
-    // pre-dates the shared helper.
-    const storeyElevationCol =
-      dataStore.spatialHierarchy?.storeyElevations?.get(storeyExpressId) ?? 0;
-    const columnGlobalId = toGlobalIdFromModels(state.models, modelId, columnId);
-    const columnMesh = buildElementMesh({
-      type: 'column',
-      globalId: columnGlobalId,
-      storeyElevation: storeyElevationCol,
-      payload: {
-        type: 'column',
-        params: { Width: params.Width, Depth: params.Depth, Height: params.Height },
-        position: params.Position,
-      },
-    });
-    if (columnMesh) {
-      const cross = get() as unknown as {
-        appendGeometryBatch?: (batch: MeshData[]) => void;
-      };
-      cross.appendGeometryBatch?.([columnMesh]);
-      revealAddedGeometryInModelView(get);
-    }
-
-    set((s) => {
-      const newUndoStacks = new Map(s.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      const mutation: Mutation = {
-        id: `mut_col_${columnId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-        type: 'CREATE_ENTITY',
-        timestamp: Date.now(),
-        modelId,
-        entityId: columnId,
-        attributeName: 'IFCCOLUMN',
-      };
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(s.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(s.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: s.mutationVersion + 1,
-      };
-    });
-
-    // Mirror the new column to peers (entity + mesh blob). No-op outside collab.
-    get().mirrorEntityCreate(modelId, columnId, 'IFCCOLUMN', readNewEntityGuid(editor, columnId), columnMesh ?? null);
-
-    return { expressId: columnId };
+  recordEntityRemoval: (modelId, expressId, overlayRecord) => {
+    recordEntityRemovalIn(get, set, modelId, expressId, overlayRecord);
   },
 
-  addWall: (modelId, storeyExpressId, params) => {
-    return runInStoreElementBuilder(
-      get, set, modelId, storeyExpressId, 'IFCWALL', 'add wall',
-      (editor, anchor) => addWallToStore(editor, anchor, params).wallId,
-      { type: 'wall', params: { Thickness: params.Thickness, Height: params.Height }, start: params.Start, end: params.End },
-    );
-  },
+  addColumn: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
+    get, set, modelId, storeyExpressId, { kind: 'column', params },
+    (editor, anchor) => addColumnToStore(editor, anchor, params).columnId,
+  ),
 
-  addSlab: (modelId, storeyExpressId, params) => {
-    return runInStoreElementBuilder(
-      get, set, modelId, storeyExpressId, 'IFCSLAB', 'add slab',
-      (editor, anchor) => addSlabToStore(editor, anchor, params).slabId,
-      { type: 'slab', params: { Width: 0, Depth: 0, Thickness: params.Thickness }, corners: profileCornersFromParams(params) },
-    );
-  },
+  addWall: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
+    get, set, modelId, storeyExpressId, { kind: 'wall', params },
+    (editor, anchor) => addWallToStore(editor, anchor, params).wallId,
+  ),
 
-  addBeam: (modelId, storeyExpressId, params) => {
-    return runInStoreElementBuilder(
-      get, set, modelId, storeyExpressId, 'IFCBEAM', 'add beam',
-      (editor, anchor) => addBeamToStore(editor, anchor, params).beamId,
-      { type: 'beam', params: { Width: params.Width, Height: params.Height }, start: params.Start, end: params.End },
-    );
-  },
+  addSlab: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
+    get, set, modelId, storeyExpressId, { kind: 'slab', params },
+    (editor, anchor) => addSlabToStore(editor, anchor, params).slabId,
+  ),
+
+  addBeam: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
+    get, set, modelId, storeyExpressId, { kind: 'beam', params },
+    (editor, anchor) => addBeamToStore(editor, anchor, params).beamId,
+  ),
 
   addDoor: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCDOOR', 'add door',
+    get, set, modelId, storeyExpressId, { kind: 'door', params },
     (editor, anchor) => addDoorToStore(editor, anchor, params).doorId,
-    { type: 'door', params: { Width: params.Width, Height: params.Height, FrameThickness: params.FrameThickness ?? 0.05 }, position: params.Position },
   ),
 
   addWindow: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCWINDOW', 'add window',
+    get, set, modelId, storeyExpressId, { kind: 'window', params },
     (editor, anchor) => addWindowToStore(editor, anchor, params).windowId,
-    { type: 'window', params: { Width: params.Width, Height: params.Height, FrameThickness: params.FrameThickness ?? 0.05 }, position: params.Position },
   ),
 
-  addSpace: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCSPACE', 'add space',
+  addSpace: (modelId, storeyExpressId, params, previewCorners) => runInStoreElementBuilder(
+    get, set, modelId, storeyExpressId, { kind: 'space', params, previewCorners },
     (editor, anchor) => addSpaceToStore(editor, anchor, params).spaceId,
-    { type: 'space', params: { Width: 0, Depth: 0, Height: params.Height }, corners: profileCornersFromParams(params) },
   ),
 
   addRoof: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCROOF', 'add roof',
+    get, set, modelId, storeyExpressId, { kind: 'roof', params },
     (editor, anchor) => addRoofToStore(editor, anchor, params).roofId,
-    { type: 'roof', params: { Width: 0, Depth: 0, Thickness: params.Thickness }, corners: profileCornersFromParams(params) },
   ),
 
   addPlate: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCPLATE', 'add plate',
+    get, set, modelId, storeyExpressId, { kind: 'plate', params },
     (editor, anchor) => addPlateToStore(editor, anchor, params).plateId,
-    { type: 'plate', params: { Width: 0, Depth: 0, Thickness: params.Thickness }, corners: profileCornersFromParams(params) },
   ),
 
   addMember: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
-    get, set, modelId, storeyExpressId, 'IFCMEMBER', 'add member',
+    get, set, modelId, storeyExpressId, { kind: 'member', params },
     (editor, anchor) => addMemberToStore(editor, anchor, params).memberId,
-    { type: 'member', params: { Width: params.Width, Height: params.Height }, start: params.Start, end: params.End },
   ),
 
+  recordAuthoredElement: (modelId, storeyExpressId, entityId, element) => {
+    const dataStore = authoredDataStore(get(), modelId);
+    const view = get().mutationViews.get(modelId);
+    if (!dataStore || !view) return;
+    recordAuthoredElementIn(get, set, modelId, dataStore, view, storeyExpressId, entityId, element);
+  },
+
   generateSpacesFromWalls: (modelId, storeyExpressId, options) => {
+    if (!options?.dryRun) {
+      const denial = mutationDenial(get(), modelId);
+      if (denial) return { error: denial };
+    }
     const state = get();
     const model = state.models.get(modelId);
     const dataStore = model?.ifcDataStore;
@@ -2467,6 +2344,9 @@ export const createMutationSlice: StateCreator<
         // detection without needing a flush to STEP first.
         {
           getNewEntities: () => view.getNewEntities(),
+          isDeleted: (id) => view.isDeleted(id),
+          getTypeMutations: () => view.getTypeMutations(),
+          getPositionalMutationsForEntity: (id) => view.getPositionalMutationsForEntity(id),
         },
       );
     } catch (err) {
@@ -2510,6 +2390,9 @@ export const createMutationSlice: StateCreator<
   },
 
   duplicateEntity: (modelId, sourceExpressId, direction = DUPLICATE_DEFAULT_DIRECTION, options) => {
+    // Gate before the local commit, as addElementViaBuilder does for creates.
+    const denial = mutationDenial(get(), modelId);
+    if (denial) return { error: denial };
     const state = get();
     const model = state.models.get(modelId);
     const dataStore = model?.ifcDataStore;
@@ -2521,12 +2404,11 @@ export const createMutationSlice: StateCreator<
     const editor = getOrCreateStoreEditor(get, set, modelId);
     if (!editor) return { error: 'Failed to create store editor' };
 
-    // Source's bounding box drives the offset magnitude. Multi-model
-    // federations key meshes by globalId — route through the central
-    // conversion helper so federation/single-model semantics stay in
-    // one place (legacy stores fall through to expressId === globalId).
+    // Source's bounding box drives the offset magnitude; meshes are keyed by globalId, so they must
+    // come from the EDITED model, not the active model's top-level mirror (#4929).
+    // Read in the MODEL frame, not the live baked bytes: the rotation bake turns the appended copy once (#4873).
     const sourceGlobalId = toGlobalIdFromModels(state.models, modelId, sourceExpressId);
-    const meshes = state.geometryResult?.meshes;
+    const meshes = meshesForOwningModel(state, modelId)?.filter((m) => m.expressId === sourceGlobalId).map((m) => modelRotationBaker.inModelFrame(m));
     const sourceBounds = getEntityBounds(meshes ?? null, sourceGlobalId);
     const bbox: ViewerBox = sourceBounds
       ? {
@@ -2543,7 +2425,7 @@ export const createMutationSlice: StateCreator<
 
     let newId: number;
     try {
-      const source = resolveDuplicateSource(dataStore, sourceExpressId);
+      const source = resolveDuplicateSource(dataStore, sourceExpressId, editor);
       const result = duplicateInStore(editor, source, { ...options, offset: ifcDelta });
       newId = result.newId;
     } catch (err) {
@@ -2595,9 +2477,11 @@ export const createMutationSlice: StateCreator<
     // renderer picks them up via its standard tick.
     if (clonedMeshes.length > 0) {
       const cross = get() as unknown as {
-        appendGeometryBatch?: (batch: MeshData[]) => void;
+        appendGeometryBatch?: (modelId: string, batch: MeshData[]) => void;
       };
-      cross.appendGeometryBatch?.(clonedMeshes);
+      cross.appendGeometryBatch?.(modelId, clonedMeshes);
+      // #4970: inModelFrame leaves alignment baked in; correct the slot.
+      applyDuplicatePreAlignmentBaseline(set, modelId, sourceGlobalId, clonedMeshes.length, viewerDelta);
       revealAddedGeometryInModelView(get);
     }
 
@@ -2605,392 +2489,9 @@ export const createMutationSlice: StateCreator<
   },
 
   // Undo/Redo
-  undo: (modelId) => {
-    const state = get();
-    const undoStack = state.undoStacks.get(modelId) || [];
-    if (undoStack.length === 0) return;
+  undo: (modelId) => replayHistory(get, set, api, modelId, 'undo'),
 
-    const mutation = undoStack[undoStack.length - 1];
-    // Batch awareness: if the mutation we're about to undo was
-    // tagged as part of a batch (via setPositionalAttributesBatch),
-    // we want one Ctrl+Z to undo every mutation in that batch.
-    // The tail-recurse at the end of this action handles that —
-    // capture the batchId here, undo this single mutation, then
-    // if the next top still shares the batchId, recurse.
-    const batchId = state.mutationBatchTags.get(mutation.id);
-
-    // Handle georef mutations directly on georefMutations map
-    if (mutation.type === 'UPDATE_ATTRIBUTE' && mutation.attributeName?.startsWith('georef.')) {
-      const parts = mutation.attributeName.split('.');
-      const entity = parts[1] as 'projectedCRS' | 'mapConversion';
-      const field = parts[2];
-      set((s) => {
-        const newGeorefMuts = new Map(s.georefMutations);
-        const modelMuts = { ...(newGeorefMuts.get(modelId) || {}) };
-        const entityMuts = { ...(modelMuts[entity] || {}) } as Record<string, unknown>;
-        if (mutation.oldValue !== undefined && mutation.oldValue !== null) {
-          entityMuts[field] = mutation.oldValue;
-        } else {
-          delete entityMuts[field];
-        }
-        if (Object.keys(entityMuts).length === 0) {
-          delete modelMuts[entity];
-        } else {
-          modelMuts[entity] = entityMuts as typeof modelMuts[typeof entity];
-        }
-        if (Object.keys(modelMuts).length === 0) {
-          newGeorefMuts.delete(modelId);
-        } else {
-          newGeorefMuts.set(modelId, modelMuts);
-        }
-
-        const newUndoStacks = new Map(s.undoStacks);
-        newUndoStacks.set(modelId, undoStack.slice(0, -1));
-        const newRedoStacks = new Map(s.redoStacks);
-        const redoStack = newRedoStacks.get(modelId) || [];
-        newRedoStacks.set(modelId, [...redoStack, mutation]);
-
-        return {
-          georefMutations: newGeorefMuts,
-          undoStacks: newUndoStacks,
-          redoStacks: newRedoStacks,
-          mutationVersion: s.mutationVersion + 1,
-        };
-      });
-      return;
-    }
-
-    const view = state.mutationViews.get(modelId);
-    if (!view) return;
-
-    // Apply inverse mutation (skipHistory=true to avoid polluting mutation history)
-    if (mutation.type === 'UPDATE_PROPERTY' || mutation.type === 'CREATE_PROPERTY') {
-      // Decide by mutation TYPE, not by `oldValue === null`: a property can have
-      // a null (unset) value yet still have existed before the edit (an unset
-      // Boolean). Undoing a CREATE removes the property; undoing an UPDATE
-      // restores its prior value — which may legitimately be null/unset (#1107).
-      if (mutation.type === 'CREATE_PROPERTY' && mutation.psetName && mutation.propName) {
-        view.deleteProperty(mutation.entityId, mutation.psetName, mutation.propName, true);
-      } else if (mutation.psetName && mutation.propName && mutation.oldValue !== undefined) {
-        view.setProperty(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          mutation.oldValue,
-          mutation.valueType,
-          undefined,
-          true // skipHistory
-        );
-      }
-    } else if (mutation.type === 'DELETE_PROPERTY') {
-      if (mutation.psetName && mutation.propName && mutation.oldValue !== undefined) {
-        view.setProperty(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          mutation.oldValue,
-          mutation.valueType,
-          undefined,
-          true // skipHistory
-        );
-      }
-    } else if (mutation.type === 'CREATE_QUANTITY') {
-      // Undo creation: remove the quantity mutation
-      view.removeQuantityMutation(mutation.entityId, mutation.psetName!, mutation.propName);
-    } else if (mutation.type === 'UPDATE_QUANTITY') {
-      if (mutation.psetName && mutation.propName && mutation.oldValue !== undefined && mutation.oldValue !== null) {
-        view.setQuantity(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          Number(mutation.oldValue),
-          undefined,
-          undefined,
-          true // skipHistory
-        );
-      }
-    } else if (mutation.type === 'UPDATE_ATTRIBUTE') {
-      if (mutation.attributeName) {
-        if (mutation.oldValue !== undefined && mutation.oldValue !== null) {
-          view.setAttribute(mutation.entityId, mutation.attributeName, String(mutation.oldValue), undefined, true);
-        } else {
-          view.removeAttributeMutation(mutation.entityId, mutation.attributeName);
-        }
-      }
-    } else if (mutation.type === 'UPDATE_POSITIONAL_ATTRIBUTE') {
-      // Positional attrs encode their index in `@N` since the existing
-      // Mutation shape has no dedicated field for it.
-      const index = positionalIndex(mutation.attributeName);
-      if (index !== null) {
-        if (mutation.oldValue === null || mutation.oldValue === undefined) {
-          view.removePositionalMutation(mutation.entityId, index);
-        } else {
-          view.setPositionalAttribute(mutation.entityId, index, mutation.oldValue as IfcAttributeValue, true);
-        }
-      }
-      // If this mutation carried a mesh translation (gizmo / numeric
-      // move), reverse it so the rendered mesh follows the undo.
-      const meshMove = get().mutationMeshTranslations.get(mutation.id);
-      if (meshMove) {
-        get().setPendingMeshTranslations(
-          new Map([[meshMove.globalId, [
-            -meshMove.rendererDelta[0],
-            -meshMove.rendererDelta[1],
-            -meshMove.rendererDelta[2],
-          ]]]),
-        );
-      }
-    } else if (mutation.type === 'CREATE_ENTITY') {
-      // Undo of a create: stash the NewEntity payload so a subsequent redo
-      // can restore it. Without this, redo finds an empty stash and becomes
-      // a no-op for the create-then-undo-then-redo path.
-      const overlay = view.getNewEntity(mutation.entityId);
-      if (overlay) {
-        set((s) => {
-          const next = new Map(s.removedNewEntities);
-          next.set(`${modelId}:${mutation.entityId}`, overlay);
-          return { removedNewEntities: next };
-        });
-      }
-      // The view's `deleteEntity` returns false if it's already gone, which
-      // is fine for redo to re-establish.
-      view.deleteEntity(mutation.entityId);
-    } else if (mutation.type === 'DELETE_ENTITY') {
-      // Undo of a delete: restore tombstone for source entity, OR replay
-      // the stashed NewEntity record for an overlay-only entity.
-      const stashKey = `${modelId}:${mutation.entityId}`;
-      const stashed = get().removedNewEntities.get(stashKey);
-      if (stashed) {
-        view.restoreNewEntity(stashed);
-      } else {
-        view.restoreFromTombstone(mutation.entityId);
-      }
-      // Also un-hide the rendered mesh — the EntityContextMenu's
-      // delete handler hid it via the visibility system, so undo has
-      // to mirror that to bring the entity back into the scene.
-      const cross = get() as unknown as {
-        toGlobalId?: (modelId: string, expressId: number) => number;
-        showEntity?: (id: number) => void;
-      };
-      if (cross.toGlobalId && cross.showEntity) {
-        const globalId = cross.toGlobalId(modelId, mutation.entityId);
-        cross.showEntity(globalId);
-      }
-    } else if (mutation.type === 'UPDATE_ENTITY_TYPE') {
-      // `oldValue` is the class right before this retype: restore it when an
-      // earlier retype is still on the stack, otherwise drop the intent to
-      // revert the entity to its original class entirely.
-      const prevType = mutation.oldValue;
-      if (prevType != null && prevType !== '') {
-        view.setEntityType(mutation.entityId, String(prevType), undefined, undefined, true);
-      } else {
-        view.removeTypeMutation(mutation.entityId);
-      }
-      syncTypeOverride(get, modelId, mutation.entityId);
-    }
-
-    set((s) => {
-      const newUndoStacks = new Map(s.undoStacks);
-      newUndoStacks.set(modelId, undoStack.slice(0, -1));
-
-      const newRedoStacks = new Map(s.redoStacks);
-      const redoStack = newRedoStacks.get(modelId) || [];
-      newRedoStacks.set(modelId, [...redoStack, mutation]);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        mutationVersion: s.mutationVersion + 1,
-      };
-    });
-
-    // Tail-recurse for the rest of the batch (if any). Reading
-    // the stack via get() picks up the just-set state. Stops as
-    // soon as the next top mutation either doesn't exist or
-    // belongs to a different batch.
-    if (batchId !== undefined) {
-      const nextStack = get().undoStacks.get(modelId) || [];
-      if (nextStack.length > 0) {
-        const nextBatchId = get().mutationBatchTags.get(nextStack[nextStack.length - 1].id);
-        if (nextBatchId === batchId) {
-          get().undo(modelId);
-        }
-      }
-    }
-  },
-
-  redo: (modelId) => {
-    const state = get();
-    const redoStack = state.redoStacks.get(modelId) || [];
-    if (redoStack.length === 0) return;
-
-    const mutation = redoStack[redoStack.length - 1];
-    const batchId = state.mutationBatchTags.get(mutation.id);
-
-    // Handle georef mutations directly
-    if (mutation.type === 'UPDATE_ATTRIBUTE' && mutation.attributeName?.startsWith('georef.')) {
-      const parts = mutation.attributeName.split('.');
-      const entity = parts[1] as 'projectedCRS' | 'mapConversion';
-      const field = parts[2];
-      set((s) => {
-        const newGeorefMuts = new Map(s.georefMutations);
-        const modelMuts = { ...(newGeorefMuts.get(modelId) || {}) };
-        const entityMuts = { ...(modelMuts[entity] || {}) } as Record<string, unknown>;
-        if (mutation.newValue !== undefined && mutation.newValue !== null) {
-          entityMuts[field] = mutation.newValue;
-        } else {
-          delete entityMuts[field];
-        }
-        if (Object.keys(entityMuts).length === 0) {
-          delete modelMuts[entity];
-        } else {
-          modelMuts[entity] = entityMuts as typeof modelMuts[typeof entity];
-        }
-        if (Object.keys(modelMuts).length === 0) {
-          newGeorefMuts.delete(modelId);
-        } else {
-          newGeorefMuts.set(modelId, modelMuts);
-        }
-
-        const newRedoStacks = new Map(s.redoStacks);
-        newRedoStacks.set(modelId, redoStack.slice(0, -1));
-        const newUndoStacks = new Map(s.undoStacks);
-        const undoStack = newUndoStacks.get(modelId) || [];
-        newUndoStacks.set(modelId, [...undoStack, mutation]);
-
-        return {
-          georefMutations: newGeorefMuts,
-          undoStacks: newUndoStacks,
-          redoStacks: newRedoStacks,
-          mutationVersion: s.mutationVersion + 1,
-        };
-      });
-      return;
-    }
-
-    const view = state.mutationViews.get(modelId);
-    if (!view) return;
-
-    // Re-apply mutation (skipHistory=true to avoid polluting mutation history)
-    if (mutation.type === 'UPDATE_PROPERTY' || mutation.type === 'CREATE_PROPERTY') {
-      if (mutation.psetName && mutation.propName && mutation.newValue !== undefined) {
-        view.setProperty(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          mutation.newValue,
-          mutation.valueType,
-          undefined,
-          true // skipHistory
-        );
-      }
-    } else if (mutation.type === 'DELETE_PROPERTY') {
-      if (mutation.psetName && mutation.propName) {
-        view.deleteProperty(mutation.entityId, mutation.psetName, mutation.propName, true);
-      }
-    } else if (mutation.type === 'CREATE_QUANTITY' || mutation.type === 'UPDATE_QUANTITY') {
-      if (mutation.psetName && mutation.propName && mutation.newValue !== undefined) {
-        view.setQuantity(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          Number(mutation.newValue),
-          undefined,
-          undefined,
-          true // skipHistory
-        );
-      }
-    } else if (mutation.type === 'UPDATE_ATTRIBUTE') {
-      if (mutation.attributeName && mutation.newValue !== undefined) {
-        view.setAttribute(mutation.entityId, mutation.attributeName, String(mutation.newValue), undefined, true);
-      }
-    } else if (mutation.type === 'UPDATE_POSITIONAL_ATTRIBUTE') {
-      const index = positionalIndex(mutation.attributeName);
-      if (index !== null && mutation.newValue !== undefined) {
-        view.setPositionalAttribute(mutation.entityId, index, mutation.newValue as IfcAttributeValue, true);
-      }
-      // Replay the mesh translation forward so the rendered mesh
-      // follows the redo — mirror of the undo reversal above.
-      const meshMove = get().mutationMeshTranslations.get(mutation.id);
-      if (meshMove) {
-        get().setPendingMeshTranslations(
-          new Map([[meshMove.globalId, meshMove.rendererDelta]]),
-        );
-      }
-    } else if (mutation.type === 'CREATE_ENTITY') {
-      // Redo of a create: replay from the stashed NewEntity. Symmetrical to
-      // DELETE_ENTITY's undo — same map, same key.
-      const stashKey = `${modelId}:${mutation.entityId}`;
-      const stashed = get().removedNewEntities.get(stashKey);
-      if (stashed) {
-        view.restoreNewEntity(stashed);
-      } else {
-        // Source-buffer entities have no stash; the editor's deleteEntity
-        // call simply re-tombstoned them — which is exactly what we want
-        // here? No — for CREATE_ENTITY redo we want the entity to come back.
-        // Source-entity creates are not a real path; CREATE_ENTITY in this
-        // codebase only ever fires for overlay-added entities. Nothing to
-        // do if the stash is empty (means the redo is unreachable).
-      }
-    } else if (mutation.type === 'DELETE_ENTITY') {
-      // Redo of a delete: tombstone again. For overlay-only entities we
-      // first stash the NewEntity (it'll be re-fetched for the next undo).
-      const overlay = view.getNewEntity(mutation.entityId);
-      if (overlay) {
-        set((s) => {
-          const next = new Map(s.removedNewEntities);
-          next.set(`${modelId}:${mutation.entityId}`, overlay);
-          return { removedNewEntities: next };
-        });
-      }
-      view.deleteEntity(mutation.entityId);
-      // Re-hide the mesh — symmetric with the menu's delete handler
-      // and with the undo path above.
-      const cross = get() as unknown as {
-        toGlobalId?: (modelId: string, expressId: number) => number;
-        hideEntity?: (id: number) => void;
-      };
-      if (cross.toGlobalId && cross.hideEntity) {
-        const globalId = cross.toGlobalId(modelId, mutation.entityId);
-        cross.hideEntity(globalId);
-      }
-    } else if (mutation.type === 'UPDATE_ENTITY_TYPE') {
-      const newType = mutation.entityType ?? (typeof mutation.newValue === 'string' ? mutation.newValue : undefined);
-      if (newType) {
-        view.setEntityType(mutation.entityId, newType, mutation.predefinedType ?? undefined, undefined, true);
-      }
-      syncTypeOverride(get, modelId, mutation.entityId);
-    }
-
-    set((s) => {
-      const newRedoStacks = new Map(s.redoStacks);
-      newRedoStacks.set(modelId, redoStack.slice(0, -1));
-
-      const newUndoStacks = new Map(s.undoStacks);
-      const undoStack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...undoStack, mutation]);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        mutationVersion: s.mutationVersion + 1,
-      };
-    });
-
-    // Tail-recurse for the rest of the batch — mirror of the
-    // undo handler's batch tail. Stops as soon as the next top
-    // of the redo stack either doesn't exist or belongs to a
-    // different batch.
-    if (batchId !== undefined) {
-      const nextStack = get().redoStacks.get(modelId) || [];
-      if (nextStack.length > 0) {
-        const nextBatchId = get().mutationBatchTags.get(nextStack[nextStack.length - 1].id);
-        if (nextBatchId === batchId) {
-          get().redo(modelId);
-        }
-      }
-    }
-  },
+  redo: (modelId) => replayHistory(get, set, api, modelId, 'redo'),
 
   canUndo: (modelId) => {
     const stack = get().undoStacks.get(modelId);
@@ -3002,6 +2503,7 @@ export const createMutationSlice: StateCreator<
     return stack ? stack.length > 0 : false;
   },
 
+  invalidateHistoryForEntity: (modelId, entityId) => set((s) => invalidateHistoryPatch(s.undoStacks, s.redoStacks, s.mutationBatchTags, s.mutationMeshTranslations, modelId, entityId)),
   // Change Sets
   createChangeSet: (name) => {
     const id = generateChangeSetId();
@@ -3159,11 +2661,8 @@ export const createMutationSlice: StateCreator<
       const newGeorefMuts = new Map(state.georefMutations);
       newGeorefMuts.delete(modelId);
 
-      const newRemoved = new Map(state.removedNewEntities);
-      const prefix = `${modelId}:`;
-      for (const key of [...newRemoved.keys()]) {
-        if (key.startsWith(prefix)) newRemoved.delete(key);
-      }
+      const newRemoved = pruneStashByModel(state.removedNewEntities, modelId);
+      const newRemovedMeshes = pruneStashByModel(state.removedMeshes, modelId);
 
       const newEditors = new Map(state.storeEditors);
       newEditors.delete(modelId);
@@ -3174,6 +2673,7 @@ export const createMutationSlice: StateCreator<
         dirtyModels: newDirty,
         georefMutations: newGeorefMuts,
         removedNewEntities: newRemoved,
+        removedMeshes: newRemovedMeshes,
         storeEditors: newEditors,
         mutationVersion: state.mutationVersion + 1,
       };
@@ -3195,6 +2695,7 @@ export const createMutationSlice: StateCreator<
       dirtyModels: new Set(),
       georefMutations: new Map(),
       removedNewEntities: new Map(),
+      removedMeshes: new Map(),
       storeEditors: new Map(),
       mutationVersion: state.mutationVersion + 1,
     }));
@@ -3204,5 +2705,23 @@ export const createMutationSlice: StateCreator<
     set((state) => ({
       mutationVersion: state.mutationVersion + 1,
     }));
+  },
+
+  markModelsDirty: (modelIds) => {
+    if (modelIds.length === 0) return;
+    set((state) => {
+      const newDirty = new Set(state.dirtyModels);
+      // A bulk edit invalidates the redo branch just like a single edit.
+      const newRedo = new Map(state.redoStacks);
+      for (const id of modelIds) {
+        newDirty.add(id);
+        newRedo.set(id, []);
+      }
+      return {
+        dirtyModels: newDirty,
+        redoStacks: newRedo,
+        mutationVersion: state.mutationVersion + 1,
+      };
+    });
   },
 });

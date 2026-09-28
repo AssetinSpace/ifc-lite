@@ -76,10 +76,13 @@ describe('Scene.getEntityLocalBounds', () => {
     // side), mirroring scene-remove.test.ts's approach for boundingBoxes.
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(),
         normals: new Float32Array(),
         indices: new Uint32Array(),
         instanceData: new ArrayBuffer(0),
+        canonicalAnchors: new Float64Array(),
+        canonicalMatrixTranslations: new Float32Array(),
         localMin: [0, 0, 0],
         localMax: [2, 2, 2],
       },
@@ -95,6 +98,9 @@ describe('Scene.getEntityLocalBounds', () => {
     // result must not corrupt internal renderer state (Greptile P1).
     bounds!.min[0] = 999;
     const tmpl = scene['instancedTemplateCpu'][0];
+    // Slots in `instancedTemplateCpu` are nullable (freed templates leave holes),
+    // so pin that this one is still populated before reading through it.
+    assert.ok(tmpl, 'precondition: template slot 0 is populated');
     assert.strictEqual(tmpl.localMin[0], 0, 'mutating the returned box must not affect the template');
     assert.deepStrictEqual(scene.getEntityLocalBounds(7), { min: [0, 0, 0], max: [2, 2, 2] });
   });
@@ -106,12 +112,14 @@ describe('Scene.getEntityLocalBounds', () => {
     const scene = new Scene();
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(), normals: new Float32Array(), indices: new Uint32Array(),
-        instanceData: new ArrayBuffer(0), localMin: [0, 0, 0], localMax: [1, 1, 1],
+        instanceData: new ArrayBuffer(0), canonicalAnchors: new Float64Array(), canonicalMatrixTranslations: new Float32Array(), localMin: [0, 0, 0], localMax: [1, 1, 1],
       },
       {
+        modelIndex: 0,
         positions: new Float32Array(), normals: new Float32Array(), indices: new Uint32Array(),
-        instanceData: new ArrayBuffer(0), localMin: [-1, 0.5, 0], localMax: [0.5, 2, 1],
+        instanceData: new ArrayBuffer(0), canonicalAnchors: new Float64Array(), canonicalMatrixTranslations: new Float32Array(), localMin: [-1, 0.5, 0], localMax: [0.5, 2, 1],
       },
     ];
     scene['instancedEntityMap'] = new Map([
@@ -161,14 +169,19 @@ describe('Scene.getEntityTransform', () => {
 
   it('reads a GPU-instanced occurrence transform, column-major -> row-major', () => {
     const scene = new Scene();
-    // Column-major identity + translation (10, 20, 30), packed as the GPU
-    // instance buffer stores it (mat4 at byte offset 0).
+    // Column-major 90°-about-Z rotation (x'=-y, y'=x, z'=z) + translation
+    // (10, 20, 30), packed as the GPU instance buffer stores it (mat4 at
+    // byte offset 0). The rotation 3x3 is deliberately non-symmetric: a
+    // uniform-scale/identity rotation would transpose to itself and could
+    // not catch a transpose bug confined to the rotation sub-block (see
+    // point-cloud-transform.test.ts's 90°-about-Y fixture for the same
+    // pattern).
     const instanceData = new ArrayBuffer(64);
     const dv = new DataView(instanceData);
     // prettier-ignore
     const colMajor = [
-      1, 0, 0, 0,
       0, 1, 0, 0,
+      -1, 0, 0, 0,
       0, 0, 1, 0,
       10, 20, 30, 1,
     ];
@@ -176,10 +189,13 @@ describe('Scene.getEntityTransform', () => {
 
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(),
         normals: new Float32Array(),
         indices: new Uint32Array(),
         instanceData,
+        canonicalAnchors: new Float64Array(),
+        canonicalMatrixTranslations: new Float32Array(),
         localMin: [0, 0, 0],
         localMax: [1, 1, 1],
       },
@@ -190,8 +206,8 @@ describe('Scene.getEntityTransform', () => {
 
     const transform = scene.getEntityTransform(8);
     assert.deepStrictEqual(Array.from(transform!), [
-      1, 0, 0, 10,
-      0, 1, 0, 20,
+      0, -1, 0, 10,
+      1, 0, 0, 20,
       0, 0, 1, 30,
       0, 0, 0, 1,
     ]);

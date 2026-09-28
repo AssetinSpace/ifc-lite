@@ -2,47 +2,54 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Combined Zustand store for viewer state
- *
- * This file combines all domain-specific slices into a single store.
- * Each slice manages a specific domain of state (loading, selection, etc.)
- */
+/** Combined Zustand store. Domain slices own their state and actions. */
 
+import { createAppearanceSlice, type AppearanceSlice } from './slices/appearanceSlice.js';
 import { create } from 'zustand';
-
-// Import slices
 import { createLoadingSlice, type LoadingSlice } from './slices/loadingSlice.js';
 import { createSelectionSlice, type SelectionSlice } from './slices/selectionSlice.js';
 import { createVisibilitySlice, type VisibilitySlice } from './slices/visibilitySlice.js';
 import { createUISlice, type UISlice } from './slices/uiSlice.js';
 import { createHoverSlice, type HoverSlice } from './slices/hoverSlice.js';
-import { createCameraSlice, type CameraSlice } from './slices/cameraSlice.js';
-import { createSectionSlice, type SectionSlice } from './slices/sectionSlice.js';
-export { customPlaneCenter, loadLastSectionMode } from './slices/sectionSlice.js';
-export type { LastSectionMode } from './slices/sectionSlice.js';
+import { createCameraSlice, DEFAULT_CONTROLS_MODE, type CameraSlice } from './slices/cameraSlice.js';
+import { createSectionSlice, type SectionSlice, clearLastSectionMode } from './slices/sectionSlice.js';
+import { registerMutationViewStoreBinding } from './mutation-view-store-binding.js';
+export { customPlaneCenter, loadLastSectionMode, type LastSectionMode } from './slices/sectionSlice.js';
 import { createMeasurementSlice, type MeasurementSlice } from './slices/measurementSlice.js';
 import { createDataSlice, type DataSlice } from './slices/dataSlice.js';
 import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
 import { createMutationSlice, type MutationSlice } from './slices/mutationSlice.js';
+<<<<<<< HEAD
 import { createDrawing2DSlice, getDefaultDisplayOptions, type Drawing2DSlice } from './slices/drawing2DSlice.js';
 // >>> AIM-FORK: fork-only store slices — D-072 underlays, D-075 documents, D-076 identifier links
 import { createDrawingUnderlaySlice, type DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 import { createDocumentsSlice, type DocumentsSlice } from './slices/documentsSlice.js';
 import { createIdentifierLinksSlice, type IdentifierLinksSlice } from './slices/identifierLinksSlice.js';
 // <<< AIM-FORK
+=======
+import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSlice.js';
+>>>>>>> upstream/main
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
+import { createValidationDraftSlice, type ValidationDraftSlice } from './slices/validationDraftSlice.js';
 import { createExtensionsSlice, type ExtensionsSlice } from './slices/extensionsSlice.js';
+import { createSourcesSlice, type SourcesSlice } from './slices/sourcesSlice.js';
+import { createSceneStateSlice, type SceneStateSlice } from './slices/sceneStateSlice.js';
 import { createListSlice, type ListSlice } from './slices/listSlice.js';
+import { createChartSlice, type ChartSlice } from './slices/chartSlice.js';
+import { createFlowSlice, type FlowSlice } from './slices/flowSlice.js';
+import { createDocumentSlice, type DocumentSlice } from './slices/documentSlice.js';
 import { createPinboardSlice, type PinboardSlice } from './slices/pinboardSlice.js';
 import { createLensSlice, type LensSlice } from './slices/lensSlice.js';
 import { createClashSlice, type ClashSlice } from './slices/clashSlice.js';
 import { createCompareSlice, type CompareSlice } from './slices/compareSlice.js';
 import { createDockSlice, type DockSlice } from './slices/dockSlice.js';
 import { createSidebarSlice, type SidebarSlice } from './slices/sidebarSlice.js';
-import { isBottomPanel, type WorkspacePanelId, type BottomPanelId } from '@/lib/panels/registry';
+import { createDrawingInspectorSlice, type DrawingInspectorSlice } from './slices/drawingInspectorSlice.js';
+import { type WorkspacePanelId } from '@/lib/panels/registry';
+import { bottomPanelFlags, isBottomPanel, isBottomPanelDocked, type BottomPanelId } from '@/lib/panels/bottom-panels';
+import { trackPanelOpened, withToolTelemetry, type PanelOpenSource } from './uiTelemetry.js';
 import { createScriptSlice, type ScriptSlice } from './slices/scriptSlice.js';
 import { createChatSlice, type ChatSlice } from './slices/chatSlice.js';
 import { createCesiumSlice, type CesiumSlice } from './slices/cesiumSlice.js';
@@ -55,17 +62,28 @@ import { createSearchSlice, type SearchSlice } from './slices/searchSlice.js';
 import { createAnnotationsSlice, type AnnotationsSlice } from './slices/annotationsSlice.js';
 import { createCollabSlice, type CollabSlice } from './slices/collabSlice.js';
 import { createAddElementSlice, type AddElementSlice } from './slices/addElementSlice.js';
-import { createSplitToolSlice, type SplitToolSlice } from './slices/splitToolSlice.js';
+import { createAuthoringSessionSlice, type AuthoringSessionSlice } from './slices/authoringSessionSlice.js';
 import { createLevelDisplaySlice, type LevelDisplaySlice } from './slices/levelDisplaySlice.js';
-import { createPointCloudSlice, type PointCloudSlice, POINT_CLOUD_DEFAULTS } from './slices/pointCloudSlice.js';
+import { createModelPlacementSlice, type ModelPlacementSlice } from './slices/modelPlacementSlice.js';
+import { createPointCloudSlice, type PointCloudSlice } from './slices/pointCloudSlice.js';
 import { createUnitDisplaySlice, type UnitDisplaySlice } from './slices/unitDisplaySlice.js';
 import { createSpaceMouseSlice, type SpaceMouseSlice } from './slices/spaceMouseSlice.js';
 import { createLayerStackSlice, type LayerStackSlice } from './slices/layerStackSlice.js';
 import { createZonesSlice, type ZonesSlice } from './slices/zonesSlice.js';
+import { createModelTagsSlice, type ModelTagsSlice } from './slices/modelTagsSlice.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
-
-// Import constants for reset function
-import { CAMERA_DEFAULTS, SECTION_PLANE_DEFAULTS, UI_DEFAULTS, getPersistedTypeVisibility, getPersistedTypeViewMode } from './constants.js';
+import { withPlacementHistory } from './placement-history.js';
+import { withVisibilityOwnershipInvalidation } from './visibility-invalidation.js';
+import { SIDEBAR_PANEL_FLAGS, registerSidebarExclusivity, registerHierarchyLeftSync, registerDrawingInspectorSheetSync, reconcileInitialStoreSync } from './store-sync.js';
+// The composed teardown `resetViewerState` dispatches. Its own module rather
+// than this file: `slices/modelSlice.ts` is another entry point and this file
+// imports that slice, so a registry declared here would be a runtime cycle.
+import { viewerTeardown } from './teardown-registry.js';
+import {
+  endClashScenePresentation,
+  type ClashSceneTeardown,
+} from '@/lib/clash/visibility-ownership';
+import { registerOverlayThemeSync } from '@/lib/viewport-ui/overlay-theme-sync';
 
 // Re-export types for consumers
 export type * from './types.js';
@@ -73,7 +91,7 @@ export type * from './types.js';
 // Explicitly re-export multi-model types that need to be imported by name
 export type { EntityRef, SchemaVersion, FederatedModel, MeasurementConstraintEdge, OrthogonalAxis, SectionCapStyle, SectionCapHatchId, SectionPlane, SectionPlaneAxis } from './types.js';
 export type { HierarchyMode } from './slices/uiSlice.js';
-export type { RibbonTabId, ToolbarStyle } from './constants.js';
+export type { RibbonTabId } from './constants.js';
 
 // Re-export utility functions for entity references
 export { entityRefToString, stringToEntityRef, entityRefEquals, isIfcxDataStore } from './types.js';
@@ -83,36 +101,31 @@ export { resolveEntityRef, resolveGlobalId } from './resolveEntityRef.js';
 export { fromGlobalIdFromModels, toGlobalIdFromModels, toGlobalIdForRef } from './globalId.js';
 export type { ForwardModelMapLike } from './globalId.js';
 
-// Re-export Drawing2D types
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
 export type { UnderlayDrawing, UnderlayCalibrationDraft, DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 export type { ViewerDocument, ViewerDocumentKind, DocTab, DocTabView, DocumentEvent, DocumentsSlice } from './slices/documentsSlice.js';
 export type { IdentifierLinksSlice, IdentifierIndexStatus } from './slices/identifierLinksSlice.js';
 
-// Re-export Sheet types
 export type { SheetState } from './slices/sheetSlice.js';
-
-// Re-export Collab types
 export type { CollabSlice, CollabRole, CollabStatus, StartCollabOptions } from './slices/collabSlice.js';
-
-// Re-export BCF types
 export type { BCFSlice, BCFSliceState } from './slices/bcfSlice.js';
 
-// Re-export IDS types
-export type { IDSSlice, IDSSliceState, IDSDisplayOptions, IDSFilterMode } from './slices/idsSlice.js';
+export type { IDSSlice, IDSSliceState, IDSDisplayOptions, IDSFilterMode, IDSFocusMode } from './slices/idsSlice.js';
 
-// Re-export List types
+// Re-export List / Chart / Flow / Document / Pinboard types
 export type { ListSlice } from './slices/listSlice.js';
-
-// Re-export Pinboard types
+export type { ChartSlice, ChartFocusMode } from './slices/chartSlice.js';
+export type { FlowSlice } from './slices/flowSlice.js';
+export type { DocumentSlice } from './slices/documentSlice.js';
 export type { PinboardSlice } from './slices/pinboardSlice.js';
 
 // Re-export Lens types
-export type { LensSlice, Lens, LensRule, LensCriteria } from './slices/lensSlice.js';
+export type { LensSlice, Lens, LensRule } from './slices/lensSlice.js';
 export type { CompareSlice, CompareResult } from './slices/compareSlice.js';
 export type { LayerStackSlice, LayerStackEntry, LayerStackDiffResult, LayerAuthorKind } from './slices/layerStackSlice.js';
 export type { DockSlice, FloatingPanelState, SnapZone } from './slices/dockSlice.js';
 export type { SidebarSlice, SidebarMode, SidebarLayoutSnapshot } from './slices/sidebarSlice.js';
+export type { DrawingInspectorSlice, DrawingInspectorTab } from './slices/drawingInspectorSlice.js';
 
 // Re-export Script types
 export type { ScriptSlice } from './slices/scriptSlice.js';
@@ -138,9 +151,7 @@ export {
   parseIsoDate,
 } from './slices/scheduleSlice.js';
 export { resolveScheduleSourceModelId } from './slices/schedule-edit-helpers.js';
-
-// Combined store type
-export type ViewerState = LoadingSlice &
+export type ViewerState = AppearanceSlice & LoadingSlice &
   SelectionSlice &
   VisibilitySlice &
   UISlice &
@@ -158,7 +169,11 @@ export type ViewerState = LoadingSlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
+  ValidationDraftSlice &
   ListSlice &
+  ChartSlice &
+  FlowSlice &
+  DocumentSlice &
   PinboardSlice &
   LensSlice &
   ClashSlice &
@@ -166,6 +181,7 @@ export type ViewerState = LoadingSlice &
   LayerStackSlice &
   DockSlice &
   SidebarSlice &
+  DrawingInspectorSlice &
   ScriptSlice &
   ChatSlice &
   CesiumSlice &
@@ -178,13 +194,11 @@ export type ViewerState = LoadingSlice &
   AnnotationsSlice &
   CollabSlice &
   AddElementSlice &
-  SplitToolSlice &
+  AuthoringSessionSlice &
   LevelDisplaySlice &
-  PointCloudSlice &
-  UnitDisplaySlice &
-  SpaceMouseSlice &
-  ZonesSlice &
-  ExtensionsSlice & {
+  PointCloudSlice & ModelPlacementSlice &
+  UnitDisplaySlice & SpaceMouseSlice & ZonesSlice & ModelTagsSlice &
+  ExtensionsSlice & SourcesSlice & SceneStateSlice & {
     resetViewerState: () => void;
     /**
      * Open one right-side analysis panel and close the others, so the chosen
@@ -195,7 +209,7 @@ export type ViewerState = LoadingSlice &
      * the right panel. Routed through by the toolbar, command palette, and the
      * BCF overlay so every entry point behaves identically.
      */
-    openWorkspacePanel: (panel: Exclude<WorkspacePanelId, 'properties'>) => void;
+    openWorkspacePanel: (panel: Exclude<WorkspacePanelId, 'properties'>, surface?: PanelOpenSource) => void;
     /**
      * Show a workspace panel docked in the sidebar, un-floating / re-docking it
      * first if it was popped out (#1200/#1201/#1208). Accepts `properties` (the
@@ -204,37 +218,44 @@ export type ViewerState = LoadingSlice &
      * activity bar, the Alt+N shortcuts, the command palette and the
      * floating / window hosts' re-dock action.
      */
-    showWorkspacePanel: (panel: WorkspacePanelId) => void;
+    showWorkspacePanel: (panel: WorkspacePanelId, surface?: PanelOpenSource) => void;
     /**
      * Toggle a sidebar panel: if it is the active docked panel, close it back
      * to Information; otherwise open it. The single entry point the activity
      * bar, toolbar and command palette use so a second click always closes.
      */
-    toggleWorkspacePanel: (panel: WorkspacePanelId) => void;
+    toggleWorkspacePanel: (panel: WorkspacePanelId, surface?: PanelOpenSource) => void;
     /**
      * Toggle a bottom-strip panel (Script / Schedule / Lists). These are
      * launched from the same sidebar rail but open in the BOTTOM panel —
      * mutually exclusive among themselves, independent of the single-tenant
      * right pane (so a side panel + a bottom panel can be open at once).
      */
-    toggleBottomPanel: (panel: BottomPanelId) => void;
+    toggleBottomPanel: (panel: BottomPanelId, surface?: PanelOpenSource) => void;
     /**
      * Open a panel in its home region: side panels dock in the right pane,
      * Script / Schedule / Lists open in the bottom strip. The rail and Alt+N
      * route through here so each panel lands where it belongs.
      */
-    openPanelInHome: (panel: WorkspacePanelId) => void;
+    openPanelInHome: (panel: WorkspacePanelId, surface?: PanelOpenSource) => void;
   };
 
 /**
- * Main viewer store combining all slices
+ * Main viewer store combining all slices.
+ *
+ * `withVisibilityOwnershipInvalidation` wraps the store's `set` (and its
+ * `setState`) so that no slice — present or future — can replace
+ * `isolatedEntities` / `ghostExceptEntities` without dropping the
+ * visibility-ownership records that write makes stale. See
+ * `store/visibility-invalidation.ts` for why that is a middleware rather than a
+ * helper each writing action remembers to call.
  */
-const createViewerStore = () => create<ViewerState>()((...args) => ({
+const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInvalidation(withPlacementHistory((...args) => ({
   // Spread all slices
   ...createLoadingSlice(...args),
   ...createSelectionSlice(...args),
   ...createVisibilitySlice(...args),
-  ...createUISlice(...args),
+  ...withToolTelemetry(createUISlice)(...args),
   ...createHoverSlice(...args),
   ...createCameraSlice(...args),
   ...createSectionSlice(...args),
@@ -249,7 +270,11 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
+  ...createValidationDraftSlice(...args),
   ...createListSlice(...args),
+  ...createChartSlice(...args),
+  ...createFlowSlice(...args),
+  ...createDocumentSlice(...args),
   ...createPinboardSlice(...args),
   ...createLensSlice(...args),
   ...createClashSlice(...args),
@@ -257,6 +282,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createLayerStackSlice(...args),
   ...createDockSlice(...args),
   ...createSidebarSlice(...args),
+  ...createDrawingInspectorSlice(...args),
   ...createScriptSlice(...args),
   ...createChatSlice(...args),
   ...createCesiumSlice(...args),
@@ -269,19 +295,24 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createAnnotationsSlice(...args),
   ...createCollabSlice(...args),
   ...createAddElementSlice(...args),
-  ...createSplitToolSlice(...args),
+  ...createAuthoringSessionSlice(...args),
   ...createLevelDisplaySlice(...args),
   ...createPointCloudSlice(...args),
+  ...createModelPlacementSlice(...args),
   ...createUnitDisplaySlice(...args),
   ...createSpaceMouseSlice(...args),
   ...createZonesSlice(...args),
+  ...createModelTagsSlice(...args),
   ...createExtensionsSlice(...args),
+  ...createSourcesSlice(...args), ...createSceneStateSlice(...args),
+  ...createAppearanceSlice(...args),
 
   // Reset all viewer state when loading new file
   // Note: Does NOT clear models - use clearAllModels() for that
   resetViewerState: () => {
     invalidateVisibleBasketCache();
     const [set, get] = args;
+<<<<<<< HEAD
     set({
       // Selection (legacy)
       selectedEntityId: null,
@@ -296,13 +327,43 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       // Drop the shared active storey — it references the outgoing model, so a
       // new file must not inherit a stale storey for Solo / Space Sketch.
       activeStorey: null,
+=======
+    // Drop the persisted "last section mode" (localStorage, survives closing
+    // the browser) together with the in-memory sectionPlane reset the section
+    // slice contributes below (`slices/sectionSlice.teardown.ts`) — its
+    // 'cardinal' axis/position is geometry, meaningful only relative to the
+    // model that was loaded when it was saved. Leaving it in localStorage past
+    // this reset let a NEW model inherit the OLD model's cut position the next
+    // time the section tool was opened (#2939). It stays HERE, not in that
+    // contribution: writing localStorage is a side effect, and a teardown is
+    // pure.
+    clearLastSectionMode();
+    // Measurements (#2641 review): the slice owns the full list of its own
+    // fields to clear on a model switch — see resetAllMeasurementState's doc
+    // comment (measurementSlice.ts) for why this must not be a field list
+    // duplicated here.
+    get().resetAllMeasurementState();
+    // The payload is composed by the slices that own the fields
+    // (`store/teardown-registry.ts`). It used to be spelled out here instead,
+    // key by key, in a file that cannot see any slice — so every reset value
+    // was a second statement of a value the owning slice already declares, and
+    // the two could drift with nothing to notice. Now each value is stated
+    // once, beside the initial value it has to agree with.
+    //
+    // Through the store's own `set`, which `withVisibilityOwnershipInvalidation`
+    // wraps. It keys on PRESENCE (`'isolatedEntities' in patch`), and both
+    // channels sit in `NEVER_DROPPED` so the filter cannot remove them, so it
+    // fires on EVERY reset as the hand-written payload did. Keep that exemption.
+    set(viewerTeardown({ kind: 'session-reset' }, get()));
+>>>>>>> upstream/main
 
-      // Selection (multi-model)
-      selectedEntity: null,
-      selectedEntitiesSet: new Set(),
-      selectedEntities: [],
-      selectedModelId: null,
+    // Camera interaction (#2934 review): the patch resets the STATE, but a
+    // teardown is pure, so the renderer still holds whatever `?controls=`
+    // restricted it to -- the param is read once and `Viewport` outlives the
+    // swap. Side effect, so it lives here like `clearLastSectionMode`.
+    get().cameraCallbacks.setInteractionMode?.(DEFAULT_CONTROLS_MODE);
 
+<<<<<<< HEAD
       // Visibility (legacy)
       hiddenEntities: new Set(),
       isolatedEntities: null,
@@ -596,10 +657,40 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       ...POINT_CLOUD_DEFAULTS,
       pointCloudFixedColor: [...POINT_CLOUD_DEFAULTS.pointCloudFixedColor] as [number, number, number, number],
     });
+=======
+    // Clash (#2654 review) — same stale-model-reference class as the
+    // `compareResult` and `zoneAssignments` the composed patch above clears
+    // (`slices/compareSlice.ts`, `slices/zonesSlice.ts`): a clash result is keyed by
+    // `model:expressId` pairs from the OUTGOING model, and an IFCX
+    // recomposition reassigns expressIds outright, so a surviving result can
+    // silently describe different entities. Worse, the on-demand intersection
+    // SOLID is a mesh drawn into the live scene: `clashSelectedId` and
+    // `clashSolidStatus: 'solid'` surviving here means `Viewport`'s draw gate
+    // passes and the previous model's solid gets re-pushed when the renderer
+    // re-initialises for the new scene.
+    //
+    // Routed through `endClashScenePresentation`, the shared model-lifecycle
+    // teardown, rather than calling `clearClash()` directly: this was the third
+    // spelling of a teardown #2574 exists to unify, and it was incomplete. The
+    // `set` above puts `pendingColorUpdates: null` (`dataSlice.teardown.ts`,
+    // which says the same thing from the other side), and `null` is a NO-OP in
+    // the effect that owns that channel (`useGeometryStreaming.ts`, "if
+    // (pendingColorUpdates === null) return") — only a non-null EMPTY map
+    // reaches `scene.clearColorOverrides()`. So the outgoing file's clash pair
+    // tint (or lens colouring) stayed pushed at the renderer across a model
+    // switch. The helper releases it with an empty `Map`.
+    //
+    // `'federation-cleared'` is the right mode: every model is gone, so both
+    // visibility channels are cleared outright and the clash RESULT goes with
+    // them — which is what `clearClash()` did here before, unchanged. Presets +
+    // settings survive (workspace prefs), as everywhere else.
+    endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'federation-cleared');
+>>>>>>> upstream/main
   },
 
-  openWorkspacePanel: (panel) => {
+  openWorkspacePanel: (panel, surface) => {
     const [set, get] = args;
+    trackPanelOpened(panel, surface, isBottomPanel(panel) || get().sidebarMode !== 'expanded' ? undefined : get().sidebarActivePanel);
     // Docking into the sidebar: if the panel was floating or popped out, re-dock
     // it so the toolbar / command-palette / activity-bar entry points stay in
     // sync with the float + window channels (#1200/#1201/#1208) instead of
@@ -610,22 +701,39 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
     get().setPanelPoppedOut(panel, false);
     set({
       bcfPanelVisible: panel === 'bcf',
-      idsPanelVisible: panel === 'ids',
+      idsPanelVisible: panel === 'validation',
       lensPanelVisible: panel === 'lens',
       clashPanelVisible: panel === 'clash',
       comparePanelVisible: panel === 'compare',
       extensionsPanelVisible: panel === 'extensions',
+      sourcesPanelVisible: panel === 'sources',
       collabPanelVisible: panel === 'collab',
       layersPanelVisible: panel === 'layers',
       underlayPanelVisible: panel === 'drawing-underlay',
       documentsPanelVisible: panel === 'documents',
       rightPanelCollapsed: false,
     });
+    // A side panel with NO visibility flag of its own (Location zones, #1869)
+    // cannot be adopted by `registerSidebarExclusivity` below, which promotes
+    // the panel whose flag just went off->on. Nothing went on, so the docked
+    // slot stayed where it was and the panel could not be opened from ANY entry
+    // point -- the activity bar included. Set it here, where the intent to open
+    // is unambiguous; a flagged panel still goes through the subscription so
+    // there remains one writer per mechanism.
+    // ...but only for a SIDE panel. `showWorkspacePanel` returns early for the
+    // bottom strip (Script / Schedule / Lists); this entry point has no such
+    // early return, so without the `isBottomPanel` clause a re-dock of a
+    // popped-out Lists window would promote it into the single-tenant side slot
+    // it does not belong to.
+    if (!isBottomPanel(panel) && !SIDEBAR_PANEL_FLAGS.some(([, id]) => id === panel)) {
+      get().setSidebarActivePanel(panel);
+    }
     if (get().sidebarMode !== 'expanded') get().setSidebarMode('expanded');
   },
 
-  showWorkspacePanel: (panel) => {
+  showWorkspacePanel: (panel, surface) => {
     const [set, get] = args;
+    const alreadyDocked = isBottomPanel(panel) && isBottomPanelDocked(get(), panel);
     // If the panel was floating / popped out, bring it back to the docked slot.
     get().closeFloatingPanel(panel);
     get().setPanelPoppedOut(panel, false);
@@ -634,12 +742,8 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
     // routes through this fn with the panel id), so it must land in its home
     // region instead of flipping side-panel flags it doesn't own (#1208).
     if (isBottomPanel(panel)) {
-      set({
-        scriptPanelVisible: panel === 'script',
-        ganttPanelVisible: panel === 'gantt',
-        listPanelVisible: panel === 'lists',
-        rightPanelCollapsed: false,
-      });
+      set({ ...bottomPanelFlags(panel), rightPanelCollapsed: false });
+      if (!alreadyDocked) trackPanelOpened(panel, surface);
       return;
     }
     if (panel === 'properties') {
@@ -652,6 +756,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         clashPanelVisible: false,
         comparePanelVisible: false,
         extensionsPanelVisible: false,
+        sourcesPanelVisible: false,
         collabPanelVisible: false,
         layersPanelVisible: false,
         underlayPanelVisible: false,
@@ -661,11 +766,11 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       get().setSidebarActivePanel('properties');
       if (get().sidebarMode !== 'expanded') get().setSidebarMode('expanded');
     } else {
-      get().openWorkspacePanel(panel);
+      get().openWorkspacePanel(panel, surface);
     }
   },
 
-  toggleWorkspacePanel: (panel) => {
+  toggleWorkspacePanel: (panel, surface) => {
     const [, get] = args;
     // "Active" means it owns the docked slot right now. A floating / popped-out
     // panel reads as open too, so toggling it re-docks rather than no-ops.
@@ -674,52 +779,36 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       && !s.floatingPanels.some((p) => p.id === panel)
       && !s.poppedOutIds.includes(panel);
     if (isActive) get().showWorkspacePanel('properties');
-    else get().showWorkspacePanel(panel);
+    else get().showWorkspacePanel(panel, surface);
   },
 
-  toggleBottomPanel: (panel) => {
+  toggleBottomPanel: (panel, surface) => {
     const [set, get] = args;
-    const s = get();
-    const flagActive = panel === 'script' ? s.scriptPanelVisible : panel === 'gantt' ? s.ganttPanelVisible : s.listPanelVisible;
-    const detached = s.floatingPanels.some((p) => p.id === panel) || s.poppedOutIds.includes(panel);
+    const docked = isBottomPanelDocked(get(), panel);
     // Re-dock any float / OS window for it first.
     get().closeFloatingPanel(panel);
     get().setPanelPoppedOut(panel, false);
-    if (flagActive && !detached) {
+    if (docked) {
       // Toggle off (only one bottom panel shows at a time).
-      set({ scriptPanelVisible: false, ganttPanelVisible: false, listPanelVisible: false });
+      set(bottomPanelFlags(null));
     } else {
-      set({
-        scriptPanelVisible: panel === 'script',
-        ganttPanelVisible: panel === 'gantt',
-        listPanelVisible: panel === 'lists',
-        rightPanelCollapsed: false,
-      });
+      set({ ...bottomPanelFlags(panel), rightPanelCollapsed: false });
+      trackPanelOpened(panel, surface);
     }
   },
 
-  openPanelInHome: (panel) => {
-    const [set, get] = args;
-    if (isBottomPanel(panel)) {
-      get().closeFloatingPanel(panel);
-      get().setPanelPoppedOut(panel, false);
-      set({
-        scriptPanelVisible: panel === 'script',
-        ganttPanelVisible: panel === 'gantt',
-        listPanelVisible: panel === 'lists',
-        rightPanelCollapsed: false,
-      });
-    } else {
-      get().showWorkspacePanel(panel);
-    }
+  openPanelInHome: (panel, surface) => {
+    const [, get] = args;
+    get().showWorkspacePanel(panel, surface);
   },
-}));
+}))));
 
 const STORE_SINGLETON_KEY = '__ifc_lite_viewer_store__';
 const globalStoreRegistry = globalThis as typeof globalThis & {
   [STORE_SINGLETON_KEY]?: ReturnType<typeof createViewerStore>;
 };
 
+<<<<<<< HEAD
 /**
  * The six per-panel visibility flags that drive the single-tenant sidebar,
  * paired with their registry id. `properties` has no flag — it is the
@@ -797,6 +886,8 @@ function registerHierarchyLeftSync(store: ReturnType<typeof createViewerStore>):
   });
 }
 
+=======
+>>>>>>> upstream/main
 export function getViewerStoreApi() {
   const existing = globalStoreRegistry[STORE_SINGLETON_KEY];
   if (existing) return existing;
@@ -804,15 +895,10 @@ export function getViewerStoreApi() {
   globalStoreRegistry[STORE_SINGLETON_KEY] = store;
   registerSidebarExclusivity(store);
   registerHierarchyLeftSync(store);
-  // Initial reconcile: a persisted panel flag (e.g. scriptPanelVisible) can be
-  // true at load before any change fires the subscription, so seed the docked
-  // panel from the current flags rather than leaving it on the fallback.
-  const init = store.getState();
-  const initialActive = SIDEBAR_PANEL_FLAGS.find(([flag]) => init[flag])?.[1];
-  if (initialActive) init.setSidebarActivePanel(initialActive);
-  // A persisted "Hierarchy hidden" never fired the subscription above, so seed
-  // the collapsed left slot from it on load (#1267).
-  if (init.sidebarHiddenIds.includes('hierarchy')) init.setLeftPanelCollapsed(true);
+  registerDrawingInspectorSheetSync(store);
+  registerMutationViewStoreBinding(store); // views read their model's CURRENT store, not the partial one (#5672)
+  registerOverlayThemeSync(store); // `--overlay-*` on <html> follow `theme` in every app that holds the store (#5490)
+  reconcileInitialStoreSync(store);
   return store;
 }
 

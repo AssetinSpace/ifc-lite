@@ -11,6 +11,8 @@
 
 import type { NamespaceSchema } from './bridge-schema.js';
 import { toRef } from './bridge-helpers.js';
+import { buildStoreCostMethods } from './bridge-store-cost.js';
+import { buildStoreModellingMethods } from './bridge-store-modelling.js';
 
 export function buildStoreNamespace(): NamespaceSchema {
   return {
@@ -157,10 +159,7 @@ export function buildStoreNamespace(): NamespaceSchema {
         ],
         tsReturn: '{ modelId: string; expressId: number }',
         call: (sdk, args) => {
-          const storeyExpressId = args[1] as number;
-          if (!Number.isInteger(storeyExpressId) || storeyExpressId < 0) {
-            throw new Error(`bim.store.addBeam: storeyExpressId must be a non-negative integer, got ${storeyExpressId}`);
-          }
+          const storeyExpressId = requireStoreyId(args[1] as number, 'addBeam');
           const params = args[2] as Parameters<typeof sdk.store.addBeam>[2];
           if (
             !params
@@ -309,6 +308,8 @@ export function buildStoreNamespace(): NamespaceSchema {
         },
         returns: 'value',
       },
+      ...buildStoreModellingMethods(),
+      ...buildStoreCostMethods(),
     ],
   };
 }

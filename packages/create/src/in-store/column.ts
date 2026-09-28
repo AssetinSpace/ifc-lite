@@ -18,8 +18,9 @@
 
 import { generateIfcGuid } from '@ifc-lite/encoding';
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, toNativePoint3, type SpatialAnchor } from './anchor.js';
-import { ownerHistoryRef } from './_emit-helpers.js';
+import { assertPositiveFinite, ownerHistoryRef, productGuid } from './_emit-helpers.js';
 
 export interface ColumnInStoreParams {
   /** Base centre of the column, in storey-local coordinates (metres). */
@@ -35,6 +36,8 @@ export interface ColumnInStoreParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 /**
@@ -68,12 +71,11 @@ export function addColumnToStore(
 ): ColumnBuildResult {
   const { ownerHistoryId, bodyContextId, storeyId, storeyPlacementId } = anchor;
 
-  if (
-    !Number.isFinite(params.Width) || !Number.isFinite(params.Depth) || !Number.isFinite(params.Height)
-    || params.Width <= 0 || params.Depth <= 0 || params.Height <= 0
-  ) {
-    throw new Error('addColumnToStore: Width, Depth, and Height must be finite positive numbers');
-  }
+  assertFinitePoint3({ Position: params.Position }, 'addColumnToStore');
+  assertPositiveFinite(
+    [params.Width, params.Depth, params.Height],
+    'addColumnToStore: Width, Depth, and Height must be finite positive numbers',
+  );
 
   // Params are metres; convert dimensioned fields to the file's native
   // length unit before emit (see SpatialAnchor.lengthUnitScale).
@@ -135,7 +137,7 @@ export function addColumnToStore(
   // onward — IFC2X3 has no such attribute, so emitting `.COLUMN.` there
   // would produce an invalid 9-arg entity record.
   const columnAttrs: Array<unknown> = [
-    generateIfcGuid(anchor.guidRandom),
+    productGuid(params, anchor.guidRandom),
     ownerHistoryRef(ownerHistoryId),
     params.Name ?? 'Column',
     params.Description ?? null,

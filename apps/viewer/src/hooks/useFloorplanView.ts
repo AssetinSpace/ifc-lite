@@ -4,13 +4,20 @@
 
 /**
  * Hook for automatic floorplan views per storey.
- * Activates section plane + orthographic top-down view at storey elevation.
+ *
+ * Activates a plan-cut section plane at the storey's elevation and opens the
+ * Drawing panel docked so the cut is visible immediately (#5497). It used to
+ * also force the 3D viewport into orthographic top-down; that stopped being
+ * automatic — the Drawing header's "Match 3D" button applies it on request
+ * instead, so switching storeys no longer yanks the 3D camera out from under
+ * a user who was mid-orbit.
  */
 
 import { useCallback, useMemo } from 'react';
 import { useViewerStore } from '@/store';
 import { totalYupOffset } from '@/lib/geo/ifc-origin';
 import { useIfc } from './useIfc';
+<<<<<<< HEAD
 
 export interface StoreyInfo {
   expressId: number;
@@ -18,6 +25,16 @@ export interface StoreyInfo {
   name: string;
   elevation: number;
 }
+=======
+import {
+  collectStoreys,
+  mergedSectionBounds,
+  sectionAxisRange,
+  storeyCutElevation,
+  worldToPercent,
+  type SectionStorey,
+} from '@/lib/section/section-distance';
+>>>>>>> upstream/main
 
 /**
  * A storey option with its resolved GlobalId — the single source for every
@@ -34,49 +51,18 @@ export interface StoreyOption {
 }
 
 export function useFloorplanView() {
-  const { models, ifcDataStore } = useIfc();
+  const { models, ifcDataStore, geometryResult } = useIfc();
   const setSectionPlaneAxis = useViewerStore((s) => s.setSectionPlaneAxis);
   const setSectionPlanePosition = useViewerStore((s) => s.setSectionPlanePosition);
   const setActiveTool = useViewerStore((s) => s.setActiveTool);
-  const cameraCallbacks = useViewerStore((s) => s.cameraCallbacks);
-  const setProjectionMode = useViewerStore((s) => s.setProjectionMode);
+  const openPanelInHome = useViewerStore((s) => s.openPanelInHome);
 
-  // Collect all available storeys sorted by elevation (descending)
-  const availableStoreys = useMemo((): StoreyInfo[] => {
-    const storeys: StoreyInfo[] = [];
-
-    if (models.size > 0) {
-      for (const [modelId, model] of models) {
-        const dataStore = model.ifcDataStore;
-        if (!dataStore?.spatialHierarchy) continue;
-        const { byStorey, storeyElevations } = dataStore.spatialHierarchy;
-
-        for (const [storeyId] of byStorey.entries()) {
-          const elevation = storeyElevations.get(storeyId) ?? 0;
-          const name = dataStore.entities.getName(storeyId) || `Storey #${storeyId}`;
-          storeys.push({ expressId: storeyId, modelId, name, elevation });
-        }
-      }
-    } else if (ifcDataStore?.spatialHierarchy) {
-      const { byStorey, storeyElevations } = ifcDataStore.spatialHierarchy;
-      for (const [storeyId] of byStorey.entries()) {
-        const elevation = storeyElevations.get(storeyId) ?? 0;
-        const name = ifcDataStore.entities.getName(storeyId) || `Storey #${storeyId}`;
-        storeys.push({ expressId: storeyId, modelId: 'legacy', name, elevation });
-      }
-    }
-
-    // Deduplicate storeys at similar elevations (within 0.5m tolerance)
-    const seen = new Map<string, StoreyInfo>();
-    for (const s of storeys) {
-      const key = (Math.round(s.elevation * 2) / 2).toFixed(2);
-      if (!seen.has(key) || s.name.length < seen.get(key)!.name.length) {
-        seen.set(key, s);
-      }
-    }
-
-    return Array.from(seen.values()).sort((a, b) => b.elevation - a.elevation);
-  }, [models, ifcDataStore]);
+  // Every storey, deduplicated and sorted top-down — the same list the
+  // Section bar's storey menu offers (#5499), from the one collector.
+  const availableStoreys = useMemo(
+    (): SectionStorey[] => collectStoreys(models, ifcDataStore),
+    [models, ifcDataStore],
+  );
 
   // Recentering offset of the shared (anchor) frame. Storey elevations are
   // IFC Z metres; the renderer works in recentered viewer-Y metres. Every
@@ -92,6 +78,7 @@ export function useFloorplanView() {
   );
 
   // Activate a floorplan view at the given storey elevation
+<<<<<<< HEAD
   const activateFloorplan = useCallback((storey: StoreyInfo) => {
     // 1. Calculate section position as percentage of Y bounds.
     // Cut 1.2 m above the floor, in the recentered viewer-Y frame (bounds
@@ -111,27 +98,34 @@ export function useFloorplanView() {
       }
     }
 
+=======
+  const activateFloorplan = useCallback((storey: SectionStorey) => {
+    // The plan cut sits 1.2 m above the floor (standard architectural
+    // practice), expressed as a percentage of the merged Y bounds — the
+    // same conversion the Section bar's distance field uses.
+    const range = sectionAxisRange(mergedSectionBounds(models, geometryResult), 'down');
+>>>>>>> upstream/main
     // Fallback bounds if no coordinate info available
-    if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) {
-      yMin = -10;
-      yMax = 50;
-    }
-
-    // Convert to 0-100 percentage
-    const range = yMax - yMin;
-    const percentage = range > 0 ? ((cutHeight - yMin) / range) * 100 : 50;
+    const percentage = range ? worldToPercent(storeyCutElevation(storey), range) : 50;
 
     // 2. Set section plane: axis=down (Y), position=calculated, enabled
     setSectionPlaneAxis('down');
-    setSectionPlanePosition(Math.max(0, Math.min(100, percentage)));
-    setActiveTool('section');
+    setSectionPlanePosition(percentage);
+    setActiveTool('section', 'programmatic');
 
+<<<<<<< HEAD
     // 3. Switch to orthographic projection
     setProjectionMode('orthographic');
 
     // 4. Set camera to top-down view
     cameraCallbacks.setPresetView?.('top');
   }, [models, worldCutY, setSectionPlaneAxis, setSectionPlanePosition, setActiveTool, setProjectionMode, cameraCallbacks]);
+=======
+    // 3. Show the cut: dock the Drawing panel (no forced 3D camera change —
+    // "Match 3D" in its header does that on request, #5497).
+    openPanelInHome('drawing', 'programmatic');
+  }, [models, geometryResult, setSectionPlaneAxis, setSectionPlanePosition, setActiveTool, openPanelInHome]);
+>>>>>>> upstream/main
 
   /**
    * Drawing view (D-072): level-locked ortho top-down with an always-on

@@ -4,6 +4,12 @@ The `@ifc-lite/mcp` package turns any IFC model into a set of tools an LLM agent
 
 The server bundles the same headless kernel the [CLI](cli.md) and [server](server.md) use, and can optionally drive the WebGL viewer so an agent paints results into a live 3D scene.
 
+For 5D workflows, `cost_data` returns the canonical IFC cost graph and
+`cost_evaluate` evaluates an `item` or `value` by local `express_id`. Pass
+`model_id` whenever multiple models are loaded. Amounts are decimal strings,
+diagnostics retain model-qualified references, and results describe the loaded
+source snapshot rather than pending mutation overlays.
+
 ## Quickstart
 
 ### stdio (local agents)
@@ -92,7 +98,7 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Category | Tools |
 |----------|-------|
 | Discovery | `model_info`, `model_list`, `model_load`, `model_unload`, `schema_describe` |
-| Query | `query_entities`, `count_entities`, `get_entity`, `get_entities_bulk`, `spatial_hierarchy`, `containment_chain`, `relationships`, `properties_unique`, `materials_list`, `classifications_list`, `georeferencing`, `units` |
+| Query | `query_entities`, `count_entities`, `get_entity`, `get_entities_bulk`, `spatial_hierarchy`, `containment_chain`, `relationships`, `properties_unique`, `materials_list`, `classifications_list`, `georeferencing`, `units`, `cost_data`, `cost_evaluate` |
 | Geometry | `geometry_bbox`, `geometry_volume`, `geometry_area`, `geometry_get` *(planned)*, `raycast` *(planned)* |
 | Clash | `clash_check`, `clash_matrix` |
 | Validation | `ids_validate`, `ids_explain`, `model_audit`, `gherkin_check` *(planned)* |
@@ -100,8 +106,161 @@ Tools are grouped by capability. Everything below is registered in the default t
 | BCF | `bcf_topic_list`, `bcf_topic_create`, `bcf_topic_update`, `bcf_topic_close`, `bcf_viewpoint_create`, `bcf_export` |
 | bSDD | `bsdd_search`, `bsdd_class`, `bsdd_property_sets`, `bsdd_match` |
 | Diff | `model_diff`, `quantity_diff` |
-| Export | `export_ifc`, `export_csv`, `export_json`, `export_glb`, `export_obj`, `export_ifcx`, `export_pdf_report` *(planned)* |
+| Export | `export_ifc`, `export_csv`, `export_json`, `export_glb`, `export_obj`, `export_ifcx`, `export_usd`, `export_pdf_report` *(planned)* |
+| Flow | `describe_flow`, `run_flow` |
 | Viewer | `viewer_ask`, `viewer_open`, `viewer_close`, `viewer_status`, `viewer_colorize`, `viewer_isolate`, `viewer_hide`, `viewer_show`, `viewer_reset`, `viewer_fly_to`, `viewer_set_section`, `viewer_clear_section`, `viewer_color_by_storey`, `viewer_color_by_property`, `viewer_get_selection`, `viewer_wait_for_selection`, `viewer_describe_selection` |
+| Draft layers & review | `create_draft_layer`, `draft_apply_ops`, `publish_layer`, `diff_layer`, `dry_run_merge`, `list_conflicts`, `request_review`, `add_review_feedback`, `get_review_feedback`, `add_review_topic`, `respond_to_review` |
+
+!!! tip "Pinning the GlobalId of a created entity"
+    `entity_create` takes an optional `global_id`: the GlobalId of the new
+    entity, the MCP counterpart of the `GlobalId` parameter the in-store
+    builders and `bim.store.add*` accept. It must be a valid 22-character IFC
+    GUID (the `isValidIfcGuid` rule from `@ifc-lite/encoding`), the class must
+    derive from `IfcRoot` (the value is written to attribute 0), and it must not
+    already be carried by an entity in the model, parsed or created this
+    session. Each violation is refused with `INVALID_INPUT` and nothing is
+    queued; a GlobalId given both as `global_id` and as a different
+    `attributes[0]` is refused too. Without `global_id` the tool behaves as
+    before.
+
+!!! tip "`model_diff` and re-exported models"
+    `model_diff` compares by GlobalId, so two files that describe the same
+    building read as *the whole model deleted and re-added* when the second was
+    re-exported from scratch. Pass `by_content: true` to route the same two
+    models through the [`@ifc-lite/diff` engine](model-diff.md), which matches
+    entities by content. It is opt-in and stays off by default: an ambiguous
+    group has no honest scalar form, so turning it on would change what the
+    existing numbers mean. Either way the diff reflects any edits the session
+    has queued but not yet saved, and says how many. `key_from` (`"Tag"` or
+    `"Pset.Prop"`) keys the comparison on an authored identifier instead of
+    GlobalId, exactly as the CLI's `--key-from` does. See [Content diffing over
+    MCP](model-diff.md#mcp-usage) and [Stable Element Identity](stable-identity.md).
+
+!!! tip "Reading back an edit you just made"
+    A `model_id` names a *session*, not a file. `entity_set_property`,
+    `entity_set_attribute`, `entity_create` and `entity_delete` queue their edits
+    in an overlay that only reaches disk at `export_ifc` / `model_save`, so the
+    read tools fold that overlay in and answer about the model as the session
+    has it.
+
+    That covers existence, attributes, properties, quantities **and
+    containment**: `get_entity`, `get_entities_bulk`, `query_entities` (filters
+    included — a query for the value you just wrote finds it, and `in_storey`
+    finds an entity you created and placed with a queued
+    `IfcRelContainedInSpatialStructure`), `count_entities`, `model_info`,
+    `model_list`, `properties_unique`, `materials_list`,
+    `classifications_list`, `spatial_hierarchy`, `containment_chain`,
+    `model_audit` and `model_diff` — plus the `ifc-lite://model/{id}/manifest`,
+    `…/entity/{globalId}` and `…/spatial-tree` resources. A created entity is
+    reachable by the GlobalId you gave it, and by the `expressId` every
+    `query_entities` row carries; a deleted one is reported as not found, and a
+    deleted `IfcRelContainedInSpatialStructure` or `IfcRelAggregates` record
+    stops affecting the containment reads above. **Only containment.** The
+    `relationships` tool reads voids, fills, groups and connections from the
+    parsed graph, so an `IfcRelVoidsElement` this session created or deleted
+    shows up there only after a save and reload.
+
+    `model_audit` scores identity and naming from effective classes, GlobalIds
+    and Names, including queued retypes and edits.
+
+    **One GlobalId, one entity, whichever tool asks.** A GlobalId is supposed to
+    be unique and in practice is not — a session can create an entity under an id
+    the file already uses. `get_entity`, `get_entities_bulk`, `entity_set_*`,
+    `entity_delete` and `bsdd_match` all resolve it the same way: **an entity
+    this session created wins over a same-GlobalId entity in the file**, and a
+    deleted entity never resolves at all. `get_entities_bulk` additionally
+    reports any key that named more than one live entity in
+    `ambiguousGlobalIds` (`globalId`, every `expressIds` it saw, and which one it
+    `returned`), so a duplicate is something you are told about rather than
+    something you have to notice. Address the other one by `express_id`.
+
+    **Type names are IfcPascalCase** in `model_info.typeCountsTop20`,
+    `count_entities(group_by: 'type')` and `model_diff.typeDiffs` alike — the
+    first two used to emit the raw uppercase STEP key. `count_entities` also
+    honours `type` on the `group_by: 'type'` branch now (it was ignored), and
+    expands subtypes the way `query_entities` does.
+
+    **`count_entities` counts BIM products on every `group_by`.** It is the
+    aggregate form of `query_entities` and answers over the same set. The
+    ungrouped total and `group_by: 'type'` used to fold raw STEP records
+    instead — geometry and property-value lines included — so the same tool
+    answered 44,249 by type and 128 by storey for one model. For the raw STEP
+    record count, which is a file statistic rather than a query, use
+    `model_info` (the MCP analogue of `ifc-lite info`).
+
+    **`pendingMutations` is a number wherever it appears, never an object.**
+    `model_diff` used to publish a `{ base, head }` object under that name
+    inside `contentDiff`; the per-side split now lives in
+    `contentDiff.pendingMutationsBySide` and `pendingMutations` is the scalar
+    total, at the top level and inside `contentDiff`. This is about its *type*
+    when present, not about whether it is present — see below.
+
+    Every one of those payloads carries `pendingMutations` — the same number
+    `mutation_diff` reports — whenever the session has unsaved edits, and the
+    field is **absent** when it has none. That is the line between "in this
+    session" and "on disk": nothing is written until you call `export_ifc` or
+    `model_save`.
+
+    **The saved file agrees with the session, including under a filter.**
+    `export_ifc`'s optional `global_ids` allowlist resolves against the folded
+    model, so an entity this session created can be named in it and lands in the
+    file. It used to be resolved and then filtered against the parsed model
+    alone, which dropped created entities from the output silently.
+
+    An allowlist that matches **nothing** now fails with `ENTITY_NOT_FOUND`
+    rather than exporting the whole model: an empty match set used to fall
+    through to an unfiltered save, so asking for one entity could write every
+    entity in the model to disk and report success. Nothing is written when it
+    fails. Ids that match nothing while *others* do are not an error — they come
+    back in `unmatchedGlobalIds` and the matched ones still export.
+
+    **What does not fold, and therefore never claims `pendingMutations`:**
+    `relationships` (voids, fills, groups and connections come from a
+    parser-side extractor with no overlay seam — unlike containment, which
+    routes through the backend the mutation tools share), `units` and
+    `georeferencing` (header data no mutation tool writes), and the geometry,
+    clash and viewer tools (the parsed geometry, which queued edits do not
+    regenerate). Save and reload to bring those up to date.
+
+!!! tip "Schema reach beyond IFC4"
+    The parser's entity registry is generated from IFC4_ADD2_TC1, and both
+    `model_audit` and `schema_describe` used to answer from it alone. They now
+    consult every bundled schema. `model_audit`'s GlobalId-uniqueness check
+    covers the 39 IFC2X3 and 80 IFC4X3 `IfcRoot` classes the pin has no row for
+    — it used to skip them silently and score the file clean on identity without
+    having looked. `schema_describe` answers for those classes instead of
+    rejecting them as unknown; its payload carries `schemaSource`, which reads
+    `IFC4_ADD2_TC1` when the pinned registry answered (attributes with their
+    EXPRESS types) and `bundled-schema-union` when it did not (attribute names
+    in positional order, no types).
+
+!!! tip "Flow graphs: describe_flow / run_flow"
+    A `.flow.json` graph — the same document the viewer's Flow editor authors
+    and `ifc-lite flow run` executes from the CLI — can be discovered and run
+    headlessly by an agent. `describe_flow` takes `flow` (the parsed document
+    inline) or `flow_path` (subject to `--allow`), and returns the graph's
+    declared inputs (name, kind, default) and outputs (node/port, value kind,
+    access) plus registry-aware wiring diagnostics. It never throws on an
+    invalid graph — a declared output naming a port no node has comes back as
+    `ok: false` with `diagnostics`, not an opaque error, because that
+    defect is exactly what an agent calls this tool to find.
+
+    `run_flow` takes the same `flow`/`flow_path`, an optional `model_id`, and
+    `inputs` (Player parameter overrides keyed `"nodeId.param"`). An `inputs`
+    key naming no declared parameter is rejected by name rather than dropped
+    silently — the graph never runs on defaults while reporting success. The
+    result carries `ok`, per-node status counts, a `tracking` summary
+    (created/updated/kept/removed elements for tracked write nodes), and the
+    declared `outputs`' values; a table output's rows are capped with a
+    `truncated` flag. A failed node marks the whole run `ok: false`, and any
+    output downstream of it comes back with no data rather than reporting the
+    half-applied model as a success.
+
+    Element-creation node types (`element.column`, `model.addElement`, …) are
+    not yet runnable through `run_flow`: the MCP server's in-session store
+    adapter does not implement `addColumn`/`addWall`/`addSlab`/`addBeam` (use
+    `entity_create` for those today). A property-writing graph, like the
+    shipped fire-rating-audit example, runs normally.
 
 !!! note "Planned tools return a clean error"
     `geometry_get`, `raycast`, `gherkin_check`, and `export_pdf_report` are

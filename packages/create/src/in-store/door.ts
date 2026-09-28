@@ -5,10 +5,9 @@
 /**
  * Anchored builder for IfcDoor — a free-standing rectangular leaf.
  *
- * v1 places a door without cutting an opening in any wall (callers
- * who need a wall-hosted door can use `IfcCreator.addIfcWallDoor`
- * for now). Geometry is a thin solid: `Width × FrameThickness ×
- * Height` extruded up.
+ * This variant places a door without cutting an opening in any wall;
+ * `addHostedDoorToStore` (hosted-fill.ts) cuts the opening and fills it.
+ * Geometry is a thin solid: `Width × FrameThickness × Height` extruded up.
  *
  * The IFC4 IfcDoor entity adds `OverallHeight`, `OverallWidth`,
  * `PredefinedType`, `OperationType`, `UserDefinedOperationType` to
@@ -17,8 +16,10 @@
  */
 
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, toNativePoint3, type SpatialAnchor } from './anchor.js';
 import {
+  assertPositiveFinite,
   emitBodyRepresentation,
   emitExtrudedSolid,
   emitLocalPlacement,
@@ -72,6 +73,8 @@ export interface DoorInStoreParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface DoorBuildResult {
@@ -89,12 +92,12 @@ export function addDoorToStore(
   anchor: SpatialAnchor,
   params: DoorInStoreParams,
 ): DoorBuildResult {
-  if (params.Width <= 0 || params.Height <= 0) {
-    throw new Error('addDoorToStore: Width and Height must be positive');
-  }
-  if ((params.FrameThickness ?? 0.05) <= 0) {
-    throw new Error('addDoorToStore: FrameThickness must be positive');
-  }
+  assertFinitePoint3({ Position: params.Position }, 'addDoorToStore');
+  assertPositiveFinite([params.Width, params.Height], 'addDoorToStore: Width and Height must be positive');
+  assertPositiveFinite(
+    [params.FrameThickness ?? 0.05],
+    'addDoorToStore: FrameThickness must be positive',
+  );
   // Params are metres; convert dimensioned fields (incl. the OverallWidth/
   // OverallHeight attributes emitted below) to the file's native length
   // unit before emit (see SpatialAnchor.lengthUnitScale).
@@ -114,27 +117,36 @@ export function addDoorToStore(
   const solidId = emitExtrudedSolid(editor, profileId, params.Height);
   const { shapeRepId, productShapeId } = emitBodyRepresentation(editor, anchor.bodyContextId, solidId);
 
-  const isIFC2X3 = (anchor.schema ?? 'IFC4') === 'IFC2X3';
   const attrs = ifcElementHeader(anchor.ownerHistoryId, placementId, productShapeId, params, 'Door', anchor.guidRandom);
-  // OverallHeight / OverallWidth are present on IfcDoor in both schemas.
-  attrs.push(params.Height, params.Width);
-  if (!isIFC2X3) {
-    // Free-form values outside IfcDoorTypeOperationEnum are normalised
-    // to USERDEFINED + UserDefinedOperationType so the exported STEP
-    // carries a valid enum token rather than `.<value>.`.
-    const requested = params.OperationType ?? 'SINGLE_SWING_LEFT';
-    const isKnownEnum = DOOR_OPERATION_ENUM.has(requested);
-    const operationType = isKnownEnum ? requested : 'USERDEFINED';
-    const userDefined = operationType === 'USERDEFINED'
-      ? (isKnownEnum ? params.UserDefinedOperationType ?? null : requested)
-      : null;
-    attrs.push(`.${params.PredefinedType ?? 'NOTDEFINED'}.`);
-    attrs.push(`.${operationType}.`);
-    attrs.push(userDefined);
-  }
+  attrs.push(...doorAttributeTail(anchor.schema, params));
 
   const doorId = editor.addEntity('IfcDoor', attrs as Parameters<StoreEditor['addEntity']>[1]).expressId;
   const relContainedId = emitRelContainedInSpatialStructure(editor, anchor.ownerHistoryId, doorId, anchor.storeyId, anchor.guidRandom);
 
   return { doorId, placementId, profileId, solidId, shapeRepId, productShapeId, relContainedId };
+}
+
+/**
+ * IfcDoor's attributes after the IfcElement header: OverallHeight and
+ * OverallWidth in every schema, then PredefinedType / OperationType /
+ * UserDefinedOperationType from IFC4 on. Shared by the hosted door builder.
+ * `Height`/`Width` must already be in the native length unit.
+ */
+export function doorAttributeTail(
+  schema: SpatialAnchor['schema'],
+  params: Pick<DoorInStoreParams, 'Height' | 'Width' | 'PredefinedType' | 'OperationType' | 'UserDefinedOperationType'>,
+): unknown[] {
+  const tail: unknown[] = [params.Height, params.Width];
+  if ((schema ?? 'IFC4') === 'IFC2X3') return tail;
+  // Free-form values outside IfcDoorTypeOperationEnum are normalised
+  // to USERDEFINED + UserDefinedOperationType so the exported STEP
+  // carries a valid enum token rather than `.<value>.`.
+  const requested = params.OperationType ?? 'SINGLE_SWING_LEFT';
+  const isKnownEnum = DOOR_OPERATION_ENUM.has(requested);
+  const operationType = isKnownEnum ? requested : 'USERDEFINED';
+  const userDefined = operationType === 'USERDEFINED'
+    ? (isKnownEnum ? params.UserDefinedOperationType ?? null : requested)
+    : null;
+  tail.push(`.${params.PredefinedType ?? 'NOTDEFINED'}.`, `.${operationType}.`, userDefined);
+  return tail;
 }

@@ -8,8 +8,24 @@
  */
 
 import type { Vec3 } from './types.js';
-import type { CameraInternalState } from './camera-controls.js';
-import { MathUtils } from './math.js';
+import type { CameraInternalState } from './camera-state.js';
+import { MathUtils, viewBasis } from './math.js';
+import { DEFAULT_ORTHO_SIZE, isUsableBounds } from './camera-guards.js';
+import type { RelativeToEyeFrame } from './relative-to-eye.js';
+
+/**
+ * One NDC axis: `screen / extent * scale + offset`, degrading to the centre
+ * of the axis when the extent is unusable.
+ *
+ * `extent` is a drawing-buffer dimension. It is zero before the canvas is
+ * first sized and while its container is collapsed, and the division would
+ * then hand back ±Infinity — or NaN, when the cursor coordinate is zero too,
+ * since `0 / 0` is NaN. Neither is a position on screen.
+ */
+function usableNdc(screen: number, extent: number, scale: number, offset: number): number {
+  if (!(Number.isFinite(extent) && extent > 0) || !Number.isFinite(screen)) return offset + scale / 2;
+  return (screen / extent) * scale + offset;
+}
 
 /**
  * Handles projection math: screen-to-world and world-to-screen conversions,
@@ -19,6 +35,7 @@ export class CameraProjection {
   constructor(
     private readonly state: CameraInternalState,
     private readonly updateMatrices: () => void,
+    private readonly relativeToEyeFrame: RelativeToEyeFrame,
   ) {}
 
   /**
@@ -29,14 +46,17 @@ export class CameraProjection {
    * @returns Screen coordinates { x, y } or null if behind camera
    */
   projectToScreen(worldPos: Vec3, canvasWidth: number, canvasHeight: number): { x: number; y: number } | null {
-    // Transform world position by view-projection matrix
-    const m = this.state.viewProjMatrix.m;
+    if (!this.relativeToEyeFrame.isAvailable()) return null;
+    // Preserve the authored f64 residual before the f32 rotation/projection.
+    const [x, y, z] = this.relativeToEyeFrame.worldToRelative([worldPos.x, worldPos.y, worldPos.z]);
+    if (![x, y, z, canvasWidth, canvasHeight].every(Number.isFinite)) return null;
+    const m = this.relativeToEyeFrame.getViewProjection().m;
 
-    // Manual matrix-vector multiplication for vec4(worldPos, 1.0)
-    const clipX = m[0] * worldPos.x + m[4] * worldPos.y + m[8] * worldPos.z + m[12];
-    const clipY = m[1] * worldPos.x + m[5] * worldPos.y + m[9] * worldPos.z + m[13];
-    const clipZ = m[2] * worldPos.x + m[6] * worldPos.y + m[10] * worldPos.z + m[14];
-    const clipW = m[3] * worldPos.x + m[7] * worldPos.y + m[11] * worldPos.z + m[15];
+    // Manual matrix-vector multiplication for vec4(eyeRelative, 1.0).
+    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
+    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const clipZ = m[2] * x + m[6] * y + m[10] * z + m[14];
+    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
 
     // Check if behind camera
     if (clipW <= 0) {
@@ -71,63 +91,97 @@ export class CameraProjection {
    * @returns Ray origin and direction in world space
    */
   unprojectToRay(screenX: number, screenY: number, canvasWidth: number, canvasHeight: number): { origin: Vec3; direction: Vec3 } {
-    // Convert screen coords to NDC (-1 to 1)
-    const ndcX = (screenX / canvasWidth) * 2 - 1;
-    const ndcY = 1 - (screenY / canvasHeight) * 2; // Flip Y
+    // Convert screen coords to NDC (-1 to 1).
+    //
+    // The divisors are the drawing-buffer dimensions, and a canvas can report
+    // zero before its first resize or while its container is collapsed — the
+    // division then yields ±Infinity and the ortho branch below writes that
+    // into the ray origin. A viewport with no extent has no meaningful cursor
+    // position, so the honest reading of "where is the cursor, in NDC" is
+    // dead centre; that is also the answer this returns for a cursor at the
+    // exact centre of a healthy canvas, so it introduces no new behaviour.
+    const ndcX = usableNdc(screenX, canvasWidth, 2, -1);
+    const ndcY = usableNdc(screenY, canvasHeight, -2, 1);
+
+    // One basis for both branches, and the same one the *view matrix* is built
+    // from (#2467). The orthographic branch used to recompute
+    // `normalize(cross(forward, up))` itself, which has no degeneracy handling
+    // at all: `MathUtils.normalize` floored on `len < 1e-10` back then, and
+    // that comparison is false for NaN, so it divided by NaN rather than
+    // falling back — a non-finite `camera.up` (a BCF `CameraUpVector` of `1e999`
+    // arrives as `Infinity` through a bare `parseFloat`) returned
+    // `origin = (NaN, NaN, NaN)` for BOTH NaN and Infinity, while the rendered
+    // frame stayed perfectly finite. Picking and measurement live outside this
+    // package and test hits with comparisons, every one of which is false
+    // against NaN, so the click read as "empty space".
+    const basis = viewBasis(
+      this.state.camera.position,
+      this.state.camera.target,
+      this.state.camera.up,
+    );
 
     if (this.state.projectionMode === 'orthographic') {
       // Orthographic: rays are parallel. Origin varies with screen position.
-      const halfH = this.state.orthoSize;
-      const halfW = halfH * this.state.camera.aspect;
-
-      // Forward direction (camera towards target)
-      const forward = MathUtils.normalize({
-        x: this.state.camera.target.x - this.state.camera.position.x,
-        y: this.state.camera.target.y - this.state.camera.position.y,
-        z: this.state.camera.target.z - this.state.camera.position.z,
-      });
-
-      // Right = forward x up
-      const right = MathUtils.normalize(MathUtils.cross(forward, this.state.camera.up));
-      // Actual up = right x forward
-      const actualUp = MathUtils.cross(right, forward);
+      // `orthoSize` has a read-site backstop in `Camera.updateMatrices` for
+      // the projection matrix; this is the other reader, so it needs its own.
+      const halfH = Number.isFinite(this.state.orthoSize) ? this.state.orthoSize : DEFAULT_ORTHO_SIZE;
+      const aspect = Number.isFinite(this.state.camera.aspect) ? this.state.camera.aspect : 1;
+      const halfW = halfH * aspect;
 
       // Ray origin: camera position offset by NDC * view extents
       const origin = {
-        x: this.state.camera.position.x + right.x * ndcX * halfW + actualUp.x * ndcY * halfH,
-        y: this.state.camera.position.y + right.y * ndcX * halfW + actualUp.y * ndcY * halfH,
-        z: this.state.camera.position.z + right.z * ndcX * halfW + actualUp.z * ndcY * halfH,
+        x: basis.eye.x + basis.right.x * ndcX * halfW + basis.up.x * ndcY * halfH,
+        y: basis.eye.y + basis.right.y * ndcX * halfW + basis.up.y * ndcY * halfH,
+        z: basis.eye.z + basis.right.z * ndcX * halfW + basis.up.z * ndcY * halfH,
       };
 
-      return { origin, direction: forward };
+      return { origin, direction: basis.forward };
     }
 
     // Perspective: ray origin is always the camera position
     // Direction is computed through the screen point
 
-    // Invert the view-projection matrix
-    const invViewProj = MathUtils.invert(this.state.viewProjMatrix);
+    if (!this.relativeToEyeFrame.isAvailable()) return { origin: { ...basis.eye }, direction: basis.forward };
+    // Inverting a matrix with absolute f32 translation destroys nearby ray
+    // offsets at survey coordinates. Unproject directly into the shared eye frame.
+    const invViewProj = MathUtils.invert(this.relativeToEyeFrame.getViewProjection());
     if (!invViewProj) {
       // Fallback: return ray from camera position towards target
-      const dir = MathUtils.normalize({
-        x: this.state.camera.target.x - this.state.camera.position.x,
-        y: this.state.camera.target.y - this.state.camera.position.y,
-        z: this.state.camera.target.z - this.state.camera.position.z,
-      });
-      return { origin: { ...this.state.camera.position }, direction: dir };
+      return { origin: { ...basis.eye }, direction: basis.forward };
     }
 
     // Unproject a point at some depth to get a point on the ray
     // Using z=0.5 (midpoint in Reverse-Z: 1.0=near, 0.0=far) to get a finite point
-    const worldPoint = MathUtils.transformPoint(invViewProj, { x: ndcX, y: ndcY, z: 0.5 });
+    const relativePoint = MathUtils.transformPoint(invViewProj, { x: ndcX, y: ndcY, z: 0.5 });
 
-    // Ray origin is camera position, direction is towards unprojected point
-    const origin = { ...this.state.camera.position };
-    const direction = MathUtils.normalize({
-      x: worldPoint.x - origin.x,
-      y: worldPoint.y - origin.y,
-      z: worldPoint.z - origin.z,
-    });
+    // Ray origin is the scrubbed camera position — the same one the view
+    // matrix's translation row uses, so the ray belongs to the frame on
+    // screen rather than to a pose that was never rendered.
+    const [x, y, z] = this.relativeToEyeFrame.getCameraWorld();
+    const origin = { x, y, z };
+    const direction = MathUtils.normalize(relativePoint);
+    // `normalize` is total — it returns the zero vector for everything it
+    // cannot normalize — and a zero-length direction is a ray that hits
+    // nothing, the same silent miss the NaN origin produced. Two inputs land
+    // here, and the second is why the floor inside `normalize` had to be a
+    // finiteness test rather than the `len < 1e-10` lower bound it was:
+    //
+    //  - the inverted matrix is ill-conditioned enough that the unprojected
+    //    point lands on the eye, leaving nothing to normalize;
+    //  - the unprojected relative point is non-finite. `MathUtils.invert` stores its result in a
+    //    `Float32Array`, so an inverse component past 3.4e38 saturates to
+    //    `Infinity` and `transformPoint` carries that into the relative point. A
+    //    lower bound admits `Infinity` (it is not *below* the floor), and
+    //    `Infinity / Infinity` is NaN while the finite components divide to
+    //    `0` — so the direction came back `{NaN, 0, -0}`, which is neither
+    //    finite nor the zero vector this branch tests for. Measured on a
+    //    camera at `(1e155, 0, 0)` with a wide viewport (#2479).
+    //
+    // Look along the view direction instead: that is the ray through the
+    // centre of the frame, which is where a cursor with no usable offset is.
+    if (direction.x === 0 && direction.y === 0 && direction.z === 0) {
+      return { origin, direction: basis.forward };
+    }
 
     return { origin, direction };
   }
@@ -138,6 +192,11 @@ export class CameraProjection {
    * Y-up coordinate system: Y is vertical
    */
   fitToBounds(min: Vec3, max: Vec3): void {
+    // Same input class, same policy as the animator's `frameBounds`/
+    // `zoomExtent` (#2461): an infinite or inverted AABB has no centre and no
+    // extent to fit to, and both go straight into `position` and `target`.
+    if (!isUsableBounds(min, max)) return;
+
     const center = {
       x: (min.x + max.x) / 2,
       y: (min.y + max.y) / 2,

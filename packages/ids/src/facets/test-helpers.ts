@@ -27,13 +27,22 @@ interface MockEntity {
     psetName: string;
     propName: string;
     value: string | number | boolean | null;
+    /** Passed through as given: an omitted type is UNKNOWN, as in a real
+     *  store. This used to default to IFCLABEL, which hid #5224. */
     dataType?: string;
+    dataTypeMixed?: true;
     /** Candidate values for multi-valued properties (issue #1766). */
     values?: Array<string | number | boolean>;
   }>;
   classifications?: Array<{ system?: string; value?: string }>;
   materials?: Array<{ name: string; category?: string }>;
-  parent?: { expressId?: number; type: string; relation: string; predefinedType?: string };
+  parent?: {
+    expressId?: number;
+    type: string;
+    relation: string;
+    predefinedType?: string;
+    objectType?: string;
+  };
   attributes?: Record<string, string | number | boolean>;
   /**
    * Optional per-attribute XSD-type metadata, mirroring the schema
@@ -86,7 +95,7 @@ export function createMockAccessor(entities: MockEntity[]): IFCDataAccessor {
       if (!prop) return undefined;
       return {
         value: prop.value,
-        dataType: prop.dataType || 'IFCLABEL',
+        dataType: prop.dataType,
         propertySetName: prop.psetName,
         propertyName: prop.propName,
       };
@@ -104,7 +113,8 @@ export function createMockAccessor(entities: MockEntity[]): IFCDataAccessor {
         pset.properties.push({
           name: prop.propName,
           value: prop.value,
-          dataType: prop.dataType || 'IFCLABEL',
+          dataType: prop.dataType,
+          ...(prop.dataTypeMixed ? { dataTypeMixed: true as const } : {}),
           ...(prop.values?.length ? { values: prop.values } : {}),
         });
       }
@@ -135,6 +145,7 @@ export function createMockAccessor(entities: MockEntity[]): IFCDataAccessor {
         expressId: entity.parent.expressId,
         entityType: entity.parent.type,
         predefinedType: entity.parent.predefinedType,
+        objectType: entity.parent.objectType,
       };
     },
     getAttribute(

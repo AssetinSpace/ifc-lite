@@ -203,7 +203,6 @@ describe.skipIf(!testFile)('IFC Mutations Integration', () => {
         store.entities,
         view,
         store.spatialHierarchy || null,
-        store.properties || null,
         store.strings || null
       );
 
@@ -219,7 +218,6 @@ describe.skipIf(!testFile)('IFC Mutations Integration', () => {
         store.entities,
         view,
         store.spatialHierarchy || null,
-        store.properties || null,
         store.strings || null
       );
 
@@ -229,12 +227,12 @@ describe.skipIf(!testFile)('IFC Mutations Integration', () => {
         typeEnumSet.add(store.entities.typeEnum[i]);
       }
 
-      if (typeEnumSet.size === 0) {
+      const firstType = typeEnumSet.values().next().value;
+      if (firstType === undefined) {
         console.log('No entity types found');
         return;
       }
 
-      const firstType = typeEnumSet.values().next().value;
       const selected = engine.select({ entityTypes: [firstType] });
       expect(selected.length).toBeGreaterThan(0);
     });
@@ -247,7 +245,6 @@ describe.skipIf(!testFile)('IFC Mutations Integration', () => {
         store.entities,
         view,
         store.spatialHierarchy || null,
-        store.properties || null,
         store.strings || null
       );
 
@@ -282,7 +279,6 @@ describe.skipIf(!testFile)('IFC Mutations Integration', () => {
         store.entities,
         view,
         store.spatialHierarchy || null,
-        store.properties || null,
         store.strings || null
       );
 

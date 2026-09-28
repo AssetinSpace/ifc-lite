@@ -23,6 +23,7 @@ import {
   setAttribute,
   setChild,
   setPropertyValue,
+  setQuantityValue,
 } from '../src/doc/entity.js';
 import { createGeometry, setGeometryBlobHash, setGeometryParam } from '../src/doc/geometry.js';
 import { addTarget, createRelationship, removeTarget } from '../src/doc/relationship.js';
@@ -135,6 +136,50 @@ describe('conflict scenarios', () => {
     }
   });
 
+  it('quantity: concurrent quantity writes inside an existing Qset', () => {
+    const h = harness();
+    shareEntity(h, 'wall');
+    // Seed the Qset on A first so both peers share the same Qset Y.Map.
+    h.a.transact(() => setQuantityValue(h.a, 'wall', 'Qto_WallBaseQuantities', 'GrossArea', 10));
+    h.sync();
+
+    h.a.transact(() => setQuantityValue(h.a, 'wall', 'Qto_WallBaseQuantities', 'GrossArea', 20));
+    h.b.transact(() => setQuantityValue(h.b, 'wall', 'Qto_WallBaseQuantities', 'GrossArea', 30));
+    h.sync();
+
+    for (const events of [h.aEvents, h.bEvents]) {
+      expect(
+        events.some(
+          (e) =>
+            e.kind === 'quantity' &&
+            e.path === 'wall' &&
+            e.field === 'Qto_WallBaseQuantities.GrossArea',
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('quantity: concurrent Qset creation surfaces at the Qset name', () => {
+    const h = harness();
+    shareEntity(h, 'wall');
+
+    // Both peers seed the same Qset name without a prior shared Y.Map.
+    h.a.transact(() => setQuantityValue(h.a, 'wall', 'Qto_WallBaseQuantities', 'GrossArea', 10));
+    h.b.transact(() => setQuantityValue(h.b, 'wall', 'Qto_WallBaseQuantities', 'GrossArea', 20));
+    h.sync();
+
+    for (const events of [h.aEvents, h.bEvents]) {
+      expect(
+        events.some(
+          (e) =>
+            e.kind === 'quantity' &&
+            e.path === 'wall' &&
+            e.field === 'Qto_WallBaseQuantities',
+        ),
+      ).toBe(true);
+    }
+  });
+
   it('hierarchy: concurrent child role assignments', () => {
     const h = harness();
     shareEntity(h, 'storey');
@@ -200,6 +245,81 @@ describe('conflict scenarios', () => {
     // assert is convergence: both peers agree the entity is gone.
     expect(h.a.getMap('entities').has('wall')).toBe(false);
     expect(h.b.getMap('entities').has('wall')).toBe(false);
+  });
+
+  it('concurrent-create: same-path concurrent creates raise a conflict, but LWW still discards one entity (#4241)', () => {
+    // Two offline peers each assign the next sequential id from their own
+    // local view and collide. Yjs LWW keeps exactly one peer's entity —
+    // that merge outcome is unchanged by this test (see the maintainer's
+    // ruling on #4241: detector + test only, LWW semantics stay as-is).
+    // What changes is that both peers now get a `concurrent-create` event
+    // instead of silence.
+    const h = harness();
+    h.a.transact(() => createEntity(h.a, 'wall-7', { ifcClass: 'IfcWall' }));
+    h.a.transact(() => setAttribute(h.a, 'wall-7', 'Name', 'Wall from Alice'));
+
+    h.b.transact(() => createEntity(h.b, 'wall-7', { ifcClass: 'IfcColumn' }));
+    h.b.transact(() => setAttribute(h.b, 'wall-7', 'Name', 'Column from Bob'));
+
+    h.sync();
+
+    for (const events of [h.aEvents, h.bEvents]) {
+      expect(events.some((e) => e.kind === 'concurrent-create' && e.path === 'wall-7')).toBe(true);
+    }
+
+    // Pin today's LWW outcome: exactly one peer's entity survives, and
+    // both peers converge on the same winner. This assertion must keep
+    // passing unchanged — the fix here is detection, not this outcome.
+    const aWinner = h.a.getMap('entities').get('wall-7') as Y.Map<unknown> | undefined;
+    const bWinner = h.b.getMap('entities').get('wall-7') as Y.Map<unknown> | undefined;
+    expect(aWinner).toBeDefined();
+    const aAttrs = aWinner!.get('attributes') as Y.Map<unknown>;
+    const bAttrs = bWinner!.get('attributes') as Y.Map<unknown>;
+    expect(aAttrs.get('Name')).toBe(bAttrs.get('Name'));
+    // Only one of the two names survives; the other is gone with no trace
+    // in the doc other than the conflict event asserted above.
+    expect(['Wall from Alice', 'Column from Bob']).toContain(aAttrs.get('Name'));
+  });
+
+  it('concurrent-create: different-path concurrent creates raise no conflict (false-positive guard)', () => {
+    // The whole point of the #4241 fix is same-PATH collisions. Two
+    // peers creating at different paths is ordinary CRDT-friendly
+    // collaboration — both entities must survive and neither peer's
+    // detector should fire concurrent-create.
+    const h = harness();
+    h.a.transact(() => createEntity(h.a, 'wall-a', { ifcClass: 'IfcWall' }));
+    h.b.transact(() => createEntity(h.b, 'wall-b', { ifcClass: 'IfcWall' }));
+    h.sync();
+
+    for (const events of [h.aEvents, h.bEvents]) {
+      expect(events.some((e) => e.kind === 'concurrent-create')).toBe(false);
+    }
+    expect(h.a.getMap('entities').has('wall-a')).toBe(true);
+    expect(h.a.getMap('entities').has('wall-b')).toBe(true);
+    expect(h.b.getMap('entities').has('wall-a')).toBe(true);
+    expect(h.b.getMap('entities').has('wall-b')).toBe(true);
+  });
+
+  it('delete-vs-edit: still raises no signal — documented gap, unchanged by #4241 (see #4241 ruling)', () => {
+    // The maintainer's ruling scoped #4241 to the same-path-create
+    // detector: "Delete-vs-edit stays as documented behaviour for now;
+    // it gets a signal only if that falls out of the same detector
+    // change for free." It doesn't fall out for free — a top-level
+    // delete and a nested attribute edit classify under different
+    // ConflictKinds, so record() never accumulates two contributors on
+    // the same key. This test pins that the gap is unchanged, not that
+    // it is desirable.
+    const h = harness();
+    shareEntity(h, 'wall');
+
+    h.a.transact(() => deleteEntity(h.a, 'wall'));
+    h.b.transact(() => setAttribute(h.b, 'wall', 'Name', "Bob's edit"));
+    h.sync();
+
+    expect(h.a.getMap('entities').has('wall')).toBe(false);
+    expect(h.b.getMap('entities').has('wall')).toBe(false);
+    expect(h.aEvents).toHaveLength(0);
+    expect(h.bEvents).toHaveLength(0);
   });
 
   it('relationship-target: concurrent additions to the targets array', () => {

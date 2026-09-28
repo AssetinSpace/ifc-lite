@@ -6,6 +6,9 @@
  * Types for @ifc-lite/sandbox
  */
 
+import type { Capability } from '@ifc-lite/extensions';
+import type { FetchTransport } from './network-request.js';
+
 /** Permission configuration — controls which SDK APIs are accessible */
 export interface SandboxPermissions {
   /** Allow bim.model.* (model loading/management) */
@@ -24,6 +27,13 @@ export interface SandboxPermissions {
   export?: boolean;
   /** Allow bim.files.* (uploaded file access) */
   files?: boolean;
+  /**
+   * Allow bim.network.* (outbound fetch). Off by default — a script gets
+   * this only when the running graph holds at least one `network.fetch:*`
+   * grant; the per-call host allow-list check still runs against the real
+   * grant list regardless of this flag (see `network-request.ts`).
+   */
+  network?: boolean;
 }
 
 /** Resource limits for sandbox execution */
@@ -42,6 +52,16 @@ export interface SandboxConfig {
   permissions?: SandboxPermissions;
   /** Resource limits */
   limits?: SandboxLimits;
+  /**
+   * `network.fetch:<host>` grants the running graph holds. Consulted by
+   * `bim.network.fetch` on every call (not just once at sandbox creation)
+   * so the allow-list is always the real, current grant set — the
+   * `network` permission flag above only gates whether the namespace
+   * exists at all. `transport` replaces `fetch` for those requests (a host's
+   * own transport, or a test's); it changes how bytes move, never whether a
+   * request is allowed.
+   */
+  network?: { grants: readonly Capability[]; transport?: FetchTransport };
 }
 
 /** Result of script execution */
@@ -54,9 +74,27 @@ export interface ScriptResult {
   durationMs: number;
 }
 
+/**
+ * The console methods the sandbox installs on its `console` global.
+ *
+ * Single source for three things that have to agree: the functions
+ * `buildConsole` actually installs, the `level` a captured `LogEntry` can
+ * carry, and the ambient `console` declaration that
+ * `scripts/generate-bim-globals.mjs` emits into `bim-globals.d.ts`.
+ *
+ * The sandbox global scope has exactly two members — `bim` and this `console`
+ * — so the ambient declaration must be derived from this list rather than
+ * borrowed from TypeScript's `DOM` lib: that would compile a template calling
+ * `console.table`, `document` or `fetch`, none of which exist in QuickJS.
+ */
+export const SANDBOX_CONSOLE_LEVELS = ['log', 'warn', 'error', 'info'] as const;
+
+/** A method name on the sandbox `console`. */
+export type SandboxConsoleLevel = (typeof SANDBOX_CONSOLE_LEVELS)[number];
+
 /** A captured console log entry */
 export interface LogEntry {
-  level: 'log' | 'warn' | 'error' | 'info';
+  level: SandboxConsoleLevel;
   args: unknown[];
   timestamp: number;
 }
@@ -71,6 +109,7 @@ export const DEFAULT_PERMISSIONS: Required<SandboxPermissions> = {
   lens: true,
   export: true,
   files: true,
+  network: false,   // Off by default — the caller must derive this from real grants
 };
 
 /** Default resource limits */

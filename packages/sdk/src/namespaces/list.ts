@@ -9,6 +9,8 @@
  * column discovery, filtering, presets, and CSV export.
  */
 
+import type { ColumnDefinition, PropertyCondition } from '@ifc-lite/lists';
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -54,6 +56,78 @@ async function loadLists(): Promise<Record<string, unknown>> {
 }
 
 type AnyFn = (...args: unknown[]) => unknown;
+
+/**
+ * Translate the SDK's flat `{ header, source }` column shape into the
+ * library's structured `ColumnDefinition` (`{ id, source: <enum>, psetName?,
+ * propertyName, label? }`). Without this the two never lined up: the library
+ * switches on `source` against its own enum ('attribute' | 'property' | ...)
+ * and SDK columns carried 'name' / 'type' / 'globalId' / 'Pset.Prop' strings
+ * that matched none of those cases, so `executeList` fell through to its
+ * `default: values[i] = null` branch for every column, every row.
+ */
+function toLibraryColumn(col: ListColumn, index: number): ColumnDefinition {
+  const id = `col_${index}`;
+  const label = col.header;
+  if (col.source === 'name') return { id, source: 'attribute', propertyName: 'Name', label };
+  if (col.source === 'type') return { id, source: 'attribute', propertyName: 'Class', label };
+  if (col.source === 'globalId') return { id, source: 'attribute', propertyName: 'GlobalId', label };
+
+  const dotIdx = col.source.indexOf('.');
+  if (dotIdx > 0) {
+    const setName = col.source.slice(0, dotIdx);
+    const propertyName = col.source.slice(dotIdx + 1);
+    // Same Qto_ convention bim.bsdd uses to split property sets from
+    // quantity sets: the library has no single "try property, then
+    // quantity" column source, so a definitive choice is required.
+    const source = setName.startsWith('Qto_') ? 'quantity' : 'property';
+    return { id, source, psetName: setName, propertyName, label };
+  }
+
+  // Unrecognized shape (not one of the three special names, no dot path) —
+  // pass through as a raw attribute name rather than silently dropping it.
+  return { id, source: 'attribute', propertyName: col.source, label };
+}
+
+/**
+ * Map the SDK's `'=' | '!=' | '>' | '<' | '>=' | '<='` operator spelling to
+ * the library's `'equals' | 'notEquals' | 'gt' | 'lt' | 'gte' | 'lte'`.
+ * `'contains'` and `'exists'` are spelled the same in both and pass through
+ * the fallback unchanged.
+ */
+const CONDITION_OPERATOR_MAP: Record<string, PropertyCondition['operator']> = {
+  '=': 'equals',
+  '!=': 'notEquals',
+  '>': 'gt',
+  '<': 'lt',
+  '>=': 'gte',
+  '<=': 'lte',
+};
+
+/**
+ * Translate the SDK's flat `{ psetName, propName, operator, value }`
+ * `ListCondition` into the library's `PropertyCondition`
+ * (`{ source: <enum>, psetName?, propertyName, operator, value }`).
+ *
+ * Without this, `execute()` passed SDK-shaped conditions straight through
+ * (PR #2841 review): `PropertyCondition.source` is required and SDK
+ * conditions carry none, so `getConditionValue` fell through to
+ * `default: return null` for every condition, and a `null` actual value
+ * makes `matchesCondition` return `false` unconditionally — every entity
+ * fails every condition, so a filtered `bim.list.execute()` call silently
+ * came back with an EMPTY table rather than an error or a table of nulls.
+ * Same `Qto_` convention as `toLibraryColumn` and `bim.bsdd` to choose
+ * between the library's `'property'` and `'quantity'` sources.
+ */
+function toLibraryCondition(condition: ListCondition): PropertyCondition {
+  return {
+    source: condition.psetName.startsWith('Qto_') ? 'quantity' : 'property',
+    psetName: condition.psetName,
+    propertyName: condition.propName,
+    operator: CONDITION_OPERATOR_MAP[condition.operator] ?? (condition.operator as PropertyCondition['operator']),
+    value: condition.value ?? '',
+  };
+}
 
 // ============================================================================
 // ListNamespace
@@ -102,9 +176,19 @@ export class ListNamespace {
     const dataName = '@ifc-lite/data';
     const data = await import(/* webpackIgnore: true */ dataName) as Record<string, unknown>;
     const convert = data.IfcTypeEnumFromString as (s: string) => number;
+    const { conditions, ...sdkDefinition } = definition;
     const libraryDef = {
-      ...definition,
+      ...sdkDefinition,
       entityTypes: (definition.types ?? []).map(t => convert(t)),
+      // SDK list queries predate saved Rules groups. They execute the
+      // supplied conditions through the provider-only path, so pass an
+      // explicit empty group set to the library's current definition shape.
+      groups: [],
+      // SDK conditions remain provider-only predicates. The Lists engine
+      // reads those through legacyConditions after the Rules migration;
+      // omitting conditions still means an unfiltered query (#5894).
+      legacyConditions: (conditions ?? []).map(toLibraryCondition),
+      columns: definition.columns.map(toLibraryColumn),
     };
     return (mod.executeList as AnyFn)(libraryDef, provider, modelId ?? 'default');
   }

@@ -2,9 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// happy-dom first: this file imports the viewer store, whose persistence
+// layer reads localStorage at module init and logs a ReferenceError without
+// it. Registering the globals keeps that out of the runner's output, where a
+// stray ReferenceError reads as a dead import rather than as the log line it is.
+import '@/test/setup-dom';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import {
+  EntityFlags,
   EntityTableBuilder,
   IfcTypeEnum,
   RelationshipGraphBuilder,
@@ -16,18 +22,24 @@ import {
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { useViewerStore, type FederatedModel } from '@/store';
 import {
+  buildIfcTypeTree,
   buildTreeData,
   buildTypeTree,
   buildUnifiedStoreys,
   compareStoreyEntries,
   buildGroupTree,
   buildMaterialTree,
+  filterNodes,
   resolveMemberGeometry,
   groupMatchesSubFilter,
   GROUP_ENTITY_TYPES,
   type AuthoredProduct,
 } from './treeDataBuilder';
+import { findNodePath } from './findNodePath';
 import type { HierarchySortMode } from './types';
+// The changed-test oracle removes new production modules. Keep this file
+// loadable under that revert so the missing projection fails an assertion.
+const projection = await import('./treeProjection').catch(() => null);
 
 function createSpatialNode(
   expressId: number,
@@ -83,6 +95,36 @@ function createDataStore(): IfcDataStore {
         if (id === 5) return 'IfcSpace';
         return 'Unknown';
       },
+    },
+  } as unknown as IfcDataStore;
+}
+
+function createSearchDataStore(): IfcDataStore {
+  const firstStorey = createSpatialNode(4, IfcTypeEnum.IfcBuildingStorey, 'Storey 1');
+  firstStorey.elements = [6];
+  const secondStorey = createSpatialNode(5, IfcTypeEnum.IfcBuildingStorey, 'Storey 2');
+  secondStorey.elements = [7];
+  const building = createSpatialNode(3, IfcTypeEnum.IfcBuilding, 'Building', [firstStorey, secondStorey]);
+  const site = createSpatialNode(2, IfcTypeEnum.IfcSite, 'Site', [building]);
+  const project = createSpatialNode(1, IfcTypeEnum.IfcProject, 'Project', [site]);
+  return {
+    spatialHierarchy: {
+      project,
+      byStorey: new Map([[4, [6]], [5, [7]]]),
+      byBuilding: new Map(),
+      bySite: new Map(),
+      bySpace: new Map(),
+      storeyElevations: new Map(),
+      storeyHeights: new Map(),
+      elementToStorey: new Map([[6, 4], [7, 5]]),
+      getStoreyElements: () => [],
+      getStoreyByElevation: () => null,
+      getContainingSpace: () => null,
+      getPath: () => [],
+    },
+    entities: {
+      getName: (id: number) => id === 7 ? 'Target Wall' : 'Other Wall',
+      getTypeName: () => 'IfcWall',
     },
   } as unknown as IfcDataStore;
 }
@@ -238,7 +280,7 @@ describe('buildTreeData', () => {
     assert.ok(spaceNode);
     assert.strictEqual(spaceNode.type, 'IfcSpace');
     assert.deepStrictEqual(spaceNode.expressIds, [5]);
-    assert.deepStrictEqual(spaceNode.globalIds, [105]);
+    assert.deepStrictEqual(spaceNode.globalIds, [1_000_105]);
     assert.strictEqual(spaceNode.elementCount, 1);
     assert.strictEqual(spaceNode.hasChildren, true);
 
@@ -247,7 +289,7 @@ describe('buildTreeData', () => {
     assert.strictEqual(windowNode.type, 'element');
     assert.strictEqual(windowNode.ifcType, 'IfcWindow');
     assert.deepStrictEqual(windowNode.expressIds, [7]);
-    assert.deepStrictEqual(windowNode.globalIds, [107]);
+    assert.deepStrictEqual(windowNode.globalIds, [1_000_107]);
     assert.strictEqual(windowNode.name, 'IfcWindow #7');
 
     assert.strictEqual(nodes.filter((node) => node.id === 'element-model-1-6').length, 1);
@@ -321,6 +363,51 @@ describe('buildTreeData', () => {
     assert.strictEqual(railing.ifcType, 'IfcRailing');
     assert.strictEqual(flight.depth, stair.depth + 1, 'parts nest one level under the assembly');
     assert.strictEqual(flight.hasChildren, false, 'leaf parts are not expandable');
+  });
+});
+
+describe('hierarchy search through collapsed branches (#5880)', () => {
+  const expandAll = { has: () => true };
+
+  it('finds only the target wall on storey 2 with its ancestor chain and restores collapse', () => {
+    const dataStore = createSearchDataStore();
+    const collapsed = new Set<string>();
+    assert.deepStrictEqual(buildTreeData(new Map(), dataStore, collapsed, false, []).map(node => node.name), ['Project']);
+
+    const matches = filterNodes(buildTreeData(new Map(), dataStore, expandAll, false, []), 'Target Wall');
+    assert.deepStrictEqual(matches.map(node => node.name), ['Project', 'Site', 'Building', 'Storey 2', 'Target Wall']);
+    assert.ok(matches.slice(0, -1).every(node => node.isExpanded));
+    assert.deepStrictEqual(buildTreeData(new Map(), dataStore, collapsed, false, []).map(node => node.name), ['Project']);
+    assert.deepStrictEqual(filterNodes(buildTreeData(new Map(), dataStore, expandAll, false, []), 'element'), []);
+  });
+
+  it('keeps a federated hit under its own model contribution only', () => {
+    useViewerStore.setState({ models: new Map() });
+    const offsetA = useViewerStore.getState().registerModelOffset('search-A', 8);
+    const offsetB = useViewerStore.getState().registerModelOffset('search-B', 8);
+    const modelA: FederatedModel = {
+      ...createModel(offsetA),
+      id: 'search-A',
+      name: 'Model A',
+      ifcDataStore: createSortStoreyModelDataStore([7], { 7: 'Wall A' }),
+      maxExpressId: 7,
+    };
+    const modelB: FederatedModel = {
+      ...createModel(offsetB),
+      id: 'search-B',
+      name: 'Model B',
+      ifcDataStore: createSortStoreyModelDataStore([7], { 7: 'Target Wall B' }),
+      maxExpressId: 7,
+    };
+    const models = new Map<string, FederatedModel>([['search-A', modelA], ['search-B', modelB]]);
+    useViewerStore.setState({ models });
+    const unified = buildUnifiedStoreys(models, 'name-asc');
+    const matches = filterNodes(buildTreeData(models, null, expandAll, true, unified), 'Target Wall B');
+    assert.deepStrictEqual(matches.map(node => node.id), [
+      `unified-${unified[0].key}`,
+      'contrib-search-B-4',
+      'element-search-B-7',
+    ]);
   });
 });
 
@@ -940,6 +1027,8 @@ describe('buildGroupTree (#1622)', () => {
     // #100 has 3 members (2 ports + 1 duct) but they resolve to ONE geometry row.
     assert.strictEqual(groupNode.elementCount, 1);
     assert.deepStrictEqual(groupNode.globalIds, [202], 'isolation ids = resolved host geometry only');
+    assert.deepStrictEqual(groupNode.memberGlobalIds, [201, 202, 203],
+      'selection targets all actual IfcRelAssignsToGroup members, including geometry-less ports');
     const memberRows = nodes.filter((n) => n.type === 'group-member' && n.id.startsWith('groupmember-legacy-100-'));
     assert.strictEqual(memberRows.length, 1);
     assert.strictEqual(memberRows[0].expressIds[0], 202, 'the duct, not the ports');
@@ -1034,6 +1123,14 @@ function createIfcxShapedDataStore(): IfcDataStore {
 }
 
 describe('buildGroupTree — IFCX-shaped store (empty entityIndex)', () => {
+  it('accepts a table-backed store with no STEP index object (#5249)', () => {
+    const ds = createIfcxShapedDataStore();
+    const indexless = { ...ds, entityIndex: undefined } as unknown as IfcDataStore;
+    const nodes = buildGroupTree(new Map(), indexless, new Set(), false, new Set([2, 3]));
+    assert.deepStrictEqual(nodes.filter(n => n.type === 'group').map(n => n.name),
+      ['Water Supply', 'Misc']);
+  });
+
   it('lists groups with real members despite empty byType/byId', () => {
     const ds = createIfcxShapedDataStore();
     const nodes = buildGroupTree(
@@ -1158,4 +1255,462 @@ describe('buildMaterialTree — type-level material expansion (#1755)', () => {
     assert.strictEqual(byName.get('wood1')!.elementCount, 2);
     assert.deepStrictEqual(byName.get('Unknown')!.globalIds, [3], 'occurrence-level association untouched');
   });
+
+  it('keeps equal material names in separate federated model rows (#5888)', () => {
+    const models = new Map<string, FederatedModel>([
+      ['A', { ...createModel(0), id: 'A', name: 'A.ifc', ifcDataStore: createTypedMaterialDataStore() }],
+      ['B', { ...createModel(1000), id: 'B', name: 'B.ifc', ifcDataStore: createTypedMaterialDataStore() }],
+    ]);
+    useViewerStore.setState({ models });
+    const nodes = buildMaterialTree(models, null, new Set(), true);
+    const wood = nodes.filter((node) => node.name === 'wood1');
+    assert.strictEqual(wood.length, 2, 'one material row per source model');
+    assert.deepStrictEqual(wood.map((node) => node.modelId), ['A', 'B']);
+    assert.ok(wood.every((node) => node.modelIds.length === 1 && node.entityExpressId === 10));
+    assert.ok(wood.every((node) => !node.name.includes('[')), 'model attribution stays outside IFC Name');
+    assert.notStrictEqual(wood[0].id, wood[1].id, 'rows remain distinct in the virtual tree');
+  });
+
+  it('does not invent a material owner for layers sharing one composed IFCX store (#5888)', () => {
+    const composed = createTypedMaterialDataStore();
+    const models = new Map<string, FederatedModel>([
+      ['A', { ...createModel(0), id: 'A', name: 'Layer A', ifcDataStore: composed }],
+      ['B', { ...createModel(0), id: 'B', name: 'Layer B', ifcDataStore: composed }],
+    ]);
+    useViewerStore.setState({ models });
+    const nodes = buildMaterialTree(models, null, new Set(), true);
+    const wood = nodes.filter((node) => node.name === 'wood1');
+    assert.strictEqual(wood.length, 1, 'one composed material row, not one invented owner per layer');
+    assert.deepStrictEqual(wood[0].modelIds, ['A', 'B']);
+    assert.strictEqual(wood[0].modelId, undefined, 'shared store has no single source model');
+    assert.deepStrictEqual(wood[0].globalIds, [1, 2], 'usage is not duplicated across layers');
+  });
+});
+
+/**
+ * A decomposition model for the 3D-oriented class/type trees.
+ *
+ *   #10 IfcElementAssembly "Pier A"   — NO geometry, aggregates #11 + #12
+ *     #11 IfcColumn  "Pierstem"       — has geometry
+ *     #12 IfcFooting "Foundation"     — has geometry
+ *   #13 IfcElementAssembly "Marker"   — NO geometry, NO parts (empty container)
+ *   #14 IfcWall "Plain Wall"          — has geometry, decomposes nothing
+ *   #15 IfcPropertySet "Pset_Common"  — NO geometry, NO parts (non-renderable)
+ *   #16 IfcBuildingStorey "Ground"    — NO geometry, aggregates nothing here
+ *   #20 IfcElementAssemblyType (IS_TYPE) — DefinesByType → #10
+ *   #21 IfcWallType            (IS_TYPE) — DefinesByType → #14
+ *
+ * Legacy mode (no federated models) → globalId === expressId, so the geometric
+ * set below is expressed in express ids.
+ */
+const DECOMPOSITION_GEOMETRIC_IDS = new Set([11, 12, 14]);
+
+function createDecompositionDataStore(opts: { cycle?: boolean; emptyTypeTarget?: boolean } = {}): IfcDataStore {
+  const names: Record<number, string> = {
+    10: 'Pier A', 11: 'Pierstem', 12: 'Foundation', 13: 'Marker',
+    14: 'Plain Wall', 15: 'Pset_Common', 16: 'Ground',
+    20: 'PierType', 21: 'WallType',
+  };
+  const types: Record<number, string> = {
+    10: 'IfcElementAssembly', 11: 'IfcColumn', 12: 'IfcFooting',
+    13: 'IfcElementAssembly', 14: 'IfcWall', 15: 'IfcPropertySet',
+    16: 'IfcBuildingStorey',
+    20: 'IfcElementAssemblyType', 21: 'IfcWallType',
+  };
+  const order = [10, 11, 12, 13, 14, 15, 16, 20, 21];
+  const flags = order.map((id) => (id >= 20 ? EntityFlags.IS_TYPE : 0));
+
+  const aggregates: Record<number, number[]> = { 10: [11, 12] };
+  // Malformed file: a part aggregates its own assembly back.
+  if (opts.cycle) aggregates[11] = [10];
+
+  const definesByType: Record<number, number[]> = { 20: [opts.emptyTypeTarget ? 13 : 10], 21: [14] };
+  const relBuilder = new RelationshipGraphBuilder();
+  for (const [source, targets] of Object.entries(aggregates)) {
+    for (const target of targets) relBuilder.addEdge(Number(source), target, RelationshipType.Aggregates, 100 + Number(source));
+  }
+  for (const [source, targets] of Object.entries(definesByType)) {
+    for (const target of targets) relBuilder.addEdge(Number(source), target, RelationshipType.DefinesByType, 200 + Number(source));
+  }
+
+  return {
+    spatialHierarchy: undefined,
+    entityIndex: { byId: new Map(), byType: new Map() },
+    entities: {
+      count: order.length,
+      expressId: order,
+      flags,
+      getName: (id: number) => names[id] ?? '',
+      getTypeName: (id: number) => types[id] ?? 'Unknown',
+    },
+    relationships: relBuilder.build(),
+  } as unknown as IfcDataStore;
+}
+
+describe('federated model attribution in hierarchy rows (#5888)', () => {
+  const modelsFor = (makeStore: () => IfcDataStore): Map<string, FederatedModel> => new Map([
+    ['A', { ...createModel(0), id: 'A', name: 'A.ifc', ifcDataStore: makeStore() }],
+    ['B', { ...createModel(1000), id: 'B', name: 'B.ifc', ifcDataStore: makeStore() }],
+  ]);
+
+  it('keeps By Class and By Type IFC names clean while assigning each row to its model', () => {
+    const models = modelsFor(createDecompositionDataStore);
+    useViewerStore.setState({ models });
+    const geometry = new Set([11, 12, 14, 1011, 1012, 1014]);
+    const byClass = buildTypeTree(models, null, new Set(['type-IfcWall']), true, geometry);
+    const walls = byClass.filter((row) => row.type === 'element' && row.expressIds[0] === 14);
+    assert.deepStrictEqual(walls.map((row) => [row.modelId, row.name]), [['A', 'Plain Wall'], ['B', 'Plain Wall']]);
+
+    const expanded = new Set(['typeclass-IfcWallType', 'ifctype-A-21', 'ifctype-B-21']);
+    const byType = buildIfcTypeTree(models, null, expanded, true, geometry);
+    const typeRows = byType.filter((row) => row.type === 'ifc-type' && row.entityExpressId === 21);
+    assert.deepStrictEqual(typeRows.map((row) => [row.modelId, row.name]), [['A', 'WallType'], ['B', 'WallType']]);
+    const occurrences = byType.filter((row) => row.type === 'element' && row.expressIds[0] === 14);
+    assert.deepStrictEqual(occurrences.map((row) => row.modelId), ['A', 'B']);
+  });
+
+  it('keeps group and member names clean while assigning each row to its model', () => {
+    const models = modelsFor(createGroupDataStore);
+    useViewerStore.setState({ models });
+    const geometry = new Set([202, 301, 302, 1202, 1301, 1302]);
+    const rows = buildGroupTree(models, null, new Set(['group-A-100', 'group-B-100']), true, geometry);
+    const groups = rows.filter((row) => row.type === 'group' && row.expressIds[0] === 100);
+    assert.deepStrictEqual(groups.map((row) => [row.modelId, row.name]), [['A', 'HVAC System'], ['B', 'HVAC System']]);
+    const members = rows.filter((row) => row.type === 'group-member' && row.expressIds[0] === 202);
+    assert.deepStrictEqual(members.map((row) => [row.modelId, row.name]), [['A', 'Main Duct'], ['B', 'Main Duct']]);
+  });
+});
+
+describe('buildTypeTree — geometry-less assemblies (By Class tab)', () => {
+  it('lists an assembly whose IfcRelAggregates parts carry the geometry', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildTypeTree(new Map(), ds, new Set(['type-IfcElementAssembly']), false, DECOMPOSITION_GEOMETRIC_IDS);
+
+    const group = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssembly');
+    assert.ok(group, 'IfcElementAssembly must have a class group — its parts render');
+    assert.deepStrictEqual(
+      nodes.filter((n) => n.type === 'element' && n.ifcType === 'IfcElementAssembly').map((n) => n.expressIds[0]),
+      [10],
+      'the assembly with geometry-bearing parts is listed; the empty one is not',
+    );
+  });
+
+  it('carries the geometry-bearing parts so a click can select / frame / isolate them', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildTypeTree(new Map(), ds, new Set(['type-IfcElementAssembly']), false, DECOMPOSITION_GEOMETRIC_IDS);
+
+    const assembly = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 10);
+    assert.ok(assembly, 'the assembly row exists');
+    assert.deepStrictEqual(assembly.assemblyChildGlobalIds, [11, 12]);
+
+    const group = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssembly')!;
+    assert.deepStrictEqual(
+      group.globalIds,
+      [11, 12],
+      'isolating the class targets the parts, not the assembly\'s geometry-less id',
+    );
+  });
+
+  it('leaves an ordinary geometry-bearing element exactly as before', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildTypeTree(new Map(), ds, new Set(['type-IfcWall']), false, DECOMPOSITION_GEOMETRIC_IDS);
+
+    const wall = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 14);
+    assert.ok(wall, 'the plain wall is still listed');
+    assert.strictEqual(wall.assemblyChildGlobalIds, undefined, 'no phantom parts on a plain element');
+    const group = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcWall')!;
+    assert.deepStrictEqual(group.globalIds, [14]);
+    assert.strictEqual(group.elementCount, 1);
+  });
+
+  it('still filters: no geometry and no renderable parts stays out of the tree', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const classes = nodes.filter((n) => n.type === 'type-group').map((n) => n.ifcType).sort();
+    assert.deepStrictEqual(
+      classes,
+      ['IfcColumn', 'IfcElementAssembly', 'IfcFooting', 'IfcWall'],
+      'IfcPropertySet, the empty assembly and the storey are all excluded',
+    );
+    assert.strictEqual(
+      nodes.find((n) => n.ifcType === 'IfcElementAssembly')!.elementCount,
+      1,
+      'only the assembly with renderable parts counts — the empty one is dropped',
+    );
+  });
+
+  it('does not admit spatial containers on their descendants\' geometry', () => {
+    // A storey that aggregates a geometry-bearing element must NOT appear in a
+    // products tree, or the whole spatial skeleton leaks into By Class.
+    const ds = createDecompositionDataStore();
+    const rel = ds.relationships as unknown as {
+      getRelated: (id: number, t: RelationshipType, d: 'forward' | 'inverse') => number[];
+    };
+    const inner = rel.getRelated;
+    rel.getRelated = (id, t, d) =>
+      t === RelationshipType.Aggregates && d === 'forward' && id === 16 ? [14] : inner(id, t, d);
+
+    const nodes = buildTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    assert.strictEqual(
+      nodes.find((n) => n.ifcType === 'IfcBuildingStorey'),
+      undefined,
+      'IfcBuildingStorey must not be pulled into the By-Class tree',
+    );
+  });
+
+  it('terminates on a malformed aggregation cycle', () => {
+    const ds = createDecompositionDataStore({ cycle: true });
+    const nodes = buildTypeTree(new Map(), ds, new Set(['type-IfcElementAssembly']), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const assembly = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 10);
+    assert.ok(assembly, 'the assembly row exists');
+    assert.deepStrictEqual(assembly.assemblyChildGlobalIds, [11, 12], 'the cycle back to #10 is not re-emitted');
+  });
+});
+
+describe('buildIfcTypeTree — geometry-less assembly occurrences (By Type tab)', () => {
+  it('reports a non-zero instance count for an assembly type', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildIfcTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const classNode = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssemblyType');
+    assert.ok(classNode, 'IfcElementAssemblyType has a class row');
+    assert.strictEqual(classNode.elementCount, 1, 'the assembly occurrence counts — it renders through its parts');
+    assert.deepStrictEqual(classNode.globalIds, [11, 12], 'isolation targets the parts');
+  });
+
+  it('carries the parts on the expanded occurrence row', () => {
+    const ds = createDecompositionDataStore();
+    const expanded = new Set(['typeclass-IfcElementAssemblyType', 'ifctype-legacy-20']);
+    const nodes = buildIfcTypeTree(new Map(), ds, expanded, false, DECOMPOSITION_GEOMETRIC_IDS);
+    const typeRow = nodes.find((n) => n.type === 'ifc-type' && n.entityExpressId === 20);
+    assert.ok(typeRow, 'the assembly type row exists');
+    assert.strictEqual(typeRow.elementCount, 1);
+    const occurrence = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 10);
+    assert.ok(occurrence, 'the assembly occurrence is listed under its type');
+    assert.deepStrictEqual(occurrence.assemblyChildGlobalIds, [11, 12]);
+  });
+
+  it('leaves an ordinary typed occurrence exactly as before', () => {
+    const ds = createDecompositionDataStore();
+    const expanded = new Set(['typeclass-IfcWallType', 'ifctype-legacy-21']);
+    const nodes = buildIfcTypeTree(new Map(), ds, expanded, false, DECOMPOSITION_GEOMETRIC_IDS);
+    const classNode = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcWallType');
+    assert.ok(classNode, 'the IfcWallType class row exists');
+    assert.strictEqual(classNode.elementCount, 1);
+    assert.deepStrictEqual(classNode.globalIds, [14]);
+    const occurrence = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 14);
+    assert.ok(occurrence, 'the wall occurrence is listed');
+    assert.strictEqual(occurrence.assemblyChildGlobalIds, undefined);
+  });
+
+  it('still filters an occurrence with neither geometry nor renderable parts', () => {
+    // Point the assembly type at the EMPTY assembly (#13) instead of #10.
+    const ds = createDecompositionDataStore({ emptyTypeTarget: true });
+
+    const nodes = buildIfcTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const classNode = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssemblyType');
+    assert.ok(classNode, 'the type row itself still exists');
+    assert.strictEqual(classNode.elementCount, 0, 'an assembly with no renderable part contributes nothing');
+  });
+
+  it('buckets that same occurrence under "Other" instead of dropping it (#4764)', () => {
+    const ds = createDecompositionDataStore({ emptyTypeTarget: true });
+
+    const nodes = buildIfcTypeTree(new Map(), ds, new Set(['typeclass-other']), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const otherGroup = nodes.find((n) => n.type === 'other-group');
+    assert.ok(otherGroup, 'a flat "Other" bucket exists');
+    assert.strictEqual(otherGroup?.elementCount, 1);
+    const row = nodes.find((n) => n.type === 'element' && n.expressIds[0] === 13);
+    assert.ok(row, 'the shapeless occurrence is a row under it');
+    assert.strictEqual(row?.noGeometry, true);
+    assert.strictEqual(row?.ifcType, 'IfcElementAssembly');
+  });
+});
+
+describe('makeAssemblyGeometry — spatial guard (deep-review follow-up)', () => {
+  it('keeps a storey out of the products tree even with an empty geometry filter', () => {
+    // The real state during initial streaming: no geometry source has arrived
+    // yet, so `geometricIds` is empty and `applyFilter` is inert. The tree
+    // used to list EVERY parsed entity in that window, storey included, and a
+    // count read off the tab then counted the spatial chain. The class test
+    // runs ahead of the geometry filter, so the storey is gone in both states.
+    const ds = createDecompositionDataStore();
+    const rel = ds.relationships as unknown as {
+      getRelated: (id: number, t: RelationshipType, d: 'forward' | 'inverse') => number[];
+    };
+    const inner = rel.getRelated;
+    rel.getRelated = (id, t, d) =>
+      t === RelationshipType.Aggregates && d === 'forward' && id === 16 ? [14] : inner(id, t, d);
+
+    const nodes = buildTypeTree(new Map(), ds, new Set(['type-IfcBuildingStorey']), false, new Set());
+    assert.strictEqual(
+      nodes.find((n) => n.expressIds[0] === 16),
+      undefined,
+      'IfcBuildingStorey has no row in the By-Class tab, filter active or not',
+    );
+  });
+
+  it('recognises a spatial type name case-insensitively', () => {
+    // spatial-types.test.ts pins IfcTypeEnumFromString/isSpatialStructureType
+    // as case-insensitive; this test only asserts the tree builder actually
+    // routes through that pair rather than a case-sensitive name-set lookup.
+    const ds = createDecompositionDataStore();
+    const rel = ds.relationships as unknown as {
+      getRelated: (id: number, t: RelationshipType, d: 'forward' | 'inverse') => number[];
+    };
+    const innerRel = rel.getRelated;
+    rel.getRelated = (id, t, d) =>
+      t === RelationshipType.Aggregates && d === 'forward' && id === 16 ? [14] : innerRel(id, t, d);
+
+    const entities = ds.entities as unknown as { getTypeName: (id: number) => string };
+    const innerType = entities.getTypeName;
+    entities.getTypeName = (id: number) => (id === 16 ? 'IFCBUILDINGSTOREY' : innerType(id));
+
+    const nodes = buildTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    assert.strictEqual(
+      nodes.find((n) => n.ifcType === 'IFCBUILDINGSTOREY'),
+      undefined,
+      'an upper-cased spatial type name must still be excluded from the By-Class tree',
+    );
+  });
+});
+
+describe('type-group / ifc-type nodes — memberGlobalIds (deep-review follow-up)', () => {
+  it('buildTypeTree: memberGlobalIds stays index-aligned to expressIds while globalIds is parts-substituted', () => {
+    const ds = createDecompositionDataStore();
+    const nodes = buildTypeTree(new Map(), ds, new Set(), false, DECOMPOSITION_GEOMETRIC_IDS);
+    const group = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssembly')!;
+    assert.deepStrictEqual(group.expressIds, [10]);
+    assert.deepStrictEqual(group.memberGlobalIds, [10], "the class's own member id, not a substituted part");
+    assert.deepStrictEqual(group.globalIds, [11, 12], 'isolation still targets the parts');
+  });
+
+  it('buildIfcTypeTree: class and type nodes carry memberGlobalIds aligned to expressIds', () => {
+    const ds = createDecompositionDataStore();
+    const expanded = new Set(['typeclass-IfcElementAssemblyType', 'ifctype-legacy-20']);
+    const nodes = buildIfcTypeTree(new Map(), ds, expanded, false, DECOMPOSITION_GEOMETRIC_IDS);
+    const classNode = nodes.find((n) => n.type === 'type-group' && n.ifcType === 'IfcElementAssemblyType')!;
+    assert.deepStrictEqual(classNode.expressIds, [10]);
+    assert.deepStrictEqual(classNode.memberGlobalIds, [10]);
+    assert.deepStrictEqual(classNode.globalIds, [11, 12]);
+
+    const typeNode = nodes.find((n) => n.type === 'ifc-type' && n.entityExpressId === 20)!;
+    assert.deepStrictEqual(typeNode.expressIds, [10]);
+    assert.deepStrictEqual(typeNode.memberGlobalIds, [10]);
+    assert.deepStrictEqual(typeNode.globalIds, [11, 12]);
+  });
+});
+
+describe('findNodePath (#5881)', () => {
+  const expandAll = { has: () => true };
+
+  it('finds a leaf several levels deep and returns its ancestor id chain in order', () => {
+    const dataStore = createSearchDataStore();
+    const expanded = buildTreeData(new Map(), dataStore, expandAll, false, []);
+    const found = findNodePath(expanded, (node) => node.name === 'Target Wall');
+    assert.ok(found);
+    assert.deepStrictEqual(
+      expanded.filter((n) => found.ancestorIds.includes(n.id)).map((n) => n.name),
+      ['Project', 'Site', 'Building', 'Storey 2'],
+    );
+    assert.strictEqual(expanded[found.targetIndex].name, 'Target Wall');
+    assert.strictEqual(found.targetId, expanded[found.targetIndex].id);
+  });
+
+  it('returns null when nothing matches', () => {
+    const dataStore = createSearchDataStore();
+    const expanded = buildTreeData(new Map(), dataStore, expandAll, false, []);
+    assert.strictEqual(findNodePath(expanded, (node) => node.name === 'Nonexistent'), null);
+  });
+
+  it('finds a node inside a federated model contribution only', () => {
+    useViewerStore.setState({ models: new Map() });
+    const offsetA = useViewerStore.getState().registerModelOffset('search-A', 8);
+    const offsetB = useViewerStore.getState().registerModelOffset('search-B', 8);
+    const modelA: FederatedModel = {
+      ...createModel(offsetA),
+      id: 'search-A',
+      name: 'Model A',
+      ifcDataStore: createSortStoreyModelDataStore([7], { 7: 'Wall A' }),
+      maxExpressId: 7,
+    };
+    const modelB: FederatedModel = {
+      ...createModel(offsetB),
+      id: 'search-B',
+      name: 'Model B',
+      ifcDataStore: createSortStoreyModelDataStore([7], { 7: 'Target Wall B' }),
+      maxExpressId: 7,
+    };
+    const models = new Map<string, FederatedModel>([['search-A', modelA], ['search-B', modelB]]);
+    useViewerStore.setState({ models });
+    const unified = buildUnifiedStoreys(models, 'name-asc');
+    const expanded = buildTreeData(models, null, expandAll, true, unified);
+    const targetGlobalId = offsetB + 7;
+
+    const found = findNodePath(
+      expanded,
+      (node) => node.type === 'element' && node.globalIds.includes(targetGlobalId),
+    );
+    assert.ok(found);
+    // The hit is under a unified storey, which the flat array lists BEFORE
+    // 'models-header' (the per-model MODELS section comes after the unified
+    // storeys) — so this hit's own ancestor chain never sees it, matching
+    // filterNodes's 'keeps a federated hit under its own model contribution
+    // only' test.
+    assert.deepStrictEqual(found.ancestorIds, [
+      `unified-${unified[0].key}`,
+      'contrib-search-B-4',
+    ]);
+    assert.strictEqual(expanded[found.targetIndex].id, 'element-search-B-7');
+  });
+});
+
+describe('cached structural tree projection (#5886)', () => {
+  const allExpanded = { has: () => true };
+
+  for (const modelCount of [1, 2]) {
+    for (const mode of ['spatial', 'type', 'ifc-type', 'material', 'groups'] as const) {
+      it(`preserves every visible row and field through scripted expansion in ${mode} mode with ${modelCount} model(s)`, () => {
+        assert.ok(projection, 'the structural tree projection must be available');
+        const makeStore = mode === 'spatial' ? createDataStore
+          : mode === 'material' ? createTypedMaterialDataStore
+          : mode === 'groups' ? createGroupDataStore
+          : createDecompositionDataStore;
+        const models = new Map<string, FederatedModel>();
+        for (let i = 0; i < modelCount; i++) {
+          const id = `projection-${i}`;
+          models.set(id, { ...createModel(i * 1000), id, name: `${id}.ifc`, ifcDataStore: makeStore() });
+        }
+        useViewerStore.setState({ models });
+        const isMultiModel = modelCount > 1;
+        const unified = mode === 'spatial' ? buildUnifiedStoreys(models, 'name-asc') : [];
+        const geometry = new Set<number>([11, 12, 14, 202, 301, 302, 1011, 1012, 1014, 1202, 1301, 1302]);
+        const build = (expanded: { has(id: string): boolean }) => {
+          if (mode === 'spatial') return buildTreeData(models, null, expanded, isMultiModel, unified, 'name-asc');
+          if (mode === 'type') return buildTypeTree(models, null, expanded, isMultiModel, geometry);
+          if (mode === 'ifc-type') return buildIfcTypeTree(models, null, expanded, isMultiModel, geometry);
+          if (mode === 'material') return buildMaterialTree(models, null, expanded, isMultiModel);
+          return buildGroupTree(models, null, expanded, isMultiModel, geometry);
+        };
+
+        const structure = build(allExpanded);
+        const index = projection.indexHierarchyTree(structure);
+        const expandable = structure.filter((node) => node.hasChildren).map((node) => node.id);
+        assert.ok(structure.length > 0, `${mode} fixture must have rows`);
+        if (mode !== 'material') assert.ok(expandable.length > 0, `${mode} fixture must have expandable rows`);
+        const stages = [
+          new Set<string>(),
+          new Set(expandable.slice(0, 1)),
+          new Set(expandable.slice(0, Math.min(3, expandable.length))),
+          new Set(expandable),
+        ];
+        for (const expanded of stages) {
+          assert.deepStrictEqual(
+            projection.flattenVisibleHierarchy(index, expanded),
+            build(expanded),
+            `${mode} ${modelCount}-model visible rows must match the old builder for ${expanded.size} expanded nodes`,
+          );
+        }
+      });
+    }
+  }
 });

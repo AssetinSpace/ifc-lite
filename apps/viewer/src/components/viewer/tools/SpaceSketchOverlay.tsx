@@ -10,54 +10,51 @@
  * Rooms are derived from the active storey's RENDERED wall meshes (min-area
  * footprint rectangles → gap detection → lifted onto the wall axis), then the
  * user can drag a shared vertex (both rooms follow), split a room — between
- * corners OR new nodes added anywhere on a wall — merge two rooms, then Bake to
- * real `IfcSpace` through the viewer's existing `addSpace`.
+ * corners OR new nodes added anywhere on a wall — merge two rooms, then confirm
+ * every storey's draft into real `IfcSpace` through the viewer's `addSpace`.
  *
  * Fluency (RFC §4.2): hover telegraphs the op; drawing/dragging/cutting snap to
  * other vertices + walls, with Shift = ortho (which dominates snap). Undo/redo
  * snapshots the plate via `duplicate()`
  * (each clone owns its heap, freed deterministically — never JS GC). 2D plan
  * sketch; 3D-on-model registration is the next step.
+ *
+ * This is the controller and the `TOOL_HUD.spaceSketch.Bar` slot (#5503): it
+ * renders the bar `ToolOverlays` places top-center, and portals the plan
+ * card, the hint and the parked chip through `HudItem` — region + order,
+ * never coordinates. The presentational pieces live in
+ * `space-sketch/SpaceSketchHud`.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
 import { useConstructionUnderlay } from '@/hooks/useConstructionUnderlay';
 import { useIfc } from '@/hooks/useIfc';
-import { snapPoint, alignToAxes, type SnapKind } from '@/lib/space-snap';
+import { snapSketchPoint, alignToAxes, type SketchSnapKind } from '@/lib/snap/space-sketch';
 import { editError } from '@/lib/space-edit-error';
+import { capturePointer, releasePointer } from '@/lib/pointer-capture';
 import { pointerButton, isRemoveModifier } from '@/lib/space-interaction';
-import {
-  SpacePlateSession,
-  ensureSpaceWasm,
-  snapshotRoomsFromRects,
-  flattenWallRects,
-  type Room,
-  type Boundary,
-} from '@/lib/space-plate-session';
+import { type Room, type Boundary } from '@/lib/space-plate-session';
 import { wallRectsFromMeshes, type WallRect } from '@/lib/wall-rects-from-meshes';
-import {
-  polyArea, pointInPoly, centroid, uniqueVerts, distToSeg, projectOnSeg,
-  computeFit, zoomFit, sX, sY, wX, wY, PAD, type Fit, type Pt,
-} from '@/lib/space-sketch-geometry';
-import {
-  existingSpaceFootprintsByStorey,
-  GENERATED_SPACE_OBJECTTYPE,
-  type BoundaryMode,
-} from '@ifc-lite/create';
-import { X, Undo2, Redo2, Layers, Maximize, AlertTriangle, Magnet, SlidersHorizontal, HelpCircle, Eraser } from 'lucide-react';
+import { polyArea, uniqueVerts, distToSeg, projectOnSeg, sX, sY, wX, wY, PAD, type Pt } from '@/lib/space-sketch-geometry';
+import { type BoundaryMode } from '@ifc-lite/create';
+import { toast } from '@/components/ui/toast';
 import { SpaceSketchCanvas } from './space-sketch/SpaceSketchCanvas';
-import { OptionsPopover, HelpPopover } from './space-sketch/SpaceSketchPopovers';
+import { SpaceSketchBar, SpaceSketchHint, SpaceSketchParkedChip, SpaceSketchPlanCard } from './space-sketch/SpaceSketchHud';
+import { useSpaceGhostPreview, type GhostSpec } from './space-sketch/useSpaceGhostPreview';
+import { useSpaceSceneFraming } from './space-sketch/useSpaceSceneFraming';
+import { exteriorPerimeter, perimeterWalls } from './space-sketch/storey-footprint';
+import { useSpacePlateSessions } from './space-sketch/useSpacePlateSessions';
+import { useSpaceViewport } from './space-sketch/useSpaceViewport';
+import { useSpaceSketchKeys } from './space-sketch/useSpaceSketchKeys';
+import { useSpaceBake } from './space-sketch/useSpaceBake';
+import { floorToFloorHeight } from './space-sketch/space-bake';
 import type { Hover, SplitTarget, IntentTone } from './space-sketch/types';
-import { eventKey, isTextEntryTarget } from '@/lib/keyboard-event';
+import { useTranslation } from '@/i18n';
+import { formatSquareMetres } from './computePolygonArea';
 
-const DEFAULT_W = 580;
-const DEFAULT_H = 460;
-const MIN_W = 360;
-const MIN_H = 280;
 const PICK_PX = 12;
 const SNAP_PX = 10;
-const BAKE_HEIGHT = 3;
 const EPS = 1e-6;
 
 /** Lock `p` to a horizontal or vertical line through `anchor` (Shift-ortho),
@@ -67,26 +64,47 @@ function orthoLock(anchor: Pt, p: Pt): Pt {
 }
 
 export function SpaceSketchOverlay() {
+  const { t } = useTranslation();
   const setActiveTool = useViewerStore((s) => s.setActiveTool);
-  const addSpace = useViewerStore((s) => s.addSpace);
-  const removeEntity = useViewerStore((s) => s.removeEntity);
   const activeModelId = useViewerStore((s) => s.activeModelId);
+  const models = useViewerStore((s) => s.models);
+  const toGlobalId = useViewerStore((s) => s.toGlobalId);
+  const minimized = useViewerStore((s) => s.spaceSketchMinimized);
+  const setMinimized = useViewerStore((s) => s.setSpaceSketchMinimized);
+  // The model this sketch session creates spaces in. `activeModelId` can be
+  // null with a single model loaded (the hierarchy stores the model UUID), so
+  // fall back to that sole model instead of disabling the whole workflow.
+  // Only when there is exactly one, though: with several loaded and no active
+  // model, map iteration order would pick an arbitrary one and silently author
+  // spaces into the wrong file.
+  const sketchModelId = useMemo(
+    () => activeModelId ?? (models.size === 1 ? models.keys().next().value ?? null : null),
+    [activeModelId, models],
+  );
   // Rooms are derived from the RENDERED wall meshes (the geometry the user sees),
   // so the room lines land on the rendered wall faces — not from STEP source
   // geometry, which has no per-wall thickness here and a centroid-biased axis.
   const geometryResult = useViewerStore((s) => s.geometryResult);
   const { ifcDataStore } = useIfc();
 
-  const sessionRef = useRef<SpacePlateSession | null>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const fitRef = useRef<Fit>({ scale: 1, offX: PAD, offY: DEFAULT_H - PAD });
+  // One persistent DCEL session PER storey, so edits on every storey are
+  // collected for a single confirm-on-close (the user never confirms per storey).
+  // `sessionRef` points at the active storey's session; `sessionsRef` keeps them
+  // all alive until the tool closes (or the drafts are created / discarded).
+  // The hook owns their whole lifetime, including the disposed-after-unmount
+  // guard that stops a suspended build allocating a plate nothing would free.
+  const { sessionsRef, sessionRef, disposedRef, buildPlate, buildStoreyPlate, ensureWasm } =
+    useSpacePlateSessions();
+  // Panel size + the world↔screen transform, with a single writer for `fitRef`
+  // so the `fitTick` bump the underlay memo depends on can't be forgotten.
+  const {
+    svgRef, attachSvg, fitRef, fitTick, size, fitToPoints, panBy, svgPoint, resizeHandlers,
+  } = useSpaceViewport();
   const rafRef = useRef<number | null>(null);
   const rebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const buildSeqRef = useRef(0);
-  // IfcSpace expressIds this session created per storey — so a re-bake (or
-  // "Generate all") replaces the spaces it dropped instead of duplicating.
-  const generatedRef = useRef<Map<number, number[]>>(new Map());
+  // Bumped whenever a storey's draft room count changes, to recompute the
+  // pending-spaces tally (which reads the per-storey sessions, not React state).
+  const [pendingTick, setPendingTick] = useState(0);
   const moveRef = useRef<{ x: number; y: number; shift: boolean; del: boolean } | null>(null);
 
   const dragRef = useRef<number | null>(null);
@@ -94,13 +112,10 @@ export function SpaceSketchOverlay() {
   const otherVertsRef = useRef<Pt[]>([]);
   const draggedRef = useRef(false);
   const panningRef = useRef(false); // Issue 4: middle-mouse / empty-drag panning
-  const resizeRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   // While drawing, Undo pops the last placed point onto this stack and Redo
   // re-adds it — so point placement uses the panel Undo/Redo, not a separate
   // draw-only control. Cleared when the draw is committed/cancelled.
   const drawRedoRef = useRef<Pt[]>([]);
-  // Timestamp of the last bare Esc — a second within 400 ms closes the panel.
-  const escTimeRef = useRef(0);
   // Building wall lines (room frame) for snapping; synced from a memo so the
   // per-frame pointer math can read it without re-binding processMove.
   const buildingSegmentsRef = useRef<Array<[Pt, Pt]>>([]);
@@ -111,37 +126,36 @@ export function SpaceSketchOverlay() {
   const [splitHover, setSplitHover] = useState<Pt | null>(null);
   const [snapPos, setSnapPos] = useState<Pt | null>(null);
   // What the live snap landed on, so the cue can differ for a wall vs a corner.
-  const [snapKind, setSnapKind] = useState<SnapKind>('none');
+  const [snapKind, setSnapKind] = useState<SketchSnapKind>('none');
   // Snap every node to the building's 2D wall lines (corners + along walls).
   // Default on; the magnet toggle in the toolbar turns it off (vertex-only).
   const [snapToBuilding, setSnapToBuilding] = useState(true);
-  // True once the user has edited the plate (drag/split/merge/draw/dissolve)
-  // since the last bake/derive — drives the "close with unbaked edits" guard.
-  const [dirty, setDirty] = useState(false);
-  // Disclosure popovers (self-managed; no radix Popover primitive here) + the
-  // unbaked-edits close confirmation. Keep the default panel clean.
+  // Disclosure popovers: controlled, so `useSpaceSketchKeys`'s capture-phase
+  // Esc (which stops the event before Radix sees it) can close them itself.
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [confirmClose, setConfirmClose] = useState(false);
   // Issue 3: the vertex that an ⌥/Ctrl-click would dissolve — telegraphed live.
   const [deleteHover, setDeleteHover] = useState<Pt | null>(null);
   // Issue 2: the in-progress drawn room (world coords) + the live cursor point.
   const [drawPts, setDrawPts] = useState<Pt[]>([]);
   const [drawCursor, setDrawCursor] = useState<Pt | null>(null);
+  // Draw mode: 'free' = modeless edit + freeform polygon; 'rect' = the quick
+  // rectangle tool (click two opposite corners). The rectangle tool is modal:
+  // while active, clicks place the rectangle rather than drag/cut.
+  const [drawMode, setDrawMode] = useState<'free' | 'rect'>('free');
+  // Footprint replaces the whole storey draft, so when that draft already holds
+  // rooms the first click only arms the button and says what will be lost. The
+  // plate rebuild resets the session's undo stack, so an accidental click was
+  // unrecoverable — the user's edits were simply gone.
+  const [footprintArmed, setFootprintArmed] = useState(false);
+  const rectStartRef = useRef<Pt | null>(null);
+  const [rectPreview, setRectPreview] = useState<Pt[] | null>(null);
   // Alignment guides while drawing: reference corners whose X (vertical guide)
   // / Y (horizontal guide) the cursor is currently locked to — so the closing
   // corner can line up under the first point, etc.
   const [alignGuides, setAlignGuides] = useState<{ vRef: Pt | null; hRef: Pt | null }>({ vRef: null, hRef: null });
   // Live "what will this click do" label, shown top-right of the canvas.
   const [intent, setIntent] = useState<{ text: string; tone: IntentTone } | null>(null);
-  // Issue 4: canvas size (resizable) + a tick that forces a re-render whenever
-  // the view transform in fitRef changes (zoom/pan/fit) without making the
-  // per-frame pointer math go through React state.
-  const [size, setSize] = useState({ w: DEFAULT_W, h: DEFAULT_H });
-  const sizeRef = useRef(size);
-  sizeRef.current = size;
-  const [fitTick, setFitTick] = useState(0);
-  const applyFit = useCallback((next: Fit) => { fitRef.current = next; setFitTick((t) => t + 1); }, []);
   const [derivedStorey, setDerivedStorey] = useState<number | null>(null);
   const [snapTol, setSnapTol] = useState<number | null>(null); // null = auto-escalate
   const [usedTol, setUsedTol] = useState(0.1);
@@ -149,18 +163,25 @@ export function SpaceSketchOverlay() {
   const lastBuildRef = useRef<{ rects: WallRect[]; label: string; storey: number | null } | null>(null);
   // Wall centrelines + thicknesses from the last derive, kept for the leak
   // diagnostics overlay + the "has wall data" affordance.
-  const extractionRef = useRef<{
-    segments: { a: Pt; b: Pt }[];
-    thicknesses: number[];
-  } | null>(null);
+  type Extraction = { segments: { a: Pt; b: Pt }[]; thicknesses: number[] };
+  const extractionRef = useRef<Extraction | null>(null);
+  // Per-storey derive context (wall rects + extraction), so switching back to a
+  // storey restores its snap-slider basis + diagnostics without re-deriving and
+  // losing the user's edits.
+  const buildsRef = useRef<Map<number, { rects: WallRect[]; label: string; extraction: Extraction }>>(new Map());
   const [hist, setHist] = useState(0);
-  const [status, setStatus] = useState('Pick a storey to derive rooms from its walls.');
+  const [status, setStatus] = useState(() => t('spaceSketch.status.pickStorey'));
   const [showBuilding, setShowBuilding] = useState(true);
   const [showDiagnostics, setShowDiagnostics] = useState(false); // Issue 7 — leak diagnostics
   // Default to the wall AXIS (face-based rooms are the gaps between wall
   // rectangles): `center` puts the room outline + nodes on the true wall
   // centreline. `inner`/`outer` show the net/gross faces.
   const [boundaryMode, setBoundaryMode] = useState<BoundaryMode>('center');
+  // Derive-all is a multi-second synchronous run; the ref is the interlock (a
+  // second click must be rejected before React re-renders) and the state drives
+  // the disabled button.
+  const derivingAllRef = useRef(false);
+  const [derivingAll, setDerivingAll] = useState(false);
   // Transient "12 → 9 rooms" badge after a corner-tolerance rebuild — the
   // effect on the plan is otherwise invisible (Issue 5).
   const [snapDelta, setSnapDelta] = useState<{ from: number; to: number } | null>(null);
@@ -229,12 +250,12 @@ export function SpaceSketchOverlay() {
   const lastActiveStoreyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!storeys.length) return;
-    const sketchModelId = activeStorey?.modelId ?? activeModelId ?? 'legacy';
+    const storeyModelKey = activeStorey?.modelId ?? activeModelId ?? 'legacy';
     const activeHere =
       activeStorey && storeys.some((s) => s.id === activeStorey.expressId)
         ? activeStorey.expressId
         : null;
-    const activeKey = activeHere == null ? null : `${sketchModelId}:${activeHere}`;
+    const activeKey = activeHere == null ? null : `${storeyModelKey}:${activeHere}`;
     // Follow the shared active storey when it changes to one in this model.
     if (activeKey != null && activeKey !== lastActiveStoreyRef.current) {
       lastActiveStoreyRef.current = activeKey;
@@ -258,12 +279,12 @@ export function SpaceSketchOverlay() {
   }, []);
 
   // After any committed plate change: re-render the canvas, refresh the
-  // undo/redo button states (`hist`), and mirror the session's dirty flag.
+  // undo/redo button states (`hist`), the dirty flag, and the pending tally.
   const commit = useCallback(() => {
     const s = sessionRef.current;
     setRooms(s?.rooms() ?? []);
     setHist((v) => v + 1);
-    setDirty(s?.dirty ?? false);
+    setPendingTick((v) => v + 1);
   }, []);
 
   const resetInteraction = useCallback(() => {
@@ -300,66 +321,35 @@ export function SpaceSketchOverlay() {
     }
   }, [resetInteraction, commit]);
 
-  // Ctrl/Cmd+Z (Shift = redo) must drive THIS overlay's history, not the 3D
-  // model behind the panel. The global handler in useKeyboardShortcuts routes
-  // Ctrl+Z to the active model's mutation stack; a capture-phase listener here
-  // runs before it and stopPropagation()s, so the sketch and the in-panel
-  // Undo/Redo buttons share one history. Skip when a text input is focused so
-  // native field undo (and the global handler, which also skips inputs) is
-  // untouched. The overlay only mounts while the tool is active, so this
-  // listener's lifetime is exactly the tool's.
-  useEffect(() => {
-    const onUndoRedo = (e: KeyboardEvent) => {
-      if (eventKey(e) !== 'z' || !(e.ctrlKey || e.metaKey)) return;
-      if (isTextEntryTarget(e)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.shiftKey) redo(); else undo();
-    };
-    window.addEventListener('keydown', onUndoRedo, true);
-    return () => window.removeEventListener('keydown', onUndoRedo, true);
-  }, [undo, redo]);
-
-  // Wheel = zoom about the cursor (Issue 4). A native non-passive listener so
-  // preventDefault() actually stops the page from scrolling under the panel.
-  useEffect(() => {
-    const el = svgRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const rect = el.getBoundingClientRect();
-      const factor = Math.exp(-e.deltaY * 0.0015); // scroll up → zoom in
-      const next = zoomFit(fitRef.current, factor, e.clientX - rect.left, e.clientY - rect.top);
-      if (next.scale >= 0.5 && next.scale <= 5000) { fitRef.current = next; setFitTick((t) => t + 1); }
-    };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, []);
-
   // Build a face-based plate from the storey's wall RECTANGLES (read from the
   // rendered meshes): rooms are the gaps between walls, so the room boundary IS
   // the rendered wall faces and every node lands on the true wall axis. `snapTol`
   // welds nearby rectangle corners (default 5 cm); a manual override comes from
-  // the slider.
+  // the slider. Session ownership, the re-entrancy guard and the
+  // disposed-after-unmount guard all live in `useSpacePlateSessions`; this is
+  // the UI half — what the user sees once a build lands.
   const buildFrom = useCallback(async (rects: WallRect[], label: string, storey: number | null) => {
-    // Re-entrancy guard: a rapid rebuild (snap slider) must not let an older
-    // async build free/replace the plate a newer one is using — that races the
-    // shared wasm heap. Only the latest build applies; superseded ones bail.
-    const seq = ++buildSeqRef.current;
+    // Record the inputs BEFORE the await, so the corner-tolerance slider can
+    // retry a build that threw (the arrangement input cap, a wasm load failure)
+    // instead of silently rebuilding the last storey that happened to succeed.
+    // The most recently REQUESTED build is also the one `buildPlate` lets win,
+    // so recording at call time cannot leave a stale storey here.
+    lastBuildRef.current = { rects, label, storey };
     try {
-      await ensureSpaceWasm();
-      if (seq !== buildSeqRef.current) return;
-      lastBuildRef.current = { rects, label, storey };
       const snapTol = snapTolRef.current ?? 0.05;
-      let session = sessionRef.current;
-      if (!session) { session = new SpacePlateSession(); sessionRef.current = session; }
-      const { rooms: snap } = session.buildFromRects(flattenWallRects(rects.map((r) => r.corners)), snapTol, 0.3);
+      const snap = await buildPlate(rects, storey, snapTol);
+      if (!snap) return; // superseded by a newer build, or the overlay is gone
       setUsedTol(snapTol);
-      applyFit(computeFit(snap, sizeRef.current.w, sizeRef.current.h));
+      // Frame the rooms when any were detected, otherwise frame the walls so a
+      // storey with no enclosed rooms (e.g. a foundation level) still shows its
+      // plan to sketch against instead of a tiny off-canvas cluster.
+      fitToPoints(snap.length > 0
+        ? snap.flatMap((r) => r.outline)
+        : rects.flatMap((r) => r.corners));
       resetInteraction();
       setDerivedStorey(storey);
       setRooms(snap); setHist((v) => v + 1);
-      setDirty(false); // a fresh derive is the new clean baseline
+      setPendingTick((v) => v + 1); // this storey's draft count changed
       // Surface the room-count consequence of a weld-tolerance change (only a
       // snap rebuild sets pendingSnapPrevRef; an initial derive leaves it null).
       const prevCount = pendingSnapPrevRef.current;
@@ -369,12 +359,12 @@ export function SpaceSketchOverlay() {
         if (snapDeltaTimerRef.current) clearTimeout(snapDeltaTimerRef.current);
         snapDeltaTimerRef.current = setTimeout(() => setSnapDelta(null), 1800);
       }
-      const total = snap.reduce((s, r) => s + r.area, 0);
-      setStatus(`${label}: ${snap.length} room(s), ${total.toFixed(1)} m² · ${rects.length} walls.`);
+      const area = formatSquareMetres(snap.reduce((s, r) => s + r.area, 0));
+      setStatus(t('spaceSketch.status.derived', { label, count: snap.length, area, walls: rects.length }));
     } catch (e) {
       setStatus(`Build failed: ${String(e)}`);
     }
-  }, [resetInteraction, applyFit]);
+  }, [buildPlate, resetInteraction, fitToPoints, t]);
 
   // Manual weld-tolerance override (null → 5 cm default). Rebuilds the current
   // plate from its wall rectangles at the chosen tolerance.
@@ -407,11 +397,13 @@ export function SpaceSketchOverlay() {
         setStatus(`No walls found on storey ${storeyId} (no rendered wall meshes in its height band).`);
         return;
       }
-      extractionRef.current = {
+      const extraction: Extraction = {
         segments: rects.map((r) => ({ a: r.centreline[0], b: r.centreline[1] })),
         thicknesses: rects.map((r) => r.thickness),
       };
+      extractionRef.current = extraction;
       const name = ifcDataStore.entities.getName(storeyId) || `Storey #${storeyId}`;
+      buildsRef.current.set(storeyId, { rects, label: name, extraction });
       await buildFrom(rects, name, storeyId);
     } catch (e) {
       setStatus(`Derive failed: ${String(e)}`);
@@ -420,155 +412,208 @@ export function SpaceSketchOverlay() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ifcDataStore, storeyId, geometryResult, buildFrom, storeys]);
 
-  // Auto-detect: derive rooms the moment a storey is chosen (and on open, when
-  // the first storey auto-selects) so the user doesn't have to click Derive.
-  // Guarded so it fires once per storey, and never clobbers a loaded demo.
+  // Activate a storey that already has a draft session (preserve its edits)
+  // instead of re-deriving. Restores its derive context for the snap slider +
+  // diagnostics + fit. Returns false when the storey has no session yet.
+  const activateStorey = useCallback((storey: number): boolean => {
+    const existing = sessionsRef.current.get(storey);
+    if (!existing?.alive) return false;
+    sessionRef.current = existing;
+    const build = buildsRef.current.get(storey);
+    if (build) { lastBuildRef.current = { ...build, storey }; extractionRef.current = build.extraction; }
+    const snap = existing.rooms();
+    resetInteraction();
+    setDerivedStorey(storey);
+    setRooms(snap); setHist((v) => v + 1);
+    fitToPoints(snap.length > 0
+      ? snap.flatMap((r) => r.outline)
+      : (build?.rects ?? []).flatMap((r) => r.corners));
+    const area = formatSquareMetres(snap.reduce((s, r) => s + r.area, 0));
+    setStatus(t('spaceSketch.status.draftRestored', { label: build?.label ?? `Storey ${storey}`, count: snap.length, area }));
+    return true;
+  }, [sessionsRef, sessionRef, resetInteraction, fitToPoints, t]);
+
+  // On a storey change (and on open): restore that storey's existing draft if we
+  // have one, otherwise derive it from the walls. Edits on every storey persist
+  // in their own session until the user confirms (or discards) on close.
   useEffect(() => {
-    // Key by model + storey so switching to another model with the same storey
-    // express-id still re-derives (a bare-id guard would treat it as unchanged
-    // and leave the previous model's rooms on screen).
-    const deriveKey = storeyId == null ? null : `${activeModelId ?? 'legacy'}:${storeyId}`;
-    if (deriveKey != null && ifcDataStore && lastDerivedRef.current !== deriveKey) {
-      lastDerivedRef.current = deriveKey;
-      void deriveFromStorey();
-    }
-  }, [storeyId, activeModelId, ifcDataStore, deriveFromStorey]);
+    if (storeyId == null || !ifcDataStore) return;
+    const key = `${activeModelId ?? 'legacy'}:${storeyId}`;
+    if (lastDerivedRef.current === key && derivedStorey === storeyId) return; // already active
+    lastDerivedRef.current = key;
+    if (!activateStorey(storeyId)) void deriveFromStorey();
+  }, [storeyId, activeModelId, ifcDataStore, derivedStorey, activateStorey, deriveFromStorey]);
 
-  const floorToFloor = useCallback((sid: number): number => {
-    const idx = storeys.findIndex((s) => s.id === sid);
-    const next = idx >= 0 ? storeys[idx + 1] : undefined;
-    const ff = next ? next.elev - storeys[idx].elev : BAKE_HEIGHT;
-    return ff > 0.1 && ff < 50 ? ff : BAKE_HEIGHT;
-  }, [storeys]);
+  // Floor-to-floor for a storey: the space height on bake, and the height band
+  // the wall-rect derive slices. Rules in `space-bake.ts`.
+  const floorToFloor = useCallback((sid: number): number => floorToFloorHeight(storeys, sid), [storeys]);
+
+  // ── 3D coupling ────────────────────────────────────────────────────────────
+  // The 2D plan and the model stay in lockstep: every storey's drafts mirror
+  // into the 3D scene as semi-transparent ghost meshes, and while anything is
+  // drafted the rest of the model is X-rayed (`ghostExceptEntities`) so the
+  // rooms read against the building instead of replacing it. The camera frames
+  // the relevant extent once on open; the prior view is restored on close.
+  const sceneEnabled = !!sketchModelId && !!ifcDataStore;
+  // The model's existing IfcSpace ids as federated GLOBAL ids (the renderer's
+  // id space; single-model globalId === expressId) — kept solid alongside the
+  // draft ghosts while the rest of the model is X-rayed, and framed on open.
+  const existingSpaceIds = useMemo(
+    () =>
+      ifcDataStore
+        ? ifcDataStore.getEntitiesByType('IfcSpace').map((e) => toGlobalId(sketchModelId ?? 'legacy', e.expressId))
+        : [],
+    [ifcDataStore, sketchModelId, toGlobalId],
+  );
+  // Every draft room across EVERY storey, as ghost specs (outline + that storey's
+  // floor elevation + height). Recomputed on any draft change so all floors'
+  // rooms stay visible in 3D, not just the active storey's.
+  const ghostSpecs = useMemo<GhostSpec[]>(() => {
+    const out: GhostSpec[] = [];
+    for (const [sid, session] of sessionsRef.current) {
+      if (!session.alive || session.roomCount === 0) continue;
+      const elev = storeys.find((s) => s.id === sid)?.elev ?? 0;
+      const height = floorToFloor(sid);
+      for (const room of session.rooms()) {
+        const corners = session.boundaryOutline(room.face, boundaryMode);
+        if (corners.length >= 3) out.push({ corners, floorElev: elev, height });
+      }
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTick, hist, boundaryMode, storeys, floorToFloor]);
+  const { restore: restoreScene } = useSpaceSceneFraming({ enabled: sceneEnabled, existingSpaceIds });
+  const { clearGhosts } = useSpaceGhostPreview({
+    enabled: sceneEnabled,
+    ghosts: ghostSpecs,
+    contextIds: existingSpaceIds,
+  });
+
+  // Confirm-on-close: turn every storey's draft into real IfcSpace. Owns the
+  // ids it authored — except a refusing frame skips that storey untouched.
+  const { createAllSpaces, createdIds } = useSpaceBake({
+    sketchModelId, ifcDataStore, boundaryMode, sessionsRef, floorToFloor, coordinateInfo: geometryResult?.coordinateInfo,
+  });
 
   /**
-   * IfcSpace is class-hidden by default (TYPE_VISIBILITY_SEMANTIC_DEFAULTS).
-   * Flip the toggle on after a successful bake so the user sees what they
-   * just created — and, since the toggle persists, so the spaces are still
-   * visible when the exported file is reopened.
+   * Derive rooms on EVERY storey into its own draft session, so the whole
+   * building becomes pending in one click (created together on confirm). Skips
+   * storeys that already have a draft so it never clobbers the user's edits, and
+   * never creates IfcSpace itself — confirm-on-close does that.
    */
-  const revealSpaces = useCallback(() => {
-    const s = useViewerStore.getState();
-    if (!s.typeVisibility.spaces) s.toggleTypeVisibility('spaces');
-  }, []);
-
-  /**
-   * Bake one storey's rooms to IfcSpace — the single path both "Bake" and
-   * "Generate all" use, so they're consistent. (1) Replace: remove the spaces
-   * this session previously dropped on the storey. (2) Skip rooms that overlap
-   * an existing authored space (dedup). (3) Emit each via `addSpace`, which
-   * mirrors a mesh into the 3D scene immediately. Net (inner-face) outline,
-   * floor-to-floor height. Returns counts.
-   */
-  const bakeStorey = useCallback((
-    sid: number,
-    rooms: { outline: Pt[]; boundary: Pt[] }[],
-    authored: Pt[][],
-  ): { emitted: number; skipped: number; error: string | null } => {
-    if (!activeModelId) return { emitted: 0, skipped: 0, error: null };
-    for (const id of generatedRef.current.get(sid) ?? []) removeEntity(activeModelId, id);
-    generatedRef.current.delete(sid);
-    const height = floorToFloor(sid);
-    const newIds: number[] = [];
-    let skipped = 0;
-    // An addSpace failure (anchor resolution, missing mutation view, …) is
-    // NOT an "already a space" skip — keep the first error so the status
-    // line tells the user the truth instead of silently dropping spaces
-    // that would then be missing from the export.
-    let error: string | null = null;
-    for (const room of rooms) {
-      const [cx, cy] = centroid(room.outline);
-      if (authored.some((fp) => pointInPoly(cx, cy, fp))) { skipped++; continue; }
-      // `boundary` is the engine's net/gross/centre outline; gross area stays on
-      // the centreline so the quantity reflects the room, not the wall face.
-      const res = addSpace(activeModelId, sid, {
-        Profile: 'polygon', OuterCurve: room.boundary, Height: height,
-        Name: `Space ${newIds.length + 1}`, ObjectType: GENERATED_SPACE_OBJECTTYPE,
-        grossFloorArea: polyArea(room.outline),
-      });
-      if (res && 'expressId' in res) newIds.push(res.expressId);
-      else error ??= (res && 'error' in res ? res.error : 'unknown error');
-    }
-    generatedRef.current.set(sid, newIds);
-    return { emitted: newIds.length, skipped, error };
-  }, [activeModelId, removeEntity, addSpace, floorToFloor]);
-
-  const bake = useCallback(() => {
-    const session = sessionRef.current;
-    if (!session?.alive || !activeModelId || derivedStorey == null || !ifcDataStore) {
-      setStatus('Derive a storey first.');
-      return;
-    }
-    const rooms = session.rooms().map((r) => ({
-      outline: r.outline,
-      boundary: session.boundaryOutline(r.face, boundaryMode),
-    }));
-    const authored = existingSpaceFootprintsByStorey(ifcDataStore).get(derivedStorey) ?? [];
-    const { emitted, skipped, error } = bakeStorey(derivedStorey, rooms, authored);
-    if (emitted > 0) revealSpaces();
-    if (!error) { session.dirty = false; setDirty(false); } // rooms now written to IfcSpace
-    setStatus(error
-      ? `Baked ${emitted} IfcSpace — others failed: ${error}`
-      : `Baked ${emitted} IfcSpace${skipped ? `, skipped ${skipped} (already a space)` : ''}.`);
-  }, [activeModelId, derivedStorey, ifcDataStore, bakeStorey, revealSpaces, boundaryMode]);
-
-  const bakeWholeBuilding = useCallback(async () => {
-    if (!activeModelId || !ifcDataStore) { setStatus('No model loaded.'); return; }
+  const deriveAllStoreys = useCallback(async () => {
+    // Re-entrancy guard: the per-storey work is synchronous and can run for
+    // seconds on a tall model, so a second click would interleave two runs over
+    // the same `sessionsRef` — the `has(st.id)` skip that protects existing
+    // drafts does not protect a draft the first run is still building.
+    if (derivingAllRef.current) return;
+    if (!ifcDataStore) { setStatus('No model loaded.'); return; }
     const meshes = geometryResult?.meshes;
     if (!meshes || meshes.length === 0) { setStatus('Model geometry still loading.'); return; }
-    setStatus('Generating spaces for every storey…');
-    await ensureSpaceWasm();
-    const authoredMap = existingSpaceFootprintsByStorey(ifcDataStore);
+    derivingAllRef.current = true;
+    setDerivingAll(true);
+    setStatus('Deriving rooms on every storey…');
+    // Yield once so the status above paints before the first (expensive)
+    // wall-rect extraction blocks the main thread.
+    await ensureWasm();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    try {
+    // Same disposed-session guard as `buildFrom`: closing the tool during
+    // either await must not resume into the loop below, which allocates one
+    // `SpacePlateSession` per storey into an already-cleared `sessionsRef`.
+    // Inside the `try` so the `finally` still clears the re-entrancy flag.
+    if (disposedRef.current) return;
     const coord = geometryResult?.coordinateInfo;
-    let totalEmitted = 0, totalSkipped = 0, floors = 0;
+    const snapTol = snapTolRef.current ?? 0.05;
+    let floors = 0;
     let firstError: string | null = null;
+    // Whether the ACTIVE storey already had a draft before this run. The loop
+    // skips storeys that do, so only a storey without one can gain a session here
+    // — and that is exactly the case the canvas would not pick up on its own.
+    const activeHadSession = storeyId != null && sessionsRef.current.has(storeyId);
     for (const st of storeys) {
+      if (sessionsRef.current.has(st.id)) continue; // keep existing drafts/edits
       const rects = wallRectsFromMeshes(meshes, coord, st.elev, floorToFloor(st.id));
       if (!rects.length) continue;
       try {
-        // Throwaway face-based plate per storey (deterministic free handled by the
-        // session module); this path doesn't touch the live session. Reads each
-        // room's wall axis + the boundary outline at the chosen mode.
-        const rooms = snapshotRoomsFromRects(flattenWallRects(rects.map((r) => r.corners)), boundaryMode);
-        if (!rooms.length) continue;
-        const { emitted, skipped, error } = bakeStorey(st.id, rooms, authoredMap.get(st.id) ?? []);
-        totalEmitted += emitted; totalSkipped += skipped;
-        firstError ??= error;
-        if (emitted) floors++;
+        const rooms = buildStoreyPlate(st.id, rects, snapTol);
+        const name = ifcDataStore.entities.getName(st.id) || `Storey #${st.id}`;
+        buildsRef.current.set(st.id, {
+          rects, label: name,
+          extraction: { segments: rects.map((r) => ({ a: r.centreline[0], b: r.centreline[1] })), thicknesses: rects.map((r) => r.thickness) },
+        });
+        if (rooms.length) floors++;
       } catch (e) {
         // A storey that exceeds the arrangement input cap (or otherwise fails to
-        // build) must not abort the whole run or leave an unhandled rejection that
-        // can tear down the canvas; record it and move on to the next storey.
+        // build) must not abort the whole run or leave an unhandled rejection
+        // that can tear down the canvas; record it and move on to the next
+        // storey. `buildStoreyPlate` has already disposed + unregistered the
+        // half-built session, so the storey is retryable.
         firstError ??= e instanceof Error ? e.message : String(e);
+        buildsRef.current.delete(st.id);
       }
     }
-    if (totalEmitted > 0) revealSpaces();
-    if (!firstError) { if (sessionRef.current) sessionRef.current.dirty = false; setDirty(false); }
+    setPendingTick((v) => v + 1);
+    // Bind the active storey to the draft it just gained. Nothing else will: the
+    // storey-change effect keys on `storeyId`, which did not change, so
+    // `sessionRef`/`rooms` would still be empty while the pending tally counted
+    // this storey's rooms — a count for something the 2D canvas does not show.
+    // Called BEFORE the summary status so it does not overwrite it.
+    if (storeyId != null && !activeHadSession && sessionsRef.current.has(storeyId)) {
+      activateStorey(storeyId);
+    }
     setStatus(firstError
-      ? `Generated ${totalEmitted} IfcSpace — others failed: ${firstError}`
-      : `Generated ${totalEmitted} IfcSpace across ${floors} storey(s)${totalSkipped ? `; skipped ${totalSkipped} existing` : ''}.`);
-  }, [activeModelId, ifcDataStore, geometryResult, storeys, floorToFloor, bakeStorey, revealSpaces, boundaryMode]);
+      ? `Derived rooms across ${floors} storey(s) — others failed: ${firstError}`
+      : `Derived rooms across ${floors} storey(s). Confirm on close to create the spaces.`);
+    } finally {
+      derivingAllRef.current = false;
+      setDerivingAll(false);
+    }
+  }, [ifcDataStore, geometryResult, storeys, floorToFloor, storeyId, activateStorey,
+      sessionsRef, disposedRef, ensureWasm, buildStoreyPlate]);
 
+  // One space for the whole floor: replace the draft with a single room whose
+  // outline is the storey's exterior wall perimeter (convex hull of the wall
+  // rectangles). Synthesised as thin perimeter walls so it flows through the
+  // same buildFrom → preview → confirm path as derived rooms (and is editable).
+  const addFootprint = useCallback(async () => {
+    if (!ifcDataStore || storeyId == null) { setStatus('Pick a storey first.'); return; }
+    const meshes = geometryResult?.meshes;
+    if (!meshes || meshes.length === 0) { setStatus('Model geometry still loading — try again in a moment.'); return; }
+    const elev = storeys.find((s) => s.id === storeyId)?.elev ?? 0;
+    const rects = wallRectsFromMeshes(meshes, geometryResult?.coordinateInfo, elev, floorToFloor(storeyId));
+    if (!rects.length) { setStatus(`No walls found on this storey to outline.`); return; }
+    const hull = exteriorPerimeter(rects);
+    const walls = perimeterWalls(hull);
+    if (!walls) { setStatus('Could not build a footprint outline from these walls.'); return; }
+    // Everything that could fail has passed, so the next step really does replace
+    // this storey's draft. Ask first when there is something to lose.
+    if (rooms.length > 0 && !footprintArmed) {
+      setFootprintArmed(true);
+      setStatus(`Footprint replaces this storey's ${rooms.length} drafted room(s), and that cannot be undone. Click the footprint button again to confirm.`);
+      return;
+    }
+    setFootprintArmed(false);
+    setDrawMode('free');
+    rectStartRef.current = null; setRectPreview(null);
+    const name = ifcDataStore.entities.getName(storeyId) || `Storey #${storeyId}`;
+    await buildFrom(walls, `${name} footprint`, storeyId);
+    // buildFrom registers the footprint room + bumps the pending tally, so it
+    // shows in the "to confirm" count immediately.
+    setStatus('Footprint added: one room over the storey outline. Confirm on close to create it.');
+  }, [ifcDataStore, storeyId, geometryResult, storeys, floorToFloor, buildFrom, rooms.length, footprintArmed]);
+
+  // Pending frame + timers. The wasm plates are disposed by
+  // `useSpacePlateSessions`, whose cleanup runs first (it is the component's
+  // first effect) and nulls `sessionRef` — every session call site below is
+  // optional-chained or `alive`-guarded, and no event can interleave two
+  // cleanups of the same synchronous unmount, so a callback cancelled here
+  // could never have run against a freed plate.
   useEffect(() => () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (rebuildTimerRef.current) clearTimeout(rebuildTimerRef.current);
     if (snapDeltaTimerRef.current) clearTimeout(snapDeltaTimerRef.current);
-    sessionRef.current?.dispose();
-    sessionRef.current = null;
   }, []);
-
-  const svgPoint = (e: React.MouseEvent): Pt => {
-    const rect = svgRef.current!.getBoundingClientRect();
-    // Clamp to the canvas: during a drag the pointer is captured, so moving it
-    // past the panel (e.g. dragging a vertex down off the bottom) would report
-    // coordinates far outside the SVG → a huge off-screen world position. That
-    // pushed the room off-canvas ("disappears") and made the SVG rasterise a
-    // polygon spanning to extreme coordinates, freezing the browser.
-    return [
-      Math.max(0, Math.min(sizeRef.current.w, e.clientX - rect.left)),
-      Math.max(0, Math.min(sizeRef.current.h, e.clientY - rect.top)),
-    ];
-  };
 
   const pickVertex = useCallback((wx: number, wy: number): number | null => {
     return sessionRef.current?.findVertexNear(wx, wy, PICK_PX / fitRef.current.scale) ?? null;
@@ -662,9 +707,48 @@ export function SpaceSketchOverlay() {
     }
   }, [drawPts, commit]);
 
+  // Rectangle tool: axis-aligned CCW corners from two opposite points (Shift
+  // equalises the sides into a square, growing from the first corner).
+  const rectCornersFrom = useCallback((start: Pt, opp: Pt, square: boolean): Pt[] => {
+    let ox = opp[0], oy = opp[1];
+    if (square) {
+      const side = Math.max(Math.abs(ox - start[0]), Math.abs(oy - start[1]));
+      ox = start[0] + (ox >= start[0] ? side : -side);
+      oy = start[1] + (oy >= start[1] ? side : -side);
+    }
+    const x0 = Math.min(start[0], ox), x1 = Math.max(start[0], ox);
+    const y0 = Math.min(start[1], oy), y1 = Math.max(start[1], oy);
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  }, []);
+
+  // Commit the in-progress rectangle as a new room face.
+  const commitRect = useCallback((opp: Pt, square: boolean) => {
+    const session = sessionRef.current;
+    const start = rectStartRef.current;
+    if (!session?.alive || !start) return;
+    const corners = rectCornersFrom(start, opp, square);
+    const w = Math.abs(corners[1][0] - corners[0][0]);
+    const h = Math.abs(corners[2][1] - corners[1][1]);
+    if (w < 0.05 || h < 0.05) { setStatus('Rectangle too small. Click further from the first corner.'); return; }
+    try {
+      session.edit((hd) => hd.addFace(new Float64Array(corners.flat()), -1));
+      rectStartRef.current = null; setRectPreview(null);
+      commit();
+      setStatus(`Added a ${w.toFixed(2)} x ${h.toFixed(2)} m room — ${session.roomCount} room(s).`);
+    } catch (err) {
+      commit();
+      setStatus(`Rectangle rejected: ${editError(err).message}`);
+    }
+  }, [commit, rectCornersFrom]);
+
   // Single Esc aborts the in-progress operation (in priority order); it does NOT
   // close the panel. Returns true if something was aborted.
   const abortCurrentOp = useCallback((): boolean => {
+    if (rectStartRef.current) {
+      rectStartRef.current = null; setRectPreview(null);
+      setStatus('Rectangle cancelled.');
+      return true;
+    }
     if (drawPts.length > 0) {
       setDrawPts([]); setDrawCursor(null); drawRedoRef.current = []; setAlignGuides({ vRef: null, hRef: null });
       setStatus('Draw cancelled.');
@@ -686,42 +770,82 @@ export function SpaceSketchOverlay() {
     return false;
   }, [drawPts, splitPick, refreshRooms]);
 
-  // While the panel is open, Esc belongs to the sketch — NOT the global
-  // shortcut (which closes the tool and would lose the sketch). Capture-phase +
-  // stopImmediatePropagation beats the window-level handler in useKeyboardShortcuts.
-  // Esc: close a popover/confirm → abort the current op → (double-tap) close, with
-  // an unbaked-edits guard. Enter closes a drawn room.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      const inField = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopImmediatePropagation(); // own Esc; don't let the global handler close us
-        if (helpOpen || optionsOpen) { setHelpOpen(false); setOptionsOpen(false); return; }
-        if (confirmClose) { setConfirmClose(false); return; } // Esc cancels the confirm (never discards)
-        const now = Date.now();
-        if (abortCurrentOp()) { escTimeRef.current = 0; return; }
-        if (now - escTimeRef.current <= 400) {
-          escTimeRef.current = 0;
-          if (dirty) setConfirmClose(true); // guard unbaked edits — must click Discard
-          else setActiveTool('select');
-        } else { escTimeRef.current = now; setStatus(dirty ? 'Unbaked edits — Esc again to review.' : 'Press Esc again to close.'); }
-      } else if (e.key === 'Enter' && drawPts.length > 0 && !inField) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        commitDraw();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [abortCurrentOp, commitDraw, drawPts.length, dirty, helpOpen, optionsOpen, confirmClose, setActiveTool]);
+  // Switch the draw mode, aborting any in-progress op so the modes never
+  // interleave (a half-drawn polygon + a started rectangle, etc.).
+  // A storey switch invalidates any armed footprint: the warning counted the
+  // PREVIOUS storey's rooms, so letting the arm survive would replace a draft the
+  // user was never warned about.
+  useEffect(() => { setFootprintArmed(false); }, [storeyId]);
 
-  // Close request from the ✕ button: guard unbaked edits with an inline confirm.
-  const requestClose = useCallback(() => {
-    if (dirty) setConfirmClose(true);
-    else setActiveTool('select');
-  }, [dirty, setActiveTool]);
+  const selectDrawMode = useCallback((mode: 'free' | 'rect') => {
+    abortCurrentOp();
+    rectStartRef.current = null; setRectPreview(null);
+    // Picking another tool is a decision NOT to replace the draft: disarm, so a
+    // later footprint click starts from the warning again rather than firing.
+    setFootprintArmed(false);
+    setDrawMode(mode);
+    setStatus(mode === 'rect'
+      ? 'Rectangle tool: click two opposite corners (Shift = square).'
+      : 'Edit mode: drag corners, draw freeform rooms, split or merge.');
+  }, [abortCurrentOp]);
+
+  // Pending spaces across EVERY storey's draft — the to-be-confirmed total shown
+  // at the top. Reads the per-storey sessions; `pendingTick` re-triggers it on
+  // any change (derive, edit, footprint, derive-all).
+  const { pendingRooms, pendingStoreys } = useMemo(() => {
+    let r = 0, s = 0;
+    for (const session of sessionsRef.current.values()) {
+      const c = session.alive ? session.roomCount : 0;
+      if (c > 0) { r += c; s++; }
+    }
+    return { pendingRooms: r, pendingStoreys: s };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTick]);
+  // There is a draft on at least one storey to create.
+  const needsConfirm = pendingRooms > 0;
+
+  // Cancel: drop ghosts, restore the prior view (X-ray off, isolation and
+  // spaces visibility as they were), and leave WITHOUT creating anything.
+  const closeNow = useCallback((via?: import('@/lib/analytics-ui-events').ToolExitVia) => {
+    clearGhosts();
+    restoreScene({ keepSpacesVisible: false });
+    setActiveTool('select', via);
+  }, [clearGhosts, restoreScene, setActiveTool]);
+
+  // The single confirm: create EVERY storey's draft as IfcSpace at once. On
+  // success the tool closes with the prior view restored (spaces stay visible)
+  // and the created spaces selected, so the result is highlighted in context
+  // and no modal view state lingers. On any create failure the tool STAYS OPEN
+  // with drafts + ghosts intact so nothing is silently dropped — the status
+  // line reports the error and confirming again retries (replacing whatever
+  // this session already created).
+  const confirmCreate = useCallback(() => {
+    const res = createAllSpaces();
+    if (res.error) {
+      setPendingTick((v) => v + 1);
+      setStatus(`Created ${res.emitted} space(s), but some failed: ${res.error}. Fix and confirm again.`);
+      return;
+    }
+    if (res.emitted > 0) {
+      const store = useViewerStore.getState();
+      store.setSelectedEntityIds(createdIds().map((id) => toGlobalId(sketchModelId ?? 'legacy', id)));
+      toast.success(
+        `Created ${res.emitted} ${res.emitted === 1 ? 'space' : 'spaces'}` +
+          (res.floors > 1 ? ` across ${res.floors} storeys` : ''),
+      );
+    }
+    clearGhosts();
+    restoreScene({ keepSpacesVisible: true });
+    setActiveTool('select');
+  }, [createAllSpaces, createdIds, clearGhosts, restoreScene, setActiveTool, sketchModelId, toGlobalId]);
+
+  // Close whichever disclosure popover is open. Returns true if one was, so Esc
+  // can spend itself on the popover instead of on the sketch.
+  const closePopovers = useCallback((): boolean => {
+    if (!helpOpen && !optionsOpen) return false;
+    setHelpOpen(false); setOptionsOpen(false);
+    return true;
+  }, [helpOpen, optionsOpen]);
 
   // "Clean up" — sweep the whole plate clean in the engine: remove dangling
   // spur walls, isolated nodes, and redundant collinear nodes left by the
@@ -752,12 +876,35 @@ export function SpaceSketchOverlay() {
     if (!m || !session?.alive) return;
     const wx = wX(fitRef.current, m.x), wy = wY(fitRef.current, m.y);
 
+    // Rectangle tool preview: first-corner cue, then the rubber-band rectangle.
+    if (drawMode === 'rect') {
+      // Free-mode leaves vertex/edge/split highlights and align guides behind, and
+      // this branch returns before the idle-hover code that would reset them. Clear
+      // them here so a stale highlight from edit mode is not drawn over the
+      // rectangle preview for as long as the user stays in this tool.
+      setHover(null); setDeleteHover(null); setSplitHover(null);
+      setAlignGuides({ vRef: null, hRef: null });
+      const tol = PICK_PX / fitRef.current.scale;
+      const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
+      setSnapKind(snap.kind); setSnapPos(snap.kind === 'none' ? null : snap.pt);
+      if (rectStartRef.current) {
+        setRectPreview(rectCornersFrom(rectStartRef.current, snap.pt, m.shift));
+        setDrawCursor(null);
+        setIntent({ text: m.shift ? 'Draw square' : 'Draw rectangle', tone: 'draw' });
+      } else {
+        setRectPreview(null);
+        setDrawCursor(snap.pt);
+        setIntent({ text: 'Rectangle: first corner', tone: 'draw' });
+      }
+      return;
+    }
+
     const vid = dragRef.current;
     if (vid != null) {
       draggedRef.current = true;
       // Snap to other room vertices + building wall lines (corners and along
       // walls), with Shift constraining to ortho from the drag start first.
-      const snap = snapPoint([wx, wy], {
+      const snap = snapSketchPoint([wx, wy], {
         vertices: otherVertsRef.current,
         segments: buildingSegmentsRef.current,
         tol: SNAP_PX / fitRef.current.scale,
@@ -778,7 +925,7 @@ export function SpaceSketchOverlay() {
     if (drawPts.length > 0) {
       const tol = PICK_PX / fitRef.current.scale;
       const anchor = drawPts[drawPts.length - 1];
-      const snap = snapPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol, ortho: m.shift, anchor });
+      const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol, ortho: m.shift, anchor });
       let pt = snap.pt;
       // Axis-align to the drawn corners only when NOT holding Shift — under Shift
       // the ortho constraint is authoritative and alignToAxes (which snaps X and Y
@@ -841,40 +988,49 @@ export function SpaceSketchOverlay() {
     // Empty space → draw a room (or Shift = pan; hide the draw dot then).
     setHover(null); setDeleteHover(null); setSplitHover(null); setAlignGuides({ vRef: null, hRef: null });
     const tol = PICK_PX / fitRef.current.scale;
-    const snap = snapPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
+    const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
     setDrawCursor(m.shift ? null : snap.pt); setSnapKind(snap.kind);
     setIntent(m.shift ? { text: 'Pan', tone: 'pan' } : { text: 'Draw room', tone: 'draw' });
-  }, [drawPts, splitPick, rooms, pickEdge, pickVertex, nearestVertPos, resolveSplitTarget, refreshRooms]);
+  }, [drawPts, splitPick, rooms, pickEdge, pickVertex, nearestVertPos, resolveSplitTarget, refreshRooms, drawMode, rectCornersFrom]);
+
+  // ONE scheduler for `processMove`. Both the pointer path and the modifier
+  // repaint go through it: two `rafRef`s would run processMove twice per frame,
+  // with no symptom except the tool feeling heavier.
+  const scheduleMove = useCallback(() => {
+    if (rafRef.current == null) rafRef.current = requestAnimationFrame(processMove);
+  }, [processMove]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     if (panningRef.current) {
       // Pan by the raw pointer delta (movement*), so it doesn't fight the
       // canvas-edge clamp in svgPoint.
-      fitRef.current = { scale: fitRef.current.scale, offX: fitRef.current.offX + e.movementX, offY: fitRef.current.offY + e.movementY };
-      setFitTick((t) => t + 1);
+      panBy(e.movementX, e.movementY);
       return;
     }
     const [x, y] = svgPoint(e);
     moveRef.current = { x, y, shift: e.shiftKey, del: isRemoveModifier(e) };
-    if (rafRef.current == null) rafRef.current = requestAnimationFrame(processMove);
-  }, [processMove]);
+    scheduleMove();
+  }, [scheduleMove, panBy, svgPoint]);
 
   // Pressing/releasing a modifier re-evaluates the hover preview at the current
   // cursor (so the action label + cues flip the instant you hold ⌥/Ctrl/Shift,
   // without having to move). No-op until the cursor has been over the canvas.
-  useEffect(() => {
-    const onMod = (e: KeyboardEvent) => {
-      if (e.key !== 'Alt' && e.key !== 'Control' && e.key !== 'Meta' && e.key !== 'Shift') return;
-      const m = moveRef.current;
-      if (!m || dragRef.current != null || panningRef.current) return;
-      m.del = isRemoveModifier(e);
-      m.shift = e.shiftKey;
-      if (rafRef.current == null) rafRef.current = requestAnimationFrame(processMove);
-    };
-    window.addEventListener('keydown', onMod);
-    window.addEventListener('keyup', onMod);
-    return () => { window.removeEventListener('keydown', onMod); window.removeEventListener('keyup', onMod); };
-  }, [processMove]);
+  const onModifiers = useCallback((e: KeyboardEvent) => {
+    const m = moveRef.current;
+    if (!m || dragRef.current != null || panningRef.current) return;
+    m.del = isRemoveModifier(e);
+    m.shift = e.shiftKey;
+    scheduleMove();
+  }, [scheduleMove]);
+
+  // Ctrl/Cmd+Z, Esc and Enter belong to the sketch while the panel is open.
+  // The capture-phase registration that takes them off the global handler
+  // lives in the hook; the policy each one runs is above.
+  useSpaceSketchKeys({
+    undo, redo, closePopovers, abortCurrentOp, closeNow, needsConfirm, setStatus,
+    commitDraw: drawPts.length > 0 ? commitDraw : null,
+    onModifiers,
+  });
 
   // The "remove at this point" gesture, shared by modifier+left-click
   // (onPointerDown) and right-click / macOS Ctrl-click (onContextMenu): a node
@@ -961,7 +1117,7 @@ export function SpaceSketchOverlay() {
     // Middle-mouse drag pans the view in any mode (Issue 4).
     if (pointerButton(e) === 'middle') {
       panningRef.current = true;
-      svgRef.current?.setPointerCapture(e.pointerId);
+      capturePointer(svgRef.current, e.pointerId);
       return;
     }
     // Right-click (incl. macOS Ctrl-click) is the remove gesture — handled in
@@ -975,10 +1131,24 @@ export function SpaceSketchOverlay() {
     const mod = isRemoveModifier(e);
     const tol = PICK_PX / fitRef.current.scale;
 
+    // 0. Rectangle tool (modal): first click sets a corner, second commits the
+    // room. Drag/cut/draw are suspended while it's active.
+    if (drawMode === 'rect' && !mod) {
+      const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
+      if (rectStartRef.current == null) {
+        rectStartRef.current = snap.pt;
+        setRectPreview(null);
+        setStatus('Rectangle: click the opposite corner (Shift = square).');
+      } else {
+        commitRect(snap.pt, e.shiftKey);
+      }
+      return;
+    }
+
     // 1. Drawing in progress → add a corner (or close on the first dot).
     if (drawPts.length > 0) {
       const anchor = drawPts[drawPts.length - 1];
-      const snap = snapPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol, ortho: e.shiftKey, anchor });
+      const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol, ortho: e.shiftKey, anchor });
       // Under Shift the ortho point is authoritative; only axis-align when free.
       const p = snap.kind === 'none' && !e.shiftKey ? alignToAxes(snap.pt, drawPts, tol).pt : snap.pt;
       setAlignGuides({ vRef: null, hRef: null });
@@ -1017,7 +1187,7 @@ export function SpaceSketchOverlay() {
       otherVertsRef.current = start
         ? uniqueVerts(rooms).filter((p) => Math.hypot(p[0] - start[0], p[1] - start[1]) > 1e-6)
         : uniqueVerts(rooms);
-      svgRef.current?.setPointerCapture(e.pointerId);
+      capturePointer(svgRef.current, e.pointerId);
       return;
     }
 
@@ -1045,30 +1215,29 @@ export function SpaceSketchOverlay() {
     //    draws). Otherwise start drawing a new room.
     if (e.shiftKey) {
       panningRef.current = true;
-      svgRef.current?.setPointerCapture(e.pointerId);
+      capturePointer(svgRef.current, e.pointerId);
       return;
     }
-    const snap = snapPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
+    const snap = snapSketchPoint([wx, wy], { vertices: uniqueVerts(rooms), segments: buildingSegmentsRef.current, tol });
     drawRedoRef.current = [];
     setDrawPts([snap.pt]);
     setStatus('Drawing — click to add corners · Enter / double-click / first dot to close · Shift = straight.');
-  }, [drawPts, splitPick, pickVertex, nearestVertPos, pickEdge, rooms, resolveSplitTarget, performSplit, commit, commitDraw, removeAtPoint]);
+  }, [drawPts, splitPick, pickVertex, nearestVertPos, pickEdge, rooms, resolveSplitTarget, performSplit, commit, commitDraw, removeAtPoint, drawMode, commitRect]);
 
   const endDrag = useCallback((e: React.PointerEvent) => {
     if (panningRef.current) {
       panningRef.current = false;
-      svgRef.current?.releasePointerCapture(e.pointerId);
+      releasePointer(svgRef.current, e.pointerId);
       return;
     }
     if (dragRef.current == null) return;
     dragRef.current = null; dragStartRef.current = null; setSnapPos(null);
-    svgRef.current?.releasePointerCapture(e.pointerId);
+    releasePointer(svgRef.current, e.pointerId);
     const session = sessionRef.current;
     if (draggedRef.current) { session?.commitDrag(); commit(); }
     else session?.cancelDrag(); // a click without a drag → discard the snapshot
-    const total = rooms.reduce((s, r) => s + r.area, 0);
-    if (draggedRef.current) setStatus(`Drag done — ${rooms.length} room(s), ${total.toFixed(1)} m² (conserved).`);
-  }, [rooms, commit]);
+    if (draggedRef.current) setStatus(t('spaceSketch.status.dragDone', { count: rooms.length, area: formatSquareMetres(rooms.reduce((s, r) => s + r.area, 0)) }));
+  }, [rooms, commit, t]);
 
   const f = fitRef.current;
   const total = rooms.reduce((s, r) => s + r.area, 0);
@@ -1092,9 +1261,8 @@ export function SpaceSketchOverlay() {
     for (let y = gy0; y <= gy1; y += gridStep) gridLines.push({ x1: PAD, y1: sY(f, y), x2: size.w - PAD, y2: sY(f, y) });
   }
 
-  const iconBtn = 'inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40';
   const previewEnd = splitHover ?? cursorWorld;
-  // The 2D preview (and bake) show the room at the chosen wall boundary; the
+  // The 2D preview (and the created space) use the chosen wall boundary; the
   // editable vertices stay on the centreline (the topology). `center` shows the
   // raw centreline.
   const ext = extractionRef.current;
@@ -1142,164 +1310,119 @@ export function SpaceSketchOverlay() {
   const leakCount = diagnostics ? diagnostics.filter((s) => !s.bounding).length : 0;
   const badCount = rooms.filter((r) => !r.simple).length;
 
+  // Minimized: the bar and plan are swapped for a parked chip so the model
+  // and the live ghost preview are unobstructed. The overlay stays mounted, so
+  // the sessions + all state survive; the chip carries the pending count
+  // across every storey.
+  if (minimized) {
+    return <SpaceSketchParkedChip pendingCount={pendingRooms} onReopen={() => setMinimized(false)} />;
+  }
+
+  // The in-progress gesture hint while drawing/cutting, else the live status.
+  const hintText = rectStartRef.current
+    ? t('spaceSketch.footer.rectHint')
+    : drawPts.length > 0
+      ? t('spaceSketch.footer.drawHint')
+      : splitPick
+        ? t('spaceSketch.footer.cutHint')
+        : status;
+
   return (
-    <div ref={panelRef} className="absolute left-1/2 top-4 -translate-x-1/2 z-30 rounded-xl border bg-background/95 shadow-xl backdrop-blur p-3 select-none pointer-events-auto"
-         style={{ width: size.w + 24 }}>
-      {/* Inline unbaked-edits close confirmation (not a native dialog). */}
-      {confirmClose && (
-        <div className="absolute inset-x-0 top-0 z-40 flex items-center gap-2 rounded-t-xl border-b border-amber-600/40 bg-amber-500 px-3 py-2 text-xs text-amber-950">
-          <AlertTriangle className="h-4 w-4 shrink-0" />
-          <span className="flex-1 font-medium">Unbaked edits will be lost.</span>
-          <button onClick={() => setConfirmClose(false)} className="rounded px-2 py-1 font-medium hover:bg-black/10">Keep editing</button>
-          <button onClick={() => { setConfirmClose(false); setActiveTool('select'); }} className="rounded bg-amber-950 px-2 py-1 font-medium text-amber-50 hover:bg-amber-900">Discard &amp; close</button>
-        </div>
-      )}
-
-      <div className="flex items-center justify-between mb-2.5">
-        <div className="flex items-center gap-2 text-sm font-semibold">
-          <Layers className="h-4 w-4 text-muted-foreground" /> Space Sketch
-          {dirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-500" title="Unbaked edits" />}
-        </div>
-        <div className="flex items-center gap-0.5">
-          <button className={`${iconBtn} ${helpOpen ? 'bg-muted text-foreground' : ''}`} aria-pressed={helpOpen}
-            onClick={() => { setHelpOpen((v) => !v); setOptionsOpen(false); }} title="How it works"><HelpCircle className="h-4 w-4" /></button>
-          <button className={iconBtn} onClick={requestClose} title="Close (double-tap Esc)"><X className="h-4 w-4" /></button>
-        </div>
-      </div>
-
-      {/* Storey + whole-building */}
-      <div className="flex items-center gap-2 mb-2">
-        <select className="h-8 flex-1 min-w-0 rounded-md border bg-background px-2 text-xs" value={storeyId ?? ''}
-          onChange={(e) => setStoreyId(Number(e.target.value))} disabled={!storeys.length}>
-          {storeys.length ? storeys.map((s) => <option key={s.id} value={s.id}>{s.name}</option>) : <option>no model</option>}
-        </select>
-        <button className="h-8 shrink-0 rounded-md bg-indigo-600 px-3 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-40"
-          onClick={() => void bakeWholeBuilding()} disabled={!activeModelId}
-          title="Create IfcSpace for every storey at once — auto floor-to-floor height, skips rooms that already have a space">Generate all</button>
-      </div>
-
-      {/* Action row — modeless, so no mode tabs: history · snap · options · fit,
-          with a live room tally. Secondary settings hide behind Options. */}
-      <div className="flex items-center gap-1 mb-2">
-        <button className={iconBtn} onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"><Undo2 className="h-4 w-4" /></button>
-        <button className={iconBtn} onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)"><Redo2 className="h-4 w-4" /></button>
-        <span className="mx-0.5 h-5 w-px bg-border" />
-        <button className={`${iconBtn} ${snapToBuilding ? 'bg-primary/10 text-primary hover:bg-primary/15' : ''}`}
-          onClick={() => setSnapToBuilding((v) => !v)} aria-pressed={snapToBuilding}
-          title={snapToBuilding ? 'Snap to walls + corners: on' : 'Snap to walls + corners: off'}><Magnet className="h-4 w-4" /></button>
-        <button className={`${iconBtn} relative ${optionsOpen ? 'bg-muted text-foreground' : ''}`} aria-pressed={optionsOpen}
-          onClick={() => { setOptionsOpen((v) => !v); setHelpOpen(false); }} title="Options — boundary, corner tolerance, underlay">
-          <SlidersHorizontal className="h-4 w-4" />
-          {(boundaryMode !== 'inner' || snapTol != null || showDiagnostics) && <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />}
-        </button>
-        <button className={iconBtn} onClick={cleanupOrphans}
-          disabled={!rooms.length} title="Clean up — remove orphaned inner walls & redundant nodes (room shapes unchanged)"><Eraser className="h-4 w-4" /></button>
-        <button className={iconBtn} onClick={() => applyFit(computeFit(rooms, sizeRef.current.w, sizeRef.current.h))}
-          disabled={!rooms.length} title="Fit plan to canvas (reset zoom & pan)"><Maximize className="h-4 w-4" /></button>
-        <span className="ml-auto pr-1 text-[11px] tabular-nums text-muted-foreground">
-          {rooms.length} {rooms.length === 1 ? 'room' : 'rooms'} · {total.toFixed(1)} m²
-        </span>
-      </div>
-
-      {/* Click-away backdrop for the disclosure popovers (panel-local). */}
-      {(optionsOpen || helpOpen) && (
-        <div className="absolute inset-0 z-10" aria-hidden onMouseDown={() => { setOptionsOpen(false); setHelpOpen(false); }} />
-      )}
-
-      {/* Disclosure popovers (Options / Help) — kept out of the default flow. */}
-      {optionsOpen && (
-        <OptionsPopover
-          boundaryMode={boundaryMode}
-          onBoundaryMode={setBoundaryMode}
-          hasWallData={!!ext}
-          snapDelta={snapDelta}
-          usedTol={usedTol}
-          snapDisabled={derivedStorey == null}
-          onSnap={rebuildWithSnap}
-          snapTol={snapTol}
-          showBuilding={showBuilding}
-          onToggleBuilding={() => setShowBuilding((v) => !v)}
-          showDiagnostics={showDiagnostics}
-          onToggleDiagnostics={() => setShowDiagnostics((v) => !v)}
-        />
-      )}
-      {helpOpen && <HelpPopover />}
-
-      <SpaceSketchCanvas
-        svgRef={svgRef}
-        width={size.w}
-        height={size.h}
-        cursor={cursor}
-        fit={f}
-        gridLines={gridLines}
-        underlay={underlayEls}
-        rooms={rooms}
-        boundaryInfo={boundaryInfo}
-        boundaryMode={boundaryMode}
-        mergeFaces={mergeRooms}
-        diagnostics={diagnostics}
-        hover={hover}
-        splitPick={splitPick}
-        previewEnd={previewEnd}
-        splitHover={splitHover}
-        snapPos={snapPos}
-        snapKind={snapKind}
-        drawPts={drawPts}
-        drawCursor={drawCursor}
-        alignGuides={alignGuides}
-        deleteHover={deleteHover}
-        intent={optionsOpen || helpOpen || confirmClose ? null : intent}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={endDrag}
-        onDoubleClick={() => { if (drawPts.length > 0) commitDraw(); }}
-        onContextMenu={onContextMenu}
-        onPointerLeave={() => { setHover(null); setSplitHover(null); setDeleteHover(null); setDrawCursor(null); setAlignGuides({ vRef: null, hRef: null }); setIntent(null); }}
+    <>
+      <SpaceSketchBar
+        canAuthor={!!sketchModelId}
+        drawMode={drawMode}
+        onDrawMode={selectDrawMode}
+        footprintArmed={footprintArmed}
+        onFootprint={() => void addFootprint()}
+        roomCount={rooms.length}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={undo}
+        onRedo={redo}
+        snapToBuilding={snapToBuilding}
+        onToggleSnap={() => setSnapToBuilding((v) => !v)}
+        optionsOpen={optionsOpen}
+        onOptionsOpenChange={(open) => { setOptionsOpen(open); if (open) setHelpOpen(false); }}
+        optionsDirty={boundaryMode !== 'center' || snapTol != null || showDiagnostics}
+        options={{
+          boundaryMode,
+          onBoundaryMode: setBoundaryMode,
+          hasWallData: !!ext,
+          snapDelta,
+          usedTol,
+          snapDisabled: derivedStorey == null,
+          onSnap: rebuildWithSnap,
+          snapTol,
+          showBuilding,
+          onToggleBuilding: () => setShowBuilding((v) => !v),
+          showDiagnostics,
+          onToggleDiagnostics: () => setShowDiagnostics((v) => !v),
+        }}
+        helpOpen={helpOpen}
+        onHelpOpenChange={(open) => { setHelpOpen(open); if (open) setOptionsOpen(false); }}
+        needsConfirm={needsConfirm}
+        pendingRooms={pendingRooms}
+        pendingStoreys={pendingStoreys}
+        onConfirm={confirmCreate}
+        onClose={() => closeNow()}
+        onMinimize={() => setMinimized(true)}
       />
 
-      {/* Footer — an in-the-moment hint only while drawing/cutting (the full
-          legend lives behind “?”), the live status, then the primary action. */}
-      <div className="mt-2.5 space-y-1.5">
-        {(drawPts.length > 0 || splitPick) && (
-          <div className="text-[11px] leading-tight text-primary">
-            {drawPts.length > 0
-              ? 'Click corners · Enter / double-click / first dot to close · Shift = straight · Esc cancels.'
-              : 'Click another wall or corner to finish the cut · Esc cancels.'}
-          </div>
-        )}
-        {status && drawPts.length === 0 && !splitPick && (
-          <div className="truncate text-[11px] leading-tight text-muted-foreground" title={status}>{status}</div>
-        )}
-        {unboundedCount > 0 && (
-          <div className="text-[11px] leading-tight text-amber-600 dark:text-amber-500">
-            {unboundedCount} room(s) unchanged by “{boundaryMode}” (dashed) — no wall offset.
-          </div>
-        )}
-        {showDiagnostics && (
-          <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px]">
-            <span className="text-emerald-600 dark:text-emerald-500">▬ bounds a room</span>
-            <span className="text-red-500">╌ bounds nothing ({leakCount})</span>
-            <span className="text-red-500">▦ failed to close ({badCount})</span>
-          </div>
-        )}
-        <button className="h-9 w-full rounded-md bg-emerald-600 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-40"
-          onClick={bake} disabled={derivedStorey == null || !rooms.length}
-          title="Write this storey's rooms as IfcSpace — replaces any this tool already dropped here">
-          Bake storey to IfcSpace
-        </button>
-      </div>
+      <SpaceSketchPlanCard
+        width={size.w}
+        storeys={storeys}
+        storeyId={storeyId}
+        onStoreyChange={setStoreyId}
+        canAuthor={!!sketchModelId}
+        derivingAll={derivingAll}
+        onDeriveAll={() => void deriveAllStoreys()}
+        roomCount={rooms.length}
+        totalArea={total}
+        canCleanup={rooms.length > 0}
+        onCleanup={cleanupOrphans}
+        canFit={derivedStorey != null}
+        onFit={() => fitToPoints(rooms.length > 0 ? rooms.flatMap((r) => r.outline) : (lastBuildRef.current?.rects ?? []).flatMap((r) => r.corners))}
+        unbounded={unboundedCount > 0 ? { count: unboundedCount, boundaryMode } : null}
+        diagnostics={showDiagnostics ? { leak: leakCount, failed: badCount } : null}
+        resizeHandlers={resizeHandlers}
+      >
+        <SpaceSketchCanvas
+          svgRef={attachSvg}
+          width={size.w}
+          height={size.h}
+          cursor={cursor}
+          fit={f}
+          gridLines={gridLines}
+          underlay={underlayEls}
+          rooms={rooms}
+          boundaryInfo={boundaryInfo}
+          boundaryMode={boundaryMode}
+          mergeFaces={mergeRooms}
+          diagnostics={diagnostics}
+          hover={hover}
+          splitPick={splitPick}
+          previewEnd={previewEnd}
+          splitHover={splitHover}
+          snapPos={snapPos}
+          snapKind={snapKind}
+          drawPts={drawPts}
+          drawCursor={drawCursor}
+          rectPreview={rectPreview}
+          alignGuides={alignGuides}
+          deleteHover={deleteHover}
+          intent={optionsOpen || helpOpen ? null : intent}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onDoubleClick={() => { if (drawPts.length > 0) commitDraw(); }}
+          onContextMenu={onContextMenu}
+          onPointerLeave={() => { setHover(null); setSplitHover(null); setDeleteHover(null); setDrawCursor(null); setAlignGuides({ vRef: null, hRef: null }); setIntent(null); }}
+        />
+      </SpaceSketchPlanCard>
 
-      {/* Resize grip (Issue 4) — drag to grow/shrink the canvas; the plan stays
-          put (hit ⤢ to reframe). */}
-      <div
-        onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); resizeRef.current = { x: e.clientX, y: e.clientY, w: size.w, h: size.h }; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); }}
-        onPointerMove={(e) => { const r = resizeRef.current; if (!r) return; setSize({ w: Math.max(MIN_W, Math.round(r.w + (e.clientX - r.x))), h: Math.max(MIN_H, Math.round(r.h + (e.clientY - r.y))) }); }}
-        onPointerUp={(e) => { resizeRef.current = null; (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); }}
-        title="Drag to resize the panel"
-        className="absolute bottom-1 right-1 h-3.5 w-3.5 cursor-nwse-resize text-muted-foreground/50 hover:text-foreground"
-        style={{ touchAction: 'none' }}>
-        <svg viewBox="0 0 10 10" className="h-full w-full" pointerEvents="none"><path d="M9 2 L2 9 M9 6 L6 9" stroke="currentColor" strokeWidth={1.2} fill="none" /></svg>
-      </div>
-    </div>
+      {/* Drafts become IfcSpace ONLY through Confirm in the bar. */}
+      <SpaceSketchHint text={hintText} />
+    </>
   );
 }
