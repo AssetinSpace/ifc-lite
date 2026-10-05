@@ -3,93 +3,44 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * LocationMap — a compact MapLibre GL JS minimap that shows the model's
- * real-world position derived from IfcMapConversion + IfcProjectedCRS.
+ * LocationMap — a compact MapLibre GL JS minimap of the declared
+ * georeference origin, with the independently transformed geometry footprint.
  *
  * Features:
- *   - Place/drag pin on map to reposition the model
+ *   - Place/drag pin on map to edit the georeference origin
  *   - Search for places via Nominatim geocoding
  *   - Query terrain elevation at pin location
  *   - Apply pin position back to IfcMapConversion (eastings/northings/height)
  *   - Links to Google Maps, OpenStreetMap, and Google Earth (KMZ export)
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
-import {
-  Map as MapIcon, ExternalLink, Loader2, MapPinOff, Globe2,
-  Search, Mountain, MapPin, X, Check,
-} from 'lucide-react';
+import { Map as MapIcon, ExternalLink, MapPinOff, Globe2, Search, Mountain, MapPin, X, Check } from 'lucide-react';
+import { IconButton } from '@/components/ui/icon-button';
+import { Spinner } from '@/components/ui/spinner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-// maplibre-gl v5 pulled `@types/geojson` in transitively, which put a global
-// `GeoJSON` namespace in scope. v6 dropped that dependency, so the type is
-// imported explicitly and `@types/geojson` is a direct devDependency.
-import type { Feature } from 'geojson';
-// See `loadMaplibre` below for why the worker URL is threaded in by hand.
-import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+import { toast } from '@/components/ui/toast';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
-import type { CoordinateInfo, GeometryResult, MeshData } from '@ifc-lite/geometry';
-import { downloadBlob } from '@/lib/export/download';
-import { reprojectToLatLon, reprojectFromLatLon, queryTerrainElevation, computeFootprintGeoJSON, type LatLon } from '@/lib/geo/reproject';
-import { buildKmz } from '@/lib/geo/kmz-exporter';
+import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
+import { downloadBlob, modelExportFilename } from '@/lib/export/download';
+import { reprojectFromLatLon, queryTerrainElevation, computeFootprintGeoJSON, type LatLon } from '@/lib/geo/reproject';
+import { buildKmzForResolvedGeoref } from '@/lib/geo/kmz-export';
+import type { KmzProcessor } from '@/lib/geo/kmz-exporter';
+import type { InstancedModelRange } from '@/utils/instancedExport';
+import { formatLocaleNumber, useTranslation } from '@/i18n';
 import {
   probeMapWebglSupport, markMapWebglUnsupported, takeMapWebglReportSlot,
   getMapWebglVerdict, describeMapInitFailure, watchContextCreationStatus,
   reconstructMapInitFailure, type MapWebglFailureReason,
 } from '@/lib/geo/map-webgl-support';
 import { posthog } from '@/lib/analytics';
-
-// Lazy-load maplibre-gl to avoid bloating the initial bundle
-let maplibrePromise: Promise<typeof import('maplibre-gl')> | null = null;
-function loadMaplibre() {
-  if (!maplibrePromise) {
-    const pending = import('maplibre-gl').then(ml => {
-      // Defence in depth against a namespace that resolves without throwing.
-      // Vite's preload helper returns `undefined` from a failed import whenever
-      // a `vite:preloadError` listener calls `preventDefault()` (ours no longer
-      // does - see lib/chunk-version-skew.ts), and every consumer below reads
-      // `.Map` / `.Marker` off this value. Failing here routes the problem into
-      // the `.catch` backstop, which degrades the panel with the right reason,
-      // instead of throwing a bare "Cannot read properties of undefined
-      // (reading 'Map')" that the WebGL try/catch misreads as a dead GPU.
-      if (!ml) throw new Error('Failed to load the maplibre-gl module');
-      // v6 ships its tile-parsing worker as a SIBLING FILE and resolves it as
-      // `new URL('./maplibre-gl-worker.mjs', import.meta.url)`. Neither end of
-      // our pipeline satisfies that on its own: the dev server rewrites the
-      // module into node_modules/.vite/deps (handled by `optimizeDeps.exclude`
-      // in vite.config.ts), and the production build emits the chunk under
-      // /assets without ever emitting that sibling, because the filename is
-      // computed at runtime and so is invisible to static analysis.
-      //
-      // The failure is silent and looks like data rather than breakage: the
-      // style, sprite and TileJSON are all fetched on the main thread, so the
-      // canvas, the marker and the attribution all appear, and only the vector
-      // tiles never arrive. In the production build the request would have
-      // resolved to the SPA's index.html with a 200, so even a network panel
-      // reads as healthy. v5 inlined the worker as a blob and had no such seam.
-      //
-      // `?worker&url` makes Vite bundle the worker (following its own import of
-      // `maplibre-gl-shared.mjs`) and hand back a real, hashed URL, in dev and
-      // in the build alike. `setWorkerUrl` then keeps MapLibre from ever
-      // computing the sibling path. It must run after the guard above: on the
-      // undefined namespace this call is what would throw first, and it would
-      // throw the wrong thing.
-      ml.setWorkerUrl(maplibreWorkerUrl);
-      return ml;
-    });
-    // A rejected promise stays rejected, so memoising one would make a single
-    // transient chunk failure permanent for the rest of the session - every
-    // later remount would degrade instantly without retrying. Drop the memo on
-    // failure so the next mount gets a real attempt.
-    maplibrePromise = pending;
-    void pending.catch((err) => {
-      if (maplibrePromise === pending) maplibrePromise = null;
-      // Logged per the no-silent-catch rule. This handler exists only to clear
-      // the memo; `pending` itself stays rejected for its real callers.
-      console.warn('[location-map] maplibre module load failed; a retry will be allowed:', err);
-    });
-  }
-  return maplibrePromise;
-}
+import { addFootprintToMap, removeFootprintFromMap } from './location-map-footprint';
+import { geocodeSearch, type GeocodeResult } from './location-map-geocode';
+import { loadMaplibre, disposeMap, purgeMapContainer, updateOriginMarker } from './location-map-lifecycle';
+import { LocationMapSearchBar } from './location-map-search';
+import { useLocationGeoreference } from './use-location-georeference';
+import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 
 /** Position picked on the map, ready to be applied to IfcMapConversion */
 export interface PickedPosition {
@@ -105,15 +56,35 @@ export interface LocationMapProps {
   coordinateInfo?: CoordinateInfo;
   /** Geometry result for KMZ export (optional — KMZ button hidden if not provided) */
   geometryResult?: GeometryResult | null;
+  /**
+   * This model's global-id bracket (`{ idOffset, maxExpressId }`), scoping the KMZ
+   * export's `withInstancedMeshes` restoration of GPU-instanced occurrences to just
+   * this model. `null` mirrors the pre-#2255 "isPrimary" behavior (no filter, take
+   * every loaded model's instanced occurrences) — correct only when this panel's
+   * model IS the sole model loaded. In a multi-model federation, passing `null`
+   * leaks every OTHER loaded model's instanced geometry into this one export.
+   * Callers with more than one model loaded must pass the displayed model's own
+   * range instead.
+   */
+  instancedModelRange?: InstancedModelRange | null;
+  modelName?: string; // the displayed model's; the KMZ download is filed under it (#5833)
   /** IFC project length unit → metres (e.g. 0.001 for mm models). Default 1 (metres). */
   lengthUnitScale?: number;
-  /** Whether the map is in edit mode (allows repositioning) */
+  /** Whether georeference origin editing is enabled */
   editable?: boolean;
-  /** Called when the user applies a new position from the map */
+  /** Called when the user applies a new origin and optional terrain height */
   onApplyPosition?: (position: PickedPosition) => void;
+  /**
+   * wasm seam for the KMZ export, forwarded to `buildKmzForResolvedGeoref`.
+   * Production leaves it undefined and gets the real `GeometryProcessor`;
+   * `LocationMap.kmz.test.tsx` passes a stub so the Google Earth button can be
+   * driven end to end under `tsx --test`, where the engine cannot load. Same
+   * seam `buildKmz` has always exposed to `kmz-exporter.test.ts`, one level up
+   * — without it this call site is untestable, which is exactly how it drifted
+   * out of sync with the Export KMZ dialog (#2526 follow-up).
+   */
+  createKmzProcessor?: () => KmzProcessor;
 }
-
-type MapState = 'idle' | 'loading' | 'ready' | 'error';
 
 /**
  * Why the minimap could not be shown. Kept separate from `MapState`, which
@@ -127,126 +98,17 @@ type MapState = 'idle' | 'loading' | 'ready' | 'error';
  */
 type MapUnavailableReason = MapWebglFailureReason | 'map_load_failed';
 
-/**
- * Dispose a MapLibre map, containing any throw from its teardown.
- *
- * After a context loss MapLibre has already run `painter.destroy()`, and
- * `remove()` runs it again and then reaches through `painter.context.gl` — so
- * teardown is exactly the moment a second throw is most likely. This runs from
- * React cleanup, where an uncaught throw unmounts the surrounding tree, so the
- * failure has to stop here.
- */
-function disposeMap(map: InstanceType<typeof import('maplibre-gl').Map>) {
-  try {
-    map.remove();
-  } catch (err) {
-    console.warn('[location-map] map teardown failed; continuing:', err);
-  }
-}
-
-/**
- * Undo what MapLibre's `_setupContainer` did to our div.
- *
- * It adds its class and builds the canvas plus control containers BEFORE the
- * context is requested, so both failure paths (v5 threw, v6 leaves `painter`
- * undefined) leave that debris behind with `mapRef` never assigned, which puts
- * it out of reach of the unmount cleanup. Purging before the fallback renders
- * keeps any frame from showing a dead canvas.
- */
-function purgeMapContainer(container: HTMLElement) {
-  container.replaceChildren();
-  container.classList.remove('maplibregl-map');
-}
-
-// Debounce helper
-function useDebouncedValue<T>(value: T, delayMs: number): T {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const timer = setTimeout(() => setDebounced(value), delayMs);
-    return () => clearTimeout(timer);
-  }, [value, delayMs]);
-  return debounced;
-}
-
-/** Geocode a query string via Nominatim */
-async function geocodeSearch(query: string): Promise<Array<{ lat: number; lon: number; display_name: string }>> {
-  if (!query.trim()) return [];
-  try {
-    const q = encodeURIComponent(query.trim());
-    const resp = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&limit=5&q=${q}`,
-      { headers: { 'Accept-Language': 'en' } },
-    );
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return data.map((r: { lat: string; lon: string; display_name: string }) => ({
-      lat: parseFloat(r.lat),
-      lon: parseFloat(r.lon),
-      display_name: r.display_name,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-/** Add or update the building footprint GeoJSON polygon on a MapLibre map */
-function addFootprintToMap(map: InstanceType<typeof import('maplibre-gl').Map>, ring: [number, number][]) {
-  const geojson: Feature = {
-    type: 'Feature',
-    properties: {},
-    geometry: {
-      type: 'Polygon',
-      coordinates: [ring],
-    },
-  };
-
-  if (map.getSource('building-footprint')) {
-    (map.getSource('building-footprint') as import('maplibre-gl').GeoJSONSource).setData(geojson);
-    return;
-  }
-
-  map.addSource('building-footprint', { type: 'geojson', data: geojson });
-
-  map.addLayer({
-    id: 'building-footprint-fill',
-    type: 'fill',
-    source: 'building-footprint',
-    paint: {
-      'fill-color': '#14b8a6',
-      'fill-opacity': ['interpolate', ['linear'], ['zoom'], 15, 0, 16, 0.15, 18, 0.25],
-    },
-  });
-
-  map.addLayer({
-    id: 'building-footprint-outline',
-    type: 'line',
-    source: 'building-footprint',
-    paint: {
-      'line-color': '#0d9488',
-      'line-width': ['interpolate', ['linear'], ['zoom'], 15, 0.5, 18, 2.5],
-      'line-opacity': ['interpolate', ['linear'], ['zoom'], 15, 0, 16, 0.7, 18, 1],
-    },
-  });
-
-}
-
-/** Remove footprint layers and source from a MapLibre map */
-function removeFootprintFromMap(map: InstanceType<typeof import('maplibre-gl').Map>) {
-  if (map.getLayer('building-footprint-outline')) map.removeLayer('building-footprint-outline');
-  if (map.getLayer('building-footprint-fill')) map.removeLayer('building-footprint-fill');
-  if (map.getSource('building-footprint')) map.removeSource('building-footprint');
-}
-
 export function LocationMap({
   mapConversion, projectedCRS, coordinateInfo, geometryResult,
-  lengthUnitScale = 1, editable, onApplyPosition,
+  lengthUnitScale = 1, editable, onApplyPosition, createKmzProcessor,
+  instancedModelRange = null, modelName = '',
 }: LocationMapProps) {
+  const { t, locale } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<InstanceType<typeof import('maplibre-gl').Map> | null>(null);
   const markerRef = useRef<InstanceType<typeof import('maplibre-gl').Marker> | null>(null);
   const pickedMarkerRef = useRef<InstanceType<typeof import('maplibre-gl').Marker> | null>(null);
   const editableRef = useRef(editable);
-
   // Keep editableRef in sync; clean up edit-only state when leaving edit mode
   useEffect(() => {
     editableRef.current = editable;
@@ -264,9 +126,9 @@ export function LocationMap({
     }
   }, [editable]);
 
-  const [mapState, setMapState] = useState<MapState>('idle');
-  const [latLon, setLatLon] = useState<LatLon | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { latLon, mapState, errorKey, geometryDistanceKm, locationKind } = useLocationGeoreference(
+    mapConversion, projectedCRS, coordinateInfo, lengthUnitScale,
+  );
 
   // Seeded from the session latch, so a remount on a device already known to
   // refuse WebGL paints the fallback immediately — no probe, no construction,
@@ -284,6 +146,16 @@ export function LocationMap({
    * point: an explicit capture is recorded as HANDLED, so an unsupported GPU
    * stops arriving as an error-level uncaught exception for something no user
    * and no code change can fix.
+   *
+   * Handled is not the same as low-severity, though, and posthog-js stamps
+   * every capture `$exception_level: 'error'` regardless. Grouping and severity
+   * are settled downstream in `lib/analytics-scrub.ts`, off the
+   * `webgl_unavailable` kind `classifyLoadError` derives from the message: ONE
+   * fingerprint for the whole family (the default hash includes the stack, so
+   * this minted a new issue per deploy — #2354) and `error` rewritten to
+   * `warning`. Nothing here needs to opt in; do not add a second reporting path
+   * for it. `map_load_failed` is deliberately outside that family — a chunk
+   * that would not download is ours to fix and stays loud.
    */
   const degradeMap = useCallback((reason: MapUnavailableReason, err: unknown) => {
     // A missing GPU capability is a property of the device, so latch it for the
@@ -313,7 +185,7 @@ export function LocationMap({
   // Search state
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<Array<{ lat: number; lon: number; display_name: string }>>([]);
+  const [searchResults, setSearchResults] = useState<GeocodeResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const debouncedQuery = useDebouncedValue(searchQuery, 400);
 
@@ -359,34 +231,6 @@ export function LocationMap({
     return () => { cancelled = true; };
   }, [debouncedQuery]);
 
-  // Reproject model position to lat/lon
-  useEffect(() => {
-    if (!mapConversion || !projectedCRS) {
-      setLatLon(null);
-      setError(null);
-      return;
-    }
-
-    let cancelled = false;
-    setMapState('loading');
-    setError(null);
-
-    reprojectToLatLon(mapConversion, projectedCRS, coordinateInfo, lengthUnitScale).then(result => {
-      if (cancelled) return;
-      if (result) {
-        setLatLon(result);
-        setMapState('ready');
-      } else {
-        setLatLon(null);
-        setError('Could not resolve projection — EPSG code may be unsupported');
-        setMapState('error');
-      }
-    });
-
-    return () => { cancelled = true; };
-  }, [mapConversion, projectedCRS, coordinateInfo, lengthUnitScale]);
-
-  // When a picked position changes, reverse-project and query elevation
   useEffect(() => {
     if (!pickedLatLon || !projectedCRS) {
       setProjectedCoords(null);
@@ -398,8 +242,8 @@ export function LocationMap({
     setProjectedCoords(null);
 
     // Reverse-project to get IfcMapConversion eastings/northings
-    // Accounts for model local geometry offset, rotation, and scale
-    reprojectFromLatLon(pickedLatLon, projectedCRS, mapConversion, coordinateInfo, lengthUnitScale).then(coords => {
+    // The pin edits the declared origin, so do not subtract the mesh centre (#6677).
+    reprojectFromLatLon(pickedLatLon, projectedCRS, lengthUnitScale).then(coords => {
       if (!cancelled) setProjectedCoords(coords);
     });
 
@@ -413,7 +257,7 @@ export function LocationMap({
     });
 
     return () => { cancelled = true; };
-  }, [pickedLatLon, projectedCRS, mapConversion, coordinateInfo, lengthUnitScale]);
+  }, [pickedLatLon, projectedCRS, lengthUnitScale]);
 
   // Place or move the picked marker on the map
   const updatePickedMarker = useCallback((pos: LatLon, maplibregl: typeof import('maplibre-gl')) => {
@@ -450,7 +294,7 @@ export function LocationMap({
   }, [updatePickedMarker]);
 
   // Handle search result selection
-  const handleSearchSelect = useCallback((result: { lat: number; lon: number; display_name: string }) => {
+  const handleSearchSelect = useCallback((result: GeocodeResult) => {
     const pos = { lat: result.lat, lon: result.lon };
     setPickedLatLon(pos);
     setSearchOpen(false);
@@ -504,9 +348,7 @@ export function LocationMap({
       // If map already exists, just fly to new position
       if (mapRef.current) {
         mapRef.current.flyTo({ center: [latLon.lon, latLon.lat], zoom: 15, duration: 1200 });
-        if (markerRef.current) {
-          markerRef.current.setLngLat([latLon.lon, latLon.lat]);
-        }
+        markerRef.current = updateOriginMarker(maplibregl, mapRef.current, markerRef.current, latLon, locationKind === 'origin');
         return;
       }
 
@@ -614,19 +456,8 @@ export function LocationMap({
       map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
       map.addControl(new maplibregl.AttributionControl({ compact: false }), 'bottom-right');
 
-      // Add marker at model location (teal = current model position)
-      const marker = new maplibregl.Marker({ color: '#14b8a6' })
-        .setLngLat([latLon.lon, latLon.lat])
-        .addTo(map);
-
-      // Toggle marker vs footprint based on zoom level
-      map.on('zoomend', () => {
-        const zoom = map.getZoom();
-        if (markerRef.current) {
-          markerRef.current.getElement().style.opacity = zoom >= 17 ? '0' : '1';
-          markerRef.current.getElement().style.pointerEvents = zoom >= 17 ? 'none' : 'auto';
-        }
-      });
+      // Teal marker is the declared origin, independent of geometry bounds.
+      const marker = updateOriginMarker(maplibregl, map, null, latLon, locationKind === 'origin');
 
       // Map click to place pin (only in edit mode)
       map.on('click', handleMapClick);
@@ -654,7 +485,7 @@ export function LocationMap({
     return () => {
       cancelled = true;
     };
-  }, [latLon, handleMapClick, mapUnavailable, degradeMap]);
+  }, [latLon, locationKind, handleMapClick, mapUnavailable, degradeMap]);
 
   // Add/update building footprint GeoJSON layer when footprint or style changes
   useEffect(() => {
@@ -697,27 +528,46 @@ export function LocationMap({
   }, [latLon]);
 
   const handleExportKmz = useCallback(async () => {
-    if (!latLon || !geometryResult || !mapConversion) return;
+    if (!latLon || !geometryResult || !mapConversion || !projectedCRS) return;
     try {
-      // Embed the model as COLLADA (Rust exporter): Google Earth's <Model> only loads
-      // COLLADA, renders it bright via emission, and clampToGround keeps it on the
+      // Embed as COLLADA: Google Earth's <Model> only loads COLLADA, and clampToGround keeps it on the
       // terrain so the MSL orthogonal height no longer floats it (#1427).
-      const kmz = await buildKmz({
-        latLon,
-        altitude: mapConversion.orthogonalHeight,
-        xAxisAbscissa: mapConversion.xAxisAbscissa,
-        xAxisOrdinate: mapConversion.xAxisOrdinate,
-        meshes: geometryResult.meshes as MeshData[],
-        name: 'IFC Model',
-      });
-      downloadBlob(new Blob([kmz as BlobPart], { type: 'application/vnd.google-earth.kmz' }), 'model.kmz');
+      //
+      // Placement is NOT computed here. This used to call `buildKmz` directly with the authored axis
+      // and a raw `orthogonalHeight`, which skipped all three corrections the Export KMZ dialog got:
+      // the map-absolute guard (#2526), the map-unit altitude scaling, and the RTC Z fold-back. Same
+      // model, two buttons, two different files. `buildKmzForResolvedGeoref` is now the single source
+      // for both (#2526 follow-up).
+      const kmz = await buildKmzForResolvedGeoref({
+        conversion: mapConversion,
+        crs: projectedCRS,
+        coordinateInfo,
+        lengthUnitScale: lengthUnitScale ?? 1,
+        // The COMPLETE mesh set is derived inside the builder — passing
+        // `geometryResult.meshes` here dropped every GPU-instanced occurrence
+        // from the exported file (#2577). The Location panel only ever shows
+        // the primary model's georeference.
+        geometryResult,
+        // Scopes the instanced-occurrence restoration to THIS model's global-id
+        // bracket (see `instancedModelRange` prop doc). Callers with only one
+        // model loaded may still pass `null`; a multi-model federation must pass
+        // the displayed model's own `{ idOffset, maxExpressId }` or every other
+        // loaded model's instanced occurrences leak into this one export (PR
+        // #2878 review).
+        instancedModelRange,
+        name: t('properties.modelMetadata.ifcModel'),
+      }, createKmzProcessor);
+      if (typeof kmz === 'string') {
+        toast.error(t('properties.locationMap.kmzExportFailedWithReason', { reason: kmz }));
+        return;
+      }
+      downloadBlob(new Blob([kmz as BlobPart], { type: 'application/vnd.google-earth.kmz' }), modelExportFilename(modelName, 'kmz'));
+      trackExportCompleted({ format: 'kmz', surface: 'location_map' });
     } catch (err) {
-      console.error('KMZ export failed:', err);
+      toast.error(t('properties.locationMap.kmzExportFailedUnknown', { message: err instanceof Error ? err.message : t('properties.locationMap.unknownError') }));
     }
-  }, [latLon, geometryResult, mapConversion]);
-
+  }, [latLon, geometryResult, mapConversion, projectedCRS, coordinateInfo, lengthUnitScale, createKmzProcessor, instancedModelRange, modelName, t]);
   const isDarkRef = useRef(false);
-
   const handleStyleToggle = useCallback(() => {
     if (!mapRef.current) return;
     isDarkRef.current = !isDarkRef.current;
@@ -751,82 +601,63 @@ export function LocationMap({
       {/* Header with search */}
       <div className="flex items-center gap-2 px-3 py-1.5">
         <MapIcon className="h-3 w-3 text-teal-500 shrink-0" />
-        <span className="font-bold text-[11px] text-zinc-700 dark:text-zinc-300 uppercase tracking-wide flex-1">
-          Location
+        <span className="font-bold text-xs text-zinc-700 dark:text-zinc-300 uppercase tracking-wide flex-1">
+          {t('properties.locationMap.heading')}
         </span>
         {latLon && !searchOpen && (
-          <span className="text-[10px] font-mono text-teal-600/70 dark:text-teal-500/60">
-            {latLon.lat.toFixed(5)}, {latLon.lon.toFixed(5)}
+          <span className="text-xs font-mono text-teal-600/70 dark:text-teal-500/60" title={t(locationKind === 'geometry' ? 'properties.locationMap.geometryLatLon' : 'properties.locationMap.latLon')}>
+            {formatLocaleNumber(locale, latLon.lat, { minimumFractionDigits: 5, maximumFractionDigits: 5 })}, {formatLocaleNumber(locale, latLon.lon, { minimumFractionDigits: 5, maximumFractionDigits: 5 })}
           </span>
         )}
         {editable && (
-          <button
+          <IconButton
+            label={t('properties.locationMap.searchTooltip')} size="icon-xs"
             onClick={() => { setSearchOpen(!searchOpen); setSearchQuery(''); setSearchResults([]); }}
-            className="p-0.5 text-zinc-400 hover:text-teal-600 dark:hover:text-teal-400 transition-colors"
-            title="Search for a place"
+            className="text-zinc-400 hover:text-teal-600 dark:hover:text-teal-400"
           >
             <Search className="h-3 w-3" />
-          </button>
+          </IconButton>
         )}
       </div>
-
-      {/* Search bar */}
+      {/* Search bar + results dropdown (#5817: the dropdown is now a Radix
+          Popover) — extracted to `location-map-search.tsx`. */}
       {editable && searchOpen && (
-        <div className="px-3 pb-1.5 relative">
-          <div className="flex items-center gap-1">
-            <div className="flex-1 relative">
-              <input
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                placeholder="Search for a place..."
-                className="w-full text-[11px] px-2 py-1 border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 outline-none focus:ring-1 focus:ring-teal-400 focus:border-teal-400 placeholder:text-zinc-400/60"
-                autoFocus
-                onKeyDown={e => { if (e.key === 'Escape') { setSearchOpen(false); setSearchQuery(''); setSearchResults([]); } }}
-              />
-              {searchLoading && (
-                <Loader2 className="absolute right-2 top-1/2 -translate-y-1/2 h-3 w-3 text-teal-500 animate-spin" />
-              )}
-            </div>
-            <button
-              onClick={() => { setSearchOpen(false); setSearchQuery(''); setSearchResults([]); }}
-              className="p-0.5 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
-            >
-              <X className="h-3 w-3" />
-            </button>
-          </div>
+        <LocationMapSearchBar
+          query={searchQuery}
+          onQueryChange={setSearchQuery}
+          results={searchResults}
+          onResultsChange={setSearchResults}
+          loading={searchLoading}
+          placeholder={t('properties.locationMap.searchPlaceholder')}
+          onSelect={handleSearchSelect}
+          onClose={() => { setSearchOpen(false); setSearchQuery(''); setSearchResults([]); }}
+        />
+      )}
 
-          {/* Search results dropdown */}
-          {searchResults.length > 0 && (
-            <div className="absolute left-3 right-3 top-full z-50 mt-0.5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 shadow-lg max-h-[160px] overflow-y-auto">
-              {searchResults.map((r, i) => (
-                <button
-                  key={i}
-                  onClick={() => handleSearchSelect(r)}
-                  className="w-full text-left px-2 py-1.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-teal-50 dark:hover:bg-teal-950/50 border-b border-zinc-100 dark:border-zinc-800 last:border-0 transition-colors"
-                >
-                  <div className="flex items-start gap-1.5">
-                    <MapPin className="h-3 w-3 text-teal-500 shrink-0 mt-0.5" />
-                    <span className="line-clamp-2">{r.display_name}</span>
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+      {locationKind === 'geometry' && (
+        <p className="px-3 pb-2 text-xs text-zinc-500 dark:text-zinc-400">
+          {t('properties.locationMap.geometryLocation')}
+        </p>
+      )}
+
+      {geometryDistanceKm !== null && (
+        <output className="block px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          {t('properties.locationMap.geometryDistance', { value: formatLocaleNumber(locale, geometryDistanceKm) })}
+        </output>
       )}
 
       {/* Map container */}
       {mapState === 'loading' && (
         <div className="flex items-center justify-center h-[180px] bg-zinc-50 dark:bg-zinc-900/50">
-          <Loader2 className="h-4 w-4 text-teal-500 animate-spin" />
-          <span className="text-[10px] text-zinc-400 ml-2">Resolving coordinates...</span>
+          <Spinner size="md" className="text-teal-500" />
+          <span className="text-xs text-zinc-400 ml-2">{t('properties.locationMap.resolvingCoordinates')}</span>
         </div>
       )}
 
       {mapState === 'error' && (
         <div className="flex items-center justify-center h-[60px] bg-zinc-50 dark:bg-zinc-900/50 gap-2 px-3">
           <MapPinOff className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-          <span className="text-[10px] text-zinc-400">{error}</span>
+          <span className="text-xs text-zinc-400">{errorKey && t(errorKey)}</span>
         </div>
       )}
 
@@ -839,26 +670,24 @@ export function LocationMap({
                which still drives the reverse projection and the Apply button. */
             <div className="flex flex-col items-center justify-center h-[180px] bg-zinc-50 dark:bg-zinc-900/50 gap-1.5 px-4 text-center">
               <MapPinOff className="h-4 w-4 text-zinc-400" />
-              <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
-                Map preview unavailable on this device
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                {t('properties.locationMap.unavailableOnDevice')}
               </span>
-              <span className="text-[9px] text-zinc-400 dark:text-zinc-500 max-w-[240px]">
-                {mapUnavailable === 'map_load_failed'
-                  ? 'The map component could not be loaded. Check your connection and reload the page.'
-                  : 'Your browser could not provide graphics for the map. Coordinates, search and the links below still work; reloading the page may restore it.'}
+              <span className="text-xs text-zinc-400 dark:text-zinc-500 max-w-[240px]">
+                {mapUnavailable === 'map_load_failed' ? t('properties.locationMap.mapLoadFailed') : t('properties.locationMap.graphicsUnavailable')}
               </span>
             </div>
           ) : (
             <div className="relative">
               <div
                 ref={containerRef}
-                className="h-[180px] w-full [&_.maplibregl-ctrl-attrib]:!text-[7px] [&_.maplibregl-ctrl-attrib]:!bg-white/40 [&_.maplibregl-ctrl-attrib]:dark:!bg-black/30 [&_.maplibregl-ctrl-attrib]:!py-0 [&_.maplibregl-ctrl-attrib]:!px-1 [&_.maplibregl-ctrl-attrib]:!shadow-none [&_.maplibregl-ctrl-attrib]:!text-zinc-400/70 [&_.maplibregl-ctrl-attrib_a]:!text-zinc-400/70 [&_.maplibregl-ctrl-attrib]:!leading-normal"
+                className="h-[180px] w-full [&_.maplibregl-ctrl-attrib]:!text-2xs [&_.maplibregl-ctrl-attrib]:!bg-white/40 [&_.maplibregl-ctrl-attrib]:dark:!bg-black/30 [&_.maplibregl-ctrl-attrib]:!py-0 [&_.maplibregl-ctrl-attrib]:!px-1 [&_.maplibregl-ctrl-attrib]:!shadow-none [&_.maplibregl-ctrl-attrib]:!text-zinc-400/70 [&_.maplibregl-ctrl-attrib_a]:!text-zinc-400/70 [&_.maplibregl-ctrl-attrib]:!leading-normal"
                 style={{ minHeight: 180 }}
               />
               {/* Edit mode hint overlay */}
               {editable && !pickedLatLon && (
-                <div className="absolute top-2 left-2 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-sm px-2 py-1 text-[9px] text-zinc-500 dark:text-zinc-400 pointer-events-none shadow-sm border border-zinc-200/50 dark:border-zinc-700/50">
-                  Click map to place pin
+                <div className="absolute top-2 left-2 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-sm px-2 py-1 text-xs text-zinc-500 dark:text-zinc-400 pointer-events-none shadow-sm border border-zinc-200/50 dark:border-zinc-700/50">
+                  {t('properties.locationMap.clickToPlacePin')}
                 </div>
               )}
             </div>
@@ -866,49 +695,49 @@ export function LocationMap({
 
           {/* Picked position info bar */}
           {pickedLatLon && editable && (
-            <div className="bg-purple-50/80 dark:bg-purple-950/30 border-t border-purple-200/50 dark:border-purple-800/30 px-3 py-2">
+            <div className="bg-overlay-accent-soft border-t border-overlay-accent/40 px-3 py-2">
               <div className="flex items-center gap-2 mb-1.5">
-                <MapPin className="h-3 w-3 text-purple-600 dark:text-purple-400 shrink-0" />
-                <span className="text-[10px] font-semibold text-purple-700 dark:text-purple-300 flex-1">
-                  New Position
+                <MapPin className="h-3 w-3 text-overlay-accent shrink-0" />
+                <span className="text-xs font-semibold text-foreground flex-1">
+                  {t('properties.locationMap.newPosition')}
                 </span>
                 <button
                   onClick={handleClearPick}
-                  className="p-0.5 text-purple-400 hover:text-purple-600 dark:hover:text-purple-300 transition-colors"
-                  title="Remove pin"
+                  className="p-0.5 text-muted-foreground hover:text-foreground transition-colors"
+                  title={t('properties.locationMap.removePinTooltip')}
                 >
                   <X className="h-3 w-3" />
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] font-mono mb-2">
-                <div className="text-zinc-500 dark:text-zinc-400">Lat/Lon</div>
-                <div className="text-purple-700 dark:text-purple-300 text-right">
-                  {pickedLatLon.lat.toFixed(6)}, {pickedLatLon.lon.toFixed(6)}
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs font-mono mb-2">
+                <div className="text-zinc-500 dark:text-zinc-400">{t('properties.locationMap.latLon')}</div>
+                <div className="text-foreground text-right">
+                  {formatLocaleNumber(locale, pickedLatLon.lat, { minimumFractionDigits: 6, maximumFractionDigits: 6 })}, {formatLocaleNumber(locale, pickedLatLon.lon, { minimumFractionDigits: 6, maximumFractionDigits: 6 })}
                 </div>
 
                 {projectedCoords && (
                   <>
-                    <div className="text-zinc-500 dark:text-zinc-400">Easting</div>
-                    <div className="text-purple-700 dark:text-purple-300 text-right tabular-nums">
-                      {projectedCoords.easting.toFixed(3)}
+                    <div className="text-zinc-500 dark:text-zinc-400">{t('properties.locationMap.easting')}</div>
+                    <div className="text-foreground text-right tabular-nums">
+                      {formatLocaleNumber(locale, projectedCoords.easting, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
                     </div>
-                    <div className="text-zinc-500 dark:text-zinc-400">Northing</div>
-                    <div className="text-purple-700 dark:text-purple-300 text-right tabular-nums">
-                      {projectedCoords.northing.toFixed(3)}
+                    <div className="text-zinc-500 dark:text-zinc-400">{t('properties.locationMap.northing')}</div>
+                    <div className="text-foreground text-right tabular-nums">
+                      {formatLocaleNumber(locale, projectedCoords.northing, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
                     </div>
                   </>
                 )}
 
-                <div className="text-zinc-500 dark:text-zinc-400 flex items-center gap-1">
+                <div title={t('properties.locationMap.terrainHeightHelp')} className="text-zinc-500 dark:text-zinc-400 flex items-center gap-1">
                   <Mountain className="h-2.5 w-2.5" />
-                  Elevation
+                  {t('properties.locationMap.elevation')}
                 </div>
-                <div className="text-purple-700 dark:text-purple-300 text-right tabular-nums">
+                <div className="text-foreground text-right tabular-nums">
                   {elevationLoading ? (
-                    <Loader2 className="h-2.5 w-2.5 animate-spin inline" />
+                    <Spinner className="h-2.5 w-2.5 inline" />
                   ) : pickedElevation !== null ? (
-                    `${pickedElevation.toFixed(1)} m`
+                    t('properties.locationMap.elevationMeters', { value: formatLocaleNumber(locale, pickedElevation, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) })
                   ) : (
                     <span className="text-zinc-400">—</span>
                   )}
@@ -920,11 +749,12 @@ export function LocationMap({
                 <button
                   onClick={handleApply}
                   disabled={elevationLoading}
-                  className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-[10px] font-semibold text-white bg-purple-600 hover:bg-purple-700 dark:bg-purple-700 dark:hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-overlay-halo bg-overlay-accent hover:bg-overlay-accent/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   <Check className="h-3 w-3" />
-                  Apply to Eastings / Northings
-                  {pickedElevation !== null && ' / Height'}
+                  {pickedElevation !== null
+                    ? t('properties.locationMap.applyToEastingsNorthingsHeight')
+                    : t('properties.locationMap.applyToEastingsNorthings')}
                 </button>
               )}
             </div>
@@ -939,13 +769,13 @@ export function LocationMap({
                     href={googleMapsUrl}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex items-center gap-1 text-[10px] text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
+                    className="flex items-center gap-1 text-xs text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
                   >
                     <ExternalLink className="h-2.5 w-2.5" />
-                    Google Maps
+                    {t('properties.locationMap.googleMaps')}
                   </a>
                 </TooltipTrigger>
-                <TooltipContent>Open model location in Google Maps</TooltipContent>
+                <TooltipContent>{t(locationKind === 'geometry' ? 'properties.locationMap.geometryGoogleMapsTooltip' : 'properties.locationMap.googleMapsTooltip')}</TooltipContent>
               </Tooltip>
             )}
             {openStreetMapUrl && (
@@ -955,13 +785,13 @@ export function LocationMap({
                     href={openStreetMapUrl}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex items-center gap-1 text-[10px] text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
+                    className="flex items-center gap-1 text-xs text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
                   >
                     <ExternalLink className="h-2.5 w-2.5" />
-                    OpenStreetMap
+                    {t('properties.locationMap.openStreetMap')}
                   </a>
                 </TooltipTrigger>
-                <TooltipContent>Open model location in OpenStreetMap</TooltipContent>
+                <TooltipContent>{t(locationKind === 'geometry' ? 'properties.locationMap.geometryOpenStreetMapTooltip' : 'properties.locationMap.openStreetMapTooltip')}</TooltipContent>
               </Tooltip>
             )}
             {geometryResult && (
@@ -969,22 +799,22 @@ export function LocationMap({
                 <TooltipTrigger asChild>
                   <button
                     onClick={handleExportKmz}
-                    className="flex items-center gap-1 text-[10px] text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
+                    className="flex items-center gap-1 text-xs text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors"
                   >
                     <Globe2 className="h-2.5 w-2.5" />
-                    Google Earth
+                    {t('properties.locationMap.googleEarth')}
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>Download KMZ for Google Earth Pro (desktop), placed at the model location. Google Earth on the web cannot show KMZ 3D models — use Export GLB for the web.</TooltipContent>
+                <TooltipContent>{t('properties.locationMap.googleEarthTooltip')}</TooltipContent>
               </Tooltip>
             )}
             {/* Hidden without a map: it would be a permanent no-op. */}
             {!mapUnavailable && (
               <button
                 onClick={handleStyleToggle}
-                className="ml-auto text-[10px] text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
+                className="ml-auto text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
               >
-                Toggle style
+                {t('properties.locationMap.toggleStyle')}
               </button>
             )}
           </div>

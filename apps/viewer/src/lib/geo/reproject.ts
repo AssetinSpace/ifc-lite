@@ -19,8 +19,15 @@ import proj4 from 'proj4';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import { lookupEpsgByCode } from '@ifc-lite/data';
-import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from './geo-scale';
-import { resolvePrecisionDef } from './precision-grids';
+import { getEffectiveAxisScales, resolveMapUnitToMetreScale } from './geo-scale';
+import { computeModelCenterInIfcMeters, effectiveMapConversionForGeometry } from './map-absolute';
+import { ifcToViewerAxes } from './coordinate-frame';
+import { wellKnownCrsCode } from './well-known-crs';
+import { isGeographicProj4, utmProj4String } from './proj4-utils';
+import { resolveMapAxisDirection } from './map-axis-direction';
+
+export { computeModelCenterInIfcMeters, effectiveMapConversionForGeometry } from './map-absolute';
+import { PRECISION_GRIDS, resolvePrecisionDef } from './precision-grids';
 
 export interface LatLon {
   lat: number;
@@ -29,6 +36,14 @@ export interface LatLon {
 
 // Cache resolved projection definitions (from any source).
 const projDefCache = new Map<string, string | null>();
+// Definitions that were made usable by injecting a Bursa-Wolf approximation
+// after their exact browser grid was unavailable. Map display may opt into
+// these; federation placement must name that compromise explicitly.
+const approximateProjectionCodes = new Set<string>();
+// A browser cannot make a horizontal datum operation from a required grid when
+// it has neither that grid nor a documented replacement.  Keep the display
+// definition separately, but never let placement silently use it.
+const refusedProjectionCodes = new Set<string>();
 const approxDatumWarningCache = new Set<string>();
 // Track datums where the bundled proj4 lacked any datum-shift parameters and we
 // couldn't supply a fallback — surfaced via diagnostics, warned once per datum.
@@ -50,84 +65,6 @@ function extractEpsgCode(crs: ProjectedCRS): string | null {
  * national grid; covering the common ones lets ifc-lite resolve a projection
  * for files that omit the "EPSG:" prefix entirely.
  */
-const WELL_KNOWN_CRS: Record<string, string> = {
-  // Global / generic
-  'wgs 84': '4326',
-  'wgs84': '4326',
-  'wgs-84': '4326',
-  'nad83': '4269',
-  'nad27': '4267',
-  'etrs89': '4258',
-  'gcs_wgs_1984': '4326',        // ArcGIS / Revit export alias
-  'gcs_north_american_1983': '4269',
-
-  // Netherlands — Rijksdriehoeksmeting (RD New, EPSG:28992)
-  'rd': '28992',
-  'rd new': '28992',
-  'amersfoort / rd new': '28992',
-  'amersfoort rd new': '28992',
-  'stelsel van de rijksdriehoeksmeting': '28992',
-  'rijksdriehoeksmeting': '28992',
-  'nl_rd': '28992',
-  // RD/NAP compound (horizontal RD + vertical NAP)
-  'rd new + nap height': '7415',
-  'amersfoort / rd new + nap height': '7415',
-
-  // United Kingdom — Ordnance Survey GB (BNG, EPSG:27700)
-  'osgb 1936 / british national grid': '27700',
-  'osgb36 / british national grid': '27700',
-  'british national grid': '27700',
-  'bng': '27700',
-
-  // Germany — DHDN / Gauss-Kruger zones + ETRS89 / UTM (most common)
-  'dhdn / gauss-kruger zone 2': '31466',
-  'dhdn / gauss-kruger zone 3': '31467',
-  'dhdn / gauss-kruger zone 4': '31468',
-  'dhdn / gauss-kruger zone 5': '31469',
-  'etrs89 / utm zone 32n': '25832',
-  'etrs89 / utm zone 33n': '25833',
-
-  // Austria — MGI Lambert / Austrian Grid (EPSG:31287)
-  'mgi / austria lambert': '31287',
-  'austria lambert': '31287',
-
-  // Switzerland — CH1903+ / LV95 (EPSG:2056) and legacy LV03 (EPSG:21781)
-  'ch1903+ / lv95': '2056',
-  'lv95': '2056',
-  'ch1903 / lv03': '21781',
-  'lv03': '21781',
-
-  // Belgium — Lambert 2008 (EPSG:3812) and legacy Lambert 72 (EPSG:31370)
-  'belge 1972 / belgian lambert 72': '31370',
-  'belgian lambert 72': '31370',
-  'etrs89 / belgian lambert 2008': '3812',
-
-  // France — RGF93 / Lambert-93 (EPSG:2154)
-  'rgf93 / lambert-93': '2154',
-  'rgf93 v1 / lambert-93': '2154',
-  'lambert-93': '2154',
-  'lambert 93': '2154',
-};
-
-/**
- * Check if a proj4 definition is a geographic (longlat) CRS rather than a projected one.
- * Geographic CRS coordinates are in degrees, not metres.
- */
-function isGeographicProj4(def: string): boolean {
-  return /\+proj=longlat\b/.test(def);
-}
-
-/**
- * Build a proj4 definition string for a UTM zone.
- */
-function utmProj4String(zone: string): string | null {
-  const match = zone.match(/^(\d{1,2})([NS])$/i);
-  if (!match) return null;
-  const zoneNum = parseInt(match[1], 10);
-  const isNorth = match[2].toUpperCase() === 'N';
-  if (zoneNum < 1 || zoneNum > 60) return null;
-  return `+proj=utm +zone=${zoneNum}${isNorth ? '' : ' +south'} +datum=WGS84 +units=m +no_defs`;
-}
 
 /**
  * Datum-keyed +towgs84 approximations for CRSs whose canonical definition
@@ -143,8 +80,12 @@ function utmProj4String(zone: string): string | null {
  * DHDN shift). Accuracy is typically ~1-5 m, sufficient for map display.
  */
 const DATUM_TOWGS84: Record<string, string> = {
-  // United Kingdom — OSGB36 (Airy 1830)
+  // United Kingdom — OSGB36 (Airy 1830). The bundled EPSG index (packages/data)
+  // reports this datum as the bare "OSGB36" for EPSG:27700 — keep both forms
+  // keyed since IFC files and EPSG metadata are inconsistent about which one
+  // they emit.
   'osgb 1936': '+towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489',
+  'osgb36': '+towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489',
   // North America — NAD27 (Clarke 1866)
   'north american datum 1927': '+towgs84=-8,160,176,0,0,0,0',
   'nad27': '+towgs84=-8,160,176,0,0,0,0',
@@ -166,9 +107,16 @@ const DATUM_TOWGS84: Record<string, string> = {
   // Austria — MGI (Bessel 1841)
   'militar-geographische institut': '+towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232',
   'mgi': '+towgs84=577.326,90.129,463.919,5.137,1.474,5.297,2.4232',
-  // Czech Republic — S-JTSK (Bessel 1841)
+  // Czech Republic — S-JTSK (Bessel 1841). EPSG:2065 (Ferro Krovak) — the
+  // exact code #1357 was filed against, and the only S-JTSK code with no
+  // precision-grid coverage (see precision-grids.ts) so this fallback is its
+  // ONLY datum shift — reports its datum as "S-JTSK (Ferro)" in the bundled
+  // EPSG index, not the bare "S-JTSK" below. Without this key the lookup
+  // silently missed (no warning either, since there's no +nadgrids to trigger
+  // one) and EPSG:2065 got zero datum shift.
   'system of the unified trigonometrical cadastral network': '+towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56',
   's-jtsk': '+towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56',
+  's-jtsk (ferro)': '+towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56',
   // New Zealand — NZGD49 (International 1924)
   'new zealand geodetic datum 1949': '+towgs84=59.47,-5.04,187.44,0.47,-0.1,1.024,-4.5993',
   'nzgd49': '+towgs84=59.47,-5.04,187.44,0.47,-0.1,1.024,-4.5993',
@@ -191,8 +139,14 @@ export function sanitizeProj4(def: string, code?: string | null, datumName?: str
   const hasNadgrids = def.includes('+nadgrids') && !def.includes('+nadgrids=@null');
   const hasTowgs84 = /\+towgs84=/.test(def);
 
-  // A datum shift is already present — keep it; only drop an unusable grid ref.
-  if (hasTowgs84) return hasNadgrids ? stripNadgrids(def) : def;
+  // An embedded Helmert is an explicit approximation only when it replaces a
+  // required grid.  The old code stripped the grid and then represented this
+  // result as an ordinary definition, allowing federation to claim exact CRS
+  // placement while silently losing metres of accuracy.
+  if (hasTowgs84) {
+    if (hasNadgrids && code) approximateProjectionCodes.add(code);
+    return hasNadgrids ? stripNadgrids(def) : def;
+  }
 
   const datumKey = datumName?.trim().toLowerCase() ?? '';
   const towgs84 = datumKey ? DATUM_TOWGS84[datumKey] : undefined;
@@ -211,6 +165,7 @@ export function sanitizeProj4(def: string, code?: string | null, datumName?: str
         + 'DATUM_TOWGS84 in apps/viewer/src/lib/geo/reproject.ts.',
       );
     }
+    if (hasNadgrids && code) refusedProjectionCodes.add(code);
     return hasNadgrids ? stripNadgrids(def) : def;
   }
 
@@ -228,6 +183,7 @@ export function sanitizeProj4(def: string, code?: string | null, datumName?: str
     );
   }
 
+  if (code) approximateProjectionCodes.add(code);
   return `${hasNadgrids ? stripNadgrids(def) : def.replace(/\s+/g, ' ').trim()} ${towgs84}`;
 }
 
@@ -265,7 +221,11 @@ export async function resolveProjection(crs: ProjectedCRS): Promise<string | nul
   let code = extractEpsgCode(crs);
 
   // 1. Check cache
-  if (code && projDefCache.has(code)) {
+  // A cached approximate/refused fallback is not terminal for a CRS with a
+  // precision grid: a later online attempt may populate the grid cache. Exact
+  // cached definitions remain fast and deterministic.
+  if (code && projDefCache.has(code)
+    && (!PRECISION_GRIDS[code] || (!approximateProjectionCodes.has(code) && !refusedProjectionCodes.has(code)))) {
     return projDefCache.get(code) ?? null;
   }
 
@@ -274,14 +234,21 @@ export async function resolveProjection(crs: ProjectedCRS): Promise<string | nul
   // entries carry is off by 80-200 m. proj4js can consume PROJ's GeoTIFF
   // datum-shift grids — load and register, then use a +nadgrids-based
   // proj4 string for sub-decimeter accuracy.
-  if (code) {
+  if (code && PRECISION_GRIDS[code]) {
     try {
       const precisionDef = await resolvePrecisionDef(code);
       if (precisionDef) {
+        approximateProjectionCodes.delete(code);
+        refusedProjectionCodes.delete(code);
         projDefCache.set(code, precisionDef);
         return precisionDef;
       }
+      // A listed precision grid is a required operation for placement. Its
+      // bundled Helmert may still be useful for a map preview, but is never an
+      // exact cached result and `resolveProjectionId` must refuse it by default.
+      approximateProjectionCodes.add(code);
     } catch (error) {
+      approximateProjectionCodes.add(code);
       console.warn(`[reproject] precision grid resolution failed for EPSG:${code}, falling back`, error);
     }
   }
@@ -302,8 +269,7 @@ export async function resolveProjection(crs: ProjectedCRS): Promise<string | nul
 
   // 3. Well-known CRS name → EPSG code (handles "WGS 84", "NAD83", "RD New", etc.)
   if (!code) {
-    const normalised = crs.name?.trim().toLowerCase() ?? '';
-    const wellKnownCode = WELL_KNOWN_CRS[normalised];
+    const wellKnownCode = wellKnownCrsCode(crs.name ?? '');
     if (wellKnownCode) {
       code = wellKnownCode;
       if (projDefCache.has(code)) {
@@ -371,6 +337,57 @@ export async function resolveProjection(crs: ProjectedCRS): Promise<string | nul
 }
 
 /**
+ * Resolve an adapter-supplied canonical CRS identifier.  Federation uses this
+ * entry point rather than reconstructing an IFC-shaped `ProjectedCRS`: only
+ * an explicit `EPSG:<code>` identifier is accepted here, so a display label
+ * can never turn into a placement decision by accident.
+ */
+export interface ResolveProjectionIdOptions {
+  /** Permit a documented browser approximation when its exact datum grid is unavailable. */
+  allowApproximate?: boolean;
+}
+
+export type ProjectionOperation =
+  | { kind: 'exact'; definition: string; provenance: 'cached-grid' | 'bundled' | 'network' }
+  | { kind: 'approximate'; definition: string; provenance: 'helmert-fallback' }
+  | { kind: 'refused'; reason: 'required-grid-unavailable' | 'approximation-not-authorized' | 'unresolvable' };
+
+/**
+ * Resolve a placement operation with its accuracy provenance.  Unlike map
+ * display, federation has no safe implicit approximation: callers must opt in
+ * to the documented Helmert fallback, and a grid with no fallback is refused.
+ */
+export async function resolveProjectionOperation(
+  id: string,
+  options: ResolveProjectionIdOptions = {},
+): Promise<ProjectionOperation> {
+  if (!/^EPSG:\d+$/i.test(id.trim())) return { kind: 'refused', reason: 'unresolvable' };
+  const canonical = id.trim().toUpperCase();
+  const code = canonical.slice('EPSG:'.length);
+  const definition = await resolveProjection({ id: 0, name: canonical });
+  if (!definition) return { kind: 'refused', reason: 'unresolvable' };
+  if (refusedProjectionCodes.has(code)) return { kind: 'refused', reason: 'required-grid-unavailable' };
+  if (approximateProjectionCodes.has(code)) {
+    return options.allowApproximate
+      ? { kind: 'approximate', definition, provenance: 'helmert-fallback' }
+      : { kind: 'refused', reason: 'approximation-not-authorized' };
+  }
+  return {
+    kind: 'exact',
+    definition,
+    provenance: definition.includes('+nadgrids=') ? 'cached-grid' : 'bundled',
+  };
+}
+
+export async function resolveProjectionId(
+  id: string,
+  options: ResolveProjectionIdOptions = {},
+): Promise<string | null> {
+  const operation = await resolveProjectionOperation(id, options);
+  return operation.kind === 'refused' ? null : operation.definition;
+}
+
+/**
  * Compute the model center in the projected CRS (easting, northing).
  *
  * The coordinate pipeline is:
@@ -385,13 +402,20 @@ export async function resolveProjection(crs: ProjectedCRS): Promise<string | nul
  * Then the projected CRS coordinates are:
  *   easting  = mapConversion.eastings + scale * (cos*ifc_x - sin*ifc_y)
  *   northing = mapConversion.northings + scale * (sin*ifc_x + cos*ifc_y)
+ *
+ * (cos, sin) is the UNIT direction of XAxisAbscissa/XAxisOrdinate
+ * ({@link resolveMapAxisDirection}); the vector's length is not a scale (#6700).
+ * Returns null when the authored vector carries no direction.
  */
 function computeProjectedCenter(
-  conversion: MapConversion,
+  rawConversion: MapConversion,
   coordinateInfo: CoordinateInfo | undefined,
   mapUnitScale: number,
   lengthUnitScale: number,
-): { easting: number; northing: number } {
+): { easting: number; northing: number } | null {
+  // Map-absolute geometry (#2526): neutralise a conversion the geometry
+  // already carries, or the offsets/rotation get applied twice.
+  const conversion = effectiveMapConversionForGeometry(rawConversion, mapUnitScale, coordinateInfo);
   const { ifcX, ifcY } = computeModelCenterInIfcMeters(coordinateInfo);
 
   // Geometry coordinates (ifcX, ifcY) are already in metres — the geometry engine
@@ -400,12 +424,13 @@ function computeProjectedCenter(
   // IfcMapConversion.Scale converts project length unit → map unit (e.g. 0.001
   // for mm→m); since geometry is already in metres, use the effective scale —
   // see issue #595.
-  const scale = getEffectiveHorizontalScale(conversion.scale, mapUnitScale, lengthUnitScale);
-  const abscissa = conversion.xAxisAbscissa ?? 1.0;
-  const ordinate = conversion.xAxisOrdinate ?? 0.0;
+  const { x: scaleX, y: scaleY } = getEffectiveAxisScales(conversion, mapUnitScale, lengthUnitScale);
+  const axis = resolveMapAxisDirection(conversion.xAxisAbscissa, conversion.xAxisOrdinate);
+  if (!axis) return null;
+  const { a: abscissa, b: ordinate } = axis;
 
-  const easting = conversion.eastings * mapUnitScale + scale * (abscissa * ifcX - ordinate * ifcY);
-  const northing = conversion.northings * mapUnitScale + scale * (ordinate * ifcX + abscissa * ifcY);
+  const easting = conversion.eastings * mapUnitScale + abscissa * scaleX * ifcX - ordinate * scaleY * ifcY;
+  const northing = conversion.northings * mapUnitScale + ordinate * scaleX * ifcX + abscissa * scaleY * ifcY;
 
   return { easting, northing };
 }
@@ -443,7 +468,9 @@ export async function reprojectToLatLon(
   // MapConversion values use the unit from IfcProjectedCRS.MapUnit. If MapUnit
   // is not specified, the IFC spec defaults to the project's length unit.
   const mapScale = resolveMapUnitToMetreScale(crs.mapUnitScale, lengthUnitScale);
-  const { easting, northing } = computeProjectedCenter(conversion, coordinateInfo, mapScale, lengthUnitScale);
+  const center = computeProjectedCenter(conversion, coordinateInfo, mapScale, lengthUnitScale);
+  if (!center) return null;
+  const { easting, northing } = center;
 
   try {
     const [lon, lat] = proj4(projDef, 'WGS84', [easting, northing]);
@@ -543,50 +570,13 @@ export function reprojectionInputKey(
 }
 
 /**
- * Compute the model's center in IFC Z-up metres from coordinate info.
- * This is the geometry center before MapConversion is applied.
- */
-export function computeModelCenterInIfcMeters(
-  coordinateInfo?: CoordinateInfo,
-): { ifcX: number; ifcY: number; ifcZ: number } {
-  if (!coordinateInfo) return { ifcX: 0, ifcY: 0, ifcZ: 0 };
-
-  const bounds = coordinateInfo.originalBounds;
-  const shift = coordinateInfo.originShift;
-  const rtc = coordinateInfo.wasmRtcOffset;
-
-  const rtcYup = rtc
-    ? { x: rtc.x, y: rtc.z, z: -rtc.y }
-    : { x: 0, y: 0, z: 0 };
-
-  const cx = (bounds.min.x + bounds.max.x) / 2;
-  const cy = (bounds.min.y + bounds.max.y) / 2;
-  const cz = (bounds.min.z + bounds.max.z) / 2;
-
-  const worldYupX = cx + shift.x + rtcYup.x;
-  const worldYupY = cy + shift.y + rtcYup.y;
-  const worldYupZ = cz + shift.z + rtcYup.z;
-
-  return {
-    ifcX: worldYupX,
-    ifcY: -worldYupZ,
-    ifcZ: worldYupY,
-  };
-}
-
-/**
- * Reverse-project a WGS84 lat/lon into the IfcMapConversion eastings/northings
- * values that would place the model center at the given location.
- *
- * This accounts for the model's local geometry offset, rotation, and scale:
- *   projected = eastings + scale * (cos*ifcX - sin*ifcY)
- *   ⟹ eastings = projected - scale * (cos*ifcX - sin*ifcY)
+ * Reverse-project a WGS84 point to the declared origin's map-unit coordinates.
+ * This is the inverse of reprojectPointToLatLon, independent of mesh placement
+ * (#6677). Geometry-aware inverse placement lives in the shared spatial reference.
  */
 export async function reprojectFromLatLon(
   latLon: LatLon,
   crs: ProjectedCRS,
-  conversion?: MapConversion,
-  coordinateInfo?: CoordinateInfo,
   lengthUnitScale = 1,
 ): Promise<{ easting: number; northing: number } | null> {
   const projDef = await resolveProjection(crs);
@@ -601,21 +591,8 @@ export async function reprojectFromLatLon(
     const [projE, projN] = proj4('WGS84', projDef, [latLon.lon, latLon.lat]);
     if (!Number.isFinite(projE) || !Number.isFinite(projN)) return null;
 
-    // Convert projected metres back to MapConversion's unit.
-    // Geometry offsets (ifcX/Y) are already in metres.
     const mapScale = resolveMapUnitToMetreScale(crs.mapUnitScale, lengthUnitScale);
-    const invScale = mapScale !== 0 ? 1 / mapScale : 1;
-    const { ifcX, ifcY } = computeModelCenterInIfcMeters(coordinateInfo);
-    // Effective horizontal scale for metre-converted geometry — see issue #595.
-    const scale = getEffectiveHorizontalScale(conversion?.scale, mapScale, lengthUnitScale);
-    const abscissa = conversion?.xAxisAbscissa ?? 1.0;
-    const ordinate = conversion?.xAxisOrdinate ?? 0.0;
-
-    // Result is in IFC native units (the reverse of: E_native * mapScale + geom_offset = E_metres)
-    const easting = (projE - scale * (abscissa * ifcX - ordinate * ifcY)) * invScale;
-    const northing = (projN - scale * (ordinate * ifcX + abscissa * ifcY)) * invScale;
-
-    return { easting, northing };
+    return { easting: projE / mapScale, northing: projN / mapScale };
   } catch {
     return null;
   }
@@ -634,7 +611,7 @@ export async function reprojectFromLatLon(
  * @returns A single GeoJSON-compatible polygon: closed ring of [lon, lat] pairs
  */
 export async function computeFootprintGeoJSON(
-  conversion: MapConversion,
+  rawConversion: MapConversion,
   crs: ProjectedCRS,
   coordinateInfo: CoordinateInfo,
   lengthUnitScale = 1,
@@ -654,15 +631,18 @@ export async function computeFootprintGeoJSON(
 
   // Effective horizontal scale for metre-converted geometry — see issue #595.
   const mapScale = resolveMapUnitToMetreScale(crs.mapUnitScale, lengthUnitScale);
-  const scale = getEffectiveHorizontalScale(conversion.scale, mapScale, lengthUnitScale);
-  const abscissa = conversion.xAxisAbscissa ?? 1.0;
-  const ordinate = conversion.xAxisOrdinate ?? 0.0;
+  // Map-absolute geometry (#2526): same neutralisation as the centre pin.
+  const conversion = effectiveMapConversionForGeometry(rawConversion, mapScale, coordinateInfo);
+  const { x: scaleX, y: scaleY } = getEffectiveAxisScales(conversion, mapScale, lengthUnitScale);
+  const axis = resolveMapAxisDirection(conversion.xAxisAbscissa, conversion.xAxisOrdinate);
+  if (!axis) {
+    console.warn('[footprint] IfcMapConversion axis has no usable direction:', conversion.xAxisAbscissa, conversion.xAxisOrdinate);
+    return null;
+  }
+  const { a: abscissa, b: ordinate } = axis;
 
   const shift = coordinateInfo.originShift;
-  const rtc = coordinateInfo.wasmRtcOffset;
-  const rtcYup = rtc
-    ? { x: rtc.x, z: -rtc.y }
-    : { x: 0, z: 0 };
+  const rtcYup = ifcToViewerAxes(coordinateInfo.wasmRtcOffset ?? { x: 0, y: 0, z: 0 });
 
   const bounds = coordinateInfo.shiftedBounds;
 
@@ -687,8 +667,8 @@ export async function computeFootprintGeoJSON(
 
     // Geometry coords (ifcX/Y) are already in metres; MapConversion values
     // are converted to metres via mapScale.
-    const easting = conversion.eastings * mapScale + scale * (abscissa * ifcX - ordinate * ifcY);
-    const northing = conversion.northings * mapScale + scale * (ordinate * ifcX + abscissa * ifcY);
+    const easting = conversion.eastings * mapScale + abscissa * scaleX * ifcX - ordinate * scaleY * ifcY;
+    const northing = conversion.northings * mapScale + ordinate * scaleX * ifcX + abscissa * scaleY * ifcY;
 
     // Projected CRS → WGS84
     try {

@@ -6,7 +6,10 @@
  * @ifc-lite/sandbox — QuickJS-in-WASM sandboxed script execution
  *
  * Runs user scripts in a secure, isolated environment with only the
- * `bim.*` API exposed. No DOM, no fetch, no network access.
+ * `bim.*` API exposed. No DOM, no global `fetch`. Outbound HTTP is
+ * available only through `bim.network.fetch`, gated by the `network`
+ * permission (off by default) plus an exact-host grant list re-checked
+ * on every call — see `network-request.ts` and `bridge-network.ts`.
  *
  * @example
  * ```ts
@@ -32,7 +35,13 @@
  * ```
  */
 
-export { Sandbox, ScriptError, createSandbox } from './sandbox.js';
+export {
+  Sandbox,
+  ScriptError,
+  SandboxAbortError,
+  createSandbox,
+  isSandboxRuntimeAborted,
+} from './sandbox.js';
 export { buildBridge } from './bridge.js';
 export { NAMESPACE_SCHEMAS, marshalValue } from './bridge-schema.js';
 export type {
@@ -43,6 +52,23 @@ export type {
   LlmTaskIntent,
 } from './bridge-schema.js';
 export { transpileTypeScript } from './transpile.js';
+// Only the GATED entry point is public. The mechanical primitive under it
+// (`executeUngatedRequest`, which has no allow-list) is package-private: it is
+// exported from `network-request.ts` only for that module's own local-server
+// tests, and neither this entry nor the package `exports` map exposes it. A
+// published function that skips the grant check is an invitation to call it. Tests and hosts that need a different transport pass one to
+// `coreNetworkRequest` — the grant check still runs first.
+export {
+  coreNetworkRequest,
+  isHostGranted,
+  NetworkDeniedError,
+} from './network-request.js';
+export type {
+  FetchTransport,
+  NetworkMethod,
+  NetworkRequestInit,
+  NetworkResponse,
+} from './network-request.js';
 
 export type {
   SandboxConfig,
@@ -50,9 +76,11 @@ export type {
   SandboxLimits,
   ScriptResult,
   LogEntry,
+  SandboxConsoleLevel,
 } from './types.js';
 
 export {
   DEFAULT_PERMISSIONS,
   DEFAULT_LIMITS,
+  SANDBOX_CONSOLE_LEVELS,
 } from './types.js';

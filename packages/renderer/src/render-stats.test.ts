@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
-import { sumResidentGpuBytes } from './render-stats.ts';
+import { sumResidentGpuBytes } from './render-stats.js';
 
 const buf = (size: number) => ({ size });
 
@@ -36,6 +36,53 @@ describe('sumResidentGpuBytes', () => {
     assert.strictEqual(r.total, r.batches);
   });
 
+  // The LOD1 index buffer (#1682 phase 5) is a SECOND index buffer allocated
+  // alongside the batch. It is real GPU memory and the residency budget is
+  // what decides when to evict — under-counting it makes the renderer believe
+  // it is inside a budget it has actually blown, so eviction never fires and
+  // large models drift toward GPU OOM / driver-level allocation failures.
+  // No existing fixture sets `lod1IndexBuffer`, so its contribution was free.
+  it('counts the LOD1 index buffer when a batch has one built', () => {
+    const withoutLod = sumResidentGpuBytes({
+      batches: [{ vertexBuffer: buf(1000), indexBuffer: buf(400), uniformBuffer: buf(224) }],
+      partialBatches: [],
+      meshes: [],
+      textured: [],
+      instanced: [],
+    });
+    assert.strictEqual(withoutLod.batches, 1000 + 400 + 224);
+
+    const withLod = sumResidentGpuBytes({
+      batches: [
+        {
+          vertexBuffer: buf(1000),
+          indexBuffer: buf(400),
+          uniformBuffer: buf(224),
+          lod1IndexBuffer: buf(128),
+        },
+      ],
+      partialBatches: [],
+      meshes: [],
+      textured: [],
+      instanced: [],
+    });
+    assert.strictEqual(withLod.batches, 1000 + 400 + 224 + 128);
+    assert.strictEqual(withLod.total, withoutLod.total + 128);
+
+    // Same accounting on every collection that flows through `sumBatch`.
+    const viaMeshesAndPartials = sumResidentGpuBytes({
+      batches: [],
+      partialBatches: [
+        { vertexBuffer: buf(10), indexBuffer: buf(4), lod1IndexBuffer: buf(2) },
+      ],
+      meshes: [{ vertexBuffer: buf(10), indexBuffer: buf(4), lod1IndexBuffer: buf(6) }],
+      textured: [],
+      instanced: [],
+    });
+    assert.strictEqual(viaMeshesAndPartials.batches, 10 + 4 + 2);
+    assert.strictEqual(viaMeshesAndPartials.meshes, 10 + 4 + 6);
+  });
+
   it('estimates textures at 4 bytes per texel across array layers', () => {
     const r = sumResidentGpuBytes({
       batches: [],
@@ -63,5 +110,16 @@ describe('sumResidentGpuBytes', () => {
     assert.strictEqual(r.meshes, 280 + 120 + 224);
     assert.strictEqual(r.instanced, 2800 + 1200 + 88 * 32);
     assert.strictEqual(r.total, r.meshes + r.instanced);
+  });
+
+  it('counts each template\'s RTE delta stream (#6393)', () => {
+    const r = sumResidentGpuBytes({
+      batches: [],
+      partialBatches: [],
+      meshes: [],
+      textured: [],
+      instanced: [{ vertexBuffer: buf(2800), indexBuffer: buf(1200), instanceBuffer: buf(88 * 32), rteDeltas: { buffer: buf(32 * 32) } }],
+    });
+    assert.strictEqual(r.instanced, 2800 + 1200 + 88 * 32 + 32 * 32);
   });
 });

@@ -47,6 +47,10 @@ impl FullIndexedColourMap {
 
     /// The most-frequently-referenced colour (single-colour maps return their
     /// only colour). Used to fill the element style index.
+    ///
+    /// A tie goes to the LOWEST palette index, so the result never depends on
+    /// `FxHashMap` order, which differs between 64-bit (server) and wasm32
+    /// (browser) builds.
     pub fn dominant(&self) -> Rgba {
         let mut counts: rustc_hash::FxHashMap<usize, u32> = rustc_hash::FxHashMap::default();
         for &p in &self.triangle_palette {
@@ -54,7 +58,7 @@ impl FullIndexedColourMap {
         }
         let idx = counts
             .iter()
-            .max_by_key(|(_, c)| *c)
+            .max_by_key(|(&i, &c)| (c, std::cmp::Reverse(i)))
             .map(|(&i, _)| i)
             .unwrap_or(0);
         self.colours.get(idx).copied().unwrap_or(Rgba::new(0.8, 0.8, 0.8, 1.0))
@@ -204,6 +208,8 @@ pub fn split_mesh_by_indexed_colour(
                 // still yields the correct entity-level box. See issue #1474.
                 local_bounds,
                 local_to_world,
+                welded_in_object_frame: false,
+                plane_tags: None,
             };
             Some((map.colours[palette], mesh))
         })
@@ -233,6 +239,8 @@ mod tests {
             instance_meta: None,
             local_bounds: None,
             local_to_world: None,
+            welded_in_object_frame: false,
+            plane_tags: None,
         };
         let map = FullIndexedColourMap {
             geometry_id: 1,
@@ -255,6 +263,31 @@ mod tests {
         assert_eq!(
             total_tris, 2,
             "the out-of-range triangle must be dropped, not partially emitted"
+        );
+    }
+
+    /// `dominant()` must pick the colour referenced by the MOST triangles, not
+    /// the fewest. Every fixture elsewhere in this crate either has a single
+    /// palette entry (so any selection rule trivially "wins") or an exactly
+    /// balanced split (6 vs. 6), so a `max_by_key` → `min_by_key` flip
+    /// (picking the least-referenced colour instead) previously passed the
+    /// full suite untouched — a real gap, since `resolve_prepass_with_style_seeds`
+    /// always calls `dominant()` to seed the element style index even when the
+    /// mesh is later split, and falls back to it whole when triangle counts
+    /// don't line up with the palette (CSG/void cutting changed the topology).
+    #[test]
+    fn dominant_picks_the_majority_colour_not_the_minority() {
+        let map = FullIndexedColourMap {
+            geometry_id: 1,
+            colours: vec![Rgba::new(1.0, 0.0, 0.0, 1.0), Rgba::new(0.0, 1.0, 0.0, 1.0)],
+            // Palette entry 0 (red) referenced once, entry 1 (green) referenced
+            // three times — green is unambiguously the majority colour.
+            triangle_palette: vec![0, 1, 1, 1],
+        };
+        assert_eq!(
+            map.dominant(),
+            Rgba::new(0.0, 1.0, 0.0, 1.0),
+            "dominant() must return the majority-referenced colour (green), not the minority (red)"
         );
     }
 }

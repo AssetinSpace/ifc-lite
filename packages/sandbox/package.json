@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/sandbox",
-  "version": "1.16.4",
+  "version": "2.10.0",
   "description": "QuickJS-in-WASM sandboxed script execution for ifc-lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -14,21 +14,30 @@
     "./schema": {
       "import": "./dist/bridge-schema.js",
       "types": "./dist/bridge-schema.d.ts"
+    },
+    "./network": {
+      "types": "./dist/network-request.d.ts",
+      "import": "./dist/network-request.js"
     }
   },
   "scripts": {
     "build": "pnpm exec tsc",
+    "typecheck": "node ../../scripts/typecheck-tests.mjs",
     "dev": "pnpm exec tsc --watch",
     "test": "vitest run"
   },
   "dependencies": {
+    "@ifc-lite/extensions": "workspace:^",
     "@ifc-lite/sdk": "workspace:^",
-    "esbuild-wasm": "^0.28.1",
+    "esbuild-wasm": "^0.28.2",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {
+    "@ifc-lite/create": "workspace:^",
+    "@ifc-lite/mutations": "workspace:^",
+    "@ifc-lite/parser": "workspace:^",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.2"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

@@ -12,6 +12,8 @@
 
 import type { StateCreator } from 'zustand';
 
+import { defineSliceTeardown, notApplicable } from '../teardown.js';
+
 export type PointColorModeUi = 'rgb' | 'classification' | 'intensity' | 'height' | 'fixed' | 'deviation';
 export type PointSizeModeUi = 'fixed-px' | 'adaptive-world' | 'attenuated';
 
@@ -101,6 +103,13 @@ export interface PointCloudSlice {
    */
   pointCloudDeviationComputed: boolean;
   /**
+   * Bumped whenever deviation is recomputed outside the Deviation panel,
+   * e.g. by COPC LOD streaming after each settled pass (#6880). The panel's
+   * statistics are a readback of one run, so they re-read when this moves
+   * (#6872); otherwise they would describe chunks no longer on screen.
+   */
+  pointCloudDeviationRevision: number;
+  /**
    * Best-effort count of point cloud assets currently uploaded to the
    * renderer. Updated by ingest paths; UI uses it to show/hide the
    * controls panel and the EDL post-pass.
@@ -149,6 +158,7 @@ export interface PointCloudSlice {
   setPointCloudDeviationCenterOffset: (m: number) => void;
   setPointCloudDeviationHalfRange: (m: number) => void;
   setPointCloudDeviationComputed: (computed: boolean) => void;
+  bumpPointCloudDeviationRevision: () => void;
   setPointCloudAssetCount: (count: number) => void;
   incrementPointCloudAssetCount: (n?: number) => void;
   setPointCloudAlignmentAvailable: (available: boolean) => void;
@@ -157,10 +167,10 @@ export interface PointCloudSlice {
 
 /**
  * Single source of truth for the slice's runtime field defaults.
- * Both the slice initializer and `resetViewerState` consume this so
+ * Both the slice initializer and `pointCloudTeardown` consume this so
  * the two paths can't drift.
  */
-export const POINT_CLOUD_DEFAULTS = {
+const POINT_CLOUD_DEFAULTS = {
   // Fixed-px is the default so the size slider feels responsive on first
   // contact. `attenuated` is nicer at extreme zooms but its "slider =
   // upper cap" semantic confuses users at typical wide views because the
@@ -179,6 +189,7 @@ export const POINT_CLOUD_DEFAULTS = {
   pointCloudDeviationCenterOffset: 0,
   pointCloudDeviationHalfRange: 0.05,
   pointCloudDeviationComputed: false,
+  pointCloudDeviationRevision: 0,
   pointCloudAssetCount: 0,
   pointCloudAlignmentAvailable: false,
   pointCloudAlignmentEnabled: true,
@@ -240,6 +251,7 @@ export const createPointCloudSlice: StateCreator<PointCloudSlice, [], [], PointC
     pointCloudDeviationHalfRange: Number.isFinite(m) ? Math.max(1e-4, m) : 0.05,
   }),
   setPointCloudDeviationComputed: (computed) => set({ pointCloudDeviationComputed: computed }),
+  bumpPointCloudDeviationRevision: () => set((s) => ({ pointCloudDeviationRevision: s.pointCloudDeviationRevision + 1 })),
   setPointCloudAssetCount: (count) => set({
     pointCloudAssetCount: Number.isFinite(count) ? Math.max(0, count) : 0,
   }),
@@ -251,3 +263,53 @@ export const createPointCloudSlice: StateCreator<PointCloudSlice, [], [], PointC
   setPointCloudAlignmentAvailable: (available) => set({ pointCloudAlignmentAvailable: available }),
   setPointCloudAlignmentEnabled: (enabled) => set({ pointCloudAlignmentEnabled: enabled }),
 });
+
+/**
+ * Point cloud — clear runtime fields so a new file doesn't inherit the
+ * previous file's color mode / size / EDL state.
+ *
+ * The one place in the registry where spreading a shared defaults const IS the
+ * explicit field list Trap A asks for: `POINT_CLOUD_DEFAULTS` is this slice's
+ * own, it is not the slice's whole state (the actions are not in it), and every
+ * field in it is session-scoped — none of them round-trips to localStorage or
+ * outlives a model swap. `owns` still names all 18 by hand, so the reviewable
+ * artefact stays a list.
+ *
+ * `pointCloudDeviationComputed` is ALSO driven to false by `removeModel` and
+ * `clearAllModels` through `setPointCloudDeviationComputed(false)`. That stays
+ * an entry-point side effect: taking it into a `model-removed` arm here as well
+ * would write the field twice on the same path.
+ */
+export const pointCloudTeardown = defineSliceTeardown(
+  'pointCloudSlice',
+  [
+    'pointCloudColorMode',
+    'pointCloudFixedColor',
+    'pointCloudSizeMode',
+    'pointCloudPointSize',
+    'pointCloudWorldRadius',
+    'pointCloudRoundShape',
+    'pointCloudEdlEnabled',
+    'pointCloudEdlStrength',
+    'pointCloudClassMask',
+    'pointCloudClassCounts',
+    'pointCloudPreviewStride',
+    'pointCloudDeviationCenterOffset',
+    'pointCloudDeviationHalfRange',
+    'pointCloudDeviationComputed',
+    'pointCloudDeviationRevision',
+    'pointCloudAssetCount',
+    'pointCloudAlignmentAvailable',
+    'pointCloudAlignmentEnabled',
+  ],
+  {
+    'session-reset': () => ({
+      ...POINT_CLOUD_DEFAULTS,
+      // Re-spread typed-array fields so consumers get fresh references
+      // instead of the readonly literal in POINT_CLOUD_DEFAULTS.
+      pointCloudFixedColor: [...POINT_CLOUD_DEFAULTS.pointCloudFixedColor] as [number, number, number, number],
+    }),
+    'model-removed': notApplicable,
+    'all-models-cleared': notApplicable,
+  },
+);

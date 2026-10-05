@@ -14,6 +14,8 @@ interface SelectionSnapshot {
   selectedEntitiesSet: Set<string>;
   selectedEntities: ReturnType<typeof useViewerStore.getState>['selectedEntities'];
   selectedModelId: string | null;
+  chartOwned: boolean;
+  selectionRevision: number;
 }
 
 function hasSelection(snapshot: SelectionSnapshot): boolean {
@@ -35,6 +37,9 @@ function snapshotSelectionState(): SelectionSnapshot {
     selectedEntitiesSet: new Set(state.selectedEntitiesSet),
     selectedEntities: state.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: state.selectedModelId,
+    chartOwned: state.chartSelectionRevision != null
+      && state.chartSelectionRevision === state.selectionRevision,
+    selectionRevision: state.selectionRevision,
   };
 }
 
@@ -46,6 +51,22 @@ function restoreSelectionState(snapshot: SelectionSnapshot): void {
     selectedEntitiesSet: new Set(snapshot.selectedEntitiesSet),
     selectedEntities: snapshot.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: snapshot.selectedModelId,
+    selectionRevision: snapshot.selectionRevision,
+    ...(snapshot.chartOwned
+      ? { chartSelectionRevision: snapshot.selectionRevision }
+      : {}),
+  });
+}
+
+/** Hide the outline for capture without publishing a new selection write. */
+function temporarilyClearSelectionState(): void {
+  useViewerStore.setState({
+    selectedEntity: null,
+    selectedEntitiesSet: new Set(),
+    selectedEntities: [],
+    selectedEntityId: null,
+    selectedEntityIds: new Set(),
+    selectedModelId: null,
   });
 }
 
@@ -60,6 +81,10 @@ async function captureCanvasThumbnail(): Promise<string | null> {
     await device.queue.onSubmittedWorkDone();
   }
 
+  // FRAME-WAIT-ALLOW(#2385): must NOT be raced against a timer — the point is
+  // that the frame was presented before `toDataURL()` samples the canvas, and
+  // timing out would save a stale or blank basket thumbnail. A hidden tab
+  // cannot present a frame at all, so bounding this buys nothing.
   await new Promise<void>((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
   );
@@ -106,16 +131,18 @@ export async function saveBasketViewWithThumbnailFromStore(
 ): Promise<string | null> {
   const before = snapshotSelectionState();
   const hadSelection = hasSelection(before);
+  let clearedSelectionRevision: number | null = null;
 
   if (hadSelection) {
-    useViewerStore.getState().clearEntitySelection();
+    temporarilyClearSelectionState();
+    clearedSelectionRevision = useViewerStore.getState().selectionRevision;
   }
 
   try {
     const thumbnailDataUrl = await captureCanvasThumbnail();
     return useViewerStore.getState().saveCurrentBasketView({ source, thumbnailDataUrl });
   } finally {
-    if (hadSelection) {
+    if (hadSelection && useViewerStore.getState().selectionRevision === clearedSelectionRevision) {
       restoreSelectionState(before);
     }
   }

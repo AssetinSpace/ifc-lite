@@ -28,9 +28,11 @@
  * state changes).
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
+import { taskStartEpoch, taskFinishEpoch } from '@/store/slices/schedule-task-dates';
 import type { GanttTimeScale, ScheduleTimeRange } from '@/store';
+import { KEYBOARD_PRIORITY, registerKeyboardCommand } from '@/lib/commands/dispatcher';
 
 export type BarDragMode = 'shift' | 'resize-start' | 'resize-finish';
 
@@ -69,13 +71,6 @@ function epochToIso(ms: number): string {
     `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T` +
     `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
   );
-}
-
-function parseIso(iso?: string): number | undefined {
-  if (!iso) return undefined;
-  const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(iso);
-  const t = Date.parse(hasTz ? iso : `${iso}Z`);
-  return Number.isNaN(t) ? undefined : t;
 }
 
 /** Milliseconds → ISO-8601 duration (same shape the animator / exporter emit). */
@@ -145,6 +140,8 @@ export interface UseGanttBarDragResult {
 export function useGanttBarDrag(opts: UseGanttBarDragOptions): UseGanttBarDragResult {
   const { range, pixelWidth, scale } = opts;
   const sessionRef = useRef<DragSession | null>(null);
+  const removeCancelRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => { removeCancelRef.current?.(); removeCancelRef.current = null; }, []);
   const [live, setLive] = useState<BarDragLive>({
     taskGlobalId: null, mode: null, liveStartMs: 0, liveFinishMs: 0,
   });
@@ -230,19 +227,12 @@ export function useGanttBarDrag(opts: UseGanttBarDragOptions): UseGanttBarDragRe
     endDrag(false);
   }, [endDrag]);
 
-  const onKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      detach();
-      endDrag(false);
-    }
-  }, [endDrag]);
-
   function detach() {
     window.removeEventListener('pointermove', onPointerMove);
     window.removeEventListener('pointerup', onPointerUp);
     window.removeEventListener('pointercancel', onPointerCancel);
-    window.removeEventListener('keydown', onKeyDown);
+    removeCancelRef.current?.();
+    removeCancelRef.current = null;
   }
 
   const onPointerDown = useCallback((
@@ -256,8 +246,10 @@ export function useGanttBarDrag(opts: UseGanttBarDragOptions): UseGanttBarDragRe
     const store = useViewerStore.getState();
     const task = store.scheduleData?.tasks.find(t => t.globalId === taskGlobalId);
     if (!task) return;
-    const origStart = parseIso(task.taskTime?.scheduleStart);
-    const origFinish = parseIso(task.taskTime?.scheduleFinish);
+    // The bar's drawn window (#6803), so early-only or actual-only tasks drag too;
+    // the drop writes ScheduleStart/ScheduleFinish, making the window planned.
+    const origStart = taskStartEpoch(task);
+    const origFinish = taskFinishEpoch(task);
     if (origStart === undefined || origFinish === undefined) return;
     // Don't try to resize a zero-width bar: shift-only instead. Also
     // milestones should never hit this path (caller gates them out) but
@@ -293,13 +285,17 @@ export function useGanttBarDrag(opts: UseGanttBarDragOptions): UseGanttBarDragRe
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerCancel);
-    window.addEventListener('keydown', onKeyDown);
+    removeCancelRef.current?.();
+    removeCancelRef.current = registerKeyboardCommand('schedule.cancelDrag', () => {
+      detach();
+      endDrag(false);
+    }, { allowInTextEntry: true, ignoreModifiers: true, priority: KEYBOARD_PRIORITY.pointerDrag });
 
     setLive({
       taskGlobalId, mode,
       liveStartMs: origStart, liveFinishMs: origFinish,
     });
-  }, [range, pixelWidth, onPointerMove, onPointerUp, onPointerCancel, onKeyDown]);
+  }, [range, pixelWidth, onPointerMove, onPointerUp, onPointerCancel, endDrag]);
 
   return { onPointerDown, live };
 }

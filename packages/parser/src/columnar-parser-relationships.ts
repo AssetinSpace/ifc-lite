@@ -9,18 +9,33 @@
  * from STEP relationship entities without TextDecoder overhead.
  */
 
-import { skipCommas, readRefId, readRefList } from './columnar-parser-attributes.js';
+import { skipCommas, readRefList } from './columnar-parser-attributes.js';
+import { getRelationshipSlotPlan } from './relationship-schema-slots.js';
+import type { IfcDataStore } from './columnar-parser.js';
 
 /**
- * Extract relatingObject and relatedObjects from a relationship entity using byte-level scanning.
- * No TextDecoder needed - only extracts numeric entity IDs.
+ * Extract relatingObject and relatedObjects from a relationship entity using
+ * byte-level scanning. No TextDecoder needed — only extracts numeric entity
+ * IDs.
+ *
+ * The attribute positions come from {@link getRelationshipSlotPlan}
+ * (schema-derived, per #4205) rather than a hand-written branch per STEP
+ * keyword. `readRefList` accepts both a bare `#id` and a `(...)` list, so a
+ * single read path serves the "relating" slot (always one reference) and the
+ * "related" slot (one reference or a list) alike — the plan's `isList` flag
+ * only documents which shape a class uses, it does not gate how the value is
+ * read.
  */
 export function extractRelFast(
     buffer: Uint8Array,
     byteOffset: number,
     byteLength: number,
     typeUpper: string,
+    schemaVersion?: IfcDataStore['schemaVersion'],
 ): { relatingObject: number; relatedObjects: number[] } | null {
+    const plan = getRelationshipSlotPlan(typeUpper, schemaVersion);
+    if (!plan) return null;
+
     const end = byteOffset + byteLength;
     let pos = byteOffset;
 
@@ -28,62 +43,63 @@ export function extractRelFast(
     if (pos >= end) return null;
     pos++;
 
-    // Skip to attr[4] (all IfcRelationship subtypes have 4 shared IfcRoot+IfcRelationship attrs)
+    // Skip to post-root attr[0] (all IfcRelationship subtypes share 4
+    // IfcRoot+IfcRelationship attrs: GlobalId, OwnerHistory, Name, Description).
     pos = skipCommas(buffer, pos, end, 4);
 
-    if (typeUpper === 'IFCRELCONTAINEDINSPATIALSTRUCTURE'
-        || typeUpper === 'IFCRELREFERENCEDINSPATIALSTRUCTURE'
-        || typeUpper === 'IFCRELDEFINESBYPROPERTIES'
-        || typeUpper === 'IFCRELDEFINESBYTYPE') {
-        // attr[4]=RelatedObjects, attr[5]=RelatingObject
-        const [related, rp] = readRefList(buffer, pos, end);
+    const slots = [
+        { kind: 'relating' as const, ...plan.relating },
+        { kind: 'related' as const, ...plan.related },
+    ].sort((a, b) => a.index - b.index);
+
+    let relatingIds: number[] = [];
+    let relatedIds: number[] = [];
+    let cursor = 0;
+    for (const slot of slots) {
+        pos = skipCommas(buffer, pos, end, slot.index - cursor);
+        cursor = slot.index;
+        const [ids, rp] = readRefList(buffer, pos, end);
+        if (slot.kind === 'relating') relatingIds = ids;
+        else relatedIds = ids;
         pos = rp;
-        while (pos < end && buffer[pos] !== 0x2C) pos++;
-        pos++;
-        const [relating, _] = readRefId(buffer, pos, end);
-        if (relating < 0 || related.length === 0) return null;
-        return { relatingObject: relating, relatedObjects: related };
-    } else if (typeUpper === 'IFCRELASSIGNSTOGROUP' || typeUpper === 'IFCRELASSIGNSTOPRODUCT') {
-        const [related, rp] = readRefList(buffer, pos, end);
-        // `readRefList` returns `rp` pointing AT the closing `)` of
-        // the list. `skipCommas` tracks paren depth, so leaving `rp`
-        // there makes that `)` cancel the implicit depth-0 baseline
-        // and subsequent commas don't count. Advance past it first.
-        let after = rp;
-        if (after < end && buffer[after] === 0x29) after++;
-        pos = skipCommas(buffer, after, end, 2);
-        const [relating, _] = readRefId(buffer, pos, end);
-        if (relating < 0 || related.length === 0) return null;
-        return { relatingObject: relating, relatedObjects: related };
-    } else if (typeUpper === 'IFCRELCONNECTSELEMENTS' || typeUpper === 'IFCRELCONNECTSPATHELEMENTS') {
-        pos = skipCommas(buffer, pos, end, 1);
-        const [relating, rp2] = readRefId(buffer, pos, end);
-        pos = skipCommas(buffer, rp2, end, 1);
-        const [related, _] = readRefId(buffer, pos, end);
-        if (relating < 0 || related < 0) return null;
-        return { relatingObject: relating, relatedObjects: [related] };
-    } else {
-        // Default: attr[4]=RelatingObject, attr[5]=RelatedObject(s)
-        const [relating, rp] = readRefId(buffer, pos, end);
-        if (relating < 0) return null;
-        pos = rp;
-        while (pos < end && buffer[pos] !== 0x2C) pos++;
-        pos++;
-        const [related, _] = readRefList(buffer, pos, end);
-        if (related.length === 0) return null;
-        return { relatingObject: relating, relatedObjects: related };
+        // `readRefList` returns `rp` pointing AT the closing `)` when it read
+        // a parenthesised list — `skipCommas` tracks paren depth from its
+        // start position, so leaving `pos` there makes that `)` register as
+        // an unmatched close and miscount every comma after it. Advance past
+        // it before the next slot's `skipCommas` call. A bare single `#id`
+        // never leaves `rp` sitting on a `)`, so this is a no-op for it.
+        if (pos < end && buffer[pos] === 0x29) pos++;
     }
+
+    const relatingObject = relatingIds[0] ?? -1;
+    if (relatingObject < 0 || relatedIds.length === 0) return null;
+    return { relatingObject, relatedObjects: relatedIds };
 }
 
 /**
- * Extract property rel data: attr[4]=relatedObjects, attr[5]=relatingDef.
+ * Extract property rel data: attr[4]=relatedObjects, attr[5]=relatingDef(s).
  * Numbers only, no TextDecoder.
+ *
+ * attr[5] is read as a ref LIST, not a single ref: it is reused for both
+ * `IfcRelDefinesByProperties.RelatingPropertyDefinition` (typed
+ * `IfcPropertySetDefinitionSelect`, whose second alternative
+ * `IfcPropertySetDefinitionSet` is a `SET [1:?] OF IfcPropertySetDefinition`
+ * and is written as a parenthesised list, e.g. `(#20,#21)`, not `#20`) and
+ * the single-ref `IfcRelAssociates*` selects (`IfcMaterialSelect` /
+ * `IfcClassificationSelect` / `IfcDocumentSelect`, always one ref).
+ * `readRefList` already accepts both a bare `#id` and a `(...)` list, so one
+ * call handles both callers; the single-ref case is a length-1 list. A prior
+ * version used `readRefId` here, which only recognises a bare `#id` — for a
+ * schema-legal grouped `IfcPropertySetDefinitionSet` (`(#20,#21)`) it saw the
+ * list's opening `(` instead of `#`, returned -1, and this function returned
+ * null, silently dropping the WHOLE `IfcRelDefinesByProperties` relationship:
+ * every related object lost all properties/quantities from that pset group.
  */
 export function extractPropertyRelFast(
     buffer: Uint8Array,
     byteOffset: number,
     byteLength: number,
-): { relatedObjects: number[]; relatingDef: number } | null {
+): { relatedObjects: number[]; relatingDefs: number[] } | null {
     const end = byteOffset + byteLength;
     let pos = byteOffset;
 
@@ -98,7 +114,7 @@ export function extractPropertyRelFast(
     while (pos < end && buffer[pos] !== 0x2C) pos++;
     pos++;
 
-    const [relatingDef, _] = readRefId(buffer, pos, end);
-    if (relatingDef < 0 || relatedObjects.length === 0) return null;
-    return { relatedObjects, relatingDef };
+    const [relatingDefs, _] = readRefList(buffer, pos, end);
+    if (relatingDefs.length === 0 || relatedObjects.length === 0) return null;
+    return { relatedObjects, relatingDefs };
 }

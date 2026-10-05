@@ -3,16 +3,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * 2D Drawing generation state slice
- *
- * Manages state for generating and viewing 2D architectural drawings
- * (floor plans, sections, elevations) from the 3D model.
+ * 2D Drawing generation state slice: manages state for generating and
+ * viewing 2D architectural drawings (floor plans, sections, elevations) from the 3D model.
  */
 
 import type { StateCreator } from 'zustand';
 import type { Drawing2D, DxfPlacement, DxfUnderlay, GraphicOverrideRule, GraphicOverridePreset } from '@ifc-lite/drawing-2d';
-import { BUILT_IN_PRESETS, DEFAULT_DXF_PLACEMENT } from '@ifc-lite/drawing-2d';
+import { BUILT_IN_PRESETS } from '@ifc-lite/drawing-2d';
+import type { DxfReferenceFrame } from '@/hooks/dxfReferencePlane';
+import { createDxfUnderlayActions } from './drawing2DSlice.dxfActions';
+import { validateDrawingDisplayOptions } from '@/lib/drawing/projection-depth';
 import { DEFAULT_SCAN_SECTION_THICKNESS } from '@/hooks/scanSectionMath';
+import { DEFAULT_SCAN_OUTLINE_MAX_GAP } from '@/lib/scan-outline/scan-outline';
+import { isDegenerateMeasurement, isDegenerateArea, isDegenerateCloud } from './drawing2DDegenerateGuards';
 
 export type Drawing2DStatus = 'idle' | 'generating' | 'ready' | 'error';
 
@@ -73,14 +76,55 @@ export interface DxfUnderlayState {
   name: string;
   /** Parsed + converted geometry in drawing space */
   underlay: DxfUnderlay;
-  /** Master visibility toggle */
+  /** Master visibility toggle for the 2D drawing panel underlay */
   visible: boolean;
-  /** Render opacity (0-1) */
+  /**
+   * Visibility toggle for the 3D viewport overlay (issue #2043, follow-up
+   * to #1782/#1929's 2D-only underlay). Independent of `visible` — the
+   * user loads a DXF once and then chooses where it shows, per the issue's
+   * explicit rejection of a load-time 2D-vs-3D choice. Defaults to `true`
+   * in both contexts (`addDxfUnderlay` below), matching `visible`.
+   */
+  visible3D: boolean;
+  /** Render opacity (0-1), shared by the 2D and 3D renderers */
   opacity: number;
   /** Per-DXF-layer visibility, seeded from the DXF layer table */
   layerVisibility: Record<string, boolean>;
   /** User placement (offset/rotation/scale) in drawing space */
   placement: DxfPlacement;
+  /**
+   * Whether this underlay's raw coordinates are map/CRS (eastings,
+   * northings) rather than IFC world coordinates — issue #1929, made
+   * TRI-STATE by the PR #1965 review round:
+   *
+   *   - `true` / `false`: explicit — written ONLY by the user flipping the
+   *     "Align to model georeference" checkbox (`setDxfUnderlayGeoreferenced`).
+   *     Always wins, regardless of whether an anchor georeference is
+   *     currently available.
+   *   - `undefined` ("auto"): follow anchor georeference availability,
+   *     resolved LAZILY at render time (`resolveEffectiveGeoreferenced` in
+   *     `dxfUnderlayMath.ts`, fed by `useDxfMapToWorldTransform`'s
+   *     `available` flag) instead of once at import time. This closes the
+   *     race where a combined model+DXF drop ingests the DXF before the
+   *     model has finished loading (`ViewportContainer.handleDrop` fires
+   *     `ingestDxfFiles` concurrently with model loading — see
+   *     `dxfIngest.ts`'s module doc) and also covers the anchor being
+   *     removed/re-added later in the session.
+   *
+   * `addDxfUnderlay` defaults a caller that doesn't explicitly request
+   * `'auto'` to `false`, NEVER to `undefined` — see its doc below. Only
+   * `ingestDxfFile` (the DXF-import feature itself) opts a freshly-created
+   * entry into `'auto'`; every other construction path, including a
+   * hypothetical future load/migration path for entries that predate this
+   * field, is conservative by construction and never starts following the
+   * anchor on its own. `dxfUnderlayToDrawing`/`dxfUnderlayDrawingBounds`
+   * apply the inverse IfcMapConversion (the federation anchor's, via
+   * `resolveDxfExportGeoreference`) before the existing world→drawing
+   * mapping and per-underlay placement, gated on the EFFECTIVE (tri-state
+   * resolved) value, not the raw field.
+   */
+  georeferenced?: boolean;
+  referenceFrame?: DxfReferenceFrame;
 }
 
 export interface Drawing2DState {
@@ -96,8 +140,6 @@ export interface Drawing2DState {
   drawing2DError: string | null;
   /** Whether the 2D panel is visible */
   drawing2DPanelVisible: boolean;
-  /** Suppress auto-opening 2D panel on next section tool activation */
-  suppressNextSection2DPanelAutoOpen: boolean;
   /** SVG content for export (cached) */
   drawing2DSvgContent: string | null;
   /** Display options */
@@ -119,10 +161,12 @@ export interface Drawing2DState {
     /**
      * Construction projection (issue #979): project geometry beyond the cut
      * as reference lines — thin solid for the visible floor side, dashed for
-     * overhead elements (beams, roofs, eaves). Plan ('down') sections only.
+     * overhead elements (beams, roofs, eaves). Cardinal Down, Front and Side sections.
      * Off by default; the section view stays cut-only until enabled.
      */
     showConstructionProjection: boolean;
+    /** Manual background depth in metres; null selects automatic bands (#6615). */
+    constructionProjectionDepth: number | null;
     /**
      * Point-cloud "scan" overlay on the 2D section view (issue #1805): a
      * thin band of loaded scan points around the cut plane, projected into
@@ -137,6 +181,20 @@ export interface Drawing2DState {
     scanSectionOpacity: number;
     /** Include the scan layer's dots in SVG export/print. */
     scanSectionIncludeInExport: boolean;
+    /**
+     * Vector outline (#6871): trace closed rings from the slab points and
+     * draw them as lines; the DXF export writes them on their own layer.
+     */
+    scanSectionOutline: boolean;
+    /** Widest gap (metres) the outline bridges, about a wall thickness. */
+    scanSectionOutlineMaxGap: number;
+    /**
+     * Print preview (#5496): forces the direct-mode canvas to white paper
+     * with black ink regardless of the active app theme, previewing what
+     * exports already produce. Off by default — the canvas otherwise
+     * follows the theme (dark paper in dark theme).
+     */
+    showPrintPreview: boolean;
   };
   /** Available graphic override presets */
   graphicOverridePresets: GraphicOverridePreset[];
@@ -205,7 +263,6 @@ export interface Drawing2DSlice extends Drawing2DState {
   setDrawing2DProgress: (progress: number, phase: string) => void;
   setDrawing2DError: (error: string | null) => void;
   setDrawing2DPanelVisible: (visible: boolean) => void;
-  setSuppressNextSection2DPanelAutoOpen: (suppress: boolean) => void;
   toggleDrawing2DPanel: () => void;
   setDrawing2DSvgContent: (svg: string | null) => void;
   updateDrawing2DDisplayOptions: (options: Partial<Drawing2DState['drawing2DDisplayOptions']>) => void;
@@ -279,23 +336,38 @@ export interface Drawing2DSlice extends Drawing2DState {
   clearAllAnnotations2D: () => void;
 
   // DXF Underlay Actions (issue #1782)
-  /** Register an imported DXF underlay; returns its id */
-  addDxfUnderlay: (underlay: DxfUnderlay) => string;
+  /**
+   * Register an imported DXF underlay; returns its id. `options.georeferenced`
+   * (issue #1929, made tri-state by the PR #1965 review) seeds the
+   * per-underlay "DXF is in map/CRS coordinates" toggle:
+   *   - omitted, or `true`/`false`: written verbatim (default `false` when
+   *     omitted — the pre-#1929, always-safe behaviour for any call site
+   *     that isn't the DXF-ingest feature itself).
+   *   - `'auto'`: stored as `undefined`, meaning "follow anchor
+   *     georeference availability, resolved at render time" — only
+   *     `ingestDxfFile` passes this, so an entry only ever starts in auto
+   *     mode when it was created by THIS feature's own import path.
+   */
+  addDxfUnderlay: (underlay: DxfUnderlay, options?: { georeferenced?: boolean | 'auto'; referenceFrame?: DxfReferenceFrame }) => string;
   removeDxfUnderlay: (id: string) => void;
   setDxfUnderlayVisible: (id: string, visible: boolean) => void;
+  /** Toggle the 3D viewport overlay independently of the 2D underlay (issue #2043) */
+  setDxfUnderlayVisible3D: (id: string, visible3D: boolean) => void;
   setDxfUnderlayOpacity: (id: string, opacity: number) => void;
   /** Toggle one DXF layer within an underlay */
   toggleDxfUnderlayLayer: (id: string, layerName: string) => void;
   updateDxfUnderlayPlacement: (id: string, placement: Partial<DxfPlacement>) => void;
+  /** Flip whether an underlay's coordinates are map/CRS vs. IFC world (issue #1929) */
+  setDxfUnderlayGeoreferenced: (id: string, georeferenced: boolean) => void;
   clearDxfUnderlays: () => void;
 }
 
 /**
  * Single source of truth for `drawing2DDisplayOptions` defaults. Both the
- * slice initializer and `resetViewerState` (`store/index.ts`) call this so
+ * slice initializer and `drawing2DSlice.teardown.ts` call this so
  * the two paths can't drift — the same pattern `POINT_CLOUD_DEFAULTS` uses.
  */
-export const getDefaultDisplayOptions = (): Drawing2DState['drawing2DDisplayOptions'] => ({
+const getDefaultDisplayOptions = (): Drawing2DState['drawing2DDisplayOptions'] => ({
   showHiddenLines: true,
   showHatching: true,
   showAnnotations: true,
@@ -303,21 +375,24 @@ export const getDefaultDisplayOptions = (): Drawing2DState['drawing2DDisplayOpti
   scale: 100, // 1:100 default
   useSymbolicRepresentations: false, // Default to section cut (Body geometry)
   showIfcAnnotations: true, // Mirror the 3D Class Visibility default
+  constructionProjectionDepth: null,
   showConstructionProjection: false, // Optional reference projection (issue #979), off by default
   showScanSection: true, // Scan overlay (issue #1805) — on by default, no-op without a loaded point cloud
   scanSectionThickness: DEFAULT_SCAN_SECTION_THICKNESS,
   scanSectionOpacity: 0.9,
   scanSectionIncludeInExport: true,
+  scanSectionOutline: false,
+  scanSectionOutlineMaxGap: DEFAULT_SCAN_OUTLINE_MAX_GAP,
+  showPrintPreview: false,
 });
 
-const getDefaultState = (): Drawing2DState => ({
+export const getDefaultDrawing2DState = (): Drawing2DState => ({
   drawing2D: null,
   drawing2DStatus: 'idle',
   drawing2DProgress: 0,
   drawing2DPhase: '',
   drawing2DError: null,
   drawing2DPanelVisible: false,
-  suppressNextSection2DPanelAutoOpen: false,
   drawing2DSvgContent: null,
   drawing2DDisplayOptions: getDefaultDisplayOptions(),
   // Graphic overrides
@@ -351,7 +426,7 @@ const getDefaultState = (): Drawing2DState => ({
 
 export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2DSlice> = (set, get) => ({
   // Initial state
-  ...getDefaultState(),
+  ...getDefaultDrawing2DState(),
 
   // Drawing Actions
   setDrawing2D: (drawing) => set({
@@ -373,17 +448,28 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
   }),
 
   setDrawing2DPanelVisible: (visible) => set({ drawing2DPanelVisible: visible }),
-  setSuppressNextSection2DPanelAutoOpen: (suppress) => set({ suppressNextSection2DPanelAutoOpen: suppress }),
 
   toggleDrawing2DPanel: () => set((state) => ({ drawing2DPanelVisible: !state.drawing2DPanelVisible })),
 
   setDrawing2DSvgContent: (svg) => set({ drawing2DSvgContent: svg }),
 
   updateDrawing2DDisplayOptions: (options) => set((state) => ({
-    drawing2DDisplayOptions: { ...state.drawing2DDisplayOptions, ...options },
+    drawing2DDisplayOptions: { ...state.drawing2DDisplayOptions, ...validateDrawingDisplayOptions(options) },
   })),
 
-  clearDrawing2D: () => set(getDefaultState()),
+  // Only the drawing-generation fields, NOT the whole slice: this is called
+  // by "View 2D" (SectionPanel.tsx) purely to force regeneration with
+  // current settings, so it must leave graphic overrides, DXF underlays,
+  // and all annotation/measurement state (which `getDefaultDrawing2DState()`
+  // would wipe) untouched.
+  clearDrawing2D: () => set({
+    drawing2D: null,
+    drawing2DStatus: 'idle',
+    drawing2DProgress: 0,
+    drawing2DPhase: '',
+    drawing2DError: null,
+    drawing2DSvgContent: null,
+  }),
 
   // Graphic Override Actions
   setActivePreset: (presetId) => set({ activePresetId: presetId }),
@@ -492,8 +578,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
       const distance = Math.sqrt(dx * dx + dy * dy);
 
       // Ignore zero-length measurements (click without drag)
-      const MIN_MEASUREMENT_DISTANCE = 0.001; // 1mm minimum
-      if (distance < MIN_MEASUREMENT_DISTANCE) {
+      if (isDegenerateMeasurement(distance)) {
         // Reset state without saving the measurement
         set({
           measure2DStart: null,
@@ -536,7 +621,6 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
   // ═══════════════════════════════════════════════════════════════════════
 
   setAnnotation2DActiveTool: (tool) => {
-    const state = get();
     // Cancel any in-progress work from previous tool
     const resetState: Partial<Drawing2DState> = {
       annotation2DActiveTool: tool,
@@ -568,6 +652,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
     const state = get();
     if (state.polygonArea2DPoints.length < 3) return;
 
+    if (isDegenerateArea(area)) { set({ polygonArea2DPoints: [], annotation2DCursorPos: null }); return; } // near-zero-area guard (#4197)
     const result: PolygonArea2DResult = {
       id: `poly-area-${Date.now()}`,
       points: [...state.polygonArea2DPoints],
@@ -625,6 +710,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
     const state = get();
     if (state.cloudAnnotation2DPoints.length < 2) return;
 
+    if (isDegenerateCloud(state.cloudAnnotation2DPoints)) { set({ cloudAnnotation2DPoints: [], annotation2DCursorPos: null }); return; } // near-zero-size guard (#4197)
     const result: CloudAnnotation2D = {
       id: `cloud-${Date.now()}`,
       points: [...state.cloudAnnotation2DPoints],
@@ -720,55 +806,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
     }
   },
 
-  // DXF Underlay Actions (issue #1782)
-  addDxfUnderlay: (underlay) => {
-    const id = `dxf-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-    const layerVisibility: Record<string, boolean> = {};
-    for (const layer of underlay.layers) layerVisibility[layer.name] = layer.visible;
-    const entry: DxfUnderlayState = {
-      id,
-      name: underlay.name,
-      underlay,
-      visible: true,
-      opacity: 1,
-      layerVisibility,
-      placement: { ...DEFAULT_DXF_PLACEMENT },
-    };
-    set((state) => ({ dxfUnderlays: [...state.dxfUnderlays, entry] }));
-    return id;
-  },
-
-  removeDxfUnderlay: (id) => set((state) => ({
-    dxfUnderlays: state.dxfUnderlays.filter((u) => u.id !== id),
-  })),
-
-  setDxfUnderlayVisible: (id, visible) => set((state) => ({
-    dxfUnderlays: state.dxfUnderlays.map((u) => (u.id === id ? { ...u, visible } : u)),
-  })),
-
-  setDxfUnderlayOpacity: (id, opacity) => set((state) => ({
-    dxfUnderlays: state.dxfUnderlays.map((u) =>
-      u.id === id ? { ...u, opacity: Math.max(0, Math.min(1, opacity)) } : u
-    ),
-  })),
-
-  toggleDxfUnderlayLayer: (id, layerName) => set((state) => ({
-    dxfUnderlays: state.dxfUnderlays.map((u) => {
-      if (u.id !== id) return u;
-      const current = u.layerVisibility[layerName]
-        ?? u.underlay.layers.find((l) => l.name === layerName)?.visible
-        ?? true;
-      return { ...u, layerVisibility: { ...u.layerVisibility, [layerName]: !current } };
-    }),
-  })),
-
-  updateDxfUnderlayPlacement: (id, placement) => set((state) => ({
-    dxfUnderlays: state.dxfUnderlays.map((u) =>
-      u.id === id ? { ...u, placement: { ...u.placement, ...placement } } : u
-    ),
-  })),
-
-  clearDxfUnderlays: () => set({ dxfUnderlays: [] }),
+  ...createDxfUnderlayActions(set),
 
   // Bulk Actions
   clearAllAnnotations2D: () => set({

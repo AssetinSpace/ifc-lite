@@ -69,10 +69,11 @@ import {
 import { ToolExecutionError, ToolErrorCode, toolError } from './errors.js';
 import { PromptRegistry } from './prompts/types.js';
 import { ResourceRegistry } from './resources/types.js';
-import { disposeLayerWorkspace } from './tools/layer-store.js';
+import { disposeSessionResources } from './session-cleanup.js';
 import { ToolRegistry } from './tools/types.js';
-import { validateInput } from './validate.js';
+import { advertisedInputSchema, validateInput } from './validate.js';
 import { ViewerManager } from './viewer-manager.js';
+import type { ViewerState } from './viewer-manager.js';
 
 export const SERVER_NAME = 'ifc-lite-mcp';
 
@@ -129,7 +130,7 @@ export class MCPServer {
     this.sessionId = opts.sessionId;
     this.registry = opts.registry ?? new InMemoryModelRegistry();
     this.scope = opts.scope ?? fullScope();
-    this.config = { ...DEFAULT_CONFIG, ...(opts.config ?? {}) };
+    this.config = { ...DEFAULT_CONFIG, ...opts.config };
     this.tools = opts.tools;
     this.resources = opts.resources;
     this.prompts = opts.prompts;
@@ -161,23 +162,44 @@ export class MCPServer {
     this.sink = null;
     this.active.forEach((c) => c.abort());
     this.active.clear();
-    try {
-      // The viewer holds an HTTP server + SSE listener; closing it stops
-      // dangling sockets when the transport disconnects.
-      if (this.viewer.isOpen()) this.viewer.close();
-    } finally {
-      // Per-session layer drafts hold live Y.Docs — free them with the
-      // session even if the viewer close throws. detach() only fires on
-      // true termination (HTTP DELETE / transport close), never on SSE
-      // client drops, so a reconnecting client keeps its workspace until
-      // the session actually ends.
-      if (this.sessionId !== undefined) disposeLayerWorkspace(this.sessionId);
-    }
+    // Close the viewer sockets, layer Y.Docs and native Room plates even if
+    // an earlier resource fails. SSE reconnects do not call detach.
+    disposeSessionResources(this.viewer, this.registry, this.sessionId, this.logger);
   }
 
   /** Update the auth scope mid-session (e.g. token refresh). */
   setScope(scope: AuthScope): void {
     this.scope = scope;
+  }
+
+  /**
+   * Open the in-process viewer for the first loaded model if configured to
+   * do so, otherwise a no-op. Makes `ServerConfig.autoOpenViewer` /
+   * `.viewerPort` (issue #2731 finding 4) actually take effect for any
+   * caller that constructs `MCPServer` with `config`, not just the CLI.
+   *
+   * Precedence: `overrides` (an explicit, per-call instruction — this is
+   * what a CLI flag like `--viewer` represents) beats `this.config` (set at
+   * construction, e.g. by an embedder) beats the built-in default of "do
+   * not auto-open, port 0". A field left `undefined` at one level falls
+   * through to the next.
+   *
+   * No-ops (returns `null`) when auto-open resolves to `false`/`undefined`,
+   * or when no model is loaded yet. Errors from `ViewerManager.open()`
+   * propagate — callers that already have their own logging/fallback (the
+   * CLI does) can catch and report; callers that don't want that risk can
+   * check `registry.count()` first.
+   */
+  async maybeAutoOpenViewer(overrides?: { autoOpen?: boolean; port?: number }): Promise<ViewerState | null> {
+    const autoOpen = overrides?.autoOpen ?? this.config.autoOpenViewer ?? false;
+    if (!autoOpen) return null;
+    const model = this.registry.list()[0];
+    if (!model) return null;
+    const port = overrides?.port ?? this.config.viewerPort ?? 0;
+    const state = await this.viewer.open(model, port);
+    const adapters = this.viewer.adapters();
+    if (adapters) model.backend.attachStreamingAdapters(adapters.viewer, adapters.visibility);
+    return state;
   }
 
   isInitialized(): boolean {
@@ -491,11 +513,11 @@ export class MCPServer {
   }
 }
 
-function toToolDefinition(tool: { name: string; description: string; inputSchema: unknown; scope?: string }): ToolDefinition {
+function toToolDefinition(tool: { name: string; description: string; inputSchema: ToolDefinition['inputSchema']; scope?: string }): ToolDefinition {
   return {
     name: tool.name,
     description: tool.description,
-    inputSchema: tool.inputSchema as ToolDefinition['inputSchema'],
+    inputSchema: advertisedInputSchema(tool.inputSchema),
     scope: tool.scope as ToolDefinition['scope'],
   };
 }

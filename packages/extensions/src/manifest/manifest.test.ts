@@ -20,6 +20,7 @@ function loadJson(path: string): unknown {
 
 describe('validateManifest — valid fixtures', () => {
   const files = readdirSync(VALID_DIR).filter((f) => f.endsWith('.json'));
+  expect(files.length, 'valid manifest fixtures must not disappear').toBeGreaterThan(0);
 
   for (const file of files) {
     it(`accepts ${file}`, () => {
@@ -34,6 +35,7 @@ describe('validateManifest — valid fixtures', () => {
 
 describe('validateManifest — invalid fixtures', () => {
   const files = readdirSync(INVALID_DIR).filter((f) => f.endsWith('.json'));
+  expect(files.length, 'invalid manifest fixtures must not disappear').toBeGreaterThan(0);
 
   for (const file of files) {
     it(`rejects ${file}`, () => {
@@ -105,6 +107,45 @@ describe('validateManifest — direct inputs', () => {
     if (!r.ok) {
       expect(r.errors.some((e) => e.code === 'invalid_reference')).toBe(true);
     }
+  });
+
+  it('rejects a bare-prefix activation event with an empty target', () => {
+    // Regression: isActivationEvent must require v.length > prefix.length,
+    // not >=. A bare "onCommand:" (empty target after the colon) must not
+    // be accepted as valid.
+    const r = validateManifest({
+      manifestVersion: 1,
+      id: 'com.example.bare-activation',
+      name: 'Bare Activation',
+      description: '...',
+      version: '1.0.0',
+      engines: { ifcLiteSdk: '>=2.0.0' },
+      capabilities: ['model.read'],
+      activation: ['onCommand:'],
+      entry: {},
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors.some((e) => e.code === 'invalid_activation')).toBe(true);
+    }
+  });
+
+  it('accepts a real onCommand activation event with a non-empty target', () => {
+    const r = validateManifest({
+      manifestVersion: 1,
+      id: 'com.example.real-activation',
+      name: 'Real Activation',
+      description: '...',
+      version: '1.0.0',
+      engines: { ifcLiteSdk: '>=2.0.0' },
+      capabilities: ['model.read'],
+      activation: ['onCommand:something'],
+      entry: {},
+    });
+    if (!r.ok) {
+      console.error('Unexpected errors:', r.errors);
+    }
+    expect(r.ok).toBe(true);
   });
 
   it('error paths point at offending field', () => {

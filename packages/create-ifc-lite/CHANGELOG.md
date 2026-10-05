@@ -1,5 +1,38 @@
 # create-ifc-lite
 
+## 1.15.0
+
+### Minor Changes
+
+- [#5567](https://github.com/LTplus-AG/ifc-lite/pull/5567) [`64af7d9`](https://github.com/LTplus-AG/ifc-lite/commit/64af7d9d2d15486982a4db12251bc5d059577d6d) Thanks [@louistrue](https://github.com/louistrue)! - The `threejs` and `babylonjs` starters now render the building in the right shape. Both converted `MeshData` without reading `origin`, and `positions` are relative to that per-element local frame — on `AC20-FZK-Haus.ifc` 285 of 317 meshes carry one, up to 15.4 m from their drawn position, so the model arrived as a pile of disconnected slabs. The repo's own Three.js and Babylon.js tutorials already showed the one-line fold; the scaffolds now do it too. Babylon meshes are also double-sided unconditionally, since IFC triangle winding is not reliably outward.
+  
+  `--template server` can be started at all: its `docker-compose.yml` and README referenced `ghcr.io/LTplus-AG/...`, which Docker rejects outright ("repository name must be lowercase"), so `docker compose up -d` — step 1 of the generated Quick Start — failed on every machine.
+  
+  Also: a scaffolded project is version `0.1.0` rather than inheriting `@ifc-lite/parser`'s major; every template ships a `.gitignore`, a `typecheck` script, and `private: true`; the `threejs`/`babylonjs` `postinstall` that rewrote a file inside `node_modules/@ifc-lite/geometry` is gone (it patched a specifier the published dist no longer contains, so it was a no-op); `tsc` no longer emits into a `dist/` that `vite build` immediately wipes; the `basic` sample prints canonical `IfcWallStandardCase` type names instead of raw `IFCWALLSTANDARDCASE`, reports a non-IFC file as a failure instead of "parsed successfully", and exits non-zero when it fails; the React template no longer stamps this project's licence header onto the developer's own files and is aligned on Vite 7 with its sibling templates; and two `ifclite.dev` links that 404 now resolve.
+  
+  The CLI argument parser rejects what it used to silently accept: an unknown flag (`--templat react` scaffolded a project literally named `react`), a second positional (`a b c` produced `c`), and a prototype-chain template name (`--template toString` produced the `basic` scaffold). `--version` prints the version instead of scaffolding a project, `-t` is documented, and a scaffold that fails partway — an offline run, since templates resolve versions from the registry before writing anything — cleans up its directory and reports the underlying cause instead of leaving a husk that makes the retry fail with "already exists".
+  
+  Version resolution also rejects a candidate whose own tarball is missing. A version can be `dist-tags.latest`, be listed in the packument, and advertise a `dist.tarball` that 404s; the resolver only checked the candidate's dependencies, so it happily wrote that version into the scaffold and `npm install` then failed on a URL npm itself had supplied.
+
+## 1.14.13
+
+### Patch Changes
+
+- [#3851](https://github.com/LTplus-AG/ifc-lite/pull/3851) [`1389598`](https://github.com/LTplus-AG/ifc-lite/commit/1389598ac7e8c4986a89b50d7671cbb5028ab066) Thanks [@louistrue](https://github.com/louistrue)! - The `server` and `server-native` scaffolds pinned `parquet-wasm: ^0.6.0` as an optional dependency, which falls outside `@ifc-lite/server-client`'s narrowed `^0.7.2` peer range. A strict package manager rejects the generated project's install; a permissive one installs a decoder the SDK no longer supports, so the first Parquet decode fails at runtime. Both templates now scaffold `^0.7.2`, and a test asserts the scaffolded pin stays inside the peer range that `packages/server-client/package.json` declares.
+
+## 1.14.12
+
+### Patch Changes
+
+- [#2024](https://github.com/LTplus-AG/ifc-lite/pull/2024) [`63905dc`](https://github.com/LTplus-AG/ifc-lite/commit/63905dc3993ad227500a0f68c406276c909eb6f5) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fixed the remaining `GeometryProcessor` WASM handle leaks tracked in issue [#1959](https://github.com/LTplus-AG/ifc-lite/issues/1959), beyond the viewer P0 sites fixed separately. Each site now frees its handle in a `try/finally` covering every early-return and throw path, not just the happy path:
+
+  - `@ifc-lite/mcp`: `clash_check` / `clash_matrix`'s model meshing (long-lived MCP server process, one handle per never-before-clashed model).
+  - `@ifc-lite/export`: `generateLod1`'s primary and fallback processors, including the forced-meshing-failure fallback path.
+  - `@ifc-lite/cli`: `diagnose-geometry`, `extract-entities --detect`, and `gym`'s lazily-created clash-channel processor — all reachable more than once per process from a long-lived host (a test harness, a REPL session) even though each is a one-shot CLI command in normal use.
+  - `create-ifc-lite`: the generated React + WebGPU template's mount effect now disposes its `GeometryProcessor` on both the mid-init cancellation path and on unmount, so scaffolded projects don't inherit the leak.
+
+  `apps/viewer/src/hooks/useIfcLoader.ts` is intentionally untouched: its processor's WASM handle is shared with `IfcParser.parseColumnar` via `getApi()`, and disposal there needs a design decision (owned-and-reused vs. freed-per-call) that has not been made yet.
+
 ## 1.14.11
 
 ### Patch Changes

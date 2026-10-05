@@ -8,19 +8,20 @@ import assert from 'node:assert';
 import {
   buildAutoColorLensToSave,
   duplicateLensConfig,
-  mergeImportedLenses,
+  isRuleValid,
   moveItem,
   reserveUniqueId,
 } from './lens-editor-utils.js';
-import type { Lens } from '@/store/slices/lensSlice';
+import type { Lens, LensRule } from '@/store/slices/lensSlice';
+import { Rule, type FilterRule } from '@ifc-lite/rules';
 
 const ruleLens: Lens = {
-  id: 'lens-envelope',
-  name: 'Building Envelope',
-  builtin: true,
+  id: 'lens-envelope', name: 'Building Envelope', builtin: true,
   rules: [
-    { id: 'wall', name: 'Walls', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#111111' },
-    { id: 'roof', name: 'Roofs', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcRoof' }, action: 'colorize', color: '#222222' },
+    { id: 'wall', name: 'Walls', enabled: true, action: 'colorize', color: '#111111',
+      groups: [{ combinator: 'AND', rules: [{ kind: 'ifcType', op: 'in', values: ['IfcWall'] }] }] },
+    { id: 'roof', name: 'Roofs', enabled: true, action: 'colorize', color: '#222222',
+      groups: [{ combinator: 'AND', rules: [{ kind: 'ifcType', op: 'in', values: ['IfcRoof'] }] }] },
   ],
 };
 
@@ -53,21 +54,32 @@ describe('buildAutoColorLensToSave (#1365)', () => {
   });
 });
 
-describe('duplicateLensConfig (#1403)', () => {
-  it('makes an editable, deletable copy of a built-in (drops builtin flag, fresh id, "(copy)" name)', () => {
+describe('duplicateLensConfig (#1403, #5896)', () => {
+  it('copies a built-in into an editable lens with fresh rule ids', () => {
     const copy = duplicateLensConfig(ruleLens, () => 'lens-NEW');
     assert.equal(copy.id, 'lens-NEW');
     assert.equal(copy.name, 'Building Envelope (copy)');
-    assert.equal(copy.builtin, undefined, 'copy must not be a builtin');
-    assert.equal(copy.rules.length, 2);
+    assert.equal(copy.builtin, undefined);
+    assert.deepEqual(copy.rules.map((r) => r.id), ['lens-NEW-rule-0', 'lens-NEW-rule-1']);
   });
 
-  it('regenerates rule ids and clones criteria so editing the copy never mutates the source', () => {
-    const copy = duplicateLensConfig(ruleLens, () => 'lens-NEW');
-    assert.deepEqual(copy.rules.map((r) => r.id), ['lens-NEW-rule-0', 'lens-NEW-rule-1']);
-    // Mutating the copy's first criteria must not affect the source.
-    copy.rules[0].criteria.ifcType = 'IfcSlab';
-    assert.equal(ruleLens.rules[0].criteria.ifcType, 'IfcWall');
+  it('deep-clones shared groups and preserved unreadable data (#5896)', () => {
+    const source: Lens = { ...ruleLens, rules: [{ ...ruleLens.rules[0], unreadableLegacy: {
+      criteria: { type: 'material', materialName: 'Concrete' }, reason: 'Unrepresentable',
+    } }] };
+    const copy = duplicateLensConfig(source, () => 'lens-NEW');
+    const group = copy.rules[0].groups![0];
+    const filter = group.rules[0];
+    assert.equal(filter.kind, 'ifcType');
+    if (filter.kind !== 'ifcType') return;
+    filter.values.push('IfcSlab');
+    (copy.rules[0].unreadableLegacy!.criteria as { materialName: string }).materialName = 'Steel';
+    assert.deepEqual(source.rules[0].groups![0].rules[0], {
+      kind: 'ifcType', op: 'in', values: ['IfcWall'],
+    });
+    assert.deepEqual(source.rules[0].unreadableLegacy!.criteria, {
+      type: 'material', materialName: 'Concrete',
+    });
   });
 
   it('carries the autoColor spec for auto-color lenses', () => {
@@ -78,79 +90,70 @@ describe('duplicateLensConfig (#1403)', () => {
   });
 });
 
-describe('mergeImportedLenses (#1403)', () => {
-  const existing: Lens[] = [
-    { id: 'lens-envelope', name: 'Building Envelope', builtin: true, rules: [] },
-    { id: 'custom-1', name: 'My Lens', rules: [] },
-  ];
+describe('isRuleValid — shared Lens groups (#5896)', () => {
+  const rule: LensRule = { id: 'r', name: 'Walls', enabled: true,
+    groups: [{ rules: [{ kind: 'ifcType', op: 'in', values: ['IfcWall'] }], combinator: 'AND' }],
+    action: 'colorize', color: '#000' };
 
-  it('upserts by id: re-importing the same ids updates in place instead of doing nothing', () => {
-    // Round-trip: an edited export carries the existing ids.
-    const imported = [
-      { id: 'lens-envelope', name: 'Building Envelope', rules: ruleLens.rules },
-      { id: 'custom-1', name: 'My Lens Renamed', rules: [] },
+  it('saves a group-only rule and keeps unreadable legacy data', () => {
+    assert.ok(isRuleValid(rule));
+    assert.ok(isRuleValid({ ...rule, groups: [], unreadableLegacy: {
+      criteria: { type: 'material', materialName: 'Concrete' }, reason: 'Unrepresentable',
+    } }));
+  });
+
+  it('rejects empty groups', () => {
+    assert.equal(isRuleValid({ ...rule, groups: [] }), false);
+    assert.equal(isRuleValid({ ...rule, groups: [{ rules: [], combinator: 'AND' }] }), false);
+  });
+
+  it('rejects unfinished shared chips before Save without losing presence rules (#5896)', () => {
+    const blankType = { kind: 'ifcType' as const, op: 'in' as const, values: [] };
+    const walls = { kind: 'ifcType' as const, op: 'in' as const, values: ['IfcWall'] };
+    const saved = (rules: FilterRule[], combinator: 'AND' | 'OR' = 'AND') =>
+      isRuleValid({ ...rule, groups: [{ rules, combinator }] });
+    assert.equal(saved([blankType]), false, 'an untouched Add type chip selects no IFC element');
+    assert.equal(saved([{ kind: 'ifcType', op: 'in' } as unknown as FilterRule]), false,
+      'a malformed imported set rule also fails closed without throwing');
+    assert.equal(saved([null as unknown as FilterRule]), false, 'a malformed imported member cannot crash Save');
+    assert.equal(saved([{ kind: 'futureKind' } as unknown as FilterRule]), false,
+      'an unknown future rule cannot be saved as if it selected entities');
+    assert.equal(saved([walls, blankType]), false, 'an incomplete AND member empties the whole selection');
+    assert.equal(saved([walls, blankType], 'OR'), false, 'an empty notIn set in OR could select every entity');
+    assert.equal(isRuleValid({ ...rule, groups: [
+      { combinator: 'AND', rules: [walls] },
+      { combinator: 'AND', rules: [{ kind: 'ifcType', op: 'notIn', values: [] }] },
+    ] }), false, 'an unfinished second group must not broaden the saved Lens');
+    assert.equal(isRuleValid({ ...rule, groups: [null] as unknown as LensRule['groups'] }), false,
+      'a malformed imported group cannot crash Save');
+    assert.equal(saved([{ kind: 'ifcType', op: 'in', values: ['IfcWall'] }]), true);
+    assert.equal(isRuleValid({ ...rule, groups: [{ combinator: 'AND', rules: [
+      { kind: 'property', setName: 'Pset_WallCommon', propertyName: '', op: 'eq', value: '' },
+    ] }] }), false, 'an untouched Property chip has no property to read');
+    assert.equal(isRuleValid({ ...rule, groups: [{ combinator: 'AND', rules: [
+      { kind: 'property', setName: 'Pset_WallCommon', propertyName: 'Reference', op: 'eq', value: '' },
+    ] }] }), true, 'an explicitly empty property value remains a valid comparison');
+    assert.equal(isRuleValid({ ...rule, groups: [{ combinator: 'AND', rules: [
+      { kind: 'modelTag', op: 'untagged', tagIds: [] },
+    ] }] }), true, 'Untagged intentionally needs no tag IDs');
+  });
+
+  it('accepts every configured shared rule kind exposed by the Lens editor (#5896)', () => {
+    const configured: FilterRule[] = [
+      Rule.model(['architecture.ifc']), Rule.modelTag('untagged', []), Rule.storey(['Level 1']),
+      Rule.ifcType(['IfcWall']), Rule.predefinedType(['STANDARD']), Rule.name('contains', 'Wall'),
+      Rule.globalId(['325Q7Fhnf67OZC$$r43uzK']), Rule.attribute('Description', 'eq', ''),
+      Rule.property('Pset_WallCommon', 'Reference', 'eq', ''), Rule.quantity('Qto_WallBaseQuantities', 'Length', 'gt', 0),
+      Rule.material('contains', 'Concrete'), Rule.classification('', 'isSet', ''), Rule.elevation('gt', 0),
+      Rule.typeName('contains', 'WT01'), Rule.parent('contains', 'Level 1'), Rule.group('isSet', ''),
+      Rule.modelFact('georef.crs', 'isSet', ''),
     ];
-    const next = mergeImportedLenses(existing, imported, (i) => `gen-${i}`);
-    assert.equal(next.length, 2, 'no duplicates created on re-import');
-    assert.equal(next[0].name, 'Building Envelope');
-    assert.equal(next[0].rules.length, 2, 'builtin override picked up the edited rules');
-    assert.equal(next[0].builtin, true, 'replacing a builtin preserves the builtin flag');
-    assert.equal(next[1].name, 'My Lens Renamed', 'custom lens updated in place');
-  });
-
-  it('appends lenses with new ids, keeping existing order', () => {
-    const next = mergeImportedLenses(existing, [{ id: 'custom-2', name: 'New', rules: [] }], (i) => `gen-${i}`);
-    assert.deepEqual(next.map((l) => l.id), ['lens-envelope', 'custom-1', 'custom-2']);
-    assert.equal(next[2].builtin, false, 'a brand-new imported lens is never a builtin');
-  });
-
-  it('generates ids for id-less hand-authored lenses', () => {
-    const next = mergeImportedLenses(existing, [{ name: 'No Id', rules: [] }], (i) => `gen-${i}`);
-    assert.equal(next.length, 3);
-    assert.equal(next[2].id, 'gen-0');
-  });
-
-  it('skips malformed entries (missing name or rules) without throwing', () => {
-    const next = mergeImportedLenses(
-      existing,
-      [null, 42, { name: '' }, { name: 'x' }, { name: 'ok', rules: [] }],
-      (i) => `gen-${i}`,
-    );
-    assert.deepEqual(next.map((l) => l.name), ['Building Envelope', 'My Lens', 'ok']);
-  });
-
-  it('rejects lenses whose rules array is shape-invalid (e.g. [null] or partial rule)', () => {
-    const next = mergeImportedLenses(
-      existing,
-      [
-        { name: 'bad-null-rule', rules: [null] },
-        { name: 'bad-partial-rule', rules: [{ id: 'r', name: 'r' /* missing enabled/criteria/action/color */ }] },
-        { name: 'good', rules: ruleLens.rules },
-      ],
-      (i) => `gen-${i}`,
-    );
-    assert.deepEqual(next.map((l) => l.name), ['Building Envelope', 'My Lens', 'good']);
-  });
-
-  it('preserves a valid imported autoColor spec (and clones it)', () => {
-    const spec = { source: 'material' as const };
-    const next = mergeImportedLenses(existing, [{ id: 'auto-x', name: 'Auto', rules: [], autoColor: spec }], (i) => `gen-${i}`);
-    assert.deepEqual(next[2].autoColor, { source: 'material' });
-    assert.notEqual(next[2].autoColor, spec, 'autoColor must be cloned, not aliased');
-  });
-
-  it('rejects a lens carrying a malformed autoColor (bad shape or unknown source)', () => {
-    const next = mergeImportedLenses(
-      existing,
-      [
-        { id: 'a1', name: 'arr-autocolor', rules: [], autoColor: [] },
-        { id: 'a2', name: 'bad-source', rules: [], autoColor: { source: 'not-a-source' } },
-        { id: 'a3', name: 'bad-pset-type', rules: [], autoColor: { source: 'property', psetName: 7 } },
-        { id: 'a4', name: 'good-autocolor', rules: [], autoColor: { source: 'ifcType' } },
-      ],
-      (i) => `gen-${i}`,
-    );
-    assert.deepEqual(next.map((l) => l.name), ['Building Envelope', 'My Lens', 'good-autocolor']);
+    for (const filter of configured) {
+      assert.equal(isRuleValid({ ...rule, groups: [{ rules: [filter], combinator: 'AND' }] }), true,
+        `${filter.kind} must remain saveable`);
+    }
+    assert.equal(isRuleValid({ ...rule, groups: [{ rules: [Rule.name('contains', '')], combinator: 'AND' }] }), false);
+    assert.equal(isRuleValid({ ...rule, groups: [{ rules: [Rule.classification('', 'contains', '')], combinator: 'AND' }] }), false);
   });
 });
 

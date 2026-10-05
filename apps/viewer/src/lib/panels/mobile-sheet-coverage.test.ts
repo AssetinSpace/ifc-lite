@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * Every registry panel has a body, and a title to put above it.
+ *
+ * The mobile bottom sheet used to hand-write an if-chain over the panels it
+ * knew — seven of them — and fall through to `<PropertiesPanel />` for the
+ * rest. Compare, Clash, Cloud sources, the Layer stack, Location zones and the
+ * collab Room all opened on a phone as the Properties panel, titled
+ * "Properties": the wrong panel, not merely a wrong label. Nothing failed,
+ * because a fall-through branch is indistinguishable from an intended one.
+ *
+ * The sheet now renders through `renderPanelBody`, the same map the sidebar,
+ * the floating host and the pop-out windows use, and titles from the registry.
+ * That closes the gap for today's panels; these tests are what stop the NEXT
+ * panel from re-opening it, since a new registry entry with no `renderPanelBody`
+ * case returns undefined rather than failing to compile.
+ */
+
+import '@/test/setup-dom.js';
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { isValidElement, Suspense, type ReactNode } from 'react';
+import { ChunkErrorBoundary } from '@/components/ChunkErrorBoundary';
+import { PanelModelGate } from '@/components/viewer/PanelModelGate';
+import { AssistantSourceContext } from '@/components/viewer/assistant/AssistantAction';
+import { WORKSPACE_PANELS, getPanelDef } from './registry.js';
+import { renderPanelBody } from './renderPanelBody.js';
+
+describe('workspace panel registry coverage', () => {
+  it('renders a body for every registered panel', () => {
+    const missing = WORKSPACE_PANELS
+      .filter((panel) => renderPanelBody(panel.id, () => {}) == null)
+      .map((panel) => panel.id);
+
+    assert.deepEqual(
+      missing,
+      [],
+      'these panels render nothing — every host (sidebar, float, pop-out, mobile sheet) would show a blank pane',
+    );
+  });
+
+  it('renders a DISTINCT body per panel, so none silently falls through to another', () => {
+    // The defect was a fall-through, so identity is the property under test:
+    // two ids resolving to the same component is how Compare came out as
+    // Properties. Compares the element TYPE, which is the component function.
+    const byType = new Map<unknown, string[]>();
+    for (const panel of WORKSPACE_PANELS) {
+      let body = renderPanelBody(panel.id, () => {});
+      // #4243: Layers and Appearance share loading/error hosts, not content.
+      // Compare the actual panel beneath those hosts so the fall-through
+      // regression remains detectable without rejecting legitimate wrappers.
+      // #6720: the no-model gate wraps model-dependent panels the same way,
+      // and the Information panel sits in a plain `<div>` carrying its tour
+      // anchor. Walk down to the first COMPONENT that is not one of those
+      // wrappers. The assistant context supplies scope, not panel content (#6813).
+      // Stopping at a host element would let `properties` report
+      // 'div', unique by construction, so another id falling through to a
+      // bare <PropertiesPanel /> would pass unnoticed.
+      while (isValidElement<{ children?: ReactNode }>(body) &&
+        (typeof body.type === 'string' || body.type === ChunkErrorBoundary || body.type === Suspense || body.type === PanelModelGate || body.type === AssistantSourceContext)) {
+        body = body.props.children;
+      }
+      assert.ok(isValidElement(body), `${panel.id} must have panel content beneath its loading/error hosts`);
+      assert.notEqual(typeof body.type, 'string', `${panel.id} must resolve to a panel component, not a host element`);
+      const type = body.type;
+      const ids = byType.get(type) ?? [];
+      ids.push(panel.id);
+      byType.set(type, ids);
+    }
+
+    const shared = [...byType.values()].filter((ids) => ids.length > 1);
+    assert.deepEqual(shared, [], 'these panel ids render the same component — one is showing the other\'s panel');
+  });
+
+  it('keeps each panel component identity stable across host renders (#4243)', () => {
+    // A wrapper allocated inside renderPanelBody would pass distinctness but
+    // remount the active editor on every host render, discarding its local state.
+    // The WHOLE wrapper chain down to the panel is compared, not just the
+    // outermost type: a wrapper allocated one level down (beneath the
+    // chunk boundary or the #6720 no-model gate) remounts just the same. A
+    // component that swaps its own wrapper on a store change is invisible
+    // to this static check; renderPanelBody.no-model.test.tsx mounts one.
+    const typeChain = (node: ReactNode): unknown[] => {
+      const chain: unknown[] = [];
+      let current = node;
+      while (isValidElement<{ children?: ReactNode }>(current)) {
+        chain.push(current.type);
+        current = current.props.children;
+      }
+      return chain;
+    };
+    for (const panel of WORKSPACE_PANELS) {
+      const first = typeChain(renderPanelBody(panel.id, () => {}));
+      const next = typeChain(renderPanelBody(panel.id, () => {}));
+      assert.ok(first.length > 0, `${panel.id} renders an element`);
+      assert.deepStrictEqual(first, next, `${panel.id} remounts on host render`);
+    }
+  });
+
+  it('gives every registered panel a title for the sheet header', () => {
+    const untitled = WORKSPACE_PANELS
+      .filter((panel) => !getPanelDef(panel.id)?.titleKey)
+      .map((panel) => panel.id);
+
+    assert.deepEqual(untitled, [], 'these panels would head the mobile sheet with a blank title');
+  });
+});

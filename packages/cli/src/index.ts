@@ -11,12 +11,16 @@
  */
 
 import { logger, parseVerbosity } from './logger.js';
+import { fatal } from './output.js';
+import { COMMANDS_WITH_OUT } from './out-flag-commands.js';
 import { infoCommand } from './commands/info.js';
 import { queryCommand } from './commands/query.js';
+import { scheduleCommand } from './commands/schedule.js';
 import { propsCommand } from './commands/props.js';
 import { exportCommand } from './commands/export.js';
 import { diagnoseGeometryCommand } from './commands/diagnose-geometry.js';
 import { extractEntitiesCommand } from './commands/extract-entities.js';
+import { anonymizeCommand } from './commands/anonymize.js';
 import { idsCommand } from './commands/ids.js';
 import { bcfCommand } from './commands/bcf.js';
 import { clashCommand } from './commands/clash.js';
@@ -27,6 +31,7 @@ import { schemaCommand } from './commands/schema.js';
 import { mergeCommand } from './commands/merge.js';
 import { convertCommand } from './commands/convert.js';
 import { diffCommand } from './commands/diff.js';
+import { rekeyCommand } from './commands/rekey.js';
 import { validateCommand } from './commands/validate.js';
 import { bsddCommand } from './commands/bsdd.js';
 import { statsCommand } from './commands/stats.js';
@@ -42,10 +47,16 @@ import { extCommand } from './commands/ext.js';
 import { layerCommand } from './commands/layer.js';
 import { refCommand } from './commands/ref.js';
 import { gymCommand } from './commands/gym.js';
-import { readFileSync } from 'node:fs';
+import { deliveryCommand } from './commands/delivery.js';
+import { checkCommand } from './commands/check.js';
+import { flowCommand } from './commands/flow.js';
+import { semanticCommand } from './commands/semantic.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { readPackageVersion } from '@ifc-lite/data/node';
+import { buildHelp, buildCommandHelp } from './help.js';
 
+<<<<<<< HEAD
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -209,8 +220,19 @@ const HELP = `
 
   Learn more: https://ifclite.com
 `;
+=======
+// package.json sits one level above both `src/` and `dist/`.
+const VERSION = readPackageVersion(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'));
+>>>>>>> upstream/main
 
 /** Command being executed, captured for the top-level error handler. */
+/**
+ * Commands that handle `--help` themselves, with more detail than the global
+ * `Commands:` block carries. Their handlers already tested for it; before
+ * #5527 that branch was simply unreachable.
+ */
+const HELP_DELEGATING_COMMANDS = new Set(['layer', 'ref', 'ext']);
+
 let activeCommand = '';
 /** True when --debug was passed (stack traces on error). */
 let debugFlag = false;
@@ -223,9 +245,23 @@ async function main(): Promise<void> {
   debugFlag = verbosity.debug;
   const args = verbosity.rest;
 
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-    process.stdout.write(HELP + '\n');
+  const wantsHelp = args.includes('--help') || args.includes('-h');
+  if (args.length === 0) {
+    process.stdout.write(buildHelp(VERSION) + '\n');
     return;
+  }
+  if (wantsHelp) {
+    // `--help` used to be answered globally BEFORE dispatch, with the command
+    // still sitting in `args`, so all 37 subcommands printed the same page and
+    // the real help written in `layer`/`ref`/`ext` was unreachable (#5527).
+    const requested = args[0];
+    if (HELP_DELEGATING_COMMANDS.has(requested)) {
+      // These three write richer help of their own; let them answer.
+    } else {
+      const commandHelp = buildCommandHelp(VERSION, requested);
+      process.stdout.write((commandHelp ?? buildHelp(VERSION)) + '\n');
+      return;
+    }
   }
 
   if (args.includes('--version') || args.includes('-v')) {
@@ -236,6 +272,14 @@ async function main(): Promise<void> {
   const command = args[0];
   activeCommand = command;
   const commandArgs = args.slice(1);
+
+  if (commandArgs.includes('--out') && !COMMANDS_WITH_OUT.has(command)) {
+    fatal(
+      `\`${command}\` does not write to a file: it has no --out. ` +
+        `Redirect its output instead, e.g. \`ifc-lite ${command} ... > out.json\`. ` +
+        `Commands that do take --out: ${[...COMMANDS_WITH_OUT].sort().join(', ')}.`,
+    );
+  }
 
   switch (command) {
     case 'info':
@@ -250,11 +294,17 @@ async function main(): Promise<void> {
     case 'export':
       await exportCommand(commandArgs);
       break;
+    case 'schedule':
+      await scheduleCommand(commandArgs);
+      break;
     case 'diagnose-geometry':
       await diagnoseGeometryCommand(commandArgs);
       break;
     case 'extract-entities':
       await extractEntitiesCommand(commandArgs);
+      break;
+    case 'anonymize':
+      await anonymizeCommand(commandArgs);
       break;
     case 'ids':
       await idsCommand(commandArgs);
@@ -285,6 +335,9 @@ async function main(): Promise<void> {
       break;
     case 'diff':
       await diffCommand(commandArgs);
+      break;
+    case 'rekey':
+      await rekeyCommand(commandArgs);
       break;
     case 'validate':
       await validateCommand(commandArgs);
@@ -330,6 +383,18 @@ async function main(): Promise<void> {
       break;
     case 'gym':
       await gymCommand(commandArgs);
+      break;
+    case 'delivery':
+      await deliveryCommand(commandArgs);
+      break;
+    case 'check':
+      await checkCommand(commandArgs);
+      break;
+    case 'semantic':
+      await semanticCommand(commandArgs);
+      break;
+    case 'flow':
+      await flowCommand(commandArgs);
       break;
     default:
       process.stderr.write(`Unknown command: ${command}\n`);

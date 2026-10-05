@@ -8,35 +8,34 @@
  */
 
 import React from 'react';
-import { AddFile, Loading, OpenFile, Refresh, Screenshot, FileCsv, FileIfc, FileGlb, FileKmz, FileJson, FileHbjson, Share, CollabsRoom } from '@/icons';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { AddFile, CloudSources, Loading, OpenFile, SaveFederationSetup, Refresh, Share, CollabsRoom } from '@/icons';
 import { useViewerStore } from '@/store';
 import { useIfc } from '@/hooks/useIfc';
 import { isCollabEnabled } from '@/lib/collab/config';
-import { ExportDialog } from '../../ExportDialog';
-import { GLBExportDialog } from '../../GLBExportDialog';
-import { KmzExportDialog } from '../../KmzExportDialog';
-import { HbjsonExportDialog } from '../../HbjsonExportDialog';
+import { useTranslation } from '@/i18n';
 import type { FileCommands } from '../../toolbar/useFileCommands';
-import { useExportCommands } from '../../toolbar/useExportCommands';
+import { useWorkspacePanelControls } from '../../toolbar/useWorkspacePanelControls';
+import { surfaceCommand } from '../../surface-commands';
+import { RibbonExportGroup } from './RibbonExportGroup';
+import { RIBBON_EXPORT_ICONS } from './ribbon-export-icons';
 import {
   RibbonGroup,
   RibbonGroupDivider,
-  RibbonLargeButton,
-  RibbonSmallButton,
   RibbonSmallStack,
 } from '../primitives';
+import { RibbonCommandLargeButton, RibbonCommandSmallButton } from '../command-button';
 
+/** Renders model input/output commands, with compact setup actions beside the prominent export controls. */
 export function FileTab({ fileCommands }: { fileCommands: FileCommands }) {
+  const { t } = useTranslation();
   const { handleOpenClick, handleAddModelClick, handleRefresh, canRefresh, hasModelsLoaded, openShareDialog } = fileCommands;
-  const { loading, models, ifcDataStore } = useIfc();
-  const { handleExportCSV, handleExportJSON, handleScreenshot } = useExportCommands();
+  const { loading, models } = useIfc();
+  const saveSetup = surfaceCommand('file:save-federation-setup', 'ribbon');
+  const shareCommand = surfaceCommand('file:share', 'ribbon');
+  const openSetup = surfaceCommand('file:open-federation-setup', 'ribbon');
+  const modelTags = surfaceCommand('file:model-tags', 'ribbon');
+  const collabRole = useViewerStore((s) => s.collabRole);
+  const canEditInSession = collabRole === null || collabRole === 'editor' || collabRole === 'admin';
 
   // Collaboration: the Share cluster is gated behind the collab feature flag.
   // The ShareDialog itself (and its `ifc-lite:open-share-dialog` listener)
@@ -47,126 +46,97 @@ export function FileTab({ fileCommands }: { fileCommands: FileCommands }) {
   const collabRoomId = useViewerStore((s) => s.collabRoomId);
   const collabPanelVisible = useViewerStore((s) => s.collabPanelVisible);
 
-  const canExport = hasModelsLoaded || Boolean(ifcDataStore);
+  // Cloud sources (CDE integrations) is a model SOURCE, so it belongs on the
+  // tab that moves bytes — not with the analysis panels. Until now the
+  // ActivityBar rail was its only entry point, the same gap Location zones
+  // had before #2508, and the parity guard cannot see it: both toolbars
+  // already reach `toggleWorkspacePanel` for other panels.
+  const { activeWorkspacePanels, handleToggleRightPanel } = useWorkspacePanelControls('ribbon');
 
   return (
     <>
-      <RibbonGroup label="Model">
-        <RibbonLargeButton
+      <RibbonGroup label={t('ribbon.file.modelGroup')}>
+        <RibbonCommandLargeButton
+          commandId="file:open"
           icon={loading ? Loading : OpenFile}
-          label="Open"
-          tooltip="Open model from disk"
           disabled={loading}
           className={loading ? '[&_svg]:animate-spin' : undefined}
-          onClick={() => { void handleOpenClick(); }}
+          commandContext={{ openFiles: () => { void handleOpenClick(); } }}
+        />
+        <RibbonCommandLargeButton
+          commandId="panel:sources"
+          icon={CloudSources}
+          tooltip={t('ribbon.file.cloudSourcesTooltip')}
+          active={activeWorkspacePanels.has('sources')}
+          commandContext={{ activateRightPanel: () => handleToggleRightPanel('sources') }}
         />
         <RibbonSmallStack>
-          <RibbonSmallButton
+          <RibbonCommandSmallButton
+            commandId="file:add-model"
             icon={AddFile}
-            label="Add model"
-            tooltip="Add model to scene (multi-select supported)"
             disabled={loading || !hasModelsLoaded}
-            onClick={() => { void handleAddModelClick(); }}
+            commandContext={{ addModel: () => { void handleAddModelClick(); } }}
           />
-          <RibbonSmallButton
+          <RibbonCommandSmallButton
+            commandId="file:refresh"
             icon={Refresh}
-            label="Refresh"
-            tooltip={models.size > 1 ? 'Refresh models from disk' : 'Refresh model from disk'}
+            tooltip={models.size > 1 ? t('ribbon.file.refreshModelsTooltip') : t('ribbon.file.refreshModelTooltip')}
             disabled={loading || !canRefresh}
-            onClick={() => { void handleRefresh(); }}
+            commandContext={{ refreshModels: handleRefresh }}
           />
         </RibbonSmallStack>
+        {[[saveSetup, openSetup], [modelTags]].map((commands) => (
+          <RibbonSmallStack key={commands[0].id} className="gap-1">
+            {commands.map((command) => (
+              <RibbonCommandSmallButton
+                key={command.id}
+                commandId={command.id}
+                icon={command.id === saveSetup.id ? SaveFederationSetup : undefined}
+                tooltip={t(command.labelKey)}
+                className="min-h-6"
+                disabled={!command.enabled({ canEditInSession })}
+              />
+            ))}
+          </RibbonSmallStack>
+        ))}
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Export">
-        {/* Gate on any loaded model, not the legacy single-model geometryResult:
-            federated / multi-model sessions populate `models` but leave
-            geometryResult null, which would hide the whole export group. */}
-        <ExportDialog
-          trigger={
-            <RibbonLargeButton icon={FileIfc} label="IFC" tooltip="Export IFC (with changes)" disabled={!canExport} />
-          }
-        />
-        <RibbonSmallStack>
-          <GLBExportDialog
-            trigger={<RibbonSmallButton icon={FileGlb} label="GLB" tooltip="Export GLB (3D model)" disabled={!canExport} />}
-          />
-          <KmzExportDialog
-            trigger={<RibbonSmallButton icon={FileKmz} label="KMZ" tooltip="Export KMZ (Google Earth Pro)" disabled={!canExport} />}
-          />
-          <HbjsonExportDialog
-            trigger={<RibbonSmallButton icon={FileHbjson} label="HBJSON" tooltip="Export HBJSON (energy model)" disabled={!canExport} />}
-          />
-        </RibbonSmallStack>
-        <RibbonSmallStack>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <RibbonSmallButton icon={FileCsv} label="CSV" hasMenu tooltip="Export CSV tables" disabled={!ifcDataStore} />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent>
-              <DropdownMenuItem onClick={() => handleExportCSV('entities')}>
-                <FileCsv className="h-4 w-4 mr-2" />
-                Entities
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('properties')}>
-                <FileCsv className="h-4 w-4 mr-2" />
-                Properties
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleExportCSV('quantities')}>
-                <FileCsv className="h-4 w-4 mr-2" />
-                Quantities
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => handleExportCSV('spatial')}>
-                <FileCsv className="h-4 w-4 mr-2" />
-                Spatial Hierarchy
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <RibbonSmallButton
-            icon={FileJson}
-            label="JSON"
-            tooltip="Export JSON (all data)"
-            disabled={!ifcDataStore}
-            onClick={handleExportJSON}
-          />
-          <RibbonSmallButton icon={Screenshot} label="Screenshot" tooltip="Save viewport as PNG" onClick={handleScreenshot} />
-        </RibbonSmallStack>
-      </RibbonGroup>
+      <RibbonExportGroup icons={RIBBON_EXPORT_ICONS} />
 
       {collabEnabled && (
         <>
           <RibbonGroupDivider />
-          <RibbonGroup label="Share">
-            <RibbonLargeButton
+          <RibbonGroup label={t('ribbon.file.shareGroup')}>
+            <RibbonCommandLargeButton
+              commandId={shareCommand.id}
               icon={Share}
-              label="Share"
-              tooltip="Share: link-based multiuser collaboration"
               disabled={!hasModelsLoaded}
-              onClick={openShareDialog}
+              commandContext={{ openShareDialog }}
               badge={collabPeerCount > 0 ? (
-                <span className="absolute right-1 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-medium text-primary-foreground">
+                <span className="absolute right-1 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-2xs font-medium text-primary-foreground">
                   {collabPeerCount + 1}
                 </span>
               ) : undefined}
             />
-            {/* Room panel toggle — live presence + management, only while in a room. */}
-            {collabRoomId && (
-              <RibbonLargeButton
-                icon={CollabsRoom}
-                label="Collabs Room"
-                tooltip="Collaboration room"
-                active={collabPanelVisible}
-                onClick={() => useViewerStore.getState().toggleWorkspacePanel('collab')}
-                badge={collabPeerCount > 0 ? (
-                  <span className="absolute right-1 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[9px] font-medium text-white">
-                    {collabPeerCount + 1}
-                  </span>
-                ) : undefined}
-              />
-            )}
+            {/* Room panel toggle — live presence + management. Shown whenever
+                collab is on, not only inside a room: the palette and rail offer
+                it unconditionally. Gating it here left ribbon users unable to
+                open the panel before joining. It also contradicted this toolbar's own rule
+                that its geography stays put rather than appearing mid-session. */}
+            <RibbonCommandLargeButton
+              commandId="panel:collab"
+              icon={CollabsRoom}
+              tooltip={collabRoomId ? t('ribbon.file.roomTooltip') : t('ribbon.file.roomNotJoinedTooltip')}
+              active={collabPanelVisible}
+              commandContext={{ activateRightPanel: () => useViewerStore.getState().toggleWorkspacePanel('collab', 'ribbon') }}
+              badge={collabPeerCount > 0 ? (
+                <span className="absolute right-1 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-emerald-500 px-1 text-2xs font-medium text-white">
+                  {collabPeerCount + 1}
+                </span>
+              ) : undefined}
+            />
           </RibbonGroup>
         </>
       )}

@@ -60,15 +60,68 @@ async function fetchAsFile(path: string, name: string): Promise<File> {
 }
 
 /**
+ * The demo project as a `File`, for callers that already hold the canonical
+ * `loadFile` (the first-run card) and so need no bus event.
+ */
+export function fetchDemoProjectFile(): Promise<File> {
+  return fetchAsFile(DEMO_KIT_PATHS.base, BASE_NAME);
+}
+
+let demoProjectInFlight: Promise<void> | null = null;
+
+/**
  * Load the demo project into the viewer, replacing the current model (the
  * `ifc-lite:load-file` listener routes to `loadFile`). The caller observes
  * completion through the store (`models.size > 0 && !loading &&
  * !geometryStreamingActive`) - same contract as a user-driven open.
  */
-export async function loadDemoProject(): Promise<void> {
-  const file = await fetchAsFile(DEMO_KIT_PATHS.base, BASE_NAME);
-  // detail IS the File - the MainToolbar listener reads e.detail directly.
-  window.dispatchEvent(new CustomEvent(EVENT_LOAD_FILE, { detail: file }));
+export function loadDemoProject(): Promise<void> {
+  // detail IS the File - useFileCommands reads e.detail directly.
+  return loadDemoProjectVia((file) => { window.dispatchEvent(new CustomEvent(EVENT_LOAD_FILE, { detail: file })); });
+}
+
+/**
+ * The same demo load through a caller-held `loadFile` (the first-run card).
+ * One fetch at a time across BOTH entry points: the card's button, a tour
+ * step's "Load demo project" and a later step's `ensureTourModel` can overlap
+ * while the store still reads empty, and a second load would REPLACE the
+ * first demo mid-tour.
+ */
+export function loadDemoProjectVia(load: (file: File) => unknown): Promise<void> {
+  demoProjectInFlight ??= fetchDemoProjectFile()
+    .then(async (file) => { await load(file); })
+    .finally(() => { demoProjectInFlight = null; });
+  return demoProjectInFlight;
+}
+
+/**
+ * A tour step that cannot mean anything without a model (read its data,
+ * browse its tree) calls this from `prepare`: a model already loaded, or
+ * loading, is waited for; an empty viewer gets the demo project. The welcome
+ * tour's own load step is skippable, and skipping it with nothing loaded used
+ * to leave every later step anchored to an empty panel, so they broke
+ * (`tour_step_broken` prerequisite-not-met on welcome/inspect and
+ * welcome/structure). Loading into an EMPTY set replaces nothing, so it never
+ * trips the tour's model-change abort.
+ */
+export async function ensureTourModel(): Promise<void> {
+  const s = getViewerStoreApi().getState();
+  if (isViewerEmpty(s)) await loadDemoProject();
+  // A legacy single-model store is loaded without a `models` entry, which
+  // `waitForModelSettled` would wait on forever.
+  else if (s.models.size === 0 && !s.loading) return;
+  await waitForModelSettled();
+}
+
+/**
+ * Nothing loaded and nothing loading: the one definition of an empty viewer
+ * that the tour's demo fallback, its "Skip (use demo)" label and the
+ * panels' no-model state share (#6720). A legacy single-model store
+ * (`ifcDataStore` without a `models` entry) counts as loaded, so the demo
+ * never replaces it.
+ */
+export function isViewerEmpty(s: Pick<ViewerState, 'models' | 'ifcDataStore' | 'loading'>): boolean {
+  return s.models.size === 0 && !s.ifcDataStore && !s.loading;
 }
 
 /**
@@ -105,6 +158,22 @@ export async function loadDemoClashModel(): Promise<void> {
   window.dispatchEvent(new CustomEvent(EVENT_LOAD_FILE, { detail: file }));
 }
 
+/**
+ * The demo IDS together with the model it is authored against: validating an
+ * arbitrary user model against the demo spec would be noise, so the demo
+ * project is swapped in first unless a kit model is already loaded. Shared by
+ * the IDS tour's "Load demo spec" action and the IDS panel's "Try with demo
+ * data" empty state (#5834).
+ */
+export async function loadDemoIdsWithProject(): Promise<void> {
+  const models = [...getViewerStoreApi().getState().models.values()];
+  if (!models.some((m) => isDemoKitModelName(m.name))) {
+    await loadDemoProject();
+    await waitForModelSettled();
+  }
+  await loadDemoIds();
+}
+
 /** Load the bundled IDS spec (parse + audit) without the panel mounted. */
 export async function loadDemoIds(): Promise<void> {
   const res = await fetch(DEMO_KIT_PATHS.ids);
@@ -115,3 +184,20 @@ export async function loadDemoIds(): Promise<void> {
 /** The exact file names the demo variants load as (compare/IDS gate on
  *  these to distinguish the kit from a user's own model). */
 export const DEMO_MODEL_NAMES = { base: BASE_NAME, revB: REV_B_NAME } as const;
+
+/** Exact kit names only, so a user's own similarly-named file is never
+ *  mistaken for the demo. */
+export function isDemoKitModelName(name: string): boolean {
+  return name === BASE_NAME || name === REV_B_NAME;
+}
+
+/**
+ * Whether an analysis panel may offer "Try with demo data" (#5834). Loading
+ * the kit REPLACES the model set, which is only harmless when nothing is
+ * loaded or everything loaded already is the kit; a user's own model is never
+ * swapped out from an empty state.
+ */
+export function demoKitReplacesNothing(models: Iterable<{ name: string }>): boolean {
+  for (const model of models) if (!isDemoKitModelName(model.name)) return false;
+  return true;
+}
