@@ -70,7 +70,11 @@ pub(super) fn project_units(project: u32, decoder: &mut EntityDecoder) -> Result
     Ok(())
 }
 
-pub(super) fn model(records: &[Record<'_>], context: u32, decoder: &mut EntityDecoder) -> Result<(), String> {
+/// Validates the scaled path's model and returns the type `RepresentationMap`s
+/// no product representation instantiates, sorted. The planner wraps those at
+/// type level with the same similarity (#6634's concern, now satisfied rather
+/// than refused): left unscaled, they would be wrong once instantiated.
+pub(super) fn model(records: &[Record<'_>], context: u32, decoder: &mut EntityDecoder) -> Result<Vec<u32>, String> {
     context_frame(context, decoder)?;
     let mut owners: HashMap<u32, u32> = HashMap::new();
     let mut body_shapes = HashSet::new();
@@ -117,18 +121,47 @@ pub(super) fn model(records: &[Record<'_>], context: u32, decoder: &mut EntityDe
     }
     let allowance = records.len().saturating_mul(ifc_lite_core::limits::MAX_MAPPED_ITEM_DEPTH as usize);
     let mapped_sources = body_mapped_sources(&used_representations, context, decoder, allowance)?;
+    let mut type_maps = std::collections::BTreeSet::new();
     for record in records.iter().filter(|record| record.kind.is_subtype_of(IfcType::IfcTypeProduct)) {
         let product = decoder.decode_by_id(record.id).map_err(|error| error.to_string())?;
-        if product.get_refs(6).is_some_and(|maps| maps.iter().any(|id| !mapped_sources.contains(id))) {
-            return Err(format!("type product #{} has uninstantiated geometry", record.id));
+        if let Some(attr) = product.get(6).filter(|attr| !attr.is_null()) {
+            let maps = attr.as_list().ok_or("type RepresentationMaps is not a list")?;
+            for map in maps {
+                let map = map.as_entity_ref().ok_or("type RepresentationMaps holds a non-reference")?;
+                if !mapped_sources.contains(&map) { type_maps.insert(map); }
+            }
         }
     }
-    Ok(())
+    // Their representations meet the same context, item and wrapper-depth
+    // rules as product representations. A type map reached from another one
+    // would be scaled twice when the outer one is instantiated: refuse it.
+    let mut roots = HashSet::new();
+    for map in &type_maps {
+        let node = decoder.decode_by_id(*map).map_err(|error| error.to_string())?;
+        if node.ifc_type != IfcType::IfcRepresentationMap {
+            return Err(format!("type RepresentationMaps entry #{map} is not an IfcRepresentationMap"));
+        }
+        roots.insert(node.get_ref(1).ok_or("type map has no MappedRepresentation")?);
+    }
+    // A type map is reached through its new type-level wrapper and then
+    // through the consumer's own instance item: reserve both levels.
+    let nested = mapped_sources_reserving(&roots, context, decoder, allowance, 2)?;
+    if let Some(map) = type_maps.iter().find(|map| nested.contains(map)) {
+        return Err(format!("uninstantiated type map #{map} is nested in other uninstantiated type geometry"));
+    }
+    Ok(type_maps.into_iter().collect())
 }
 
 /// Pure reachable-ID set: memoization is global, unlike mesh accumulation.
 /// Only actual product Body roots confer ownership; orphan items do not.
 pub(super) fn body_mapped_sources(roots: &HashSet<u32>, context: u32, decoder: &mut EntityDecoder, max_work: usize) -> Result<HashSet<u32>, String> {
+    mapped_sources_reserving(roots, context, decoder, max_work, 1)
+}
+
+/// [`body_mapped_sources`] with `added_levels` mapped levels reserved above
+/// each root: 1 for a product representation's wrapper, 2 for a type map's
+/// type-level wrapper plus a consumer's instance item.
+fn mapped_sources_reserving(roots: &HashSet<u32>, context: u32, decoder: &mut EntityDecoder, max_work: usize, added_levels: usize) -> Result<HashSet<u32>, String> {
     let mut pending: Vec<_> = roots.iter().map(|id| (*id, false)).collect();
     let mut seen = HashSet::new();
     let mut active = HashSet::new();
@@ -150,8 +183,12 @@ pub(super) fn body_mapped_sources(roots: &HashSet<u32>, context: u32, decoder: &
             // The emitted Body adds a mapped wrapper; submesh collection also
             // charges the terminal leaf. Reserve both levels to preserve
             // authored styles, not merely the cached aggregate geometry.
-            if depth.saturating_add(1) >= ifc_lite_core::limits::MAX_MAPPED_ITEM_DEPTH as usize {
-                return Err("Body map nesting leaves no room for the normalization wrapper".into());
+            if depth.saturating_add(added_levels) >= ifc_lite_core::limits::MAX_MAPPED_ITEM_DEPTH as usize {
+                return Err(if added_levels > 1 {
+                    "type map nesting leaves no room for the type-level normalization wrapper and an instance".into()
+                } else {
+                    "Body map nesting leaves no room for the normalization wrapper".into()
+                });
             }
             depths.insert(id, depth);
             active.remove(&id);
