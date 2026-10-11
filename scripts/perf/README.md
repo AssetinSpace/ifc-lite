@@ -203,7 +203,7 @@ instead of trusting the "incremental" comment.
 
 ## Federated appearance-source rebuilding candidate (#6537 / #7021)
 
-**Draft; end-to-end performance held.** The
+**Merged in #7369; end-to-end performance held.** The
 [real FZK/Snowdon mounted controls](evidence/federated-appearance-6537/README.md)
 demonstrate repeated accumulated/peer mesh visits and ownership wrapper copies
 in the remaining multi-model appearance list. Canonical producer stamping and
@@ -215,6 +215,11 @@ accepted: actual worker-pool federation A/B and focused GPU acceptance remain
 outstanding. Lesson: borrowing producer objects removes wrapper allocation,
 but grouped ordering still has a movement cost; qualify the real federation
 journey instead of a single-model cold load.
+The [removal gate and idle admission](evidence/federated-appearance-6537/gate-and-admission-20261010/README.md)
+are recorded separately: global Knip failed with unrelated source findings
+adjudicated by the campaign root; the timing cohort stopped at actual CPU,
+paging and swap admission before any model or probe ran. Lesson: a campaign
+reservation does not establish host-wide idle across other project owners.
 
 ## Frame-time rigs (#6960)
 
