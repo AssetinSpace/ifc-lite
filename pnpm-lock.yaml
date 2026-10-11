@@ -983,6 +983,9 @@ importers:
       '@ifc-lite/ids':
         specifier: workspace:^
         version: link:../ids
+      '@ifc-lite/ids-authoring':
+        specifier: workspace:^
+        version: link:../ids-authoring
       '@ifc-lite/ifcx':
         specifier: workspace:^
         version: link:../ifcx
@@ -1385,6 +1388,12 @@ importers:
       '@ifc-lite/flow':
         specifier: workspace:^
         version: link:../flow
+      '@ifc-lite/ids':
+        specifier: workspace:^
+        version: link:../ids
+      '@ifc-lite/ids-authoring':
+        specifier: workspace:^
+        version: link:../ids-authoring
       '@ifc-lite/mutations':
         specifier: workspace:^
         version: link:../mutations
@@ -1630,6 +1639,9 @@ importers:
       '@ifc-lite/ids':
         specifier: workspace:^
         version: link:../ids
+      '@ifc-lite/ids-authoring':
+        specifier: workspace:^
+        version: link:../ids-authoring
       '@ifc-lite/ifcx':
         specifier: workspace:^
         version: link:../ifcx
@@ -1942,6 +1954,9 @@ importers:
       '@ifc-lite/ids':
         specifier: workspace:^
         version: link:../ids
+      '@ifc-lite/ids-authoring':
+        specifier: workspace:^
+        version: link:../ids-authoring
       '@ifc-lite/lens':
         specifier: workspace:^
         version: link:../lens

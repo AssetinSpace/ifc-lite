@@ -435,6 +435,36 @@ metadata, extension fields and opaque later-pitch payloads remain intact.
   and signature, then by similarity. Comments and provenance therefore
   survive a revised IDS sent back by a client.
 
+## Headless helpers
+
+For the CLI, MCP server, SDK and Flow nodes, which hold no state between
+calls:
+
+- `readStudioDocument(xml)` derives node ids from the content, so reading
+  the same XML twice gives the same ids. An agent can read a document in one
+  call and address its nodes in the next.
+- `parseStudioDocument(json)` accepts a document that crossed a process
+  boundary. It checks the shape and the node index and throws on anything
+  else.
+- `writeStudioDocument(doc, writer)`, `writeIdsChecked(ids, writer)` and
+  `formatIds(xml, writer)` write through an injected `IdsWriter`, normally
+  `writeIdsXml` from `@ifc-lite/ids`. They then parse the output again
+  and return `{ ok: false, reason: 'lossy', lost }` when a value did not
+  survive, instead of handing back XML with less content. A writer that
+  refuses the document gives `{ ok: false, reason: 'refused', message }`.
+- `nodePath(doc, nodeId)` gives a node's XML path, e.g.
+  `specifications[0].requirements[1].baseName`.
+
+```ts
+import { writeIdsXml } from '@ifc-lite/ids';
+import { formatIds } from '@ifc-lite/ids-authoring';
+
+declare const xml: string;
+const out = formatIds(xml, writeIdsXml);
+if (out.ok === false) console.error(out.message, out.lost ?? []);
+else if (out.changed) console.log(out.xml);
+```
+
 ## License
 
 MPL-2.0.

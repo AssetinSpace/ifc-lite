@@ -177,6 +177,31 @@ export type {
   SuppressedDiagnostic,
 } from './lint/types.js';
 
+// Headless surfaces: CLI, MCP, SDK, Flow (IDS-115, IDS-118)
+export { readStudioDocument, studioDocumentFromIds, parseStudioDocument } from './headless/read.js';
+export {
+  formatIds,
+  writeIdsChecked,
+  writeStudioDocument,
+  type IdsWriter,
+  type WriteOutcome,
+  type WriteFailure,
+  type FormatOutcome,
+} from './headless/write.js';
+export { nodePath } from './headless/node-path.js';
+export { diffIds, type IdsDiff, type IdsDiffEntry, type IdsDiffChange } from './headless/diff.js';
+export { applyOpsGated, type GatedApplyResult } from './headless/apply-gated.js';
+export {
+  searchSchema,
+  describeEntity,
+  describePset,
+  type SchemaKind,
+  type SchemaHit,
+  type SchemaSearchOptions,
+  type EntityDescription,
+  type PsetDescription,
+} from './headless/schema-lookup.js';
+
 // bSDD: source port, HTTP client, picker view model (IDS-069)
 export {
   BsddHttpError,
