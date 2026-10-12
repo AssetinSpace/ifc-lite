@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 /**
  * Test script for IFCX parsing
  * Run with: node test-parse.mjs <ifcx-file>
@@ -83,6 +87,7 @@ try {
   // Show spatial hierarchy
   console.log('\n=== Spatial Hierarchy ===');
   const hierarchy = result.spatialHierarchy;
+  // eslint-disable-next-line no-inner-declarations -- a hand-run scratch script
   function printNode(node, indent = 0) {
     const prefix = '  '.repeat(indent);
     console.log(`${prefix}- ${node.name} (${node.type === 1 ? 'Project' : node.type === 2 ? 'Site' : node.type === 3 ? 'Building' : node.type === 4 ? 'Storey' : node.type === 5 ? 'Space' : 'Element'})`);

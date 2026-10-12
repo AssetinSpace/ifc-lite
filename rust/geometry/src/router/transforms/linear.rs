@@ -5,16 +5,19 @@
 //! IfcLinearPlacement resolution (#859): sample the basis curve at the authored distance.
 
 use super::super::GeometryRouter;
+use super::walk::PlacementWalk;
+use crate::alignment::AlignmentCurve;
+use crate::alignment_arc_length::ArcLengthMap;
 use crate::profiles::ProfileProcessor;
 use crate::{Point3, Result, TessellationQuality, Vector3};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 use nalgebra::Matrix4;
 
 impl GeometryRouter {
-    /// Resolve `IfcLinearPlacement` into a 4×4 transform by sampling the
-    /// referenced basis curve at the authored `DistanceAlong`. Falls back
-    /// gracefully when the curve cannot be sampled or the attribute layout
-    /// is malformed; never panics.
+    /// Resolve `IfcLinearPlacement` into a 4×4 transform: the authored
+    /// `CartesianPosition` when the exporter baked one, otherwise by
+    /// sampling the referenced basis curve at the authored `DistanceAlong`.
+    /// Falls back gracefully when neither resolves; never panics.
     ///
     /// Output transform: the origin is the curve sample plus
     /// `lateral*right + vertical*up + longitudinal*tangent`. Basis is
@@ -26,32 +29,66 @@ impl GeometryRouter {
         placement: &DecodedEntity,
         decoder: &mut EntityDecoder,
         depth: usize,
-    ) -> Result<Matrix4<f64>> {
-        // PlacementRelTo (attr 0) composes the same way IfcLocalPlacement does.
-        let parent_transform = if let Some(parent_attr) = placement.get(0) {
-            if !parent_attr.is_null() {
-                if let Some(parent) = decoder.resolve_ref(parent_attr)? {
-                    self.get_placement_transform_with_depth(&parent, decoder, depth + 1)?
-                } else {
-                    Matrix4::identity()
+    ) -> Result<PlacementWalk> {
+        // PlacementRelTo (attr 0) composes the same way IfcLocalPlacement does,
+        // truncation included: a parent walk cut short by the depth guard makes
+        // this result depth-dependent too, so it must not be memoised. #3012
+        let parent = match placement.get(0) {
+            Some(parent_attr) if !parent_attr.is_null() => {
+                match decoder.resolve_ref(parent_attr)? {
+                    Some(p) => self.get_placement_transform_with_depth(&p, decoder, depth + 1)?,
+                    None => PlacementWalk::complete(Matrix4::identity()),
                 }
-            } else {
-                Matrix4::identity()
             }
-        } else {
-            Matrix4::identity()
+            _ => PlacementWalk::complete(Matrix4::identity()),
         };
 
-        // RelativePlacement (attr 1) → IfcAxis2PlacementLinear with the curve
-        // sampling info. If we can't reach a valid sample, prefer the
-        // pre-baked CartesianPosition (attr 2) over identity so the element
-        // at least lands somewhere sensible.
-        let local = match self.try_resolve_axis2_placement_linear(placement, decoder) {
-            Some(m) => m,
-            None => self.try_resolve_cartesian_fallback(placement, decoder),
-        };
+        // Prefer the authored CartesianPosition (attr 2) when the exporter
+        // supplied one: it is the exact pre-computed placement. Sample the
+        // curve only when no authored position exists (an `IfcGradientCurve`
+        // is then evaluated with its vertical profile, see `gradient.rs`).
+        let local = self
+            .linear_placement_local(placement, decoder)
+            .unwrap_or_else(Matrix4::identity);
 
-        Ok(parent_transform * local)
+        Ok(PlacementWalk { transform: parent.transform * local, truncated: parent.truncated })
+    }
+
+    /// The frame an `IfcLinearPlacement` adds to its `PlacementRelTo`: the
+    /// authored `CartesianPosition`, else the sampled basis curve. File units.
+    fn linear_placement_local(
+        &self,
+        placement: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Option<Matrix4<f64>> {
+        self.try_resolve_cartesian_position(placement, decoder)
+            .or_else(|| self.try_resolve_axis2_placement_linear(placement, decoder))
+    }
+
+    /// Strict column-major local frame of an `IfcLinearPlacement` relative to
+    /// its `PlacementRelTo`, exactly as rendering composes it, in file units.
+    /// Unlike rendering there is no identity fallback: a writer baking this
+    /// frame must refuse a placement it cannot resolve (#7335).
+    pub fn resolve_linear_placement_local_strict(
+        &self,
+        placement: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<[f64; 16]> {
+        if placement.ifc_type != IfcType::IfcLinearPlacement {
+            return Err(crate::Error::geometry(format!(
+                "#{} is not an IfcLinearPlacement",
+                placement.id
+            )));
+        }
+        let local = self.linear_placement_local(placement, decoder).ok_or_else(|| {
+            crate::Error::geometry(format!(
+                "IfcLinearPlacement #{} cannot be resolved",
+                placement.id
+            ))
+        })?;
+        let mut result = [0.0; 16];
+        result.copy_from_slice(local.as_slice());
+        Ok(result)
     }
 
     /// Decode `IfcLinearPlacement.RelativePlacement` → sample the basis
@@ -99,17 +136,22 @@ impl GeometryRouter {
         }
         let basis_curve = decoder.resolve_ref(basis_attr).ok().flatten()?;
 
-        // Sample the basis curve into a polyline. `ProfileProcessor::get_curve_points`
-        // already handles IfcCompositeCurve, IfcPolyline, IfcGradientCurve via its
-        // composite-curve walk, IfcTrimmedCurve, IfcIndexedPolyCurve, etc. — every
-        // curve type the alignment authors in #859's fixture eventually reduce to.
-        let processor = ProfileProcessor::new(IfcSchema::new());
-        let samples = processor
-            .get_curve_points(&basis_curve, decoder, TessellationQuality::Medium)
-            .ok()
-            .filter(|pts| pts.len() >= 2)?;
-
-        let (origin, tangent) = sample_polyline_at_distance(&samples, distance_along)?;
+        let (origin, tangent) = if basis_curve.ifc_type == IfcType::IfcGradientCurve {
+            // `DistanceAlong` is 3D arc length. Use the same mapping and
+            // authored-station rebase as sectioned solids and centerlines.
+            let alignment = AlignmentCurve::parse(&basis_curve, decoder).ok().flatten()?;
+            let station = ArcLengthMap::new(&alignment).horizontal_station(distance_along);
+            let station = station.max(0.0).min(alignment.horizontal_length());
+            let frame = alignment.evaluate(station);
+            (frame.origin, frame.tangent)
+        } else {
+            // Other basis curves retain the existing polyline sampler.
+            let samples = ProfileProcessor::new(IfcSchema::new())
+                .get_curve_points(&basis_curve, decoder, TessellationQuality::Medium)
+                .ok()
+                .filter(|pts| pts.len() >= 2)?;
+            sample_polyline_at_distance(&samples, distance_along)?
+        };
 
         // Build the curve-aligned frame with world-up. Railway alignments
         // are near-horizontal so this is well-conditioned; in the
@@ -147,28 +189,23 @@ impl GeometryRouter {
     }
 
     /// `IfcLinearPlacement.CartesianPosition` (attr 2) is an optional
-    /// pre-baked `IfcAxis2Placement3D` that authors are encouraged to
-    /// supply for tools that cannot resolve the linear sampling. Use it
-    /// when our sampler can't reach a result; identity otherwise.
-    fn try_resolve_cartesian_fallback(
+    /// pre-baked `IfcAxis2Placement3D` carrying the exporter's own answer
+    /// to the linear sampling. `None` when absent, null, or unparseable —
+    /// the caller then samples the curve itself.
+    fn try_resolve_cartesian_position(
         &self,
         placement: &DecodedEntity,
         decoder: &mut EntityDecoder,
-    ) -> Matrix4<f64> {
-        let Some(cart_attr) = placement.get(2) else {
-            return Matrix4::identity();
-        };
+    ) -> Option<Matrix4<f64>> {
+        let cart_attr = placement.get(2)?;
         if cart_attr.is_null() {
-            return Matrix4::identity();
+            return None;
         }
-        let Ok(Some(cart)) = decoder.resolve_ref(cart_attr) else {
-            return Matrix4::identity();
-        };
+        let cart = decoder.resolve_ref(cart_attr).ok().flatten()?;
         if cart.ifc_type != IfcType::IfcAxis2Placement3D {
-            return Matrix4::identity();
+            return None;
         }
-        self.parse_axis2_placement_3d(&cart, decoder)
-            .unwrap_or_else(|_| Matrix4::identity())
+        self.parse_axis2_placement_3d(&cart, decoder).ok()
     }
 }
 
@@ -229,44 +266,5 @@ fn sample_polyline_at_distance(
 }
 
 #[cfg(test)]
-mod sample_polyline_tests {
-    use super::*;
-
-    #[test]
-    fn samples_at_start_middle_end() {
-        // Straight line along +X from (0,0,0) to (10,0,0) in 1 m segments.
-        let samples: Vec<Point3<f64>> = (0..=10)
-            .map(|i| Point3::new(i as f64, 0.0, 0.0))
-            .collect();
-
-        let (p0, t0) = sample_polyline_at_distance(&samples, 0.0).unwrap();
-        assert!((p0 - Point3::new(0.0, 0.0, 0.0)).norm() < 1e-9);
-        assert!((t0 - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-9);
-
-        let (p5, t5) = sample_polyline_at_distance(&samples, 5.0).unwrap();
-        assert!((p5 - Point3::new(5.0, 0.0, 0.0)).norm() < 1e-9);
-        assert!((t5 - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-9);
-
-        let (p10, _) = sample_polyline_at_distance(&samples, 10.0).unwrap();
-        assert!((p10 - Point3::new(10.0, 0.0, 0.0)).norm() < 1e-9);
-    }
-
-    #[test]
-    fn clamps_past_end() {
-        let samples = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(3.0, 4.0, 0.0), // length 5
-        ];
-        let (p, t) = sample_polyline_at_distance(&samples, 99.0).unwrap();
-        assert!((p - Point3::new(3.0, 4.0, 0.0)).norm() < 1e-9);
-        assert!((t.norm() - 1.0).abs() < 1e-9, "tangent must be unit");
-    }
-
-    #[test]
-    fn empty_returns_none() {
-        let none = sample_polyline_at_distance(&[], 0.0);
-        assert!(none.is_none());
-        let single = sample_polyline_at_distance(&[Point3::new(0.0, 0.0, 0.0)], 0.0);
-        assert!(single.is_none());
-    }
-}
+#[path = "linear_tests.rs"]
+mod tests;

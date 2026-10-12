@@ -124,7 +124,7 @@ export function changeSetToOps(
   const components = new Map<string, Map<string, Record<string, PropertyValue | null> | null>>();
   const entityOps = new Map<string, ChangeSetOp>();
 
-  const componentFor = (entity: string, componentKey: string) => {
+  const componentFor = (entity: string) => {
     let perEntity = components.get(entity);
     if (!perEntity) {
       perEntity = new Map();
@@ -139,7 +139,7 @@ export function changeSetToOps(
     member: string,
     value: PropertyValue | null
   ) => {
-    const perEntity = componentFor(entity, componentKey);
+    const perEntity = componentFor(entity);
     const existing = perEntity.get(componentKey);
     const values = existing === null || existing === undefined ? {} : existing;
     values[member] = value;
@@ -148,13 +148,26 @@ export function changeSetToOps(
 
   const skipped: Mutation[] = [];
   for (const mutation of changeSet.mutations) {
+    // Session layouts belong to local history, never IFC collaboration ops.
+    if (mutation.type === 'SESSION_EDIT') continue;
     const entity = identityOf(mutation.entityId);
     if (entity === undefined) continue;
     applyMutation(mutation, entity, setMember, componentFor, entityOps, resolver, skipped);
   }
 
   const ops: ChangeSetOp[] = [...entityOps.values()];
+  // Component ops fold in mutation order alongside entityOps above, but an
+  // entity's terminal state (LWW over entityOps) is only known once the
+  // whole mutation list has been consumed. Filter here, after both are
+  // complete, rather than during the fold: a DELETE_ENTITY appearing after
+  // the property mutation that produced a component would otherwise be
+  // missed by an in-flight check (the same forward-pass hazard as #2044).
+  // An entity tombstoned and later recreated (DELETE_ENTITY then
+  // CREATE_ENTITY for the same identity) resolves to 'add-entity' here,
+  // since entityOps is itself LWW keyed by entity — so its components
+  // correctly survive.
   for (const [entity, perEntity] of components) {
+    if (entityOps.get(entity)?.op === 'tombstone-entity') continue;
     for (const [componentKey, values] of perEntity) {
       if (values === null) {
         ops.push({ op: 'tombstone-component', entity, componentKey });
@@ -171,7 +184,7 @@ function applyMutation(
   mutation: Mutation,
   entity: string,
   setMember: (entity: string, componentKey: string, member: string, value: PropertyValue | null) => void,
-  componentFor: (entity: string, componentKey: string) => Map<string, Record<string, PropertyValue | null> | null>,
+  componentFor: (entity: string) => Map<string, Record<string, PropertyValue | null> | null>,
   entityOps: Map<string, ChangeSetOp>,
   resolver: EntityIdentityResolver,
   skipped: Mutation[]
@@ -192,6 +205,30 @@ function applyMutation(
     case 'UPDATE_QUANTITY':
       if (mutation.psetName && mutation.propName) {
         setMember(entity, `qset:${mutation.psetName}`, mutation.propName, mutation.newValue ?? null);
+      } else if (mutation.type === 'CREATE_QUANTITY' && mutation.psetName && Array.isArray(mutation.newValue)) {
+        // `MutablePropertyView.createQuantitySet()` (whole-qset creation, e.g.
+        // `StoreEditor.addQuantitySet`) records ONE CREATE_QUANTITY mutation for
+        // the whole set — no `propName`, `newValue` is the full quantities array
+        // — unlike `setQuantity()`'s per-quantity CREATE_QUANTITY, which always
+        // carries both. Without this branch the `psetName && propName` check
+        // above is false and the mutation fell through with nothing published:
+        // not even into `skipped` (it matches this case, so the default branch
+        // never runs), so a freshly-created quantity set vanished from the
+        // layer with zero trace.
+        const qsetComponentKey = `qset:${mutation.psetName}`;
+        // Materialize the (possibly empty) set — mirrors CREATE_PROPERTY_SET
+        // below. `createQuantitySet(entity, name, [])` is a legal call (a set
+        // created with zero quantities, to be populated later); without this
+        // line the loop below runs zero times and never touches `components`,
+        // so the whole set still vanished with zero trace for exactly the
+        // empty-array case — the same #2263 shape surviving in a corner the
+        // original fix didn't cover.
+        componentFor(entity).set(qsetComponentKey, {});
+        for (const q of mutation.newValue as Array<{ name?: string; value?: PropertyValue }>) {
+          if (q && typeof q.name === 'string') {
+            setMember(entity, qsetComponentKey, q.name, q.value ?? null);
+          }
+        }
       }
       break;
     case 'DELETE_QUANTITY':
@@ -201,13 +238,34 @@ function applyMutation(
       break;
     case 'CREATE_PROPERTY_SET':
       if (mutation.psetName) {
-        // Materialize the (possibly empty) set; members follow.
-        componentFor(entity, `pset:${mutation.psetName}`).set(`pset:${mutation.psetName}`, {});
+        const componentKey = `pset:${mutation.psetName}`;
+        // Materialize the (possibly empty) set.
+        componentFor(entity).set(componentKey, {});
+        // `MutablePropertyView.createPropertySet()` (whole-pset creation, e.g.
+        // `StoreEditor.addPropertySet`) records ONE CREATE_PROPERTY_SET mutation
+        // for the whole set — `newValue` is the full properties array — and does
+        // NOT also push a separate CREATE_PROPERTY mutation per member into
+        // `mutationHistory`. "members follow" was therefore never true for this
+        // path: nothing else in the change set ever populated `values`, so the
+        // published set-component op carried `values: {}` and every property the
+        // user entered was silently dropped from the layer.
+        if (Array.isArray(mutation.newValue)) {
+          for (const prop of mutation.newValue as Array<{ name?: string; value?: PropertyValue }>) {
+            if (prop && typeof prop.name === 'string') {
+              setMember(entity, componentKey, prop.name, prop.value ?? null);
+            }
+          }
+        }
       }
       break;
     case 'DELETE_PROPERTY_SET':
       if (mutation.psetName) {
-        componentFor(entity, `pset:${mutation.psetName}`).set(`pset:${mutation.psetName}`, null);
+        componentFor(entity).set(`pset:${mutation.psetName}`, null);
+      }
+      break;
+    case 'DELETE_QUANTITY_SET':
+      if (mutation.psetName) {
+        componentFor(entity).set(`qset:${mutation.psetName}`, null);
       }
       break;
     case 'UPDATE_ATTRIBUTE':

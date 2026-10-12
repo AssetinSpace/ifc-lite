@@ -17,6 +17,7 @@ import { useViewerStore } from './index.js';
 import { toGlobalIdFromModels } from './globalId.js';
 import { isTypeVisible } from './typeVisibilityFilter.js';
 import { collectAggregatedDescendants, type AggregationRelationships } from '../utils/aggregation.js';
+import { effectiveSpatialMembers } from '../lib/effective-spatial-members.js';
 
 type ViewerStateSnapshot = ReturnType<typeof useViewerStore.getState>;
 
@@ -52,17 +53,7 @@ function digestNumberSet(values: Iterable<number>): string {
   return `${count}:${xor >>> 0}:${sum >>> 0}`;
 }
 
-function digestModelEntityMap(map: Map<string, Set<number>>): string {
-  if (map.size === 0) return '0';
-  const parts: string[] = [];
-  for (const [modelId, ids] of map) {
-    parts.push(`${modelId}:${digestNumberSet(ids)}`);
-  }
-  parts.sort();
-  return parts.join('|');
-}
-
-function visibilityFingerprint(state: ViewerStateSnapshot): string {
+export function visibilityFingerprint(state: ViewerStateSnapshot): string {
   const tv = state.typeVisibility;
 
   // Include per-model visible flag and geometry mesh count so the cache
@@ -78,8 +69,6 @@ function visibilityFingerprint(state: ViewerStateSnapshot): string {
     state.isolatedEntities ? digestNumberSet(state.isolatedEntities) : 'none',
     state.classFilter ? digestNumberSet(state.classFilter.ids) : 'none',
     digestNumberSet(state.lensHiddenIds),
-    digestModelEntityMap(state.hiddenEntitiesByModel),
-    digestModelEntityMap(state.isolatedEntitiesByModel),
     digestNumberSet(state.selectedStoreys),
     tv.spaces ? 1 : 0,
     tv.spatialZones ? 1 : 0,
@@ -200,15 +189,15 @@ function getSelectedStoreyElementRefs(state: ViewerStateSnapshot): EntityRef[] {
   if (state.selectedStoreys.size === 0) return [];
 
   const refs: EntityRef[] = [];
-
   if (state.models.size > 0) {
     for (const [modelId, model] of state.models) {
-      const hierarchy = model.ifcDataStore?.spatialHierarchy;
-      if (!hierarchy) continue;
+      const modelStore = model.ifcDataStore;
+      const hierarchy = modelStore?.spatialHierarchy;
+      if (!modelStore || !hierarchy) continue;
       const offset = model.idOffset ?? 0;
       for (const storeyId of state.selectedStoreys) {
-        const storeyElementIds = hierarchy.byStorey.get(storeyId) || hierarchy.byStorey.get(storeyId - offset);
-        if (!storeyElementIds) continue;
+        const localStoreyId = hierarchy.byStorey.has(storeyId) ? storeyId : storeyId - offset;
+        const storeyElementIds = effectiveSpatialMembers(modelStore, state.mutationViews.get(modelId), localStoreyId);
         for (const localId of storeyElementIds) {
           refs.push({ modelId, expressId: localId });
         }
@@ -216,8 +205,7 @@ function getSelectedStoreyElementRefs(state: ViewerStateSnapshot): EntityRef[] {
     }
   } else if (state.ifcDataStore?.spatialHierarchy) {
     for (const storeyId of state.selectedStoreys) {
-      const storeyElementIds = state.ifcDataStore.spatialHierarchy.byStorey.get(storeyId);
-      if (!storeyElementIds) continue;
+      const storeyElementIds = effectiveSpatialMembers(state.ifcDataStore, state.mutationViews.get('legacy'), storeyId);
       for (const id of storeyElementIds) {
         refs.push({ modelId: 'legacy', expressId: id });
       }
@@ -395,6 +383,42 @@ function collectVisibleCandidates(state: ViewerStateSnapshot): VisibleCandidate[
   return candidates;
 }
 
+/**
+ * The isolation ALLOWLIST currently in force, in global-id space: storey
+ * selection ∩ class filter ∩ manual isolation, or `null` when no isolation
+ * channel is active at all.
+ *
+ * This is the same quantity `ViewportContainer` memoises as
+ * `computedIsolatedIds` and hands the renderer as `isolatedIds`. It is exported
+ * because that memo is prop-drilled through the viewport tree and is therefore
+ * unreachable from the toolbar — where the to-scale PDF export lives (#2042).
+ * An exporter that read only `isolatedEntities` would print every storey while
+ * the screen shows one, which is the #2578 "the export disagrees with the
+ * viewport" class; deriving it here instead of restating the intersection is
+ * what stops a third copy appearing.
+ */
+export function computeIsolationFilterSet(state: ViewerStateSnapshot): Set<number> | null {
+  // Collect all active filter sets and intersect them
+  const filters: Set<number>[] = [];
+  const storeyIsolation = computeStoreyIsolation(state);
+  if (storeyIsolation !== null) filters.push(storeyIsolation);
+  if (state.classFilter !== null) filters.push(state.classFilter.ids);
+  if (state.isolatedEntities !== null) filters.push(state.isolatedEntities);
+
+  if (filters.length === 0) return null;
+  if (filters.length === 1) return filters[0];
+
+  // Intersect all active filters — start from smallest for efficiency
+  const sorted = filters.sort((a, b) => a.size - b.size);
+  const intersection = new Set<number>();
+  for (const id of sorted[0]) {
+    if (sorted.every((s) => s.has(id))) {
+      intersection.add(id);
+    }
+  }
+  return intersection;
+}
+
 function getVisibleGlobalIds(state: ViewerStateSnapshot): Set<number> {
   const candidates = collectVisibleCandidates(state);
 
@@ -403,37 +427,12 @@ function getVisibleGlobalIds(state: ViewerStateSnapshot): Set<number> {
     globalHidden.add(id);
   }
 
-  // Collect all active filter sets and intersect them
-  const filters: Set<number>[] = [];
-  const storeyIsolation = computeStoreyIsolation(state);
-  if (storeyIsolation !== null) filters.push(storeyIsolation);
-  if (state.classFilter !== null) filters.push(state.classFilter.ids);
-  if (state.isolatedEntities !== null) filters.push(state.isolatedEntities);
-
-  let globalIsolation: Set<number> | null = null;
-  if (filters.length === 1) {
-    globalIsolation = filters[0];
-  } else if (filters.length > 1) {
-    // Intersect all active filters — start from smallest for efficiency
-    const sorted = filters.sort((a, b) => a.size - b.size);
-    globalIsolation = new Set<number>();
-    for (const id of sorted[0]) {
-      if (sorted.every(s => s.has(id))) {
-        globalIsolation.add(id);
-      }
-    }
-  }
+  const globalIsolation = computeIsolationFilterSet(state);
 
   const visible = new Set<number>();
   for (const candidate of candidates) {
     if (globalIsolation !== null && !globalIsolation.has(candidate.globalId)) continue;
     if (globalHidden.has(candidate.globalId)) continue;
-
-    const modelHidden = state.hiddenEntitiesByModel.get(candidate.modelId);
-    if (modelHidden?.has(candidate.expressId)) continue;
-
-    const modelIsolated = state.isolatedEntitiesByModel.get(candidate.modelId);
-    if (modelIsolated && !modelIsolated.has(candidate.expressId)) continue;
 
     visible.add(candidate.globalId);
   }
@@ -441,17 +440,13 @@ function getVisibleGlobalIds(state: ViewerStateSnapshot): Set<number> {
   return visible;
 }
 
-export function getVisibleBasketEntityRefsFromStore(): EntityRef[] {
-  const state = useViewerStore.getState();
+/** `ignoreIsolatedEntities`: as if `isolatedEntities` were unset, so a panel's own isolation does not filter its own rows (#6368). */
+export function getVisibleBasketEntityRefsFromStore(ignoreIsolatedEntities = false, live = useViewerStore.getState()): EntityRef[] {
+  const state = ignoreIsolatedEntities && live.isolatedEntities !== null ? { ...live, isolatedEntities: null } : live;
   const key = visibilityFingerprint(state);
   if (_visibleCache?.key === key) return _visibleCache.refs;
 
   const visibleIds = getVisibleGlobalIds(state);
-  if (visibleIds.size === 0) {
-    _visibleCache = { key, refs: [] };
-    return [];
-  }
-
   const refs: EntityRef[] = [];
   for (const globalId of visibleIds) {
     const resolved = state.resolveGlobalIdFromModels(globalId);
@@ -470,8 +465,7 @@ export function getVisibleBasketEntityRefsFromStore(): EntityRef[] {
  * Resolve active entity selection into basket refs.
  * Explicit selected entities are preferred; if empty, selected storeys are expanded.
  */
-export function getBasketSelectionRefsFromStore(): EntityRef[] {
-  const state = useViewerStore.getState();
+export function getBasketSelectionRefsFromStore(state = useViewerStore.getState()): EntityRef[] {
 
   const expandedSelection = getExpandedSelectionRefs(state);
   if (expandedSelection.length > 0) {
@@ -534,13 +528,12 @@ export function getSmartBasketInputFromStore(): { refs: EntityRef[]; source: Bas
   return { refs: [], source: 'empty' };
 }
 
+/** "Is the basket shown?" — every basket element is isolated. A subset test, not equality: a basket that
+ *  WIDENED a foreign isolation (#4527) is shown too, and "Show active basket" would evict the foreign ids. */
 export function isBasketIsolationActiveFromStore(): boolean {
   const state = useViewerStore.getState();
   if (state.pinboardEntities.size === 0 || state.isolatedEntities === null) return false;
-
-  const basketIds = basketToGlobalIds(state);
-  if (basketIds.size !== state.isolatedEntities.size) return false;
-  for (const id of basketIds) {
+  for (const id of basketToGlobalIds(state)) {
     if (!state.isolatedEntities.has(id)) return false;
   }
   return true;

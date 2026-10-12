@@ -1,0 +1,307 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * The per-facet-family matchers — simple value, pattern, enumeration
+ * and bounds — plus their compiled-form caches.
+ *
+ * Split out of `constraints/index.ts` so that module is the matching
+ * entry point and this one holds the primitives, letting the reporting
+ * module (`describe.ts`) reach them without an import cycle.
+ *
+ * `matchSimpleValue`/`matchEnumeration` try string equality first, then
+ * fall back to numeric (1e-6 tolerance) / boolean coercion. `stringOnly`
+ * (set by the property facet from the value's declared IFC type) skips
+ * that fallback: a string-flavoured value (`IfcLabel`, …) must compare
+ * as an exact string even when it looks numeric — `IFCLABEL('1.0000001')`
+ * must NOT match a requirement of `1` (#6117).
+ */
+
+import type {
+  IDSConstraint,
+  IDSSimpleValue,
+  IDSPatternConstraint,
+  IDSEnumerationConstraint,
+} from '../types.js';
+
+import {
+  compareBoolean,
+  compareNumeric,
+  compareString,
+  isStrictNumericLiteral,
+  isBooleanLiteral,
+} from './comparators.js';
+import { isNumericXsdBase, isBooleanXsdBase } from './xsd-cast.js';
+import { translateXsdRegex } from './xsd-regex.js';
+import { matchBounds } from './match-bounds.js';
+import { assertGuardedRegexPattern, UnsafeRegexPatternError } from '@ifc-lite/regex-guard';
+
+/** Tolerance for the bounds matcher's exclusive comparators. */
+export const NUMERIC_TOLERANCE = 1e-6;
+
+/**
+ * The conjunctive facets `parseRestriction` attached to this constraint
+ * from the same `<xs:restriction>`, or `undefined` when it declared one
+ * facet family (the common case). `simpleValue` never carries any: it
+ * does not come from a restriction.
+ */
+export function conjunctiveFacetsOf(
+  constraint: IDSConstraint
+): readonly IDSConstraint[] | undefined {
+  return constraint.type === 'simpleValue' ? undefined : constraint.and;
+}
+
+export function matchOneFamily(
+  constraint: IDSConstraint,
+  actualValue: string | number | boolean,
+  ci: boolean,
+  stringOnly = false
+): boolean {
+  switch (constraint.type) {
+    case 'simpleValue':
+      return matchSimpleValue(constraint, actualValue, ci, stringOnly);
+    case 'pattern':
+      return matchPattern(constraint, actualValue, ci);
+    case 'enumeration':
+      return matchEnumeration(constraint, actualValue, ci, stringOnly);
+    case 'bounds':
+      return matchBounds(constraint, actualValue);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Per-constraint comparator applicability. `compareNumeric` runs two
+ * regex tests and `compareBoolean` two equality checks per call — and
+ * simple-value matching sits inside per-entity × per-specification hot
+ * loops (name matching against every pset/property). Whether the IDS
+ * literal could EVER match numerically or boolean-ly depends only on
+ * the constraint, so decide it once.
+ */
+const SIMPLE_VALUE_COERCIBLE = new WeakMap<IDSSimpleValue, boolean>();
+
+function isCoercibleSimpleValue(constraint: IDSSimpleValue): boolean {
+  let coercible = SIMPLE_VALUE_COERCIBLE.get(constraint);
+  if (coercible === undefined) {
+    coercible =
+      isStrictNumericLiteral(constraint.value) ||
+      isBooleanLiteral(constraint.value);
+    SIMPLE_VALUE_COERCIBLE.set(constraint, coercible);
+  }
+  return coercible;
+}
+
+/**
+ * Match against a simple value. Tries each comparator in order:
+ * string → numeric → boolean. The first decisive result wins;
+ * `undefined` lets the next strategy run.
+ */
+function matchSimpleValue(
+  constraint: IDSSimpleValue,
+  actualValue: string | number | boolean,
+  caseInsensitive: boolean,
+  stringOnly = false
+): boolean {
+  const expected = constraint.value;
+  const stringResult = compareString(expected, actualValue, caseInsensitive);
+  if (stringResult !== undefined) return stringResult;
+  // A string-typed IFC value only matches through string equality (#6117).
+  if (stringOnly) return false;
+  // A non-numeric, non-boolean literal can only match through string
+  // equality — skip the comparators that would return undefined anyway.
+  if (!isCoercibleSimpleValue(constraint)) return false;
+  const numericResult = compareNumeric(expected, actualValue, constraint.toleranceRule);
+  if (numericResult !== undefined) return numericResult;
+  const booleanResult = compareBoolean(expected, actualValue);
+  if (booleanResult !== undefined) return booleanResult;
+  return false;
+}
+
+/**
+ * Match against a regex pattern
+ * IDS uses XSD regex syntax which is slightly different from JavaScript
+ */
+function matchPattern(
+  constraint: IDSPatternConstraint,
+  actualValue: string | number | boolean,
+  caseInsensitive = false
+): boolean {
+  // An XSD `xs:pattern` facet constrains the *lexical* space of its base
+  // datatype, so it matches the textual representation of the value — the
+  // official IDS reference (ifctester) does `re.fullmatch(pattern,
+  // str(value))`. A numeric value therefore satisfies e.g.
+  // `<restriction base="xs:decimal"><pattern value="^.*$"/>` ("any
+  // decimal value present"), which the previous blanket number/boolean
+  // bail-out wrongly failed on every numeric property.
+  //
+  // But the runtime value must first be type-compatible with the declared
+  // base: a number only matches a numeric base and a boolean only a
+  // boolean base. A number tested against `base="xs:string"` is a type
+  // mismatch — buildingSMART's corpus encodes exactly this as
+  // `patterns_always_fail_on_any_number`. (A string actual is already the
+  // lexical form, so it is matched directly regardless of base.)
+  if (typeof actualValue === 'number') {
+    if (!isNumericXsdBase(constraint.base)) return false;
+  } else if (typeof actualValue === 'boolean') {
+    if (!isBooleanXsdBase(constraint.base)) return false;
+  }
+  const actualStr = String(actualValue);
+
+  const regex = compilePatternRegex(constraint, caseInsensitive);
+  // An un-compilable pattern can't match anything (e.g. an unbalanced
+  // `[`); treat it as a non-match rather than throwing.
+  return regex ? regex.test(actualStr) : false;
+}
+
+/**
+ * Compiled-pattern cache. Translating XSD → JS regex and building the
+ * `RegExp` on every value check dominated pattern-heavy validation; the
+ * compiled form depends only on (constraint, caseInsensitive), and the
+ * constraint object is stable per parsed document.
+ */
+const PATTERN_REGEX_CACHE = new WeakMap<
+  IDSPatternConstraint,
+  { cs?: RegExp | null; ci?: RegExp | null }
+>();
+
+/** The cached whole-value `RegExp` for `constraint`, or null if it cannot compile. */
+function compilePatternRegex(
+  constraint: IDSPatternConstraint,
+  caseInsensitive: boolean
+): RegExp | null {
+  let entry = PATTERN_REGEX_CACHE.get(constraint);
+  if (!entry) {
+    entry = {};
+    PATTERN_REGEX_CACHE.set(constraint, entry);
+  }
+  const slot = caseInsensitive ? 'ci' : 'cs';
+  let regex = entry[slot];
+  if (regex === undefined) {
+    regex = buildPatternRegex(constraint.pattern, caseInsensitive);
+    entry[slot] = regex;
+  }
+  return regex;
+}
+
+/** Compile one XSD pattern for whole-value matching; throws when it cannot be evaluated. */
+function buildPatternRegex(
+  xsdPattern: string,
+  caseInsensitive: boolean
+): RegExp | null {
+  // Reject a catastrophic-backtracking or over-long pattern BEFORE any
+  // translation/compilation is attempted. This throws (rather than
+  // returning null like the malformed-syntax cases below) because a
+  // rejected pattern must surface as a validation failure the caller
+  // can see, not silently evaluate to "no match" — see
+  // `@ifc-lite/regex-guard`'s doc comment and this package's
+  // `validateSpecification`, which turns the thrown error into a
+  // failed specification result.
+  assertGuardedRegexPattern(xsdPattern);
+  // Shared XSD → JS translation (XML Schema Part 2 Appendix F, see
+  // `xsd-regex.ts`): multi-char escapes, `\p{Is…}` blocks, class
+  // subtraction and negated escapes inside classes are translated exactly,
+  // and `^` / `$` are literals. The result requires the `u` flag.
+  // A construct with no exact translation (an unknown block or property
+  // name, an escape XSD does not define, an undelimitable subtraction) is
+  // refused rather than approximated: an any-character placeholder passed
+  // every value silently (#7400), and dropping a subtraction's exclusion
+  // accepted exactly the values it was written to exclude (#5183).
+  // `UnsafeRegexPatternError` becomes a failed specification result in
+  // `validateSpecification`, never a silent pass.
+  const { pattern, supported, reason } = translateXsdRegex(xsdPattern);
+  if (!supported) {
+    throw new UnsafeRegexPatternError(xsdPattern, reason);
+  }
+  // IDS patterns must match the entire lexical value. Wrapping in a
+  // non-capturing group anchors top-level alternation correctly
+  // (`a|b` → `^(?:a|b)$`, not `^a|b$`). Case-insensitive matching is
+  // opt-in per the call site (entity / predefined-type names use it;
+  // property and attribute values do not).
+  const anchored = `^(?:${pattern})$`;
+  try {
+    return new RegExp(anchored, caseInsensitive ? 'iu' : 'u');
+  } catch {
+    // Some patterns are valid under JS's lenient (Annex-B) dialect but
+    // rejected under `u` (a lone `{` or `]`). Retry without it so plain
+    // patterns keep matching — but only when the translation emitted no
+    // `\p{…}` / `\P{…}` / `\u{…}`: without `u` those silently mean the
+    // literal text `p{L}` or a repeated `u`, which made e.g. `\p{L}+…`
+    // fail every value instead of reporting the bad pattern (#7400).
+    if (/\\[pPu]\{/.test(pattern)) return null;
+    try {
+      return new RegExp(anchored, caseInsensitive ? 'i' : '');
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Compiled exact-match sets per enumeration constraint. Real-world IDS
+ * code lists carry hundreds of values and are matched against every
+ * candidate entity, so the linear comparator walk dominated validation
+ * time. Constraint objects are stable per parsed document, making a
+ * WeakMap cache safe.
+ */
+const ENUM_VALUE_SETS = new WeakMap<
+  IDSEnumerationConstraint,
+  { exact: Set<string>; upper: Set<string>; anyCoercible: boolean }
+>();
+
+function getEnumValueSets(constraint: IDSEnumerationConstraint): {
+  exact: Set<string>;
+  upper: Set<string>;
+  anyCoercible: boolean;
+} {
+  let sets = ENUM_VALUE_SETS.get(constraint);
+  if (!sets) {
+    const exact = new Set(constraint.values);
+    const upper = new Set<string>();
+    let anyCoercible = false;
+    for (const v of constraint.values) {
+      upper.add(v.toUpperCase());
+      if (isStrictNumericLiteral(v) || isBooleanLiteral(v)) anyCoercible = true;
+    }
+    sets = { exact, upper, anyCoercible };
+    ENUM_VALUE_SETS.set(constraint, sets);
+  }
+  return sets;
+}
+
+/**
+ * Match against an enumeration. The actual value matches if ANY of the
+ * declared options matches under string / numeric / boolean comparison
+ * — same strategy table as `matchSimpleValue`, just iterated.
+ */
+function matchEnumeration(
+  constraint: IDSEnumerationConstraint,
+  actualValue: string | number | boolean,
+  caseInsensitive: boolean,
+  stringOnly = false
+): boolean {
+  // O(1) fast path: a set hit is exactly the condition under which
+  // `compareString` would have returned true for some value, so this
+  // never changes the outcome — misses fall through to the full
+  // comparator walk for numeric / boolean semantics.
+  const sets = getEnumValueSets(constraint);
+  const actualStr = String(actualValue);
+  if (sets.exact.has(actualStr)) return true;
+  if (caseInsensitive && sets.upper.has(actualStr.toUpperCase())) return true;
+  // Same string-only rule as `matchSimpleValue` (#6117).
+  if (stringOnly) return false;
+  // Pure-string enumerations are fully decided by the set lookups —
+  // only numeric/boolean literals can still match in the slow walk.
+  if (!sets.anyCoercible) return false;
+
+  return constraint.values.some((v) => {
+    const stringResult = compareString(v, actualValue, caseInsensitive);
+    if (stringResult !== undefined) return stringResult;
+    const numericResult = compareNumeric(v, actualValue, constraint.toleranceRule);
+    if (numericResult !== undefined) return numericResult;
+    const booleanResult = compareBoolean(v, actualValue);
+    if (booleanResult !== undefined) return booleanResult;
+    return false;
+  });
+}

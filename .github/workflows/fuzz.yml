@@ -41,7 +41,7 @@ jobs:
     # Free GitHub-hosted runner (public repo) — weekly + on-demand only, so a
     # slow cold build costs wall-clock, not money (same rationale as
     # determinism.yml).
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       # One crashing target must not cancel the others mid-run.
@@ -71,7 +71,7 @@ jobs:
         run: rustup show
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: '${{ matrix.crate_dir }} -> target'
           prefix-key: ci-fuzz-${{ matrix.target }}
@@ -108,9 +108,9 @@ jobs:
       # land as a permanent regression test.
       - name: Upload crash artifact
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: ${{ matrix.crate_dir }}/artifacts/${{ matrix.target }}
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error

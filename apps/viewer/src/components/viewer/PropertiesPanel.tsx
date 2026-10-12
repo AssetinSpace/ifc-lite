@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+<<<<<<< HEAD
 import { useMemo, useState, useCallback, useEffect, type ReactNode } from 'react';
 import {
   Copy,
@@ -21,42 +22,70 @@ import {
   Crosshair,
   Box,
 } from 'lucide-react';
+=======
+import { ACTION_NAME_KEYS } from '@/lib/commands/action-names';
+import { effectiveTypeProperties } from './properties/effectiveTypeProperties';
+import { useMemo, useState, useCallback, useEffect } from 'react';
+import { useTranslation } from '@/i18n';
+import { Copy, Check, Building2, Layers, Layers2, FileText, Calculator, Tag, MousePointer2, PenLine, Crosshair, Box, ChevronDown } from 'lucide-react';
+>>>>>>> upstream/main
 import { Badge } from '@/components/ui/badge';
 import { EditToolbar } from './PropertyEditor';
 import { GeometryEditCard } from './GeometryEditCard';
 import { ModelBadge } from './ModelBadge';
-import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { EmptyState } from '@/components/ui/empty-state';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store';
+import { mutationDenialKey, mutationPermission } from '@/store/mutation-permission';
+import { effectiveQuantitySets } from './properties/effectiveSets';
+import { readOccurrenceQuantityResult } from './properties/readOccurrenceQuantityResult';
+import { useSelectAssembly } from './properties/useSelectAssembly';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { useIfc } from '@/hooks/useIfc';
-import { configureMutationView } from '@/utils/configureMutationView';
+import { getOrCreateMutationView } from '@/sdk/adapters/mutation-view';
 import { IfcQuery } from '@ifc-lite/query';
-import { MutablePropertyView } from '@ifc-lite/mutations';
-import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
-import type { NewEntity } from '@ifc-lite/mutations';
-import { EntityFlags, RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
+import { extractClassificationsOnDemand, extractTypeEntityOwnProperties, extractGeoreferencingOnDemand, extractLengthUnitScale, ProjectUnits, taskProductExpressIds, taskProductGlobalIds, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
+import { RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
 import type { EntityRef, FederatedModel } from '@/store/types';
-
+import { ZoneVolumeBreakdown } from './ZoneVolumeBreakdown';
+import type { ZoneSet } from '@/lib/zones';
+import { effectiveMaterials, effectiveMaterialProperties } from './properties/effectiveMaterials';
+import { useInheritedTypeQuantities } from './properties/useInheritedTypeQuantities';
+import { useCurrentProjectUnits } from './properties/useCurrentProjectUnits';
 import { CoordVal, CoordRow } from './properties/CoordinateDisplay';
+import { renderToWorldViewer } from './tools/measure-modes/coordinates';
+import { viewerToIfcAxes } from '@/lib/geo/coordinate-frame';
+import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
+import { displayStoreyElevationMeters } from '@/lib/geo/storey-elevation';
+import { useRenderFrameOffsets } from '@/hooks/useRenderFrameOffsets';
 import { PropertySetCard } from './properties/PropertySetCard';
 import { QuantitySetCard } from './properties/QuantitySetCard';
+import { SweptDiskInspection } from './properties/SweptDiskInspection';
+import { ExtrusionInspection } from './properties/ExtrusionInspection';
 import { ModelMetadataPanel } from './properties/ModelMetadataPanel';
+import { useInspectTiming } from './properties/useInspectTiming';
+import { useLandXmlSourceInspector } from './properties/useLandXmlSourceInspector';
 import { ClassificationCard } from './properties/ClassificationCard';
 import { MaterialCard } from './properties/MaterialCard';
 import { MaterialTotalsPanel } from './properties/MaterialTotalsPanel';
 import { ScheduleCard } from './properties/ScheduleCard';
+import { StructuralCard } from './properties/StructuralCard';
 import { TaskEditCard } from './properties/TaskEditCard';
 import { DocumentCard } from './properties/DocumentCard';
+import { effectiveDocuments } from './properties/effectiveDocuments';
 import { RelationshipsCard } from './properties/RelationshipsCard';
+import { SpatialLocationBadge } from './properties/SpatialLocationBadge';
+import { AssemblyBadge } from './properties/AssemblyBadge';
 import type { PropertySet, QuantitySet } from './properties/encodingUtils';
 import { BsddCard } from './properties/BsddCard';
 import { GeoreferencingPanel } from './properties/GeoreferencingPanel';
 import { RawStepCard } from './properties/RawStepCard';
 import { UnitDisplayControl } from './properties/UnitDisplayControl';
+<<<<<<< HEAD
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
 // >>> AIM-FORK: AIM asset card, rendered only inside the AIM host (see docs/FORK_MAINTENANCE.md)
 import { AimInspectorTabs, useAimNativeHidden } from '@/aim/AimInspectorTabs';
@@ -165,7 +194,32 @@ function mergePropertySetLists(base: DisplayPropertySet[], incoming: DisplayProp
   return merged;
 }
 
+=======
+import { EntityHeaderActions } from './properties/EntityHeaderActions';
+import { isMaterialDefinitionType } from '@/utils/materialDefinitionTypes';
+import { attributesFromOverlayEntity } from './properties/overlayAttributes';
+import { createQueryAdapter } from '@/sdk/adapters/query-adapter';
+import { groupMembersForRef, relationshipsForSelection } from './properties/merge-relationship-data';
+import { relationshipPopulationUnavailable } from './properties/effective-relationship-availability';
+import { effectiveSelectedClass } from './properties/effectiveSelectedClass';
+import { effectiveStructuralData } from './properties/effectiveStructuralData';
+import { selectedOverlayEntity } from './properties/selectedOverlayEntity';
+import { mergePropertySetLists, type DisplayPropertySet } from './properties/mergePropertySetLists';
+import { filterMaterialPropertyGroups, filterPropertySets, filterQuantitySets, matchesPropertySearch, searchTabForHits } from './properties/propertySearch';
+import { PropertySearchHighlight } from './properties/PropertySearchHighlight';
+import { PropertyFindBox } from './properties/PropertyFindBox';
+import { AssociationAttributeSearchCard, findAssociationAttributes } from './properties/associationAttributeSearch';
+import { associationDisclosureId } from './properties/associationDisclosureId';
+import { PersistentCollapsible } from './properties/PersistentCollapsible';
+import { usePersistentDisclosure } from './properties/usePersistentDisclosure';
+import { AttributeEditorField } from './properties/AttributeEditorField';
+import { CopyValueButton } from './properties/CopyValueButton';
+import { useCopyValue } from './properties/useCopyValue';
+import { SelectionSummaryPanel } from './properties/SelectionSummaryPanel';
+import { AssistantAction } from './assistant/AssistantAction';
+>>>>>>> upstream/main
 export function PropertiesPanel() {
+  const { t, locale } = useTranslation();
   // Display-unit converter overrides (issue #1573 proposal 2) — read once
   // here and threaded to every PropertySetCard/QuantitySetCard render site
   // below, plus the secondary EntityDataSection component.
@@ -177,8 +231,6 @@ export function PropertiesPanel() {
   const zoneAssignments = useViewerStore((s) => s.zoneAssignments);
   const selectedModelId = useViewerStore((s) => s.selectedModelId);
   const cameraCallbacks = useViewerStore((s) => s.cameraCallbacks);
-  const toggleEntityVisibility = useViewerStore((s) => s.toggleEntityVisibility);
-  const isEntityVisible = useViewerStore((s) => s.isEntityVisible);
   // Relationship navigation: select a related entity (e.g. an IfcZone) to show
   // its attributes, or isolate a group's members in 3D (#1075).
   const setSelectedEntity = useViewerStore((s) => s.setSelectedEntity);
@@ -190,6 +242,7 @@ export function PropertiesPanel() {
   // the user has the merge-layers load setting active so they
   // understand the displayed solid is the aggregated representation.
   const mergeLayersActive = useViewerStore((s) => s.mergeLayers);
+<<<<<<< HEAD
   // On mobile the panel lives inside a fixed-height bottom sheet (see
   // ViewerLayout's MobileBottomSheet). The desktop layout splits the panel into
   // a fixed header region + a `flex-1` internal ScrollArea for the tab content —
@@ -199,6 +252,10 @@ export function PropertiesPanel() {
   // whole panel flow as one column, scrolled by the sheet.
   const isMobile = useViewerStore((s) => s.isMobile);
   const { query, ifcDataStore, geometryResult, models, getQueryForModel } = useIfc();
+=======
+  const { query, ifcDataStore, geometryResult, models } = useIfc();
+  const overlayAwareQuery = useMemo(() => createQueryAdapter(useViewerStore), []);
+>>>>>>> upstream/main
 
   // Get model-aware query based on selectedEntity
   const { modelQuery, model } = useMemo(() => {
@@ -222,37 +279,30 @@ export function PropertiesPanel() {
   // Subscribe to mutation views and version to trigger re-render when mutations change
   const mutationViews = useViewerStore((s) => s.mutationViews);
   const mutationVersion = useViewerStore((s) => s.mutationVersion);
-  const getMutationView = useViewerStore((s) => s.getMutationView);
-  const registerMutationView = useViewerStore((s) => s.registerMutationView);
-
-  // Ensure mutation view exists for editing - creates it on-demand if needed
+  // The SDK adapter shares this view with scripts and context-menu actions.
   useEffect(() => {
     if (!model || !model.ifcDataStore || !selectedEntity || selectedEntity.modelId === 'legacy') return;
+    getOrCreateMutationView(useViewerStore, selectedEntity.modelId);
+  }, [model, selectedEntity]);
 
-    const modelId = selectedEntity.modelId;
-    let mutationView = getMutationView(modelId);
-    if (mutationView) return; // Already exists
-
-    // Create new mutation view
-    const dataStore = model.ifcDataStore;
-    mutationView = new MutablePropertyView(dataStore.properties || null, modelId);
-
-    configureMutationView(mutationView, dataStore as IfcDataStore);
-
-    registerMutationView(modelId, mutationView);
-  }, [model, selectedEntity, getMutationView, registerMutationView]);
-
-  // Copy feedback state - must be before any early returns (Rules of Hooks)
-  const [copied, setCopied] = useState(false);
-  const [coordCopied, setCoordCopied] = useState<string | null>(null);
-  const [coordOpen, setCoordOpen] = useState(false);
+  const multiSelectionCount = useViewerStore((s) => s.selectedEntitiesSet.size);
+  const { copiedKey, copy } = useCopyValue(); // the panel's one clipboard path (#5900)
+  const copied = copiedKey === 'globalId';
+  const [coordOpen, setCoordOpen] = usePersistentDisclosure('coordinates', false);
+  const [find, setFind] = useState('');
 
   // Inline property editing is gated by the global edit-mode pill in
   // the main toolbar (see `uiSlice.editEnabled`). Reading it from the
   // store keeps every edit affordance — properties, attributes,
-  // geometry manipulators, georeference placement, add-element draw
+  // geometry manipulators, georeference placement, the Model workspace's draw
   // tools — behind a single switch.
-  const editMode = useViewerStore((s) => s.editEnabled);
+  const editEnabled = useViewerStore((s) => s.editEnabled);
+  const collabRole = useViewerStore((s) => s.collabRole);
+  const editPermission = useMemo(
+    () => mutationPermission(useViewerStore.getState(), selectedEntity?.modelId),
+    [editEnabled, collabRole, selectedEntity?.modelId, models],
+  );
+  const editMode = editEnabled && editPermission.allowed;
   const propertiesActiveTab = useViewerStore((s) => s.propertiesActiveTab);
   // >>> AIM-FORK: AIM | IFC inspector (D-077) — skrytie natívneho obsahu pod AIM tabom
   const aimNativeHidden = useAimNativeHidden();
@@ -261,6 +311,7 @@ export function PropertiesPanel() {
   const setEditEnabled = useViewerStore((s) => s.setEditEnabled);
   const pendingPropertyFocus = useViewerStore((s) => s.pendingPropertyFocus);
   const setPendingPropertyFocus = useViewerStore((s) => s.setPendingPropertyFocus);
+  const georefMutations = useViewerStore((s) => s.georefMutations);
 
   // One-shot "jump to the property I just added in bSDD" focus (issue #1107).
   // The bSDD card arms `pendingPropertyFocus` and the user crosses over via its
@@ -277,6 +328,7 @@ export function PropertiesPanel() {
     // focus for a different entity is left untouched (never consumed here).
     if (focus.modelId !== selectedEntity.modelId || focus.entityId !== selectedEntity.expressId) return;
     setEditEnabled(true);
+    setFind(''); // A prior query must not hide the row bSDD asked us to reveal.
     // entityId-qualified key so it can only ever highlight the occurrence row
     // (not an inherited type pset that happens to share the name).
     setFocusedPropKey(`${focus.entityId}:${focus.psetName}:${focus.propName}`);
@@ -318,18 +370,6 @@ export function PropertiesPanel() {
       window.clearTimeout(fade);
     };
   }, [focusedPropKey]);
-
-  const copyToClipboard = useCallback((text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }, []);
-
-  const copyCoords = useCallback((label: string, text: string) => {
-    navigator.clipboard.writeText(text);
-    setCoordCopied(label);
-    setTimeout(() => setCoordCopied(null), 1500);
-  }, []);
 
   // Get spatial location info
   // IMPORTANT: Use selectedEntity.expressId (original ID) for IfcDataStore lookups
@@ -412,8 +452,15 @@ export function PropertiesPanel() {
   // To reverse back to world coordinates (Y-up):
   //   world_yup = scene_local + originShift + wasmRtcOffset_converted_to_yup
   //
-  // For multi-model: all models are aligned to the first model's RTC frame,
-  // so we always use the first model's wasmRtcOffset for reconstruction.
+  // For multi-model: all models are aligned to the first model's RTC frame, so
+  // BOTH offsets must come from that one model. This panel used to take
+  // `wasmRtcOffset` from the anchor and `originShift` from the SELECTED model,
+  // which mixes two frames and shifts the reported world centre by their
+  // difference. `useRenderFrameOffsets` is the one resolver — the same one the
+  // measure tool's picked-point readout uses — so the two cannot disagree about
+  // the frame any more than they can about which axis is up.
+  const renderFrame = useRenderFrameOffsets();
+
   const entityCoordinates = useMemo(() => {
     if (!selectedEntity) return null;
 
@@ -452,28 +499,6 @@ export function PropertiesPanel() {
     if (!found) return null;
 
     const coordInfo = geoResult.coordinateInfo;
-    const shift = coordInfo?.originShift ?? { x: 0, y: 0, z: 0 };
-
-    // Get the reference WASM RTC offset for world coordinate reconstruction.
-    // For multi-model: all models are aligned to the first model's RTC frame,
-    // so we must use the first model's wasmRtcOffset (not the current model's).
-    // For single/legacy: use the geometry result's own offset.
-    let wasmRtcIfc = coordInfo?.wasmRtcOffset;
-    if (models.size > 1) {
-      let earliest = Infinity;
-      for (const [, m] of models) {
-        if (m.loadedAt < earliest) {
-          earliest = m.loadedAt;
-          wasmRtcIfc = m.geometryResult?.coordinateInfo?.wasmRtcOffset;
-        }
-      }
-    }
-
-    // Convert WASM RTC offset from IFC Z-up to viewer Y-up:
-    //   viewer X = IFC X, viewer Y = IFC Z, viewer Z = -IFC Y
-    const wasmRtcYup = wasmRtcIfc
-      ? { x: wasmRtcIfc.x, y: wasmRtcIfc.z, z: -wasmRtcIfc.y }
-      : { x: 0, y: 0, z: 0 };
 
     // Local (scene) center - what the renderer uses (Y-up, shifted)
     const localCenter = {
@@ -482,28 +507,20 @@ export function PropertiesPanel() {
       z: (minZ + maxZ) / 2,
     };
 
-    // World center (Y-up) = scene_local + originShift + wasmRtcOffset_yup
-    const worldCenterYup = {
-      x: localCenter.x + shift.x + wasmRtcYup.x,
-      y: localCenter.y + shift.y + wasmRtcYup.y,
-      z: localCenter.z + shift.z + wasmRtcYup.z,
-    };
-
-    // Convert world Y-up to IFC Z-up for display:
-    //   IFC X = viewer X, IFC Y = -viewer Z, IFC Z = viewer Y
-    const worldCenterZup = {
-      x: worldCenterYup.x,
-      y: -worldCenterYup.z,
-      z: worldCenterYup.y,
-    };
+    // World center (Y-up) = scene_local + originShift + wasmRtcOffset_yup, and
+    // then IFC Z-up for display. Both transforms live in the measure tool's
+    // `coordinates` module so this panel and the picked-point readout can no
+    // longer disagree about which axis is up or which sign a northing takes.
+    const worldCenterYup = renderToWorldViewer(localCenter, renderFrame);
+    const worldCenterZup = viewerToIfcAxes(worldCenterYup);
 
     return {
       local: { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ }, center: localCenter },
       worldYup: { center: worldCenterYup },
       worldZup: { center: worldCenterZup },
-      hasLargeCoordinates: (coordInfo?.hasLargeCoordinates ?? false) || !!wasmRtcIfc,
+      hasLargeCoordinates: (coordInfo?.hasLargeCoordinates ?? false) || !!renderFrame.wasmRtcOffsetIfc,
     };
-  }, [selectedEntity, model, geometryResult, models]);
+  }, [selectedEntity, model, geometryResult, models, renderFrame]);
 
   // Get entity node - must be computed before early return to maintain hook order
   // IMPORTANT: Use selectedEntity.expressId (original ID) for IfcDataStore lookups
@@ -513,17 +530,19 @@ export function PropertiesPanel() {
     return modelQuery.entity(originalExpressId);
   }, [selectedEntity, modelQuery]);
 
-  // Overlay-only entity record (duplicates, scripted adds). Carries
-  // the type + positional attributes the StoreEditor recorded — used
-  // as a fallback when the parsed entityNode comes up empty so the
-  // panel doesn't render `UNKNOWN / Unknown` for fresh entities.
+  // Issue #3620: the selected element gives no indication it is a member of
+  // an IfcElementAssembly, nor a way to select that assembly. `decomposedBy`
+  // walks the IfcRelAggregates edge to the parent; gate on the parent's type
+  // so a plain spatial/aggregation parent that isn't an assembly stays quiet.
+  const assemblyParent = useMemo(() => {
+    const parent = entityNode?.decomposedBy();
+    if (!parent || parent.type !== 'IfcElementAssembly') return null;
+    return { expressId: parent.expressId, name: parent.name || undefined };
+  }, [entityNode]);
+
+  // Keep overlay-created entities out of the panel's `UNKNOWN / Unknown` display path.
   const overlayEntity = useMemo(() => {
-    let modelId = selectedEntity?.modelId;
-    if (modelId === 'legacy') modelId = '__legacy__';
-    const expressId = selectedEntity?.expressId;
-    if (!modelId || !expressId) return null;
-    const view = mutationViews.get(modelId);
-    return view?.getNewEntity(expressId) ?? null;
+    return selectedOverlayEntity(selectedEntity, mutationViews);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedEntity, mutationViews, mutationVersion]);
 
@@ -539,25 +558,17 @@ export function PropertiesPanel() {
     return null;
   }, [overlayEntity]);
 
-  // Check if the selected entity is a type entity (IfcWallType, etc.)
-  // Uses the entity type name to detect — type entity names end with "Type"
-  const isTypeEntity = useMemo(() => {
-    if (!selectedEntity) return false;
-    const dataStore = model?.ifcDataStore ?? ifcDataStore;
-    if (!dataStore?.entities) return false;
-    const typeName = dataStore.entities.getTypeName(selectedEntity.expressId);
-    return typeName.endsWith('Type');
-  }, [selectedEntity, model, ifcDataStore]);
-
-  // Detect a material definition selected from the "Materials" hierarchy tab.
-  // Materials aren't products, so the EntityTable's getTypeName doesn't cover
-  // them — read the raw class from the entity index instead.
-  const selectedMaterialId = useMemo(() => {
+  // Selection can name an overlay-created or retyped class that the parsed
+  // EntityTable and source index have never seen. Both type-owned properties
+  // and the Materials route must use the same live answer.
+  const selectedClass = useMemo(() => {
     if (!selectedEntity) return null;
-    const dataStore = model?.ifcDataStore ?? ifcDataStore;
-    const rawType = (dataStore as IfcDataStore | null)?.entityIndex?.byId?.get(selectedEntity.expressId)?.type;
-    return rawType && MATERIAL_DEF_TYPES.has(rawType.toUpperCase()) ? selectedEntity.expressId : null;
-  }, [selectedEntity, model, ifcDataStore]);
+    const modelId = selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId;
+    return effectiveSelectedClass(activeDataStore as IfcDataStore | null, mutationViews.get(modelId), selectedEntity.expressId);
+  }, [selectedEntity, activeDataStore, mutationViews, mutationVersion]);
+  const isTypeEntity = selectedClass?.endsWith('Type') ?? false;
+  const selectedMaterialId = selectedEntity && isMaterialDefinitionType(selectedClass)
+    ? selectedEntity.expressId : null;
 
   // Unified property/quantity access - EntityNode handles on-demand extraction automatically
   // These hooks must be called before any early return to maintain hook order
@@ -651,23 +662,19 @@ export function PropertiesPanel() {
     return result;
   }, [entityNode, selectedEntity, mutationViews, mutationVersion, isTypeEntity, activeDataStore, ifcDataStore]);
 
-  const quantities: QuantitySet[] = useMemo(() => {
-    let modelId = selectedEntity?.modelId;
+  const occurrenceQuantities = useMemo(() => readOccurrenceQuantityResult(() => {
+    const modelId = selectedEntity?.modelId === 'legacy' ? '__legacy__' : selectedEntity?.modelId;
     const expressId = selectedEntity?.expressId;
-
-    if (modelId === 'legacy') modelId = '__legacy__';
-
-    // Try mutation view first to include added quantities from bSDD
+    // The view's answer holds even when empty (a deleted last qset stays deleted).
     const mutationView = modelId ? mutationViews.get(modelId) : null;
-    if (mutationView && expressId) {
-      const merged = mutationView.getQuantitiesForEntity(expressId);
-      if (merged.length > 0) return merged;
-    }
+    if (!expressId) return entityNode?.quantities() ?? [];
+    return effectiveQuantitySets(mutationView, expressId, (baseId) => (baseId === expressId ? entityNode : modelQuery?.entity(baseId))?.quantities() ?? []);
+  }), [entityNode, modelQuery, selectedEntity, mutationViews, mutationVersion]);
+  const quantities = occurrenceQuantities.quantities;
 
-    // Fallback to entity node quantities
-    if (!entityNode) return [];
-    return entityNode.quantities();
-  }, [entityNode, selectedEntity, mutationViews, mutationVersion]);
+  const inheritedTypeQuantities = useInheritedTypeQuantities(quantities,
+    (model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null, selectedEntity?.expressId,
+    mutationViews.get(selectedEntity?.modelId === 'legacy' ? '__legacy__' : selectedEntity?.modelId ?? '__legacy__'), occurrenceQuantities.status);
 
   // Build attributes array for display - must be before early return to maintain hook order
   // Uses schema-aware extraction to show ALL string/enum attributes for the entity type.
@@ -697,10 +704,10 @@ export function PropertiesPanel() {
           if (baseNames.has(ma.name)) {
             // Update existing attribute value
             const idx = merged.findIndex(a => a.name === ma.name);
-            if (idx >= 0) merged[idx] = { name: ma.name, value: ma.value };
+            if (idx >= 0) merged[idx] = { name: ma.name, value: ma.value === '$' ? '' : ma.value };
           } else {
             // Add new attribute
-            merged.push({ name: ma.name, value: ma.value });
+            merged.push({ name: ma.name, value: ma.value === '$' ? '' : ma.value });
           }
         }
         return merged;
@@ -731,8 +738,9 @@ export function PropertiesPanel() {
     if (!selectedEntity || lookupExpressId === null) return [];
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
     if (!dataStore) return [];
-    return extractClassificationsOnDemand(dataStore as IfcDataStore, lookupExpressId);
-  }, [selectedEntity, lookupExpressId, model, ifcDataStore]);
+    const view = mutationViews.get(selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId);
+    return extractClassificationsOnDemand(dataStore as IfcDataStore, selectedEntity.expressId, view);
+  }, [selectedEntity, lookupExpressId, model, ifcDataStore, mutationViews, mutationVersion]);
 
   // Extract materials for the selected entity from the IFC data store —
   // ALL associations, so an element carrying e.g. a layer set AND a fallback
@@ -741,8 +749,9 @@ export function PropertiesPanel() {
     if (!selectedEntity || lookupExpressId === null) return [];
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
     if (!dataStore) return [];
-    return extractAllMaterialsOnDemand(dataStore as IfcDataStore, lookupExpressId);
-  }, [selectedEntity, lookupExpressId, model, ifcDataStore]);
+    const view = mutationViews.get(selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId);
+    return effectiveMaterials(dataStore as IfcDataStore, selectedEntity.expressId, view);
+  }, [selectedEntity, lookupExpressId, model, ifcDataStore, mutationViews, mutationVersion]);
 
   // Property sets attached to the selected entity's material(s) via
   // IfcMaterialProperties (e.g. Pset_MaterialConcrete). These live on the
@@ -752,26 +761,26 @@ export function PropertiesPanel() {
     if (!selectedEntity || lookupExpressId === null) return [];
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
     if (!dataStore) return [];
-    return extractMaterialPropertiesOnDemand(dataStore as IfcDataStore, lookupExpressId);
-  }, [selectedEntity, lookupExpressId, model, ifcDataStore]);
+    const view = mutationViews.get(selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId);
+    return effectiveMaterialProperties(dataStore as IfcDataStore, selectedEntity.expressId, view, mutationVersion);
+  }, [selectedEntity, lookupExpressId, model, ifcDataStore, mutationViews, mutationVersion]);
 
   // Extract documents for the selected entity from the IFC data store
-  const documents = useMemo(() => {
-    if (!selectedEntity || lookupExpressId === null) return [];
-    const dataStore = model?.ifcDataStore ?? ifcDataStore;
-    if (!dataStore) return [];
-    return extractDocumentsOnDemand(dataStore as IfcDataStore, lookupExpressId);
-  }, [selectedEntity, lookupExpressId, model, ifcDataStore]);
+  const documentData = useMemo(() => effectiveDocuments(model?.ifcDataStore ?? ifcDataStore, selectedEntity?.expressId,
+    mutationViews.get(selectedEntity?.modelId === 'legacy' ? '__legacy__' : selectedEntity?.modelId ?? '')),
+  [selectedEntity, model, ifcDataStore, mutationViews, mutationVersion]);
+  const documents = documentData.rows;
 
   // Extract structural relationships (openings, fills, groups, connections)
   const entityRelationships = useMemo(() => {
     if (!selectedEntity || lookupExpressId === null) return null;
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
     if (!dataStore) return null;
-    const rels = extractRelationshipsOnDemand(dataStore as IfcDataStore, lookupExpressId);
-    const totalCount = rels.voids.length + rels.fills.length + rels.groups.length + rels.connections.length;
-    return totalCount > 0 ? rels : null;
-  }, [selectedEntity, lookupExpressId, model, ifcDataStore]);
+    const rels = relationshipsForSelection(overlayAwareQuery.relationships, selectedEntity, lookupExpressId);
+    const totalCount = rels.voids.length + rels.fills.length + rels.groups.length
+      + rels.connections.length + (rels.relations?.length ?? 0);
+    return totalCount > 0 || relationshipPopulationUnavailable(dataStore as IfcDataStore, mutationViews.get(selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId)) ? rels : null;
+  }, [selectedEntity, lookupExpressId, model, ifcDataStore, mutationVersion, overlayAwareQuery]);
 
   // Select a related entity by express id (e.g. click an IfcZone in the
   // Relationships card to inspect its Name/attributes). Resolves in the same
@@ -779,23 +788,67 @@ export function PropertiesPanel() {
   // frame for non-geometric ones like IfcZone (#1075).
   const handleSelectRelatedEntity = useCallback((expressId: number) => {
     if (!selectedEntity) return;
-    setSelectedEntityIds([]);
+    const globalId = toGlobalIdFromModels(models, selectedEntity.modelId, expressId);
+    setSelectedEntityIds([globalId]);
     setSelectedEntity({ modelId: selectedEntity.modelId, expressId });
+    if (useViewerStore.getState().selectedEntitiesSet.size > 0) {
+      useViewerStore.setState({ selectedEntitiesSet: new Set<string>() });
+    }
     if (cameraCallbacks.frameSelection) {
       window.setTimeout(() => cameraCallbacks.frameSelection?.(), 50);
     }
-  }, [selectedEntity, setSelectedEntity, setSelectedEntityIds, cameraCallbacks]);
+  }, [selectedEntity, models, setSelectedEntity, setSelectedEntityIds, cameraCallbacks]);
+
+  const handleSelectAssembly = useSelectAssembly();
 
   // Isolate + select all member objects of a group/zone (the IfcSpace /
   // IfcSpatialZone in an IfcZone — e.g. one dwelling, house number or fire
   // compartment). Members are hidden-by-default spatial elements, so flip their
   // visibility toggles on first or the isolated set would render nothing (#1075).
+  //
+  // A member can also be geometry-LESS: an IfcElementAssembly (or an IfcStair /
+  // IfcRoof used as a container) carries no mesh of its own, its geometry hangs
+  // off the IfcRelAggregates parts. The renderer matches `isolatedEntities`
+  // against mesh ids directly, so isolating such a member's bare id contributes
+  // nothing renderable and a group made of assemblies blanked the view -- the
+  // same class #2531 fixed for framing and the class trees, and #2660 fixed for
+  // the advanced filter's "Isolate in 3D". Resolve through the same Viewport
+  // channel those use (`cameraCallbacks.resolveHighlightIds`, backed by
+  // `expandToGeometryBearingIds`).
   const handleIsolateGroupMembers = useCallback((groupId: number) => {
-    const dataStore = (model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null;
-    if (!dataStore || !selectedEntity) return;
-    const members = extractGroupMembersOnDemand(dataStore, groupId);
+    if (!selectedEntity) return;
+    const members = groupMembersForRef(overlayAwareQuery.relationships,
+      { modelId: selectedEntity.modelId, expressId: groupId });
     if (members.length === 0) return;
     const globalIds = members.map((m) => toGlobalIdFromModels(models, selectedEntity.modelId, m.id));
+    // The members' own ids are ADDED to what the resolver returns, never
+    // REPLACED by it -- the one place this departs from #2660, which isolates
+    // the resolved set alone. The resolver reads the type-visibility-FILTERED
+    // mesh list (Viewport gets ViewportContainer's `filteredGeometry`), and
+    // this handler exists for zones of hidden-by-default IfcSpaces (#1075):
+    // those members resolve to nothing until the toggles below flip, so
+    // replacing would drop exactly the ids the feature is about. Keeping them
+    // costs nothing -- `isolatedEntities` is a whitelist the renderer matches
+    // mesh ids against, and an id with no mesh simply never matches.
+    //
+    // Both store setters take the Set of this array, so the resolver handing
+    // back a member id it passed through is a harmless duplicate rather than a
+    // second entry. Members ride LAST because `selectedEntityId` is the
+    // ARRAY's final element (selectionSlice.ts): the primary selection stays a
+    // member of the group the user clicked instead of an arbitrary aggregated
+    // part -- the #1133 convention SearchModal.text's commit and
+    // HierarchyPanel's group isolate already follow.
+    //
+    // Residual gap, documented rather than pretended closed: an assembly
+    // member whose parts are THEMSELVES hidden types resolves to nothing and
+    // still contributes no geometry, because the toggles below only flip for
+    // the classes present among the DIRECT members. Closing it properly wants
+    // a resolver that sees UNFILTERED geometry, which is Viewport plumbing
+    // shared with frameSelection and the Search tab.
+    const isolationIds = [
+      ...(cameraCallbacks.resolveHighlightIds?.(globalIds) ?? []),
+      ...globalIds,
+    ];
     // Only turn a hidden class toggle on when the zone actually contains members
     // of that class — otherwise clearing isolation later would surface unrelated
     // spaces/zones the user had deliberately hidden (PR #1094 review).
@@ -805,12 +858,12 @@ export function PropertiesPanel() {
     if (!typeVisibility.spatialZones && members.some((m) => m.type === 'IfcSpatialZone')) {
       toggleTypeVisibility('spatialZones');
     }
-    isolateEntities(globalIds);
-    setSelectedEntityIds(globalIds);
+    isolateEntities(isolationIds);
+    setSelectedEntityIds(isolationIds);
     if (cameraCallbacks.frameSelection) {
       window.setTimeout(() => cameraCallbacks.frameSelection?.(), 50);
     }
-  }, [model, ifcDataStore, selectedEntity, models, typeVisibility, toggleTypeVisibility, isolateEntities, setSelectedEntityIds, cameraCallbacks]);
+  }, [selectedEntity, overlayAwareQuery, models, typeVisibility, toggleTypeVisibility, isolateEntities, setSelectedEntityIds, cameraCallbacks]);
 
   // 4D schedule — both parsed-from-IFC and locally-generated schedules live in
   // the schedule slice. ScheduleCard renders nothing when no task in the
@@ -818,7 +871,7 @@ export function PropertiesPanel() {
   // unconditionally.
   const scheduleData = useViewerStore((s) => s.scheduleData);
   // Single-task selection from the Gantt triggers the Task edit card —
-  // pull the set and its size so the Inspector can react to any change.
+  // pull the set and its size so Properties can react to any change.
   const selectedTaskGlobalIds = useViewerStore((s) => s.selectedTaskGlobalIds);
   const singleSelectedTaskGlobalId = useMemo(() => {
     if (selectedTaskGlobalIds.size !== 1) return null;
@@ -838,22 +891,49 @@ export function PropertiesPanel() {
     return (dataStore as IfcDataStore | null)?.entities?.getGlobalId?.(selectedEntity.expressId) ?? null;
   }, [selectedEntity, model, ifcDataStore]);
   /** True when at least one task in the current schedule controls this entity —
-   *  used to keep the Inspector's empty-state from hiding a populated card.
+   *  used to keep the Properties empty-state from hiding a populated card.
    *  Federation-aware: matches globalId first (see `ScheduleCard`). */
   const hasScheduleForSelection = useMemo(() => {
     if (!selectedEntity || !scheduleData || scheduleData.tasks.length === 0) return false;
     const expressId = selectedEntity.expressId;
     const gid = selectedEntityGlobalId;
     for (const task of scheduleData.tasks) {
-      const taskHasGlobalIds = task.productGlobalIds.some(Boolean);
-      if (gid && taskHasGlobalIds) {
-        if (task.productGlobalIds.includes(gid)) return true;
+      const productGlobalIds = taskProductGlobalIds(task);
+      if (gid && productGlobalIds.some(Boolean)) {
+        if (productGlobalIds.includes(gid)) return true;
         continue;
       }
-      if (expressId > 0 && task.productExpressIds.includes(expressId)) return true;
+      if (expressId > 0 && taskProductExpressIds(task).includes(expressId)) return true;
     }
     return false;
   }, [selectedEntity, scheduleData, selectedEntityGlobalId]);
+
+  // Structural analysis read model — extracted on demand per model, like
+  // georef/typeProperties below, not selection-dependent, so it's memoized
+  // on the model/dataStore alone and StructuralCard does the per-selection
+  // filtering. `extractStructuralOnDemand` costs one `byType` sweep on a
+  // model with no structural entity (see its own docblock) so this is safe
+  // to compute unconditionally rather than gating on selection first.
+  const structuralData = useMemo(() => {
+    const dataStore = model?.ifcDataStore ?? ifcDataStore;
+    if (!dataStore) return null;
+    const id = selectedEntity?.modelId === 'legacy' ? '__legacy__' : (model?.id ?? selectedEntity?.modelId);
+    const mutationView = id ? mutationViews.get(id) : undefined;
+    const out = effectiveStructuralData(dataStore as IfcDataStore, mutationView);
+    return out.hasStructural ? out : null;
+  }, [model, ifcDataStore, selectedEntity?.modelId, mutationViews, mutationVersion]);
+  /** True when the selection is itself a structural member the extraction
+   *  knows about — used, like `hasScheduleForSelection`, to keep the
+   *  separator above StructuralCard from rendering on its own. */
+  const hasStructuralForSelection = useMemo(() => {
+    if (!selectedEntity || !structuralData) return false;
+    const gid = selectedEntityGlobalId;
+    const expressId = selectedEntity.expressId;
+    return structuralData.members.some((m) => {
+      if (gid && m.globalId === gid) return true;
+      return expressId > 0 && m.expressId === expressId;
+    });
+  }, [selectedEntity, structuralData, selectedEntityGlobalId]);
 
   // Extract georeferencing info for the model (used in coordinates section)
   const georef = useMemo(() => {
@@ -863,6 +943,22 @@ export function PropertiesPanel() {
     return info?.hasGeoreference ? info : null;
   }, [model, ifcDataStore]);
 
+  // The hierarchy retains model-relative elevations for level operations.
+  // Resolve the selected model's effective georeference only for Properties
+  // display so a federated selection never borrows the anchor model's height.
+  const effectiveGeoref = useMemo(() => {
+    const dataStore = model?.ifcDataStore ?? ifcDataStore;
+    const coordinateInfo = (model?.geometryResult ?? geometryResult)?.coordinateInfo;
+    const modelId = selectedEntity?.modelId === 'legacy'
+      ? '__legacy__'
+      : (model?.id ?? selectedEntity?.modelId);
+    return getEffectiveGeoreference(
+      dataStore,
+      coordinateInfo,
+      modelId ? georefMutations.get(modelId) : undefined,
+    );
+  }, [model, ifcDataStore, geometryResult, selectedEntity?.modelId, georefMutations, mutationVersion]);
+
   // Extract IFC length unit scale (e.g. 0.001 for mm, 0.3048 for ft)
   const lengthUnitScale = useMemo(() => {
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
@@ -870,72 +966,20 @@ export function PropertiesPanel() {
     return extractLengthUnitScale(dataStore.source, dataStore.entityIndex);
   }, [model, ifcDataStore]);
 
-  // Extract the file's full declared unit assignment (per-unit-type symbols +
-  // SI scales) so property/quantity cards can render values with their units
-  // (issue #1573). Falls back to an empty resolver (SI defaults) when the
-  // source buffer / entity index aren't available.
-  const projectUnits = useMemo(() => {
-    const dataStore = model?.ifcDataStore ?? ifcDataStore;
-    if (!dataStore?.source?.length || !dataStore?.entityIndex) return ProjectUnits.empty();
-    return extractProjectUnits(dataStore.source, dataStore.entityIndex);
-  }, [model, ifcDataStore]);
+  // Native edits to UnitsInContext and its dependencies determine current
+  // quantity units. Preserve unavailable coverage rather than interpreting
+  // an occurrence basis through obsolete source units (#7353).
+  const quantityUnitContext = useCurrentProjectUnits((model?.ifcDataStore ?? ifcDataStore) as IfcDataStore | null,
+    mutationViews.get(selectedEntity?.modelId === 'legacy' ? '__legacy__' : selectedEntity?.modelId ?? '__legacy__'));
+  const projectUnits = quantityUnitContext.value ?? ProjectUnits.empty();
 
   // Extract type-level properties (e.g., from IfcWallType's HasPropertySets)
   const typeProperties = useMemo(() => {
     if (!selectedEntity) return null;
     const dataStore = model?.ifcDataStore ?? ifcDataStore;
     if (!dataStore) return null;
-    const result = extractTypePropertiesOnDemand(dataStore as IfcDataStore, selectedEntity.expressId);
-    if (!result) return null;
-
-    let modelId = selectedEntity.modelId;
-    if (modelId === 'legacy') modelId = '__legacy__';
-    const mutationView = modelId ? mutationViews.get(modelId) : null;
-    const mutations = mutationView?.getMutationsForEntity(result.typeId) ?? [];
-    const mergedTypeProps = mutationView?.getForEntity(result.typeId) ?? [];
-
-    const mutatedKeys = new Set<string>();
-    const newPsetNames = new Set<string>();
-    for (const mutation of mutations) {
-      if (mutation.psetName && mutation.propName) {
-        mutatedKeys.add(`${mutation.psetName}:${mutation.propName}`);
-      }
-      if (mutation.type === 'CREATE_PROPERTY_SET' && mutation.psetName) {
-        newPsetNames.add(mutation.psetName);
-      }
-      if (mutation.type === 'CREATE_PROPERTY' && mutation.psetName) {
-        const existsInBase = result.properties.some(pset => pset.name === mutation.psetName);
-        if (!existsInBase) {
-          newPsetNames.add(mutation.psetName);
-        }
-      }
-    }
-
-    const sourcePsets = mergedTypeProps.length > 0
-      ? mergedTypeProps
-      : result.properties.map(pset => ({
-          name: pset.name,
-          globalId: pset.globalId || '',
-          properties: pset.properties.map(p => ({
-            name: p.name,
-            type: p.type,
-            value: p.value,
-          })),
-        }));
-
-    return {
-      typeName: result.typeName,
-      typeId: result.typeId,
-      psets: sourcePsets.map(pset => ({
-        name: pset.name,
-        properties: pset.properties.map(p => ({
-          name: p.name,
-          value: p.value,
-          isMutated: mutatedKeys.has(`${pset.name}:${p.name}`),
-        })),
-        isNewPset: newPsetNames.has(pset.name),
-      })),
-    };
+    const modelId = selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId;
+    return effectiveTypeProperties(dataStore as IfcDataStore, selectedEntity.expressId, mutationViews.get(modelId));
   }, [selectedEntity, model, ifcDataStore, mutationViews, mutationVersion]);
 
   // Spatial containment info for spatial containers (Project, Facility, Part, Storey, Space)
@@ -1000,12 +1044,13 @@ export function PropertiesPanel() {
     if (isStoreyLikeSpatialTypeName(typeName)) {
       const elevation = hierarchy.storeyElevations.get(expressId);
       if (elevation !== undefined) {
-        stats.push({ label: 'Elevation', value: `${elevation.toFixed(2)} m` });
+        const displayElevation = displayStoreyElevationMeters(elevation, effectiveGeoref, dataStore, expressId);
+        stats.push({ label: 'Elevation', value: `${displayElevation.toFixed(2)} m` });
       }
     }
 
     return stats.length > 0 ? stats : null;
-  }, [selectedEntity, model, ifcDataStore]);
+  }, [selectedEntity, model, ifcDataStore, effectiveGeoref]);
 
   // Location-zone membership (issue #1810): which zone this element falls in
   // per defined zone set, read straight from the last-computed assignment
@@ -1020,7 +1065,7 @@ export function PropertiesPanel() {
     // display NAME, which is "unique-by-convention but not enforced" (see
     // `ZoneSet.name`), so two same-named sets would collide as React keys
     // (CodeRabbit review of PR #1869).
-    const rows: Array<{ setId: string; label: string; value: string }> = [];
+    const rows: Array<{ setId: string; label: string; value: string; straddles: boolean; zoneSet: ZoneSet }> = [];
     for (const zs of zoneSets) {
       const assignment = record?.[zs.id];
       if (!assignment) continue;
@@ -1028,9 +1073,12 @@ export function PropertiesPanel() {
         const touched = assignment.touchedZoneIds
           .map((zoneId) => zs.zones.find((z) => z.id === zoneId)?.name)
           .filter((n): n is string => !!n);
-        rows.push({ setId: zs.id, label: zs.name, value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles' });
+        rows.push({
+          setId: zs.id, label: zs.name, straddles: true, zoneSet: zs,
+          value: touched.length > 0 ? `${touched.join(', ')} (straddles)` : 'straddles',
+        });
       } else if (assignment.zoneName) {
-        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName });
+        rows.push({ setId: zs.id, label: zs.name, value: assignment.zoneName, straddles: false, zoneSet: zs });
       }
     }
     return rows.length > 0 ? rows : null;
@@ -1100,37 +1148,6 @@ export function PropertiesPanel() {
     [occurrenceProperties, inheritedTypeProperties]
   );
 
-  // Build a set of existing property keys ("PsetName:PropName") for bSDD deduplication
-  const existingProps = useMemo(() => {
-    const keys = new Set<string>();
-    for (const pset of mergedProperties) {
-      for (const prop of pset.properties) {
-        keys.add(`${pset.name}:${prop.name}`);
-      }
-    }
-    return keys;
-  }, [mergedProperties]);
-
-  // Build a set of existing quantity keys ("QsetName:QuantName") for bSDD deduplication
-  const existingQuants = useMemo(() => {
-    const keys = new Set<string>();
-    for (const qset of quantities) {
-      for (const q of qset.quantities) {
-        keys.add(`${qset.name}:${q.name}`);
-      }
-    }
-    return keys;
-  }, [quantities]);
-
-  // Build a set of existing attribute names for bSDD deduplication
-  const existingAttributeNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const attr of attributes) {
-      if (attr.value) names.add(attr.name);
-    }
-    return names;
-  }, [attributes]);
-
   // Overlay (authored) entities — split halves, duplicates, scripted
   // adds — live only in the StoreEditor overlay, NOT the parsed store.
   // `modelQuery.entity()` always returns a node, and its getters fall
@@ -1141,13 +1158,12 @@ export function PropertiesPanel() {
   const renderedEntityType = overlayEntity?.type ?? entityNode?.type ?? 'Unknown';
   const renderedEntityName = overlayAttr(2) ?? entityNode?.name ?? undefined;
   const renderedEntityGlobalId = overlayAttr(0) ?? entityNode?.globalId;
-  const renderedEntityDescription = overlayAttr(3) ?? entityNode?.description ?? undefined;
-  const renderedEntityObjectType = overlayAttr(4) ?? entityNode?.objectType ?? undefined;
   const renderedSpatialInfo = spatialInfo;
   const renderedOccurrenceProperties = occurrenceProperties;
   const renderedInheritedTypeProperties = inheritedTypeProperties;
   const renderedMergedProperties = mergedProperties;
   const renderedQuantities = quantities;
+  const renderedQuantitiesWithInheritedType = inheritedTypeQuantities.quantities;
   const renderedAttributes = attributes;
   const renderedClassifications = classifications;
   const renderedMaterialInfos = materialInfos;
@@ -1158,6 +1174,38 @@ export function PropertiesPanel() {
   const renderedSpatialContainment = spatialContainment;
   const renderedTypeProperties = typeProperties;
   const renderedTypeEditImpact = typeEditImpact;
+  const findQuery = find.trim();
+  const foundAttributes = renderedAttributes.filter((attr) => matchesPropertySearch(attr.name, findQuery) || matchesPropertySearch(attr.value, findQuery));
+  const foundStructure = renderedSpatialContainment?.filter((item) => matchesPropertySearch(item.label, findQuery) || matchesPropertySearch(item.value, findQuery));
+  const foundZones = zoneMembership?.filter((item) => matchesPropertySearch(item.label, findQuery) || matchesPropertySearch(item.value, findQuery));
+  const foundOccurrence = filterPropertySets(renderedOccurrenceProperties, findQuery, projectUnits, unitDisplayOverrides, quantityUnitContext.status !== 'unavailable');
+  const foundInherited = filterPropertySets(renderedInheritedTypeProperties, findQuery, projectUnits, unitDisplayOverrides, quantityUnitContext.status !== 'unavailable');
+  const foundQuantities = filterQuantitySets(renderedQuantities, findQuery, projectUnits, unitDisplayOverrides, locale, quantityUnitContext.status !== 'unavailable');
+  // Own sets remain the canonical prefix; identical names do not identify ownership (#7382).
+  const foundInheritedQuantities = filterQuantitySets(renderedQuantitiesWithInheritedType.slice(renderedQuantities.length), findQuery, projectUnits, unitDisplayOverrides, locale, quantityUnitContext.status !== 'unavailable');
+  const foundMaterialProperties = filterMaterialPropertyGroups(renderedMaterialProperties, findQuery, projectUnits, unitDisplayOverrides, quantityUnitContext.status !== 'unavailable');
+  const foundAssociations = findAssociationAttributes({
+    classifications: renderedClassifications, materials: renderedMaterialInfos,
+    documents: renderedDocuments, query: findQuery, t, locale,
+  });
+  const hasAssociationHits = foundAssociations.classifications.length + foundAssociations.materials.length + foundAssociations.documents.length > 0;
+  const visibleClassificationCount = findQuery ? foundAssociations.classifications.length : renderedClassifications.length;
+  const visibleMaterialCount = findQuery ? foundAssociations.materials.length : renderedMaterialInfos.length;
+  const visibleDocumentCount = findQuery ? foundAssociations.documents.length : renderedDocuments.length;
+  const visiblePsetCount = findQuery ? foundOccurrence.length + foundInherited.length : renderedMergedProperties.length;
+  const hasPropertyHits = foundAttributes.length + (foundStructure?.length ?? 0) + (foundZones?.length ?? 0)
+    + foundOccurrence.length + foundInherited.length + foundMaterialProperties.length > 0 || hasAssociationHits;
+  // Switch tabs when the only search hits live on the other Properties tab.
+  useEffect(() => {
+    if (!findQuery) return;
+    const next = searchTabForHits(propertiesActiveTab, foundQuantities.length + foundInheritedQuantities.length > 0, hasPropertyHits);
+    if (next) setPropertiesActiveTab(next);
+  }, [findQuery, propertiesActiveTab, foundQuantities.length, foundInheritedQuantities.length, hasPropertyHits, setPropertiesActiveTab]);
+  // Sets the element only inherits: adding to one overrides it here, carrying the type's properties (#5966).
+  const inheritedFrom = useMemo(() => renderedTypeProperties && !isTypeEntity ? {
+    typeId: renderedTypeProperties.typeId, typeName: renderedTypeProperties.typeName,
+    psetNames: renderedTypeProperties.psets.map((p) => p.name).filter((n) => !renderedOccurrenceProperties.some((o) => o.name === n)),
+  } : null, [renderedTypeProperties, renderedOccurrenceProperties, isTypeEntity]);
   const renderedIsTypeEntity = isTypeEntity;
   const renderedProjectUnits = projectUnits;
   const renderedExistingProps = useMemo(() => {
@@ -1185,8 +1233,11 @@ export function PropertiesPanel() {
     }
     return names;
   }, [renderedAttributes]);
-
   // Model metadata display (when clicking top-level model in hierarchy)
+  const landXmlInspector = useLandXmlSourceInspector(models);
+  useInspectTiming(!landXmlInspector && !selectedModelId && selectedMaterialId === null && selectedEntities.length <= 1 && selectedEntityId !== null && modelQuery && (entityNode || overlayEntity) ? selectedEntityId : null); // #6961 ifc_inspect: the single-entity view only
+  if (landXmlInspector) return landXmlInspector;
+
   if (selectedModelId) {
     const selectedModel = models.get(selectedModelId);
     if (selectedModel) {
@@ -1210,6 +1261,8 @@ export function PropertiesPanel() {
       />
     );
   }
+  // A multi-selection is summarised, never shown as its primary element alone (#5900).
+  if (multiSelectionCount > 1) return <SelectionSummaryPanel models={models} ifcDataStore={ifcDataStore} />;
 
   // Newly-created/duplicated entities live only in the mutation overlay,
   // so the synthesized attributes + Raw STEP tab fall back to
@@ -1241,19 +1294,16 @@ export function PropertiesPanel() {
     }
     // Multi-model or no model loaded: show empty state
     return (
-      <div {...tourAnchor(TOUR_ANCHORS.propertiesPanel)} className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
+      <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black">
         <div className="p-3 border-b-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
-          <h2 className="font-bold uppercase tracking-wider text-xs text-zinc-900 dark:text-zinc-100">Inspector</h2>
+          <h2 className="font-bold uppercase tracking-wider text-xs text-zinc-900 dark:text-zinc-100">{t('properties.panel.title')}</h2>
         </div>
-        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-white dark:bg-black">
-          <div className="w-16 h-16 border-2 border-dashed border-zinc-300 dark:border-zinc-800 flex items-center justify-center mb-4 bg-zinc-100 dark:bg-zinc-950">
-            <MousePointer2 className="h-8 w-8 text-zinc-400 dark:text-zinc-500" />
-          </div>
-          <p className="font-bold uppercase text-zinc-900 dark:text-zinc-100 mb-2">No Selection</p>
-          <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 max-w-[150px]">
-            {models.size > 1 ? 'Select a model or element to view details' : 'Select an element to view details'}
-          </p>
-        </div>
+        <EmptyState
+          className="flex-1 bg-white dark:bg-black"
+          icon={<MousePointer2 className="size-8" />}
+          title={t('properties.panel.emptyTitle')}
+          description={models.size > 1 ? t('properties.panel.emptyHintMultiModel') : t('properties.panel.emptyHintSingleModel')}
+        />
       </div>
     );
   }
@@ -1262,11 +1312,13 @@ export function PropertiesPanel() {
   const entityType = renderedEntityType;
   const entityName = renderedEntityName;
   const entityGlobalId = renderedEntityGlobalId;
-  const entityDescription = renderedEntityDescription;
-  const entityObjectType = renderedEntityObjectType;
 
   return (
+<<<<<<< HEAD
     <div {...tourAnchor(TOUR_ANCHORS.propertiesPanel)} className={`${isMobile ? 'min-h-full' : 'h-full'} flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black`}>
+=======
+    <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
+>>>>>>> upstream/main
       {/* Entity Header */}
       <div className="p-4 border-b-2 border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-black space-y-3">
         <div className="flex items-start gap-3">
@@ -1289,14 +1341,14 @@ export function PropertiesPanel() {
                   <TooltipTrigger asChild>
                     <Badge
                       variant="secondary"
-                      className="shrink-0 rounded-sm px-1.5 py-0 text-[9px] font-semibold uppercase tracking-wider gap-1 leading-none h-[18px] mt-0.5"
+                      className="shrink-0 rounded-sm px-1.5 py-0 text-2xs font-semibold uppercase tracking-wider gap-1 leading-none h-[18px] mt-0.5"
                     >
                       <Layers2 className="h-2.5 w-2.5" />
-                      Layers merged
+                      {t('properties.panel.layersMergedBadge')}
                     </Badge>
                   </TooltipTrigger>
                   <TooltipContent>
-                    Multilayer wall parts have been merged into the parent solid.
+                    {t('properties.panel.layersMergedTooltip')}
                   </TooltipContent>
                 </Tooltip>
               )}
@@ -1304,53 +1356,14 @@ export function PropertiesPanel() {
             <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">{entityType}</p>
             {/* Show associated type entity for occurrences */}
             {!renderedIsTypeEntity && renderedTypeProperties && (
-              <p className="text-[11px] font-mono text-indigo-500 dark:text-indigo-400 truncate" title={`${activeDataStore?.entities.getTypeName(renderedTypeProperties.typeId) || 'Type'}: ${renderedTypeProperties.typeName}`}>
+              <p className="text-2xs font-mono text-indigo-500 dark:text-indigo-400 truncate" title={`${activeDataStore?.entities.getTypeName(renderedTypeProperties.typeId) || t('properties.panel.associatedTypeFallback')}: ${renderedTypeProperties.typeName}`}>
                 <Building2 className="inline h-3 w-3 mr-1 -mt-0.5" />
-                {activeDataStore?.entities.getTypeName(renderedTypeProperties.typeId) || 'Type'}: {renderedTypeProperties.typeName}
+                {activeDataStore?.entities.getTypeName(renderedTypeProperties.typeId) || t('properties.panel.associatedTypeFallback')}: {renderedTypeProperties.typeName}
               </p>
             )}
           </div>
           <div className="flex gap-1 shrink-0">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className="rounded-none hover:bg-zinc-200 dark:hover:bg-zinc-700"
-                  onClick={() => {
-                    if (selectedEntityId && cameraCallbacks.frameSelection) {
-                      cameraCallbacks.frameSelection();
-                    }
-                  }}
-                >
-                  <Focus className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Zoom to</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className="rounded-none hover:bg-zinc-200 dark:hover:bg-zinc-700"
-                  onClick={() => {
-                    if (selectedEntityId) {
-                      toggleEntityVisibility(selectedEntityId);
-                    }
-                  }}
-                >
-                  {selectedEntityId && isEntityVisible(selectedEntityId) ? (
-                    <EyeOff className="h-3.5 w-3.5" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {selectedEntityId && isEntityVisible(selectedEntityId) ? 'Hide' : 'Show'}
-              </TooltipContent>
-            </Tooltip>
+            <EntityHeaderActions />
             {/* Display-unit converter (issue #1573 proposal 2) — covers both
                 the Properties and Quantities tabs below, so it lives in the
                 shared header rather than inside either TabsContent. */}
@@ -1365,83 +1378,53 @@ export function PropertiesPanel() {
               ? 'border-emerald-400 dark:border-emerald-600'
               : 'border-zinc-200 dark:border-zinc-800'
           }`}>
-            <code className="flex-1 text-[10px] bg-white dark:bg-zinc-950 px-2 py-1 truncate font-mono select-all text-zinc-900 dark:text-zinc-100">
+            <code className="flex-1 text-2xs bg-white dark:bg-zinc-950 px-2 py-1 truncate font-mono select-all text-zinc-900 dark:text-zinc-100">
               {entityGlobalId}
             </code>
-            <Button
-              variant="ghost"
+            <IconButton
+              label={t(ACTION_NAME_KEYS.copyGlobalId)}
               size="icon-xs"
               className={`h-6 w-6 rounded-none border-l transition-all duration-200 ${
                 copied
                   ? 'border-emerald-400 dark:border-emerald-600 bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400'
                   : 'border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-950'
               }`}
-              onClick={() => copyToClipboard(entityGlobalId)}
+              onClick={() => copy(entityGlobalId, 'globalId')}
             >
               {copied ? (
                 <Check className="h-3 w-3" />
               ) : (
                 <Copy className="h-3 w-3 text-zinc-600 dark:text-zinc-400" />
               )}
-            </Button>
+            </IconButton>
           </div>
         )}
 
         {/* Spatial Location */}
-        {renderedSpatialInfo && (
-          <div className="flex items-center gap-2 text-xs border border-emerald-500/30 bg-emerald-50/50 dark:bg-emerald-900/10 px-2 py-1.5 text-emerald-800 dark:text-emerald-400 min-w-0">
-            <Layers className="h-3.5 w-3.5 shrink-0" />
-            <span className="font-bold uppercase tracking-wide truncate min-w-0 flex-1">{renderedSpatialInfo.storeyName}</span>
-            <div className="flex items-center gap-1.5 shrink-0">
-              {renderedSpatialInfo.elevation !== undefined && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="text-emerald-600/70 dark:text-emerald-500/70 font-mono whitespace-nowrap">
-                      {renderedSpatialInfo.elevation >= 0 ? '+' : ''}{renderedSpatialInfo.elevation.toFixed(2)}m
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <p className="text-xs">Elevation: {renderedSpatialInfo.elevation >= 0 ? '+' : ''}{renderedSpatialInfo.elevation.toFixed(2)}m from ground</p>
-                  </TooltipContent>
-                </Tooltip>
-              )}
-              {renderedSpatialInfo.height !== undefined && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="flex items-center gap-1 text-emerald-500/60 dark:text-emerald-400/60 font-mono text-[10px] whitespace-nowrap">
-                      <ArrowUpDown className="h-2.5 w-2.5 shrink-0" />
-                      <span className="hidden sm:inline">{renderedSpatialInfo.height.toFixed(2)}m</span>
-                      <span className="sm:hidden">{renderedSpatialInfo.height.toFixed(1)}m</span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <p className="text-xs">Height: {renderedSpatialInfo.height.toFixed(2)}m to next storey</p>
-                  </TooltipContent>
-                </Tooltip>
-              )}
-            </div>
-          </div>
-        )}
+        <SpatialLocationBadge spatialInfo={renderedSpatialInfo} />
+
+        {/* Part of Assembly (#3620) */}
+        <AssemblyBadge assembly={assemblyParent} onSelect={handleSelectAssembly} />
 
         {/* World coordinates + Georeferencing — single consolidated section */}
         {(entityCoordinates || renderedGeoref || editMode) && (
           <Collapsible open={coordOpen} onOpenChange={setCoordOpen}>
             <CollapsibleTrigger className="flex items-center gap-2 w-full text-xs border border-teal-500/30 px-2 py-1.5 text-teal-800 dark:text-teal-400 min-w-0 text-left group/coord">
               <Crosshair className="h-3.5 w-3.5 shrink-0" />
-              <span className="font-bold uppercase tracking-wide shrink-0">World</span>
+              <span className="font-bold uppercase tracking-wide shrink-0">{t('properties.panel.worldCoordinates')}</span>
               {!coordOpen && (
                 <>
                   {entityCoordinates && (
-                    <span className="font-mono text-[10px] text-teal-600/70 dark:text-teal-500/70 truncate min-w-0 flex-1 tabular-nums">
+                    <span className="font-mono text-2xs text-teal-600/70 dark:text-teal-500/70 truncate min-w-0 flex-1 tabular-nums">
                       <CoordVal axis="E" value={entityCoordinates.worldZup.center.x} />{' '}
                       <CoordVal axis="N" value={entityCoordinates.worldZup.center.y} />{' '}
                       <CoordVal axis="Z" value={entityCoordinates.worldZup.center.z} />
                     </span>
                   )}
                   {renderedGeoref?.projectedCRS?.name && (
-                    <span className="font-mono text-[9px] text-teal-500/60 shrink-0">{renderedGeoref.projectedCRS.name}</span>
+                    <span className="font-mono text-2xs text-teal-500/60 shrink-0">{renderedGeoref.projectedCRS.name}</span>
                   )}
-                  <span className="text-[9px] text-teal-500/0 group-hover/coord:text-teal-500/40 transition-colors shrink-0">details</span>
+                  <span className="text-2xs text-teal-500/0 group-hover/coord:text-teal-500/40 transition-colors shrink-0">{t('properties.panel.worldCoordinatesDetails')}</span>
                 </>
               )}
             </CollapsibleTrigger>
@@ -1456,9 +1439,7 @@ export function PropertiesPanel() {
                       { axis: 'Z', value: entityCoordinates.worldZup.center.z },
                     ]}
                     primary
-                    copyLabel="world"
-                    coordCopied={coordCopied}
-                    onCopy={copyCoords}
+                    copyName={t('properties.panel.worldCoordinates')}
                   />
                   <CoordRow
                     label="Local"
@@ -1467,14 +1448,11 @@ export function PropertiesPanel() {
                       { axis: 'Y', value: entityCoordinates.local.center.y },
                       { axis: 'Z', value: entityCoordinates.local.center.z },
                     ]}
-                    copyLabel="local"
-                    coordCopied={coordCopied}
-                    onCopy={copyCoords}
                   />
                   <div className="flex items-start gap-1.5">
-                    <span className="text-[9px] font-medium text-muted-foreground/50 uppercase tracking-wider w-[34px] shrink-0 pt-px">Size</span>
-                    <span className="font-mono text-[10px] text-muted-foreground/50 tabular-nums">
-                      {(entityCoordinates.local.max.x - entityCoordinates.local.min.x).toFixed(2)} x {(entityCoordinates.local.max.y - entityCoordinates.local.min.y).toFixed(2)} x {(entityCoordinates.local.max.z - entityCoordinates.local.min.z).toFixed(2)}
+                    <span className="text-2xs font-medium text-muted-foreground uppercase tracking-wider w-[34px] shrink-0 pt-px">{t('properties.panel.sizeLabel')}</span>
+                    <span className="font-mono text-2xs text-muted-foreground tabular-nums">
+                      {t('properties.panel.sizeDisplay', { x: (entityCoordinates.local.max.x - entityCoordinates.local.min.x).toFixed(2), y: (entityCoordinates.local.max.y - entityCoordinates.local.min.y).toFixed(2), z: (entityCoordinates.local.max.z - entityCoordinates.local.min.z).toFixed(2) })}
                     </span>
                   </div>
                 </div>
@@ -1482,7 +1460,7 @@ export function PropertiesPanel() {
               <GeoreferencingPanel
                 georef={renderedGeoref}
                 modelId={selectedEntity?.modelId === 'legacy' ? '__legacy__' : (model?.id ?? selectedEntity?.modelId)}
-                enableEditing
+                enableEditing={editMode}
                 schemaVersion={activeDataStore?.schemaVersion}
                 coordinateInfo={(model?.geometryResult ?? geometryResult)?.coordinateInfo}
                 geometryResult={model?.geometryResult ?? geometryResult}
@@ -1496,11 +1474,12 @@ export function PropertiesPanel() {
         {/* Model Source (when multiple models loaded) - below storey, less prominent */}
         {models.size > 1 && model && (
           <div className="px-2 py-1">
-            <ModelBadge modelId={model.id} className="gap-2 text-[11px] max-w-full" />
+            <ModelBadge modelId={model.id} className="gap-2 text-2xs max-w-full" />
           </div>
         )}
       </div>
 
+<<<<<<< HEAD
       {/* >>> AIM-FORK: AIM | IFC inspector (D-077) — tab lišta + AIM karta;
           natívny obsah nižšie je pod AIM tabom skrytý (display:contents wrapper,
           layout pri IFC tabe ostáva upstream-identický) */}
@@ -1512,82 +1491,123 @@ export function PropertiesPanel() {
       {renderedAttributes.length > 0 && (
         <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+=======
+      <PropertyFindBox value={find} onChange={setFind} hasMatches={hasPropertyHits || foundQuantities.length + foundInheritedQuantities.length > 0} />
+
+      {/* IFC Attributes */}
+      {foundAttributes.length > 0 && (
+        <PersistentCollapsible id="attributes" forceOpen={!!findQuery} className="border-b">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+>>>>>>> upstream/main
             <Tag className="h-4 w-4 text-muted-foreground" />
-            <span className="font-medium text-sm">Attributes</span>
-            {editMode && <PenLine className="h-3 w-3 text-purple-500 ml-1" />}
-            <span className="text-xs text-muted-foreground ml-auto">{renderedAttributes.length}</span>
+            <span className="font-medium text-sm">{t('properties.panel.attributesHeading')}</span>
+            {editMode && <PenLine className="h-3 w-3 text-overlay-accent ml-1" />}
+            <span className="text-xs text-muted-foreground ml-auto">{foundAttributes.length}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="divide-y border-t">
-              {renderedAttributes.map((attr) => (
-                <div key={attr.name} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
-                  <span className="text-muted-foreground truncate" title={attr.name}>{attr.name}</span>
-                  {editMode && selectedEntity ? (
-                    <AttributeEditorField
-                      modelId={selectedEntity.modelId}
-                      entityId={selectedEntity.expressId}
-                      attrName={attr.name}
-                      currentValue={String(attr.value)}
-                    />
-                  ) : (
-                    <div className="overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
-                      <span className="font-medium whitespace-nowrap" title={String(attr.value)}>
-                        {String(attr.value)}
-                      </span>
-                    </div>
-                  )}
+              {foundAttributes.map((attr) => (
+                <div key={attr.name} className="group/copyrow grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
+                  <span className="text-muted-foreground truncate" title={attr.name}><PropertySearchHighlight text={attr.name} query={findQuery} /></span>
+                  <div className="flex items-center gap-1 min-w-0">
+                    {editMode && selectedEntity && !findQuery ? (
+                      <AttributeEditorField
+                        modelId={selectedEntity.modelId}
+                        entityId={selectedEntity.expressId}
+                        attrName={attr.name}
+                        currentValue={String(attr.value)}
+                      />
+                    ) : (
+                      <div className="flex-1 overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
+                        <span className="font-medium whitespace-nowrap" title={String(attr.value)}>
+                          <PropertySearchHighlight text={String(attr.value)} query={findQuery} />
+                        </span>
+                      </div>
+                    )}
+                    <CopyValueButton name={attr.name} value={String(attr.value)} />
+                  </div>
                 </div>
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
 
       {/* Spatial Containment - for spatial containers (Project, Site, Building, Storey) */}
+<<<<<<< HEAD
       {renderedSpatialContainment && (
         <Collapsible defaultOpen={!isMobile} className="border-b">
           <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+=======
+      {foundStructure && foundStructure.length > 0 && (
+        <PersistentCollapsible id="structure" forceOpen={!!findQuery} className="border-b">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+>>>>>>> upstream/main
             <Layers className="h-4 w-4 text-emerald-600" />
-            <span className="font-medium text-sm">Structure</span>
-            <span className="text-xs text-muted-foreground ml-auto">{renderedSpatialContainment.length}</span>
+            <span className="font-medium text-sm">{t('properties.panel.structureHeading')}</span>
+            <span className="text-xs text-muted-foreground ml-auto">{foundStructure.length}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="divide-y border-t">
-              {renderedSpatialContainment.map((item) => (
+              {foundStructure.map((item) => (
                 <div key={item.label} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
-                  <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
-                  <span className="font-medium font-mono">{item.value}</span>
+                  <span className="text-muted-foreground truncate" title={item.label}><PropertySearchHighlight text={item.label} query={findQuery} /></span>
+                  <span className="font-medium font-mono"><PropertySearchHighlight text={String(item.value)} query={findQuery} /></span>
                 </div>
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
 
       {/* Location zones (issue #1810) — which user-defined zone box(es) this
           element falls in, per zone set. Read-only: editing zones happens in
           the Zones panel, not here. */}
-      {zoneMembership && (
-        <Collapsible defaultOpen className="border-b">
-          <CollapsibleTrigger className="flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
+      {foundZones && foundZones.length > 0 && (
+        <PersistentCollapsible id="zones" forceOpen={!!findQuery} className="border-b">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-3 hover:bg-muted/50 text-left">
             <Box className="h-4 w-4 text-amber-600" />
-            <span className="font-medium text-sm">Zones</span>
-            <span className="text-xs text-muted-foreground ml-auto">{zoneMembership.length}</span>
+            <span className="font-medium text-sm">{t('properties.panel.zonesHeading')}</span>
+            <span className="text-xs text-muted-foreground ml-auto">{foundZones.length}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="divide-y border-t">
-              {zoneMembership.map((item) => (
-                <div key={item.setId} className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
-                  <span className="text-muted-foreground truncate" title={item.label}>{item.label}</span>
-                  <span className="font-medium font-mono truncate" title={item.value}>{item.value}</span>
+              {foundZones.map((item) => (
+                <div key={item.setId}>
+                  <div className="grid grid-cols-[minmax(80px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-sm">
+                    <span className="text-muted-foreground truncate" title={item.label}><PropertySearchHighlight text={item.label} query={findQuery} /></span>
+                    <span className="font-medium font-mono truncate" title={item.value}><PropertySearchHighlight text={item.value} query={findQuery} /></span>
+                  </div>
+                  {/* Only a straddler has anything to apportion (#2508): an
+                      element wholly inside one zone contributes its whole
+                      volume to that zone and needs no clip to say so. */}
+                  {item.straddles && selectedEntityId !== null && (
+                    <ZoneVolumeBreakdown
+                      zoneSet={item.zoneSet}
+                      globalId={selectedEntityId}
+                      quantitySets={renderedQuantitiesWithInheritedType}
+                      inheritedQuantityCoverage={inheritedTypeQuantities}
+                      quantityUnitCoverage={quantityUnitContext}
+                      projectUnits={renderedProjectUnits}
+                      unitDisplayOverrides={unitDisplayOverrides}
+                    />
+                  )}
                 </div>
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
 
       {/* Tabs */}
+      {editEnabled && !editPermission.allowed && selectedEntity && (
+        <output className="block border-b px-3 py-2 text-xs text-muted-foreground">
+          {t(mutationDenialKey(editPermission.reason))}
+        </output>
+      )}
       <Tabs
         value={propertiesActiveTab}
         onValueChange={(v) => setPropertiesActiveTab(v as 'properties' | 'quantities' | 'bsdd' | 'raw-step')}
@@ -1596,39 +1616,39 @@ export function PropertiesPanel() {
         <TabsList className="properties-tabs-list w-full shrink-0">
           <TabsTrigger
             value="properties"
-            title="Properties"
-            className="properties-tab-trigger flex-1 min-w-0 uppercase text-[11px] tracking-wide"
+            title={t('properties.panel.tab.properties')}
+            className="properties-tab-trigger flex-1 min-w-0 uppercase text-2xs tracking-wide"
           >
             <FileText className="h-3 w-3 shrink-0 panel-compact-icon" />
-            <span className="panel-compact-text">Properties</span>
+            <span className="panel-compact-text">{t('properties.panel.tab.properties')}</span>
           </TabsTrigger>
           <TabsTrigger
             value="quantities"
-            title="Quantities"
-            className="properties-tab-trigger flex-1 min-w-0 uppercase text-[11px] tracking-wide"
+            title={t('properties.panel.tab.quantities')}
+            className="properties-tab-trigger flex-1 min-w-0 uppercase text-2xs tracking-wide"
           >
             <Calculator className="h-3 w-3 shrink-0 panel-compact-icon" />
-            <span className="panel-compact-text">Quantities</span>
+            <span className="panel-compact-text">{t('properties.panel.tab.quantities')}</span>
           </TabsTrigger>
           <TabsTrigger
             value="bsdd"
-            title="bSDD"
-            className="properties-tab-trigger flex-1 min-w-0 uppercase text-[11px] tracking-wide"
+            title={t('properties.panel.tab.bsdd')}
+            className="properties-tab-trigger flex-1 min-w-0 uppercase text-2xs tracking-wide"
           >
             <Tag className="h-3 w-3 shrink-0 panel-compact-icon" />
-            <span className="panel-compact-text">bSDD</span>
+            <span className="panel-compact-text">{t('properties.panel.tab.bsdd')}</span>
           </TabsTrigger>
           <TabsTrigger
             value="raw-step"
-            title="Raw STEP — developer view of positional arguments"
+            title={t('properties.panel.tab.rawStepTitle')}
             className="properties-tab-trigger raw-step-tab-trigger shrink-0 grow-0 px-2 font-mono"
           >
             {/* Bracket glyphs read as "code" without an icon dependency,
                 stay readable at 9px, and free up width for the three
                 primary tabs to keep their text visible at the default
                 panel size. */}
-            <span aria-hidden className="text-[10px] leading-none tracking-tight">&lt;/&gt;</span>
-            <span className="sr-only">Raw STEP</span>
+            <span aria-hidden className="text-2xs leading-none tracking-tight">&lt;/&gt;</span>
+            <span className="sr-only">{t('properties.panel.tab.rawStepLabel')}</span>
           </TabsTrigger>
         </TabsList>
 
@@ -1659,35 +1679,33 @@ export function PropertiesPanel() {
                   existingPsets={renderedMergedProperties.map(p => p.name)}
                   existingQtos={renderedQuantities.map(q => q.name)}
                   schemaVersion={activeDataStore?.schemaVersion}
+                  inheritedFrom={inheritedFrom}
                 />
               </>
             )}
-            {renderedMergedProperties.length === 0
-              && renderedClassifications.length === 0
-              && renderedMaterialInfos.length === 0
-              && renderedMaterialProperties.length === 0
-              && renderedDocuments.length === 0
-              && !renderedEntityRelationships
-              && !hasScheduleForSelection ? (
-              <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">No property sets</p>
+            {foundOccurrence.length === 0 && foundInherited.length === 0 && foundMaterialProperties.length === 0
+              && (findQuery ? !hasAssociationHits : (renderedClassifications.length === 0 && renderedMaterialInfos.length === 0
+                && renderedMaterialProperties.length === 0 && renderedDocuments.length === 0 && !documentData.membershipUnavailable
+                && !renderedEntityRelationships && !hasScheduleForSelection && !hasStructuralForSelection)) ? (
+              findQuery ? null : <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">{t('properties.panel.noPropertySets')}</p>
             ) : (
               <div className="space-y-3 w-full overflow-hidden">
                 {/* Occurrence/Type Properties (based on whether entity itself is a type) */}
-                {renderedOccurrenceProperties.length > 0 && (
+                {foundOccurrence.length > 0 && (
                   <>
                     {(renderedIsTypeEntity || (renderedTypeProperties && renderedTypeProperties.psets.length > 0)) && (
-                      <div className="flex items-center gap-2 px-1 pb-0.5 text-[11px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wider font-semibold">
+                      <div className="flex items-center gap-2 px-1 pb-0.5 text-2xs text-zinc-500 dark:text-zinc-400 uppercase tracking-wider font-semibold">
                         {renderedIsTypeEntity ? (
                           <>
                             <Building2 className="h-3 w-3 shrink-0 text-indigo-500" />
-                            Type Properties:
+                            {t('properties.panel.typePropertiesHeading')}
                           </>
-                        ) : 'Occurrence Properties:'}
+                        ) : t('properties.panel.occurrencePropertiesHeading')}
                       </div>
                     )}
-                    {renderedOccurrenceProperties.map((pset: PropertySet) => (
+                    {foundOccurrence.map((pset: PropertySet, index: number) => (
                       <PropertySetCard
-                        key={`occ-${pset.name}`}
+                        key={`occ-${pset.name}-${index}`}
                         pset={pset}
                         modelId={selectedEntity?.modelId}
                         entityId={selectedEntity?.expressId}
@@ -1695,7 +1713,8 @@ export function PropertiesPanel() {
                         isTypeProperty={renderedIsTypeEntity}
                         typeEditScope={renderedIsTypeEntity ? renderedTypeEditImpact ?? undefined : undefined}
                         focusedPropKey={focusedPropKey}
-                        projectUnits={renderedProjectUnits}
+                        searchQuery={findQuery} sectionScope="occurrence"
+                        projectUnits={renderedProjectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'}
                         unitDisplayOverrides={unitDisplayOverrides}
                       />
                     ))}
@@ -1703,18 +1722,18 @@ export function PropertiesPanel() {
                 )}
 
                 {/* Inherited Type Properties */}
-                {renderedInheritedTypeProperties.length > 0 && renderedTypeProperties && (
+                {foundInherited.length > 0 && renderedTypeProperties && (
                   <>
-                    {renderedOccurrenceProperties.length > 0 && (
+                    {foundOccurrence.length > 0 && (
                       <div className="border-t border-indigo-200 dark:border-indigo-800/50 pt-2 mt-2" />
                     )}
-                    <div className="flex items-center gap-2 px-1 pb-0.5 text-[11px] text-indigo-600/70 dark:text-indigo-400/60 uppercase tracking-wider font-semibold">
+                    <div className="flex items-center gap-2 px-1 pb-0.5 text-2xs text-indigo-600/70 dark:text-indigo-400/60 uppercase tracking-wider font-semibold">
                       <Building2 className="h-3 w-3 shrink-0" />
-                      <span className="truncate">Type Properties ({renderedTypeProperties.typeName})</span>
+                      <span className="truncate">{t('properties.panel.typePropertiesGroupHeading', { typeName: renderedTypeProperties.typeName })}</span>
                     </div>
-                    {renderedInheritedTypeProperties.map((pset: PropertySet) => (
+                    {foundInherited.map((pset: PropertySet, index: number) => (
                       <PropertySetCard
-                        key={`type-${pset.name}`}
+                        key={`type-${pset.name}-${index}`}
                         pset={pset}
                         modelId={selectedEntity?.modelId}
                         entityId={renderedTypeProperties.typeId}
@@ -1722,7 +1741,8 @@ export function PropertiesPanel() {
                         isTypeProperty
                         typeEditScope={renderedTypeEditImpact?.mode === 'inherited' ? renderedTypeEditImpact : undefined}
                         focusedPropKey={focusedPropKey}
-                        projectUnits={renderedProjectUnits}
+                        searchQuery={findQuery} sectionScope="inherited"
+                        projectUnits={renderedProjectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'}
                         unitDisplayOverrides={unitDisplayOverrides}
                       />
                     ))}
@@ -1730,51 +1750,47 @@ export function PropertiesPanel() {
                 )}
 
                 {/* Classifications */}
-                {renderedClassifications.length > 0 && (
+                {visibleClassificationCount > 0 && (
                   <>
-                    {renderedMergedProperties.length > 0 && (
+                    {visiblePsetCount > 0 && (
                       <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
                     )}
-                    {renderedClassifications.map((classification, i) => (
-                      <ClassificationCard key={`class-${i}`} classification={classification} />
-                    ))}
+                    {findQuery ? foundAssociations.classifications.map((card, i) => <AssociationAttributeSearchCard key={`class-${i}`} card={card} query={findQuery} />)
+                      : renderedClassifications.map((classification, i) => <ClassificationCard key={`class-${i}`} classification={classification} sectionId={associationDisclosureId('classification', classification, renderedClassifications, i)} />)}
                   </>
                 )}
 
                 {/* Materials — one card per IfcRelAssociatesMaterial */}
-                {renderedMaterialInfos.length > 0 && (
+                {visibleMaterialCount > 0 && (
                   <>
-                    {(renderedMergedProperties.length > 0 || renderedClassifications.length > 0) && (
+                    {(visiblePsetCount > 0 || visibleClassificationCount > 0) && (
                       <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
                     )}
-                    {renderedMaterialInfos.map((info, i) => (
-                      <MaterialCard key={i} material={info} />
-                    ))}
+                    {findQuery ? foundAssociations.materials.map((card, i) => <AssociationAttributeSearchCard key={`mat-${i}`} card={card} query={findQuery} />)
+                      : renderedMaterialInfos.map((info, i) => <MaterialCard key={i} material={info} sectionId={associationDisclosureId('material', info, renderedMaterialInfos, i)} />)}
                   </>
                 )}
 
                 {/* Material Property Sets (Pset_Material* attached to the
                     IfcMaterial via IfcMaterialProperties). Grouped per material,
                     mirroring the Type Properties block. */}
-                {renderedMaterialProperties.length > 0 && (
+                {foundMaterialProperties.length > 0 && (
                   <>
-                    {(renderedMergedProperties.length > 0 || renderedClassifications.length > 0 || renderedMaterialInfos.length > 0) && (
+                    {(visiblePsetCount > 0 || visibleClassificationCount > 0 || visibleMaterialCount > 0) && (
                       <div className="border-t border-amber-200 dark:border-amber-800/50 pt-2 mt-2" />
                     )}
-                    {renderedMaterialProperties.map((group) => (
+                    {foundMaterialProperties.map((group) => (
                       <div key={`matpset-${group.materialId}`} className="space-y-3">
-                        <div className="flex items-center gap-2 px-1 pb-0.5 text-[11px] text-amber-600/70 dark:text-amber-400/60 uppercase tracking-wider font-semibold">
+                        <div className="flex items-center gap-2 px-1 pb-0.5 text-2xs text-amber-600/70 dark:text-amber-400/60 uppercase tracking-wider font-semibold">
                           <Layers className="h-3 w-3 shrink-0" />
-                          <span className="truncate">Material Properties ({group.materialName})</span>
+                          <span className="truncate">{t('properties.panel.materialPropertiesGroupHeading', { materialName: group.materialName })}</span>
                         </div>
-                        {group.psets.map((pset) => (
+                        {group.psets.map((pset, index) => (
                           <PropertySetCard
-                            key={`matpset-${group.materialId}-${pset.name}`}
-                            pset={{
-                              name: pset.name,
-                              properties: pset.properties.map((p) => ({ name: p.name, value: p.value, isMutated: false, dataType: p.dataType })),
-                            }}
-                            projectUnits={renderedProjectUnits}
+                            key={`matpset-${group.materialId}-${pset.name}-${index}`}
+                            pset={pset}
+                            searchQuery={findQuery} sectionScope={`material:${group.materialId}`}
+                            projectUnits={renderedProjectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'}
                             unitDisplayOverrides={unitDisplayOverrides}
                           />
                         ))}
@@ -1784,23 +1800,24 @@ export function PropertiesPanel() {
                 )}
 
                 {/* Documents */}
-                {renderedDocuments.length > 0 && (
+                {(visibleDocumentCount > 0 || (!findQuery && documentData.membershipUnavailable)) && (
                   <>
-                    {(renderedMergedProperties.length > 0 || renderedClassifications.length > 0 || renderedMaterialInfos.length > 0 || renderedMaterialProperties.length > 0) && (
+                    {(visiblePsetCount > 0 || visibleClassificationCount > 0 || visibleMaterialCount > 0 || foundMaterialProperties.length > 0) && (
                       <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
                     )}
-                    {renderedDocuments.map((doc, i) => (
-                      <DocumentCard key={`doc-${i}`} document={doc} />
-                    ))}
+                    {!findQuery && documentData.membershipUnavailable && <output className="block text-xs text-amber-700 dark:text-amber-300">{t('properties.document.membershipUnavailable')}</output>}
+                    {findQuery ? foundAssociations.documents.map((card, i) => <AssociationAttributeSearchCard key={`doc-${i}`} card={card} query={findQuery} />)
+                      : renderedDocuments.map((doc, i) => <DocumentCard key={`doc-${i}`} document={doc} sectionId={associationDisclosureId('document', doc, renderedDocuments, i)} />)}
                   </>
                 )}
 
                 {/* Relationships */}
-                {renderedEntityRelationships && (
+                {!findQuery && renderedEntityRelationships && (
                   <>
                     <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
                     <RelationshipsCard
                       relationships={renderedEntityRelationships}
+                      populationUnavailable={relationshipPopulationUnavailable(activeDataStore as IfcDataStore | null, selectedEntity ? mutationViews.get(selectedEntity.modelId === 'legacy' ? '__legacy__' : selectedEntity.modelId) : null)}
                       onSelectEntity={handleSelectRelatedEntity}
                       onIsolateGroupMembers={handleIsolateGroupMembers}
                     />
@@ -1810,7 +1827,7 @@ export function PropertiesPanel() {
                 {/* 4D / Construction schedule — controlling tasks for this entity.
                     Gated on `hasScheduleForSelection` so the separator above
                     doesn't render on its own when ScheduleCard would return null. */}
-                {selectedEntity && scheduleData && hasScheduleForSelection && (
+                {!findQuery && selectedEntity && scheduleData && hasScheduleForSelection && (
                   <>
                     <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
                     <ScheduleCard
@@ -1821,22 +1838,51 @@ export function PropertiesPanel() {
                     />
                   </>
                 )}
+
+                {/* Structural analysis — analysis model, connections and
+                    applied loads for a selected IfcStructuralMember. Gated
+                    on `hasStructuralForSelection` for the same reason as the
+                    schedule separator above. */}
+                {!findQuery && selectedEntity && structuralData && hasStructuralForSelection && (
+                  <>
+                    <div className="border-t border-zinc-200 dark:border-zinc-800 pt-2 mt-2" />
+                    <StructuralCard
+                      structuralData={structuralData}
+                      sourceUnavailable={!activeDataStore?.source?.length}
+                      selectedExpressId={selectedEntity.expressId}
+                      selectedGlobalId={selectedEntityGlobalId}
+                    />
+                  </>
+                )}
               </div>
             )}
           </TabsContent>
-
           <TabsContent value="quantities" className="m-0 p-3 overflow-hidden">
-            {renderedQuantities.length === 0 ? (
-              <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">No quantities</p>
+            {occurrenceQuantities.status === 'unavailable' ? <output className="block text-sm text-muted-foreground">{t('properties.panel.occurrenceUnavailable', { reason: occurrenceQuantities.reason ?? '' })}</output> : null}
+            <div className="mb-3"><SweptDiskInspection enabled={propertiesActiveTab === 'quantities'} /></div>
+            <div className="mb-3"><ExtrusionInspection enabled={propertiesActiveTab === 'quantities'} /></div>
+            {quantityUnitContext.status === 'unavailable' ? (
+              <output className="block text-sm text-muted-foreground">{t('zonesPanel.volumeBreakdown.quantityUnitsUnavailable', { reason: quantityUnitContext.reason ?? 'unverified current data' })}</output>
+            ) : null}
+            {inheritedTypeQuantities.status === 'unavailable' ? (
+              <output className="block text-sm text-muted-foreground">{t('zonesPanel.volumeBreakdown.inheritedUnavailable', { reason: inheritedTypeQuantities.reason ?? 'unverified current data' })}</output>
+            ) : null}
+            {foundQuantities.length + foundInheritedQuantities.length === 0 ? (
+              findQuery || occurrenceQuantities.status === 'unavailable' || inheritedTypeQuantities.status === 'unavailable' ? null : <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">{t('properties.panel.noQuantities')}</p>
             ) : (
               <div className="space-y-3 w-full overflow-hidden">
-                {renderedQuantities.map((qset: QuantitySet) => (
-                  <QuantitySetCard key={qset.name} qset={qset} projectUnits={renderedProjectUnits} unitDisplayOverrides={unitDisplayOverrides} />
-                ))}
+                {[{ scope: 'occurrence', sets: foundQuantities, heading: 'properties.panel.occurrenceQuantitiesHeading' as const },
+                  { scope: 'type', sets: foundInheritedQuantities, heading: 'properties.panel.typeQuantitiesHeading' as const }].map(({ scope, sets, heading }) => sets.length > 0 ? (
+                  <section key={scope} aria-label={t(heading)} className="space-y-3">
+                    <h3 className="text-sm font-medium">{t(heading)}</h3>
+                    {sets.map((qset: QuantitySet, index: number) => (
+                      <QuantitySetCard key={`${scope}-${qset.name}-${index}`} qset={qset} projectUnits={renderedProjectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'} unitDisplayOverrides={unitDisplayOverrides} searchQuery={findQuery} />
+                    ))}
+                  </section>
+                ) : null)}
               </div>
             )}
           </TabsContent>
-
           <TabsContent value="bsdd" className="m-0 p-3 overflow-hidden">
             {selectedEntity && (
               <BsddCard
@@ -1848,6 +1894,7 @@ export function PropertiesPanel() {
                 existingQsets={renderedQuantities.map(q => q.name)}
                 existingQuants={renderedExistingQuants}
                 existingAttributes={renderedExistingAttributeNames}
+                inheritedFrom={inheritedFrom}
               />
             )}
           </TabsContent>
@@ -1863,7 +1910,7 @@ export function PropertiesPanel() {
               />
             ) : (
               <p className="text-sm text-zinc-500 dark:text-zinc-500 text-center py-8 font-mono">
-                Select an entity to inspect raw STEP arguments
+                {t('properties.panel.selectEntityForRawStep')}
               </p>
             )}
           </TabsContent>
@@ -1872,93 +1919,6 @@ export function PropertiesPanel() {
       {/* >>> AIM-FORK: koniec wrappera natívneho obsahu (D-077) */}
       </div>
       {/* <<< AIM-FORK */}
-    </div>
-  );
-}
-
-/** Inline attribute editor — pen icon to enter edit mode, input + save/cancel */
-function AttributeEditorField({
-  modelId,
-  entityId,
-  attrName,
-  currentValue,
-}: {
-  modelId: string;
-  entityId: number;
-  attrName: string;
-  currentValue: string;
-}) {
-  const setAttribute = useViewerStore((s) => s.setAttribute);
-  const bumpMutationVersion = useViewerStore((s) => s.bumpMutationVersion);
-  const [editing, setEditing] = useState(false);
-  const [value, setValue] = useState(currentValue);
-  const inputRef = useCallback((node: HTMLInputElement | null) => {
-    if (node) { node.focus(); node.select(); }
-  }, []);
-
-  const save = useCallback(() => {
-    let normalizedModelId = modelId;
-    if (modelId === 'legacy') normalizedModelId = '__legacy__';
-    setAttribute(normalizedModelId, entityId, attrName, value, currentValue || undefined);
-    bumpMutationVersion();
-    setEditing(false);
-  }, [modelId, entityId, attrName, value, currentValue, setAttribute, bumpMutationVersion]);
-
-  const cancel = useCallback(() => {
-    setValue(currentValue);
-    setEditing(false);
-  }, [currentValue]);
-
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') { e.preventDefault(); save(); }
-    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-  }, [save, cancel]);
-
-  if (editing) {
-    return (
-      <div className="flex items-center gap-1 min-w-0">
-        <input
-          ref={inputRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onBlur={save}
-          className="flex-1 min-w-0 h-6 px-1.5 text-sm font-mono bg-white dark:bg-zinc-900 border border-purple-300 dark:border-purple-700 outline-none focus:ring-1 focus:ring-purple-400"
-        />
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-5 w-5 p-0 shrink-0 hover:bg-emerald-100 dark:hover:bg-emerald-900/30"
-          onClick={save}
-        >
-          <Check className="h-3 w-3 text-emerald-500" />
-        </Button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center gap-1 min-w-0 group/attr">
-      <span
-        className="font-medium whitespace-nowrap truncate flex-1 min-w-0 cursor-text"
-        title={currentValue}
-        onClick={() => setEditing(true)}
-      >
-        {currentValue || <span className="text-zinc-400 italic">empty</span>}
-      </span>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-5 w-5 p-0 shrink-0 opacity-0 group-hover/attr:opacity-100 hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-opacity"
-            onClick={() => setEditing(true)}
-          >
-            <PenLine className="h-3 w-3 text-purple-500" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="left">Edit attribute</TooltipContent>
-      </Tooltip>
     </div>
   );
 }
@@ -1973,6 +1933,7 @@ function MultiEntityPanel({
   models: Map<string, FederatedModel>;
   ifcDataStore: IfcDataStore | null;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
       {/* Header */}
@@ -1980,23 +1941,21 @@ function MultiEntityPanel({
         <div className="flex items-center gap-2">
           <Layers className="h-4 w-4 text-emerald-600" />
           <h2 className="font-bold uppercase tracking-wider text-xs text-zinc-900 dark:text-zinc-100">
-            Unified Storey
+            {t('properties.panel.multiEntity.heading')}
           </h2>
-          <span className="text-[10px] font-mono bg-emerald-100 dark:bg-emerald-900 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
-            {entities.length} models
+          <span className="text-2xs font-mono bg-emerald-100 dark:bg-emerald-900 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+            {t('properties.panel.multiEntity.modelCount', { count: entities.length })}
           </span>
           {/* Display-unit converter (issue #1573 proposal 2) — one control
               for the whole stacked list below, not per-entity section. */}
-          <div className="ml-auto">
-            <UnitDisplayControl />
-          </div>
+          <div className="ml-auto flex items-center gap-1"><AssistantAction /><UnitDisplayControl /></div>
         </div>
       </div>
 
       {/* Scrollable content with each entity's data */}
       <ScrollArea className="flex-1">
         <div className="divide-y-2 divide-zinc-200 dark:divide-zinc-800">
-          {entities.map((entityRef, index) => (
+          {entities.map((entityRef) => (
             <EntityDataSection
               key={`${entityRef.modelId}-${entityRef.expressId}`}
               entityRef={entityRef}
@@ -2023,6 +1982,7 @@ function EntityDataSection({
   ifcDataStore: IfcDataStore | null;
   showModelName: boolean;
 }) {
+  const { t } = useTranslation();
   // Get the appropriate data store and query
   const { dataStore, model } = useMemo(() => {
     if (entityRef.modelId !== 'legacy') {
@@ -2071,18 +2031,18 @@ function EntityDataSection({
     return entityNode.quantities();
   }, [entityNode]);
 
-  // The file's declared units, for rendering unit suffixes on property/
-  // quantity values (issue #1573). Mirrors the `projectUnits` memo above.
-  const projectUnits = useMemo(() => {
-    if (!dataStore?.source?.length || !dataStore?.entityIndex) return ProjectUnits.empty();
-    return extractProjectUnits(dataStore.source, dataStore.entityIndex);
-  }, [dataStore]);
+  // Multi-selection quantity cards use the same current native unit context.
+  const quantityUnitContext = useCurrentProjectUnits(dataStore as IfcDataStore | null,
+    headerMutationViews.get(entityRef.modelId === 'legacy' ? '__legacy__' : entityRef.modelId));
+  const projectUnits = quantityUnitContext.value ?? ProjectUnits.empty();
 
   // Display-unit converter overrides (issue #1573 proposal 2) — this
   // component renders in the multi-entity selection panel, a sibling
   // component to the main PropertiesPanel, so it reads the store directly
   // rather than threading the value through as a prop.
   const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
+  const georefMutations = useViewerStore((s) => s.georefMutations);
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
 
   // Get attributes - uses schema-aware extraction to show ALL string/enum attributes
   // Note: GlobalId is intentionally excluded since it's shown in the dedicated GUID field above
@@ -2095,13 +2055,20 @@ function EntityDataSection({
   const elevationInfo = useMemo(() => {
     if (!dataStore?.spatialHierarchy) return null;
     const elevation = dataStore.spatialHierarchy.storeyElevations.get(entityRef.expressId);
-    return elevation !== undefined ? elevation : null;
-  }, [dataStore, entityRef.expressId]);
+    if (elevation === undefined) return null;
+    const modelId = entityRef.modelId === 'legacy' ? '__legacy__' : entityRef.modelId;
+    const effectiveGeoref = getEffectiveGeoreference(
+      dataStore,
+      model?.geometryResult?.coordinateInfo,
+      georefMutations.get(modelId),
+    );
+    return displayStoreyElevationMeters(elevation, effectiveGeoref, dataStore, entityRef.expressId);
+  }, [dataStore, entityRef.modelId, entityRef.expressId, model, georefMutations, mutationVersion]);
 
   if (!entityNode) {
     return (
       <div className="p-4 text-center text-zinc-500 text-sm">
-        Unable to load entity data
+        {t('properties.panel.multiEntity.loadFailed')}
       </div>
     );
   }
@@ -2111,7 +2078,7 @@ function EntityDataSection({
       {/* Entity Header with model name */}
       <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50 space-y-2">
         {showModelName && model && (
-          <ModelBadge modelId={model.id} className="gap-2 text-[11px] max-w-full" />
+          <ModelBadge modelId={model.id} className="gap-2 text-2xs max-w-full" />
         )}
         <div className="flex items-center gap-2">
           <Layers className="h-4 w-4 text-emerald-600" />
@@ -2122,8 +2089,8 @@ function EntityDataSection({
             <p className="text-xs font-mono text-zinc-500">{displayType}</p>
           </div>
           {elevationInfo !== null && (
-            <span className="text-[10px] font-mono bg-emerald-100 dark:bg-emerald-950 px-1.5 py-0.5 border border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400">
-              {elevationInfo >= 0 ? '+' : ''}{elevationInfo.toFixed(2)}m
+            <span className="text-2xs font-mono bg-emerald-100 dark:bg-emerald-950 px-1.5 py-0.5 border border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400">
+              {t('properties.panel.multiEntity.elevationMeters', { sign: elevationInfo >= 0 ? '+' : '', value: elevationInfo.toFixed(2) })}
             </span>
           )}
         </div>
@@ -2131,61 +2098,70 @@ function EntityDataSection({
 
       {/* Attributes */}
       {attributes.length > 0 && (
-        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
-          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+        <PersistentCollapsible id="multi-attributes" className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
             <Tag className="h-3 w-3 text-zinc-400" />
-            <span className="font-medium">Attributes</span>
-            <span className="text-[10px] text-zinc-400 ml-auto">{attributes.length}</span>
+            <span className="font-medium">{t('properties.panel.multiEntity.attributesHeading')}</span>
+            <span className="text-2xs text-zinc-400 ml-auto">{attributes.length}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="divide-y divide-zinc-100 dark:divide-zinc-900 border-t border-zinc-100 dark:border-zinc-900">
               {attributes.map((attr) => (
-                <div key={attr.name} className="grid grid-cols-[minmax(60px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-xs">
+                <div key={attr.name} className="group/copyrow grid grid-cols-[minmax(60px,1fr)_minmax(0,2fr)] gap-2 px-3 py-1.5 text-xs">
                   <span className="text-zinc-500 truncate" title={attr.name}>{attr.name}</span>
-                  <div className="overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
-                    <span className="font-medium whitespace-nowrap">{attr.value}</span>
+                  <div className="flex items-center gap-1 min-w-0">
+                    <div className="flex-1 overflow-x-auto scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 min-w-0">
+                      <span className="font-medium whitespace-nowrap">{attr.value}</span>
+                    </div>
+                    <CopyValueButton name={attr.name} value={String(attr.value)} />
                   </div>
                 </div>
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
 
       {/* Properties */}
       {properties.length > 0 && (
-        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
-          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+        <PersistentCollapsible id="multi-properties" className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
             <FileText className="h-3 w-3 text-zinc-400" />
-            <span className="font-medium">Properties</span>
-            <span className="text-[10px] text-zinc-400 ml-auto">{properties.length} sets</span>
+            <span className="font-medium">{t('properties.panel.multiEntity.propertiesHeading')}</span>
+            <span className="text-2xs text-zinc-400 ml-auto">{t('properties.panel.multiEntity.propertySetsCount', { count: properties.length })}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="p-2 pt-0 space-y-2">
-              {properties.map((pset) => (
-                <PropertySetCard key={pset.name} pset={pset} projectUnits={projectUnits} unitDisplayOverrides={unitDisplayOverrides} />
+              {properties.map((pset, index) => (
+                <PropertySetCard key={`${pset.name}-${index}`} pset={pset} projectUnits={projectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'} unitDisplayOverrides={unitDisplayOverrides} />
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
 
       {/* Quantities */}
       {quantities.length > 0 && (
-        <Collapsible defaultOpen className="border-b border-zinc-200 dark:border-zinc-800">
-          <CollapsibleTrigger className="flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
+        <PersistentCollapsible id="multi-quantities" className="border-b border-zinc-200 dark:border-zinc-800">
+          <CollapsibleTrigger className="group/disclosure flex items-center gap-2 w-full p-2 hover:bg-zinc-50 dark:hover:bg-zinc-900 text-left text-xs">
             <Calculator className="h-3 w-3 text-zinc-400" />
-            <span className="font-medium">Quantities</span>
-            <span className="text-[10px] text-zinc-400 ml-auto">{quantities.length} sets</span>
+            <span className="font-medium">{t('properties.panel.multiEntity.quantitiesHeading')}</span>
+            <span className="text-2xs text-zinc-400 ml-auto">{t('properties.panel.multiEntity.quantitySetsCount', { count: quantities.length })}</span>
+            <ChevronDown className="size-3 transition-transform group-data-[state=closed]/disclosure:-rotate-90" aria-hidden="true" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="p-2 pt-0 space-y-2">
-              {quantities.map((qset) => (
-                <QuantitySetCard key={qset.name} qset={qset} projectUnits={projectUnits} unitDisplayOverrides={unitDisplayOverrides} />
+              {quantityUnitContext.status === 'unavailable' ? (
+                <output className="block text-xs text-muted-foreground">{t('zonesPanel.volumeBreakdown.quantityUnitsUnavailable', { reason: quantityUnitContext.reason ?? 'unverified current data' })}</output>
+              ) : null}
+              {quantities.map((qset, index) => (
+                <QuantitySetCard key={`${qset.name}-${index}`} qset={qset} projectUnits={projectUnits} projectUnitsAvailable={quantityUnitContext.status !== 'unavailable'} unitDisplayOverrides={unitDisplayOverrides} />
               ))}
             </div>
           </CollapsibleContent>
-        </Collapsible>
+        </PersistentCollapsible>
       )}
     </div>
   );

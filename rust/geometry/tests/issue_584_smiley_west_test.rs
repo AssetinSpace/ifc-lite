@@ -10,6 +10,13 @@
 //! `BoolFailure`s drained from the router, doors and windows count above
 //! the previously-broken floor.
 //!
+//! NOTE: `AC-20-Smiley-West-10-Bldg.ifc` is NOT in `tests/models/manifest.json`,
+//! so `pnpm fixtures` does not download it and these tests can never run in CI.
+//! They are `#[ignore]` so that status is explicit rather than reading as three
+//! passing tests — same convention as `rect_param_validate.rs` and friends.
+//! After sourcing the fixture manually (recipe below), run them with:
+//! `cargo test -p ifc-lite-geometry --test issue_584_smiley_west_test -- --ignored`
+//!
 //! ## Sourcing the fixture
 //!
 //! The IFC originates from `http://www.ifcwiki.org/index.php?title=File:Download-Smiley-West.png`
@@ -21,10 +28,17 @@ use ifc_lite_core::IfcType;
 use ifc_lite_geometry::{GeometryRouter, VoidIndex};
 use rustc_hash::FxHashMap;
 
+mod support;
+
 fn read_fixture(rel: &str) -> Option<String> {
     let path = format!("../../tests/models/{}", rel);
     match std::fs::read_to_string(&path) {
         Ok(s) if s.starts_with("version https://git-lfs.github.com/spec/") => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture is an LFS pointer and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download real bytes"
+            );
             eprintln!(
                 "skipping: fixture {path} is a Git LFS pointer; run `pnpm fixtures` from the repo root"
             );
@@ -32,6 +46,11 @@ fn read_fixture(rel: &str) -> Option<String> {
         }
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture missing and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)"
+            );
             eprintln!(
                 "skipping: fixture {path} not present. Source from ifcwiki.org and drop \
                  under tests/models/ara3d/. See `rust/geometry/tests/issue_584_smiley_west_test.rs` \
@@ -105,6 +124,7 @@ fn run_geometry_pipeline(content: &str) -> PipelineStats {
 }
 
 #[test]
+#[ignore = "fixture AC-20-Smiley-West-10-Bldg.ifc is not in the manifest; source it manually (see module header) and run with --ignored"]
 fn issue_584_smiley_west_doors_and_walls_present() {
     let Some(content) = read_fixture("ara3d/AC-20-Smiley-West-10-Bldg.ifc") else {
         return;
@@ -134,6 +154,7 @@ fn issue_584_smiley_west_doors_and_walls_present() {
 }
 
 #[test]
+#[ignore = "fixture AC-20-Smiley-West-10-Bldg.ifc is not in the manifest; source it manually (see module header) and run with --ignored"]
 fn issue_584_smiley_west_no_csg_failures() {
     let Some(content) = read_fixture("ara3d/AC-20-Smiley-West-10-Bldg.ifc") else {
         return;
@@ -146,6 +167,7 @@ fn issue_584_smiley_west_no_csg_failures() {
 }
 
 #[test]
+#[ignore = "fixture AC-20-Smiley-West-10-Bldg.ifc is not in the manifest; source it manually (see module header) and run with --ignored"]
 fn issue_584_smiley_west_total_mesh_complexity_above_floor() {
     let Some(content) = read_fixture("ara3d/AC-20-Smiley-West-10-Bldg.ifc") else {
         return;

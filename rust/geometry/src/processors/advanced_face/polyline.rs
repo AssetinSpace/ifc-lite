@@ -7,7 +7,9 @@
 use crate::{scale_segments, Point3, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder};
 
-use super::bspline::{evaluate_bspline_curve, expand_knots};
+use super::bspline::evaluate_bspline_curve;
+use super::bspline_budget::{MAX_BSPLINE_CURVE_CONTROL_POINTS, MAX_BSPLINE_DEGREE};
+use super::bspline_parse::expand_knots;
 use super::conics::{read_axis2_placement_3d, sample_circle_edge_curve};
 use super::curves::sample_bspline_edge_curve;
 
@@ -20,6 +22,49 @@ pub(super) fn sample_curve_polyline(
     decoder: &mut EntityDecoder,
     quality: TessellationQuality,
 ) -> Vec<Point3<f64>> {
+    let mut visited = std::collections::HashSet::new();
+    sample_curve_polyline_guarded(curve, decoder, quality, 0, &mut visited)
+}
+
+/// Longest `IfcTrimmedCurve.BasisCurve` chain the sampler will follow.
+///
+/// The visited set below stops CYCLES; this stops LENGTH. They are not
+/// interchangeable: a chain of 200k distinct trimmed curves makes every
+/// `visited.insert` succeed, so the set never fires and the recursion consumes
+/// one stack frame per file-supplied entity until the process aborts. A file
+/// with no cycle at all reaches the same crash, and a chain is as easy to
+/// author as a loop.
+///
+/// 32 matches the mapped-item bound used elsewhere for file-driven chains.
+/// Real trimming nests one or two levels.
+const MAX_BASIS_CURVE_DEPTH: u32 = 32;
+
+/// `IfcTrimmedCurve.BasisCurve` may itself be an `IfcTrimmedCurve`, and the
+/// reference comes from the file, so `#10=IFCTRIMMEDCURVE(#10,...)` — a single
+/// self-referential entity — recursed forever. A Rust stack overflow ABORTS
+/// rather than raising a catchable panic, so nothing downstream could turn it
+/// into a load error, and this is reached by any `IfcAdvancedBrep` with a
+/// composite edge curve (#2866).
+///
+/// Both a visited set and a depth cap, because they bound different things:
+/// the set stops cycles (and any future fan-out, which the single tail call
+/// here does not have today but which nothing enforces), the cap stops a long
+/// ACYCLIC chain, where every insert succeeds and the set never fires.
+///
+/// It is global to one top-level sample, not path-scoped: the result is a pure
+/// function of (curve, quality), so a curve already being sampled cannot yield
+/// a different polyline further down, and the delegation returns rather than
+/// accumulating.
+fn sample_curve_polyline_guarded(
+    curve: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+    depth: u32,
+    visited: &mut std::collections::HashSet<u32>,
+) -> Vec<Point3<f64>> {
+    if depth >= MAX_BASIS_CURVE_DEPTH || !visited.insert(curve.id) {
+        return Vec::new();
+    }
     use std::f64::consts::TAU;
     let kind = curve.ifc_type.as_str().to_uppercase();
     // The rational variant shares attributes 0-7 with the plain one; sampling
@@ -33,9 +78,16 @@ pub(super) fn sample_curve_polyline(
             decoder,
             quality,
         );
-        if !pts.is_empty() {
+        // `sample_bspline_edge_curve`'s capped fallback IS a non-empty
+        // single-point `vec![*start]` (#4901), so `!pts.is_empty()` alone
+        // cannot tell "genuinely sampled" from "degree/point-count rejected"
+        // — re-checking the SAME bounds here before redoing the unbounded
+        // parse + `evaluate_bspline_curve` below closes that gap rather than
+        // trusting the emptiness of the result.
+        let degree = curve.get_float(0).unwrap_or(3.0) as usize;
+        let raw_cp_len = curve.get(1).and_then(|a| a.as_list()).map(<[_]>::len).unwrap_or(0);
+        if !pts.is_empty() && degree <= MAX_BSPLINE_DEGREE && raw_cp_len <= MAX_BSPLINE_CURVE_CONTROL_POINTS {
             // Replace the synthetic start with an explicit evaluation at t_min.
-            let degree = curve.get_float(0).unwrap_or(3.0) as usize;
             if let (Some(cp_list), Some((mults, knot_values))) = (
                 curve.get(1).and_then(|a| a.as_list()),
                 super::curves::parse_curve_knots(curve),
@@ -248,7 +300,11 @@ pub(super) fn sample_curve_polyline(
                 };
             }
         }
-        return sample_curve_polyline(&basis, decoder, quality);
+        return sample_curve_polyline_guarded(&basis, decoder, quality, depth + 1, visited);
     }
     Vec::new()
 }
+
+#[cfg(test)]
+#[path = "polyline_cycle_tests.rs"]
+mod polyline_cycle_tests;

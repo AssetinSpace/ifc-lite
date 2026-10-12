@@ -34,7 +34,7 @@ function makeTask(overrides: Partial<ScheduleTaskInfo>): ScheduleTaskInfo {
 }
 
 function makeSchedule(tasks: ScheduleTaskInfo[]): ScheduleExtraction {
-  return { hasSchedule: true, workSchedules: [], sequences: [], tasks };
+  return { hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [], tasks };
 }
 
 // Tests exercise the colour pipeline, which requires at least one
@@ -238,7 +238,7 @@ describe('computeAnimationFrame — style / flag behaviour', () => {
 
   it('style=minimal still removes demolished products after their task finishes', () => {
     const demo: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [],
       tasks: [{
         expressId: 0, globalId: 'd', name: 'Demo', isMilestone: false,
         predefinedType: 'DEMOLITION', childGlobalIds: [],
@@ -448,5 +448,25 @@ describe('computeAnimationFrame — showCompletedTint', () => {
     );
     assert.equal(frame.colorOverrides.size, 1);
     assert.deepEqual(frame.colorOverrides.get(1), DEFAULT_PALETTE.COMPLETED);
+  });
+});
+
+// #6749: a task bound to the product it builds via IfcRelAssignsToProduct
+// (its OUTPUT) animates that product exactly like an IfcRelAssignsToProcess
+// input — the buildingSMART examples use only outputs.
+describe('computeAnimationFrame — IfcRelAssignsToProduct outputs (#6749)', () => {
+  const data = makeSchedule([makeTask({
+    predefinedType: 'CONSTRUCTION',
+    outputProductExpressIds: [7],
+    outputProductGlobalIds: ['wall-gid'],
+    taskTime: { scheduleStart: '2024-05-10T08:00:00Z', scheduleFinish: '2024-05-20T17:00:00Z' },
+  })]);
+
+  it('hides an output product before its task and shows it once complete', () => {
+    const before = computeAnimationFrame(data, parseDate('2024-05-01T00:00:00Z'), settings());
+    assert.ok(before.hiddenIds.has(7));
+    const after = computeAnimationFrame(data, parseDate('2024-06-01T00:00:00Z'), settings());
+    assert.ok(!after.hiddenIds.has(7));
+    assert.equal(after.stats.complete, 1);
   });
 });

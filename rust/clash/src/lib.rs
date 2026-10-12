@@ -25,22 +25,30 @@
 //! // idx_ranges: [idx_offset, idx_len] per element
 //! // aabbs: [minx, miny, minz, maxx, maxy, maxz] per element
 //! session.ingest(&[], &[], &[], &[], &[]);
-//! let result = session.run_rule(&[], &[], 0, 0.0, 0.0, false);
+//! let result = session.run_rule(&[], None, 0, 0.0, 0.0, false);
 //! assert!(result.records.is_empty());
 //! ```
 
 mod aabb;
 mod bvh;
+mod depth;
 mod generated;
 mod narrow;
+mod obb;
 mod triangle;
 mod tri_mesh;
 mod vec3;
 mod session;
 
 pub use aabb::Aabb;
-pub use narrow::ClashStatus;
+pub use narrow::{ClashStatus, DistanceKind};
 pub use session::{ClashRecord, ClashSession, RuleResult};
 
 #[cfg(test)]
+mod kernel_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod world_frame_corpus;
+#[cfg(test)]
+mod world_frame_tests;

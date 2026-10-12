@@ -31,6 +31,14 @@ export interface LoadedModel {
   /** Concrete backend, retained so mutation tools can reach the editor without reflection. */
   backend: HeadlessLikeBackend;
   filePath?: string;
+  /**
+   * `sourceModelIdentity(name, postUnwrapBytes)` — the same string the viewer
+   * stores as `FederatedModel.sourceFingerprint`, so a `.rules.json` rule set
+   * whose `targets.modelFingerprints` were authored in the viewer resolves to
+   * this model in `check_rules` too (#5138). Absent when the model did not come
+   * from a file this process read (it then matches no fingerprint target).
+   */
+  sourceFingerprint?: string;
   loadedAt: number;
 }
 
@@ -70,10 +78,14 @@ export class InMemoryModelRegistry implements ModelRegistry {
   }
 
   add(model: LoadedModel): void {
+    const previous = this.models.get(model.id);
+    if (previous && previous !== model) previous.backend.dispose();
     this.models.set(model.id, model);
+    model.backend.setPeerScopes(() => this.list().filter(peer => peer !== model).map(peer => ({ dataStore: peer.store, view: peer.backend.getMutationView() })));
   }
 
   remove(id: string): boolean {
+    this.models.get(id)?.backend.dispose();
     return this.models.delete(id);
   }
 

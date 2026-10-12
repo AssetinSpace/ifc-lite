@@ -31,7 +31,7 @@ export interface PointCloudRaySource {
    * alignment while the shader draws it somewhere else — see
    * `point-cloud-ray-transform.ts`.
    */
-  model?: Float32Array;
+  model?: Float32Array | Float64Array;
 }
 
 /** Supplied by the renderer once point clouds are loaded; empty/null disables point snapping. */
@@ -85,6 +85,16 @@ export function pointCloudSnapToleranceAt(t: number, camera: PointCloudSnapCamer
   return screenToWorldRadius(POINT_CLOUD_SNAP_TOLERANCE_PX, t, camera.fov, camera.canvasHeightPx);
 }
 
+/** A scan point steals an exact source snap only when clearly in front. */
+export function pointCloudWinsOverSourceSnap(
+  pointHit: PointCloudRayResult, source: SnapTarget, ray: Ray, camera: PointCloudSnapCamera,
+): boolean {
+  const p = source.position;
+  const sourceDepth = (p.x - ray.origin.x) * ray.direction.x
+    + (p.y - ray.origin.y) * ray.direction.y + (p.z - ray.origin.z) * ray.direction.z;
+  return pointHit.distance + pointCloudSnapToleranceAt(pointHit.distance, camera) < sourceDepth;
+}
+
 /**
  * Whether the caller's snap configuration allows point-cloud snapping at
  * all. Mirrors `SnapDetector`'s defaulting (absent fields mean ON): with
@@ -126,6 +136,11 @@ export function queryPointClouds(
   const toleranceAt = (t: number): number => pointCloudSnapToleranceAt(t, camera);
 
   let best: PointCloudRayResult | null = null;
+  // A streamed COPC asset contributes one source per resident node, all
+  // sharing its placement: rewrite the ray once per matrix, not per node.
+  let lastModel: Float32Array | Float64Array | undefined;
+  let lastLocal: ReturnType<typeof toLocalFrameRay> = null;
+  let haveLocal = false;
   for (const src of sources) {
     if (options?.hiddenIds?.has(src.expressId)) continue;
     if (
@@ -145,7 +160,12 @@ export function queryPointClouds(
     // with it, or the screen-space tolerance quietly changes meaning under
     // a non-metre CRS. `null` means "no transform needed", which is both
     // the unaligned fast path and the safe fallback for a singular matrix.
-    const local = toLocalFrameRay(ray.origin, ray.direction, src.model);
+    if (!haveLocal || src.model !== lastModel) {
+      lastLocal = toLocalFrameRay(ray.origin, ray.direction, src.model);
+      lastModel = src.model;
+      haveLocal = true;
+    }
+    const local = lastLocal;
     if (!local) {
       const hit = src.index.queryRay(ray.origin, ray.direction, bound, toleranceAt, src.classMask);
       if (hit && (!best || hit.distance < best.distance)) {

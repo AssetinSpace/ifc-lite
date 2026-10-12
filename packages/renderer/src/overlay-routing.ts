@@ -5,16 +5,16 @@
 /**
  * Routing predicates for the opaque/transparent pipeline split.
  *
- * Lens / Pset colour overrides are drawn by a second "overlay paint" pass
- * whose pipeline uses `depthCompare: 'equal'` so it only paints where the
- * base draw already wrote depth. The transparent pipeline runs with
- * `depthWriteEnabled: false`, so a colour override on an entity whose base
- * draw is transparent (IfcSpace, IfcOpeningElement, glass, …) silently
- * fails — the equality test never matches.
+ * Lens / Pset colour overrides are painted in the base pass from the
+ * per-entity colour table (#6076, entity-color-table.ts), and only on
+ * depth-writing opaque draws — the rule the retired equal-depth overlay pass
+ * imposed, kept so the composite is unchanged. A colour override on an
+ * entity whose base draw is transparent (IfcSpace, IfcOpeningElement,
+ * glass, …) would therefore never show.
  *
  * To fix that, the renderer promotes the base draw of overridden entities
- * to the opaque pipeline so depth gets written and the overlay paint
- * succeeds. To avoid turning non-overridden batchmates opaque, batches
+ * to the opaque pipeline, where the table paints it. To avoid turning
+ * non-overridden batchmates opaque, batches
  * with mixed override membership are split into a "promoted" sub-batch
  * (all overridden) and a "remaining" sub-batch (all not), each routed
  * through its appropriate pipeline.
@@ -26,6 +26,18 @@
 export type RGBAOverrideMap = ReadonlyMap<number, readonly [number, number, number, number]>;
 
 export const OPAQUE_ALPHA_CUTOFF = 0.99;
+
+/**
+ * Alpha applied to everything outside an X-Ray context set (`ghostExceptIds`).
+ *
+ * Exported because the Cesium world view has to reach the SAME verdict this
+ * renderer does: it draws the model through its own glTF pipeline, so it bakes
+ * the ghost alpha into the exported material rather than inheriting this
+ * pass (#2591). A second literal in the viewer would be a second definition of
+ * "how ghosted looks", and the two would drift the way the hide/isolate rule
+ * did (#2578).
+ */
+export const DEFAULT_GHOST_ALPHA = 0.12;
 
 /**
  * Minimum override alpha that triggers opaque-pipeline promotion.
@@ -60,8 +72,8 @@ export function shouldRouteMeshTransparent(
 ): boolean {
   const nativelyTransparent = alpha < OPAQUE_ALPHA_CUTOFF || transparency > 0.01;
   if (!nativelyTransparent) return false;
-  // Lens / Pset override above the ghost threshold → promote to opaque
-  // so the overlay paint (depthCompare 'equal') has matching depth.
+  // Lens / Pset override above the ghost threshold → promote to opaque,
+  // the only draws the colour table paints (#6076).
   if (colorOverrides != null) {
     const override = colorOverrides.get(expressId);
     if (override != null && override[3] >= OVERRIDE_PROMOTION_MIN_ALPHA) return false;

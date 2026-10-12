@@ -1,0 +1,231 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * buildingSMART's official IDS conformance corpus, run against this package
+ * (github.com/LTplus-AG/ifc-lite/issues/2747).
+ *
+ * The 318 IDS+IFC pairs under `buildingsmart-ids/` were vendored in #1685 and
+ * then referenced by nothing. Their README asserted that "the `corpus.test.ts`
+ * test runs the entire corpus"; `git log --all --diff-filter=A` shows no such
+ * file has ever existed in this repository, and four source files describe a
+ * "corpus-parity harness" consuming the IDS bridge that did not exist either.
+ * Five places said the corpus was wired in, which is the likeliest reason
+ * nobody noticed that it was not. This file is that harness.
+ *
+ * ## Why an official corpus, rather than more hand-written fixtures
+ *
+ * A spec-validation library tested only against models it should accept cannot
+ * detect an inverted predicate. #2746 found `matchBounds` had its `xs:length` /
+ * `xs:minLength` / `xs:maxLength` inequalities unpinned: inverting all three
+ * left the whole package green, because no fixture anywhere built a bounds
+ * constraint with those fields. The corpus contains the fixtures for exactly
+ * that (`restriction/*max_and_min_length*`), in both directions, and had done
+ * all along.
+ *
+ * ## The three prefixes route to two different entry points
+ *
+ * `pass-` and `fail-` are questions about a MODEL: the IDS is well-formed and
+ * the answer is whether the IFC satisfies it, which is `validateIDS`.
+ * `invalid-` is a question about the IDS DOCUMENT: the file is not conforming
+ * IDS, so the validator is the wrong judge of it and `auditIDSDocument` is the
+ * right one. Routing every prefix through the validator was measured first and
+ * reports `fail` for all 27 `invalid-` cases, which is not wrong so much as an
+ * answer to a different question.
+ *
+ * Assertions are PER SPECIFICATION, not per file. A file-level aggregate ("did
+ * anything fail?") can be green while individual specifications disagree in
+ * compensating directions, which would make this corpus test one more thing
+ * that cannot observe what it claims. Every corpus file currently holds exactly
+ * one specification and `EXPECTED_SPECS_PER_FILE` pins that, so a future corpus
+ * update introducing a multi-specification case fails here loudly instead of
+ * being silently averaged.
+ *
+ * ## Licence
+ *
+ * The corpus is (c) buildingSMART International Ltd under CC BY-ND 4.0 (see
+ * `buildingsmart-ids/UPSTREAM_LICENSE`). NoDerivatives: this harness only ever
+ * READS the vendored files. Nothing here rewrites a fixture, and a test needing
+ * a variant must build it in memory rather than committing a modified copy.
+ */
+
+import { describe, expect, it } from 'vitest';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { IfcParser } from '@ifc-lite/parser';
+import { parseIDS } from '../parser/xml-parser.js';
+import { validateIDS } from '../validation/validator.js';
+import { auditIDSDocument } from '../audit/index.js';
+import { createDataAccessor } from '../bridge/index.js';
+
+const CORPUS_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'buildingsmart-ids');
+
+/**
+ * What the corpus holds today. These are guards, not trivia: a harness whose
+ * file discovery quietly breaks finds zero pairs, asserts nothing, and reports
+ * exactly the same green as one that checked all 318. Empty input must not
+ * score perfect.
+ */
+const EXPECTED = { pass: 187, fail: 120, invalid: 27 } as const;
+const EXPECTED_SPECS_PER_FILE = 1;
+
+type Expectation = keyof typeof EXPECTED;
+
+interface CorpusCase {
+  /** `restriction/pass-a_bound_can_be_inclusive_1_4`, for the test name. */
+  id: string;
+  expectation: Expectation;
+  idsPath: string;
+  ifcPath: string;
+}
+
+function collect(): CorpusCase[] {
+  const cases: CorpusCase[] = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) {
+        walk(path);
+        continue;
+      }
+      if (!name.endsWith('.ids')) continue;
+      const base = name.slice(0, -4);
+      const expectation: Expectation | null = base.startsWith('pass-')
+        ? 'pass'
+        : base.startsWith('fail-')
+          ? 'fail'
+          : base.startsWith('invalid-')
+            ? 'invalid'
+            : null;
+      // An unknown prefix means the corpus grew a convention this harness does
+      // not encode. Skipping it silently is how a case stops being run.
+      expect(expectation, `unrecognised corpus prefix: ${name}`).not.toBeNull();
+      cases.push({
+        // Separators normalised to `/` because the id is matched by string
+        // (test names here, the eval datasets outside). Defensive rather than a live fix: the
+        // corpus is one directory deep, so the relative path is a single
+        // segment containing no separator at all and Windows produces the same
+        // id today. It stops mattering only while that stays true. The paths
+        // below keep platform-native separators, being handed to the
+        // filesystem.
+        id: `${relative(CORPUS_ROOT, dir).split(sep).join('/')}/${base}`,
+        expectation: expectation as Expectation,
+        idsPath: path,
+        ifcPath: join(dir, `${base}.ifc`),
+      });
+    }
+  };
+  walk(CORPUS_ROOT);
+  return cases;
+}
+
+const CASES = collect();
+
+/** Parse the paired IFC and project it through the shared bridge. */
+async function accessorFor(ifcPath: string) {
+  const bytes = readFileSync(ifcPath);
+  const store = await new IfcParser().parseColumnar(
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+  );
+  return { accessor: createDataAccessor(store), store };
+}
+
+describe('buildingSMART IDS conformance corpus', () => {
+  it('discovers the whole corpus', () => {
+    // First, because every assertion below is vacuous if this is wrong.
+    const counted = { pass: 0, fail: 0, invalid: 0 };
+    for (const c of CASES) counted[c.expectation]++;
+    expect(counted).toEqual(EXPECTED);
+  });
+
+  it('builds ids in the <group>/<prefix>-<name> shape', () => {
+    // Ids are matched by string (case lists in the eval datasets), so the id
+    // FORMAT is part of the contract rather than cosmetic. What this can
+    // actually catch is a corpus update that nests a directory or introduces
+    // a new prefix, either of which would make such lists miss silently. It does NOT
+    // pin the separator normalisation above: with a single-segment relative
+    // path there is no separator to normalise, so that line is a no-op on
+    // every platform today and no single-platform test can observe it.
+    const malformed = CASES.map((c) => c.id).filter((id) => !/^[a-z]+\/(pass|fail|invalid)-/.test(id));
+    expect(malformed).toEqual([]);
+  });
+
+  it('pairs every IDS with its IFC', () => {
+    const missing = CASES.filter((c) => c.expectation !== 'invalid')
+      .filter((c) => !statSync(c.ifcPath, { throwIfNoEntry: false }));
+    expect(missing.map((c) => c.id)).toEqual([]);
+  });
+
+  describe('pass- and fail-: does the MODEL satisfy a well-formed IDS', () => {
+    for (const c of CASES.filter((x) => x.expectation !== 'invalid')) {
+      it(`${c.id} -> ${c.expectation}`, async () => {
+        const document = parseIDS(readFileSync(c.idsPath, 'utf8'));
+        expect(document.specifications).toHaveLength(EXPECTED_SPECS_PER_FILE);
+        const { accessor, store } = await accessorFor(c.ifcPath);
+        const report = await validateIDS(document, accessor, {
+          modelId: c.id,
+          schemaVersion: String(store.schemaVersion ?? 'IFC4'),
+          entityCount: 0,
+        });
+        // Per specification: the single result's own status, not "did anything
+        // in the file fail".
+        expect(report.specificationResults.map((r) => r.status)).toEqual([c.expectation]);
+      });
+    }
+
+    // A pass-/fail- IDS is conforming by definition, so the audit must not
+    // report an error on any of them (IDS-008b). Eighteen did: user-defined
+    // predefined types, the IFC2X3 occurrence/type mapping table, and a
+    // classification on a material. Warnings stay allowed.
+    it('every conforming IDS audits without errors', async () => {
+      const flagged: string[] = [];
+      for (const c of CASES.filter((x) => x.expectation !== 'invalid')) {
+        const report = await auditIDSDocument(readFileSync(c.idsPath, 'utf8'));
+        const errors = report.issues.filter((issue) => issue.severity === 'error');
+        if (errors.length > 0) flagged.push(`${c.id}: ${errors.map((e) => e.code).join(', ')}`);
+      }
+      expect(flagged).toEqual([]);
+    }, 120_000);
+  });
+
+/**
+ * Every `invalid-` case is rejected by the audit with at least one ERROR.
+ *
+ * Until P-01 (IDS-004…008) this block carried an `AUDIT_UNDETECTED`
+ * allowlist of 21 cases the audit missed; it shrank family by family (typed
+ * property literals, attribute value types, entity requirements, the
+ * prohibited-specification and IFC2X3 predefined-type rules) and was deleted
+ * once empty, so a regression now fails the case by name instead of being
+ * re-listed.
+ *
+ * `validateIDS` would report `fail` for each, because the model does not
+ * satisfy a specification the IDS should never have been able to express.
+ * That is a defensible answer to a different question, which is why they are
+ * audited here rather than validated.
+ */
+const AUDIT_DETECTS = EXPECTED.invalid;
+
+  describe('invalid-: is the IDS DOCUMENT itself non-conforming', () => {
+    it(`the audit rejects all ${AUDIT_DETECTS} of them`, async () => {
+      let detected = 0;
+      for (const c of CASES.filter((x) => x.expectation === 'invalid')) {
+        const report = await auditIDSDocument(readFileSync(c.idsPath, 'utf8'));
+        if (report.issues.some((issue) => issue.severity === 'error')) detected++;
+      }
+      expect(detected).toBe(AUDIT_DETECTS);
+    });
+
+    for (const c of CASES.filter((x) => x.expectation === 'invalid')) {
+      it(`${c.id} is rejected by the audit`, async () => {
+        const report = await auditIDSDocument(readFileSync(c.idsPath, 'utf8'));
+        // An error, and the document is not reported as valid. Both, because
+        // `status` and `issues` are separately derived and a harness asserting
+        // only one of them would not notice the other going quiet.
+        expect(report.issues.filter((issue) => issue.severity === 'error').length).toBeGreaterThan(0);
+        expect(report.status).not.toBe('valid');
+      });
+    }
+  });
+});

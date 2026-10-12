@@ -4,6 +4,15 @@
 
 import type { DecodedPointChunk, PointCloudBBox } from '../types.js';
 
+/** Explicit CRS metadata read from the source, never inferred from coordinates. */
+export interface PointSourceSpatialMetadata {
+  horizontalId?: string;
+  verticalId?: string;
+  /** Source WKT retained verbatim even when it declares only one CRS component. */
+  wkt?: string;
+  provenance: string;
+}
+
 /** Aggregate metadata returned from `StreamingPointSource.open()`. */
 export interface PointSourceInfo {
   /** Total points the source will emit if it streams to completion. */
@@ -18,6 +27,8 @@ export interface PointSourceInfo {
   hasIntensity: boolean;
   /** Free-form display label (filename, URL, etc.). */
   label?: string;
+  /** Source-declared CRS metadata, available before the first decoded chunk. */
+  spatialMetadata?: PointSourceSpatialMetadata;
 }
 
 /**
@@ -44,4 +55,19 @@ export interface StreamingPointSource {
  */
 export interface DownsampleHint {
   stride: number;
+}
+
+/**
+ * Random-access byte source: the seam that lets one reader work over a local
+ * `File`/`Blob` (`BlobByteSource`) or a remote file through HTTP Range
+ * requests (`HttpRangeSource`) without ever holding the whole file (#6869).
+ */
+export interface RangeByteSource {
+  /** Total size in bytes. */
+  readonly size: number;
+  /**
+   * Bytes `[start, end)`, clamped to the source size. A caller that needs
+   * every byte it asked for must check the returned length.
+   */
+  read(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
 }

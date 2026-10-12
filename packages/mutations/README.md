@@ -2,6 +2,8 @@
 
 Property editing and mutation tracking for IFClite. Edit IFC properties, quantities, and attributes in-place via an overlay pattern — original data stays read-only, changes export back to STEP. Supports undo / redo, change-set sharing, bulk updates, and CSV import.
 
+`MutablePropertyView.getQuantityMutation(entityId, qsetName, quantityName)` reads the current quantity override, including `unitRemoved`. It returns `undefined` when no override exists. Use this live state when retaining a source unit: an explicit removal must stay removed, including after an edit which omits its unit. The append-only mutation journal is unsuitable for current-state reads after Undo or `skipHistory` writes.
+
 ## Installation
 
 ```bash
@@ -60,6 +62,29 @@ Edits accumulate in the same overlay used by `setProperty` / `setAttribute`
 and materialise the next time you call
 `StepExporter.export({ applyMutations: true })`.
 
+For a query that needs to revisit source entities whose attributes changed,
+`view.getAttributeOverrideEntityIds()` returns a snapshot of the current named,
+positional and type override IDs, including edits made without history records.
+It is a candidate set: use effective entity reads to check deletion, the live
+type and attribute layout. Created entities are enumerated separately by
+`iterateEffectiveEntityIds`.
+
+### Compound undo records
+
+`recordCompoundMutation(view, draft => ...)` runs a synchronous edit atomically
+and records the complete earlier overlay as one operation. Write through the
+supplied draft. This supports commands that replace profiles or axes and forget
+entities created earlier in the session, as well as commands that create graphs.
+
+`undoRecordedMutationOperations(view, count, revertRaw)` restores the last
+`count` operations atomically. Recorded compounds restore their whole earlier
+graph and journal; `revertRaw(draft, mutation)` handles other journal entries.
+The result counts mutation records reverted. A thrown inverse leaves both IFC
+state and compound history unchanged. Both edit and inverse callbacks must be synchronous.
+Retained history stores only changed overlay entries and removed journal records;
+unchanged graph and journal prefixes are not copied per operation. Allocated express IDs remain monotonic.
+This in-memory history belongs to the live view and does not survive serialization.
+
 ### Whole numbers on REAL-typed attributes
 
 ISO 10303-21 requires a REAL-typed attribute (`IfcLengthMeasure` coordinates,
@@ -69,6 +94,10 @@ is unambiguously REAL-backed, a whole-number value is serialized with the
 decimal point automatically, so the natural call just works:
 
 ```typescript
+const profile = editor.addEntity('IfcRectangleProfileDef', [
+  '.AREA.', null, '#34', 0.6, 0.4,
+]);
+
 editor.setPositionalAttribute(profile.expressId, 3, 1);  // XDim → 1.  (dotted)
 ```
 
@@ -77,6 +106,8 @@ For the rare slot that a bare value genuinely can't disambiguate — a
 the number in the write-only `{ real }` marker to force a REAL literal:
 
 ```typescript
+const unitRef = '#34';  // STEP reference to an IfcNamedUnit
+
 editor.addEntity('IfcQuantityLength', ['L', null, unitRef, { real: 3 }]); // → IFCLENGTHMEASURE-safe 3.
 ```
 
@@ -88,6 +119,12 @@ type-QUALIFIED — `IFCBOOLEAN(.T.)`, not a bare `.T.`, in an
 the member is unambiguous, so the natural call just works:
 
 ```typescript
+// IfcBoundaryNodeCondition: Name, TranslationalStiffnessX/Y/Z,
+//                           RotationalStiffnessX/Y/Z
+const condition = editor.addEntity('IfcBoundaryNodeCondition', [
+  'Pinned', null, null, null, null, null, null,
+]);
+
 // TranslationalStiffnessX : SELECT(IfcBoolean, IfcLinearStiffnessMeasure)
 editor.setPositionalAttribute(condition.expressId, 1, true);  // → IFCBOOLEAN(.T.)
 editor.setPositionalAttribute(condition.expressId, 1, 1000);  // → IFCLINEARSTIFFNESSMEASURE(1000.)
@@ -122,7 +159,56 @@ Reset back to the source data:
 view.clear();
 ```
 
+### Serializing history: `exportMutations` / `importMutations`
+
+```typescript
+const json = view.exportMutations();
+// → ship to a teammate, persist, or replay onto another MutablePropertyView
+
+mutationView.importMutations(json);
+```
+
+**`importMutations` is not a full inverse of `exportMutations` for created
+entities.** A `CREATE_ENTITY` record (from `view.createEntity(...)`) carries
+only the expressId in the history — not the entity's type and attributes —
+so `importMutations` cannot rebuild the entity from the record alone. It
+logs a `console.warn` and skips the record, and also drops every other
+mutation recorded against that same entity id in the same batch (so the
+round trip is lossy — the entity and its edits are both dropped — rather
+than leaving an orphaned property/attribute/quantity keyed to an id that
+was never created on the receiving view).
+
+To carry a created entity across, call `restoreNewEntity()` with its
+`NewEntity` payload (read via `getNewEntity`/`getNewEntities` on the source
+view) **before** calling `importMutations`:
+
+Native `createEntity()` records carry `creationId`, matching their original
+`CREATE_ENTITY` mutation UUID. This is provenance metadata, not an IFC
+attribute. Preserve the original token when cloning an original record for
+undo or recovery. A tokenless replacement body cannot borrow an old journal
+entry as identity, even if its express ID and fields match.
+
+```typescript
+const json = view.exportMutations();
+
+const created = view.getNewEntity(expressId)!;
+mutationView.restoreNewEntity(created);
+mutationView.importMutations(json); // dependent property/attribute/quantity mutations now replay
+```
+
+Mutations recorded against a pre-existing (source-buffer) entity always
+round-trip — this caveat is scoped to entities created via `createEntity` /
+`StoreEditor.addEntity`.
+
 ## Bulk updates
+
+Use `@ifc-lite/rules` to evaluate property filter groups and pass the resulting Express IDs in `select.expressIds`.
+
+Spatial filters (`storeys`, `buildings`, `sites`, `spaces`) use the supplied
+`SpatialHierarchy` for an unchanged source model. After session edits, supply a
+live container-membership reader as the seventh `BulkQueryEngine` constructor
+argument. A spatial filter throws if its hierarchy is missing or an edited
+session has no live reader, so a bulk edit cannot silently target a wider set.
 
 ```typescript
 import { BulkQueryEngine } from '@ifc-lite/mutations';
@@ -133,12 +219,6 @@ const engine = new BulkQueryEngine(store.entities, view);
 const result = engine.execute({
   select: {
     entityTypes: [/* IfcWall enum value */],
-    propertyFilters: [{
-      psetName: 'Pset_WallCommon',
-      propName: 'IsExternal',
-      operator: '=',
-      value: true,
-    }],
   },
   action: {
     type: 'SET_PROPERTY',
@@ -155,7 +235,26 @@ console.log(`Updated ${result.affectedEntityCount} walls`);
 Preview without applying:
 
 ```typescript
-const preview = engine.preview(query);
+import { BulkQueryEngine, type BulkQuery } from '@ifc-lite/mutations';
+import { PropertyValueType } from '@ifc-lite/data';
+
+const engine = new BulkQueryEngine(store.entities, view);
+
+// The same query the execute example above runs.
+const bulkQuery: BulkQuery = {
+  select: {
+    entityTypes: [/* IfcWall enum value */],
+  },
+  action: {
+    type: 'SET_PROPERTY',
+    psetName: 'Pset_WallCommon',
+    propName: 'ThermalTransmittance',
+    value: 0.18,
+    valueType: PropertyValueType.Real,
+  },
+};
+
+const preview = engine.preview(bulkQuery);
 console.log(`Would update ${preview.matchedCount} entities`);
 ```
 
@@ -168,6 +267,8 @@ import { CsvConnector } from '@ifc-lite/mutations';
 import { PropertyValueType } from '@ifc-lite/data';
 
 const connector = new CsvConnector(store.entities, view);
+
+const csvText = await file.text();  // or any string of CSV
 
 const stats = connector.import(csvText, {
   matchStrategy: { type: 'globalId', column: 'GlobalId' },

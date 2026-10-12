@@ -2,26 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * useSearchIndex — lazy builder for the Tier-1 search index.
- *
- * Mount once near the root of the viewer shell (currently `SearchInline`,
- * since it's always rendered once the toolbar is up). The hook watches
- * the federated `models` map; for each model with a populated
- * `ifcDataStore` that doesn't yet have a Tier-1 record, it spawns a
- * chunked build. Models that disappear get their index record dropped.
- *
- * Load-perf guarantee: the build NEVER runs during the actual IFC load
- * because `ifcDataStore` is non-null only after the parser reports the
- * model is ready (`onSpatialReady` + geometry). The build itself yields
- * to the event loop every `DEFAULT_CHUNK_SIZE` rows so a 4M-entity
- * index doesn't hog the main thread.
+/** One viewer-shell owner builds per-model search indexes (#3993).
+ * Search interfaces consume the records and use Tier-0 while a build is pending.
+ * Partial/final metadata wrappers retain their model's in-flight or ready index.
  */
 
 import { useEffect, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '@/store';
 import { buildTier1Index } from '@/lib/search/tier1-index';
+import { modelLoadTrace, tracePhaseOnce } from '@/lib/perf/activeLoadTrace';
 
 export function useSearchIndex(): void {
   const {
@@ -68,7 +58,7 @@ export function useSearchIndex(): void {
     // Kick off builds for models that are loaded but not yet indexed.
     for (const [modelId, model] of models) {
       if (!model.ifcDataStore) continue;
-      const existing = searchIndexes.get(modelId);
+      const existing = useViewerStore.getState().searchIndexes.get(modelId);
       if (existing && existing.status !== 'pending') continue;
       if (controllers.has(modelId)) continue;
 
@@ -79,20 +69,23 @@ export function useSearchIndex(): void {
 
       // Fire-and-forget — the build is cancellable via the controller, and
       // the completion handlers update the store without needing a ref.
-      void buildTier1Index(modelId, model.ifcDataStore, {
+      // The first build after a load is its `search.tier1` span (#6979).
+      const store = model.ifcDataStore;
+      void tracePhaseOnce(modelLoadTrace(modelId), 'search.tier1').span('search.tier1', () => buildTier1Index(modelId, store, {
         signal: controller.signal,
         onProgress: (done, total) => {
           if (controller.signal.aborted) return;
           const progress = total > 0 ? done / total : 1;
           setSearchIndexRecord(modelId, { status: 'building', progress });
         },
-      })
+      }))
         .then((index) => {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || controllers.get(modelId) !== controller) return;
           controllers.delete(modelId);
           setSearchIndexRecord(modelId, { status: 'ready', index, progress: 1 });
         })
         .catch((err: unknown) => {
+          if (controllers.get(modelId) !== controller) return;
           controllers.delete(modelId);
           if (err instanceof DOMException && err.name === 'AbortError') return;
           const message = err instanceof Error ? err.message : String(err);
@@ -102,24 +95,22 @@ export function useSearchIndex(): void {
         });
     }
 
-    // On unmount OR next effect pass, abort everything. The effect re-runs
-    // only when `models` / `searchIndexes` changes, so steady-state
-    // incurs no abort — the `controllers.has(modelId)` guard above makes
-    // re-entry idempotent.
-    return () => {
-      // Intentionally NOT aborting everything on every re-render — only
-      // models that went missing got aborted above. The real cleanup is
-      // the component-unmount pass below.
-    };
   }, [models, searchIndexes, setSearchIndexRecord, removeSearchIndexRecord, searchFilterSchema, removeFilterSchema]);
 
-  // Abort any in-flight builds when the consumer unmounts. Separate effect
-  // so it only fires on unmount (no deps).
+  // Cleanup must release claims, including StrictMode's setup/cleanup/setup.
+  // Old promise handlers cannot delete a replacement controller or its result.
   useEffect(() => {
     const controllers = controllersRef.current;
     return () => {
-      for (const c of controllers.values()) c.abort();
+      const active = [...controllers];
       controllers.clear();
+      for (const [modelId, controller] of active) {
+        controller.abort();
+        const state = useViewerStore.getState();
+        if (state.models.has(modelId) && state.searchIndexes.get(modelId)?.status === 'building') {
+          state.setSearchIndexRecord(modelId, { status: 'pending', progress: 0 });
+        }
+      }
     };
   }, []);
 }

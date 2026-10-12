@@ -10,10 +10,13 @@
  *     structuredContent.
  */
 
+import { EntityNode } from '@ifc-lite/query';
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
 import type { CallToolResult, ContentBlock } from '../protocol/index.js';
 import type { LoadedModel, ToolContext } from '../context.js';
 import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { modelAllowed } from '../auth/scope.js';
+import { pendingOverlay } from '../overlay.js';
 
 /**
  * Throw PERMISSION_DENIED when the caller's scope carries a model allowlist
@@ -65,6 +68,77 @@ export function resolveModel(ctx: ToolContext, modelId?: string): LoadedModel {
   return assertModelAccess(ctx, only);
 }
 
+/**
+ * **The GlobalId precedence rule, defined once.**
+ *
+ * A `model_id` names a session, not a file, so resolving a GlobalId has to
+ * include what `entity_create` queued and exclude what `entity_delete`
+ * tombstoned (#2004). An agent that creates an entity and then addresses it by
+ * the GlobalId it just wrote — to read it back, or to set a property on it — has
+ * to reach it, and one that addresses an entity it deleted must not.
+ *
+ * **Queued entities come first.** They are few, and a re-GUID that reuses a
+ * deleted entity's GlobalId should resolve to the live one. That order is not an
+ * implementation detail: it is what `get_entity`, `entity_set_property`,
+ * `entity_delete` and `bsdd_match` all answer with, so anything keyed by
+ * GlobalId has to agree with it or the same identifier names two different
+ * entities depending on which tool you asked (#2015).
+ *
+ * A GlobalId is supposed to be unique and in practice is not — a session can
+ * create an entity under an id the file already uses, which is exactly what
+ * `model_audit`'s `duplicate-globalid` rule reports. Both functions below apply
+ * the same order; {@link resolveGlobalIds} additionally hands back the whole
+ * carrier list, because a caller that asked by GlobalId and got one of two
+ * entities deserves to be told rather than to guess.
+ */
+
+/** The expressId carrying `globalId` in this session, or null — the first entry
+ *  {@link resolveGlobalIds} would list for it. Early-exits on the first match,
+ *  which is why it is the single-lookup path; error policy is the caller's, so
+ *  it returns null rather than throwing. */
+export function findByGlobalId(model: LoadedModel, globalId: string): number | null {
+  const overlay = pendingOverlay(model);
+  for (const created of overlay?.created ?? []) {
+    if (created.globalId === globalId) return created.expressId;
+  }
+  for (const { expressId, overlayCreated } of iterateEffectiveEntityIds(model.store, model.backend.getMutationView())) {
+    if (overlayCreated) continue; // Queued carriers already took precedence.
+    if (new EntityNode(model.store, expressId).globalId === globalId) return expressId;
+  }
+  return null;
+}
+
+/**
+ * Every live carrier of each requested GlobalId, in the precedence above.
+ *
+ * One pass over the store for the whole request rather than one per key, which
+ * is why bulk readers use this instead of calling {@link findByGlobalId} in a
+ * loop. Keys with no carrier are absent from the result.
+ */
+export function resolveGlobalIds(model: LoadedModel, globalIds: Iterable<string>): Map<string, number[]> {
+  const wanted = new Set(globalIds);
+  const carriers = new Map<string, number[]>();
+  if (wanted.size === 0) return carriers;
+  const note = (globalId: string, expressId: number): void => {
+    const list = carriers.get(globalId);
+    if (list) list.push(expressId);
+    else carriers.set(globalId, [expressId]);
+  };
+  const overlay = pendingOverlay(model);
+  for (const created of overlay?.created ?? []) {
+    if (wanted.has(created.globalId)) note(created.globalId, created.expressId);
+  }
+  for (const { expressId, overlayCreated } of iterateEffectiveEntityIds(model.store, model.backend.getMutationView())) {
+    if (overlayCreated) continue; // Queued carriers already took precedence.
+    // A store entity's GlobalId is the one attribute no MCP write can change —
+    // `entity_set_attribute` accepts Name/Description/ObjectType/Tag — so
+    // reading it off the store is exact, not stale.
+    const globalId = new EntityNode(model.store, expressId).globalId;
+    if (wanted.has(globalId)) note(globalId, expressId);
+  }
+  return carriers;
+}
+
 export function okResult(text: string, structured?: Record<string, unknown>): CallToolResult {
   const content: ContentBlock[] = [{ type: 'text', text }];
   if (structured) {
@@ -73,9 +147,22 @@ export function okResult(text: string, structured?: Record<string, unknown>): Ca
   return { content };
 }
 
+/**
+ * A number for tool TEXT, grouped the en-US way (`2,500`) on every host.
+ *
+ * `toLocaleString()` with no argument follows the host's `LC_ALL` / `LANG`, so
+ * the same tool call answered `2 500` on a Swedish machine and `2.500` on a
+ * German one (#7027). Tool text is English prose read by a model and a person;
+ * its numbers are en-US wherever the server runs. Machine-read values do not
+ * come through here: they travel as plain numbers in `structuredContent`.
+ */
+export function fmtInt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
 export function fmtCount(n: number, singular: string, plural?: string): string {
   if (n === 1) return `1 ${singular}`;
-  return `${n.toLocaleString()} ${plural ?? singular + 's'}`;
+  return `${fmtInt(n)} ${plural ?? singular + 's'}`;
 }
 
 /** Slice a large array down to `limit` and return `{ items, truncated }`. */

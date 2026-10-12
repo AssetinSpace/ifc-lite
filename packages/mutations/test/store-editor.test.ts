@@ -27,6 +27,14 @@ function makeStore(maxId: number, deferredIds?: number[]): MutationStoreShape {
 }
 
 describe('StoreEditor', () => {
+  it('exposes the loaded model schema without guessing one', () => {
+    const store = { ...makeStore(1), schemaVersion: 'IFC4X3' };
+    const editor = new StoreEditor(store, new MutablePropertyView(null, 'm1'));
+    expect(editor.getSchemaVersion()).toBe('IFC4X3');
+    expect(new StoreEditor(makeStore(1), new MutablePropertyView(null, 'm2')).getSchemaVersion())
+      .toBeUndefined();
+  });
+
   it('addEntity allocates an expressId above the existing watermark', () => {
     const store = makeStore(10);
     const view = new MutablePropertyView(null, 'm1');
@@ -41,6 +49,19 @@ describe('StoreEditor', () => {
 
     expect(editor.getNewEntities()).toHaveLength(1);
     expect(editor.getNewEntity(11)?.attributes).toEqual(['.AREA.', null, '#34', 0.6, 0.4]);
+  });
+
+  // Regression: #5008 — a reconstructed collab-room (IFCX) store keeps
+  // `entityIndex.byId` empty; its entities exist only in the entity table.
+  it('addEntity allocates above entity-table ids when byId is empty', () => {
+    const store: MutationStoreShape = {
+      entityIndex: { byId: new Map() },
+      entities: { expressId: new Uint32Array([1, 2, 3, 0, 7]) },
+    };
+    const view = new MutablePropertyView(null, 'room');
+    const editor = new StoreEditor(store, view);
+
+    expect(editor.addEntity('IFCWALL', ['0000000000000000000009']).expressId).toBe(8);
   });
 
   // Regression: github.com/LTplus-AG/ifc-lite/issues/1110 (PR review)
@@ -59,6 +80,34 @@ describe('StoreEditor', () => {
     expect(ref.expressId).toBe(26);
   });
 
+  // #5222: hasEntity and removeEntity must agree about existence. Both used to
+  // spell out the source-index union by hand, and removeEntity left out the
+  // deferred half, so it returned a silent `false` for a deferred property atom
+  // that hasEntity reported present, and deleted nothing.
+  it('removeEntity deletes a deferred-index entity that hasEntity reports (#5222)', () => {
+    const store = makeStore(10, [25]);
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(store, view);
+
+    expect(editor.hasEntity(25)).toBe(true);
+    expect(editor.removeEntity(25)).toBe(true);
+    expect(view.isDeleted(25)).toBe(true);
+    expect(editor.hasEntity(25)).toBe(false);
+    // Existence is still bounded by the two indexes: an id in neither is refused.
+    expect(editor.hasEntity(26)).toBe(false);
+    expect(editor.removeEntity(26)).toBe(false);
+  });
+
+  it('setEntityType accepts a deferred-index entity that hasEntity reports, recording its source type (#5222)', () => {
+    const store = makeStore(10, [25]);
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(store, view);
+
+    expect(editor.setEntityType(25, 'IfcPropertyEnumeratedValue')).toBe(true);
+    expect(view.getEntityTypeMutation(25)?.oldType).toBe('IFCPROPERTYSINGLEVALUE');
+    expect(editor.setEntityType(26, 'IfcPropertyEnumeratedValue')).toBe(false);
+  });
+
   it('addEntity continues allocating monotonically across calls', () => {
     const store = makeStore(5);
     const view = new MutablePropertyView(null, 'm1');
@@ -71,7 +120,7 @@ describe('StoreEditor', () => {
     expect([a.expressId, b.expressId, c.expressId]).toEqual([6, 7, 8]);
   });
 
-  it('removeEntity tombstones existing entities and forgets new ones', () => {
+  it('removeEntity tombstones existing AND overlay-created entities (#2012)', () => {
     const store = makeStore(3);
     const view = new MutablePropertyView(null, 'm1');
     const editor = new StoreEditor(store, view);
@@ -79,10 +128,28 @@ describe('StoreEditor', () => {
     expect(editor.removeEntity(2)).toBe(true);
     expect(view.isDeleted(2)).toBe(true);
 
+    // A created entity is dropped from the new-entity list, so it is emitted
+    // nowhere — and tombstoned, so `isDeleted` tells the truth about it. It
+    // used to be only forgotten, which made every downstream "was this
+    // deleted" guard answer false for an entity that no longer exists.
     const created = editor.addEntity('IFCDIRECTION', [[1, 0, 0]]);
     expect(editor.removeEntity(created.expressId)).toBe(true);
     expect(editor.getNewEntity(created.expressId)).toBeNull();
+    expect(view.isDeleted(created.expressId)).toBe(true);
+  });
+
+  it('restoreNewEntity lifts the tombstone as well (#2012)', () => {
+    const store = makeStore(3);
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(store, view);
+
+    const created = editor.addEntity('IFCDIRECTION', [[1, 0, 0]]);
+    const stashed = view.getNewEntity(created.expressId)!;
+    editor.removeEntity(created.expressId);
+    view.restoreNewEntity(stashed);
+
     expect(view.isDeleted(created.expressId)).toBe(false);
+    expect(view.getNewEntity(created.expressId)).not.toBeNull();
   });
 
   it('removeEntity returns false for unknown ids', () => {
@@ -166,6 +233,60 @@ describe('StoreEditor', () => {
     expect(() => editor.addEntity('IFCRECTANGLEPROFILEDEF', [])).not.toThrow();
   });
 
+  // Regression: github.com/LTplus-AG/ifc-lite/issues/4239
+  // The watermark is seeded once at construction from a scan of
+  // store.entityIndex.byId. If the store grows afterward (lazy index
+  // hydration finishing late, or a federated merge adding entities) without
+  // StoreEditor being reconstructed, the next addEntity() must notice the
+  // collision and refresh the watermark — or it hands out an id that's
+  // already taken, producing two records with the same STEP id on export.
+  it('addEntity refreshes a stale watermark when the store grows after construction (#4239)', () => {
+    const store = makeStore(10);
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(store, view);
+
+    // Grow the store's byId AFTER construction — this is what a late
+    // hydration or federated merge looks like. StoreEditor's watermark
+    // (seeded at 10, the max at construction time) doesn't know id 11
+    // now exists.
+    // `makeStore` builds a real Map; `MutationEntityByIdIndex` deliberately
+    // exposes only the read methods, so reach the concrete map to grow it.
+    (store.entityIndex.byId as Map<number, MutationEntityRef>).set(11, {
+      expressId: 11,
+      type: 'IFCWALL',
+      byteOffset: 0,
+      byteLength: 1,
+      lineNumber: 11,
+    });
+
+    const ref = editor.addEntity('IFCDIRECTION', [[0, 0, 1]]);
+
+    // Without the guard, addEntity would silently hand back id 11 again —
+    // a duplicate STEP entity number. The guard must notice the collision
+    // against the now-grown byId and reallocate above it.
+    expect(ref.expressId).not.toBe(11);
+    expect(ref.expressId).toBeGreaterThan(11);
+
+    // The new entity must not be recorded under the id that the
+    // pre-existing (post-hydration) store entity #11 already owns.
+    expect(editor.getNewEntity(11)).toBeNull();
+  });
+
+  // Companion ordinary-path check: when the store does NOT grow after
+  // construction, the guard's `if` is false and the watermark from
+  // construction stands untouched — addEntity must still return 11. This
+  // proves the test above discriminates the guard's specific collision
+  // condition rather than failing for any unrelated reason.
+  it('addEntity returns the expected next id when the store does not grow after construction', () => {
+    const store = makeStore(10);
+    const view = new MutablePropertyView(null, 'm1');
+    const editor = new StoreEditor(store, view);
+
+    const ref = editor.addEntity('IFCDIRECTION', [[0, 0, 1]]);
+
+    expect(ref.expressId).toBe(11);
+  });
+
   it('addEntity routes through a registered normalizer (canonical name + registry check)', async () => {
     const { setEntityTypeNormalizer } = await import('../src/store-editor.js');
     const store = makeStore(5);
@@ -185,5 +306,15 @@ describe('StoreEditor', () => {
     } finally {
       setEntityTypeNormalizer(null);
     }
+  });
+
+  it('getEntityType ignores orphan retypes and normalizes source/deferred types (#4857)', () => {
+    const store = makeStore(2, [8]);
+    const view = new MutablePropertyView(null, 'm1');
+    view.setEntityType(999, 'IfcColumn');
+    const editor = new StoreEditor(store, view);
+    expect(editor.getEntityType(999)).toBeUndefined();
+    expect(editor.getEntityType(1)).toBe('IfcWall');
+    expect(editor.getEntityType(8)).toBe('IfcPropertySingleValue');
   });
 });

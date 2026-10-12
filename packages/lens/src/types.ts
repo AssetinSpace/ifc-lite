@@ -18,6 +18,8 @@
  * consumers can bridge any data source.
  */
 
+import type { CapturedEntityScope } from '@ifc-lite/rules';
+
 // ============================================================================
 // Data Provider Interface
 // ============================================================================
@@ -29,6 +31,8 @@
  * server API, IndexedDB, etc.) to the lens engine.
  */
 export interface LensDataProvider {
+  /** Resolve pinned membership to native global ids; required for a scoped lens. */
+  resolveCapturedScope?(scope: CapturedEntityScope): ReadonlySet<number>;
   /** Total entity count (used for pre-allocation hints) */
   getEntityCount(): number;
 
@@ -145,54 +149,17 @@ export interface ClassificationInfo {
 // Lens Configuration Types
 // ============================================================================
 
-/** Criteria for matching entities */
-export interface LensCriteria {
-  type: 'ifcType' | 'property' | 'material' | 'attribute' | 'quantity' | 'classification' | 'model' | 'group';
-  /** IFC class name (e.g. "IfcWall") — used when type === "ifcType" */
-  ifcType?: string;
-  /** Property set name (e.g. "Pset_WallCommon") — used when type === "property" */
-  propertySet?: string;
-  /** Property name (e.g. "IsExternal") — used when type === "property" */
-  propertyName?: string;
-  /** Comparison operator for property value */
-  operator?: 'equals' | 'contains' | 'exists';
-  /** Property value to compare against */
-  propertyValue?: string;
-  /** Material name pattern — used when type === "material" */
-  materialName?: string;
-  /** Attribute name (e.g. "Name", "Description") — used when type === "attribute" */
-  attributeName?: string;
-  /** Attribute value to compare against */
-  attributeValue?: string;
-  /** Quantity set name (e.g. "Qto_WallBaseQuantities") — used when type === "quantity" */
-  quantitySet?: string;
-  /** Quantity name (e.g. "Length") — used when type === "quantity" */
-  quantityName?: string;
-  /** Quantity value to compare against (stringified) */
-  quantityValue?: string;
-  /** Classification system (e.g. "Uniclass") — used when type === "classification" */
-  classificationSystem?: string;
-  /** Classification code (e.g. "Pr_60_10_32") — used when type === "classification" */
-  classificationCode?: string;
-  /** Federated model identifier — used when type === "model" */
-  modelId?: string;
-  /** Group/zone name to match (case-insensitive substring) — used when
-   *  type === "group". Matches if the entity is assigned to an IfcZone /
-   *  IfcGroup whose name contains this value (#1075). */
-  groupName?: string;
-}
-
 /** A single rule within a Lens */
 export interface LensRule {
   id: string;
   name: string;
   enabled: boolean;
-  criteria: LensCriteria;
+  groups: import('@ifc-lite/rules').FilterGroup[];
+  unreadableLegacy?: { criteria: unknown; reason: string };
   action: 'colorize' | 'hide' | 'transparent';
   /** Hex color for colorize/transparent actions (e.g. "#E53935") */
   color: string;
 }
-
 /**
  * Data source specification for automatic coloring.
  *
@@ -210,6 +177,31 @@ export interface AutoColorSpec {
   psetName?: string;
   /** Attribute, property, or quantity name */
   propertyName?: string;
+  /**
+   * Opt-in, `source: "classification"` only: give value-less entities a real
+   * legend entry instead of silently ghosting them (#unclassified-bucket).
+   *
+   * Two absence reasons are distinguished whenever `psetName` (the
+   * classification-system filter) is set, because they mean different things:
+   * "No classification" (zero classification references at all) vs. "Not in
+   * this system" (the entity has references, just none in the selected
+   * system). Collapsing them would hide that distinction behind one number.
+   * When `psetName` is unset there is no system to be "not in", so only "No
+   * classification" is emitted.
+   *
+   * Default `false`/unset preserves the pre-existing behaviour exactly:
+   * value-less entities are ghosted (`GHOST_COLOR`, no legend entry, no
+   * count). This is deliberately opt-in, not a new default — an existing
+   * saved lens (or a consumer relying on ghosted-and-invisible unclassified
+   * elements) must not change appearance on upgrade.
+   *
+   * Forward compatibility: this field is additive. An engine build that
+   * predates it does not read it, so an exported lens with
+   * `includeUnclassified: true` opened in an older build silently falls back
+   * to ghosting the absent entities — the pre-existing, safe behaviour —
+   * rather than doing anything wrong with a field it doesn't understand.
+   */
+  includeUnclassified?: boolean;
 }
 
 /** A saved Lens configuration */
@@ -221,6 +213,8 @@ export interface Lens {
   builtin?: boolean;
   /** Auto-color mode: color entities by distinct values from a data column */
   autoColor?: AutoColorSpec;
+  /** A captured population independent of later selection and visibility. */
+  capturedScope?: CapturedEntityScope;
 }
 
 // ============================================================================
@@ -254,15 +248,24 @@ export interface AutoColorLegendEntry {
   name: string;
   color: string;
   count: number;
+  /**
+   * Set (`true`) only for a synthetic "absence" bucket — e.g. "No
+   * classification" or "Not in this system" — rather than a real distinct
+   * value drawn from the model. Consumers that group/filter/export values
+   * should not treat `name` as a classification code, material name, etc.
+   * when this is set.
+   *
+   * Forward compatibility: an older consumer that doesn't know this field
+   * simply renders the entry like any other legend row. That's safe, not
+   * silently wrong: the `name` text ("No classification") is self-describing
+   * and the entry behaves like a normal clickable/isolatable row — it just
+   * can't be told apart from a real value by an older UI's styling.
+   */
+  isAbsent?: boolean;
 }
 
 /** Supported auto-color data sources for display in UI */
 export const AUTO_COLOR_SOURCES = [
-  'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material', 'model', 'group',
-] as const;
-
-/** All supported criteria types for lens rules */
-export const LENS_CRITERIA_TYPES = [
   'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material', 'model', 'group',
 ] as const;
 
@@ -297,12 +300,11 @@ export const LENS_PALETTE = [
   '#EC407A', '#5C6BC0', '#26A69A', '#78909C',
 ] as const;
 
-/** IFC subclass → base class mapping for hierarchy-aware matching */
+/** IFC subclass -> base class map for hierarchy-aware matching: every `*StandardCase` entity plus the two `*Flight` types. */
 export const IFC_SUBTYPE_TO_BASE: Readonly<Record<string, string>> = {
-  IfcWallStandardCase: 'IfcWall',
-  IfcSlabStandardCase: 'IfcSlab',
-  IfcColumnStandardCase: 'IfcColumn',
-  IfcBeamStandardCase: 'IfcBeam',
-  IfcStairFlight: 'IfcStair',
-  IfcRampFlight: 'IfcRamp',
-};
+  IfcWallStandardCase: 'IfcWall', IfcSlabStandardCase: 'IfcSlab',
+  IfcColumnStandardCase: 'IfcColumn', IfcBeamStandardCase: 'IfcBeam',
+  IfcDoorStandardCase: 'IfcDoor', IfcWindowStandardCase: 'IfcWindow',
+  IfcMemberStandardCase: 'IfcMember', IfcPlateStandardCase: 'IfcPlate',
+  IfcOpeningStandardCase: 'IfcOpeningElement', IfcStairFlight: 'IfcStair',
+  IfcRampFlight: 'IfcRamp' };

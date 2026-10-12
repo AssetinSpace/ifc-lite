@@ -10,23 +10,29 @@ import type {
   IDSDocument,
   IDSSpecification,
   IDSRequirement,
-  IDSFacet,
   IDSValidationReport,
   IDSSpecificationResult,
   IDSEntityResult,
   IDSRequirementResult,
   IDSValidationSummary,
-  IDSModelInfo,
+  ValidationModelInfo,
   IDSCardinalityResult,
   IFCDataAccessor,
   ValidatorOptions,
   ValidationProgress,
   TranslationService,
   PartOfRelation,
+  SpecificationResult,
 } from '../types.js';
-import { checkFacet, facetPasses, filterByFacet, type FacetCheckResult } from '../facets/index.js';
-import { formatConstraint } from '../constraints/index.js';
+import { checkFacet, facetPasses, filterByFacet } from '../facets/index.js';
 import { ApplicabilityPropertyIndex } from './property-index.js';
+import { UnsafeRegexPatternError } from '@ifc-lite/regex-guard';
+import { formatFailureReason, formatRequirementDescription } from './format-failure-reason.js';
+import { boundedPassRate } from './pass-rate.js';
+import { requirementsToCheck } from './prohibited-specification.js';
+import { BoundedCache } from '../bounded-cache.js';
+import { assertIds11Allowed } from '../preview/features.js';
+export { formatFailureReason } from './format-failure-reason.js';
 
 /** Memoize a single-argument accessor lookup keyed by express ID. */
 function memoById<T>(fn: (expressId: number) => T): (expressId: number) => T {
@@ -43,7 +49,7 @@ function memoById<T>(fn: (expressId: number) => T): (expressId: number) => T {
 function memoByIdAndKey<T>(
   fn: (expressId: number, key: string) => T
 ): (expressId: number, key: string) => T {
-  const cache = new Map<string, T>();
+  const cache = new BoundedCache<string, T>();
   return (expressId: number, key: string): T => {
     const cacheKey = `${expressId}\u0000${key}`;
     if (cache.has(cacheKey)) return cache.get(cacheKey) as T;
@@ -54,8 +60,10 @@ function memoByIdAndKey<T>(
 }
 
 /**
- * Wrap an accessor so every per-entity lookup is computed at most once
- * for the lifetime of one validation run.
+ * Wrap an accessor so per-entity lookups are computed once for one validation
+ * run. Compound entity/name lookup caches are bounded (#4057); evicted
+ * compound lookups are recomputed. Per-entity caches remain proportional to
+ * the model population so repeated specification scans do not re-parse it.
  *
  * The validator re-checks the same entities once per specification, and
  * real-world IDS documents carry hundreds of specifications over the
@@ -116,6 +124,15 @@ export function createCachedAccessor(accessor: IFCDataAccessor): IFCDataAccessor
     cached.getAncestors = memoByIdAndKey((id, rel) =>
       accessor.getAncestors!(id, rel as PartOfRelation)
     ) as IFCDataAccessor['getAncestors'];
+  }
+  if (accessor.getSchemaVersion) {
+    // Model-wide, not per-entity — compute once and hand back the
+    // same value forever for this accessor's lifetime.
+    const schemaVersion = accessor.getSchemaVersion();
+    cached.getSchemaVersion = () => schemaVersion;
+  }
+  if (accessor.getTypeEntityType) {
+    cached.getTypeEntityType = memoById((id) => accessor.getTypeEntityType!(id));
   }
 
   return cached;
@@ -182,11 +199,11 @@ type MaybeYield = ReturnType<typeof createYielder>;
 export async function validateIDS(
   document: IDSDocument,
   accessor: IFCDataAccessor,
-  modelInfo: IDSModelInfo,
+  modelInfo: ValidationModelInfo,
   options: ValidatorOptions = {}
 ): Promise<IDSValidationReport> {
-  const { translator, onProgress, includePassingEntities = true } = options;
-
+  const { onProgress } = options;
+  assertIds11Allowed(document, options.preview, 'validateIDS'); // ADR-011: no silent 1.1 skips
   const cachedAccessor = createCachedAccessor(accessor);
   const descriptionCache: DescriptionCache = new Map();
   const maybeYield = createYielder(options.yieldEveryMs ?? 40);
@@ -214,29 +231,38 @@ export async function validateIDS(
     // specs are fast.
     await maybeYield();
 
-    const result = await validateSpecification(
-      spec,
-      cachedAccessor,
-      modelInfo,
-      options,
-      descriptionCache,
-      maybeYield,
-      propertyIndex,
-      (progress) => {
-        if (onProgress) {
-          onProgress({
-            ...progress,
-            specificationIndex: i,
-            totalSpecifications: totalSpecs,
-            percentage: Math.floor(
-              ((i + progress.entitiesProcessed / Math.max(progress.totalEntities, 1)) /
-                totalSpecs) *
-                100
-            ),
-          });
+    let result: IDSSpecificationResult;
+    try {
+      result = await validateSpecification(
+        spec,
+        cachedAccessor,
+        modelInfo,
+        options,
+        descriptionCache,
+        maybeYield,
+        propertyIndex,
+        (progress) => {
+          if (onProgress) {
+            onProgress({
+              ...progress,
+              specificationIndex: i,
+              totalSpecifications: totalSpecs,
+              percentage: Math.floor(
+                ((i + progress.entitiesProcessed / Math.max(progress.totalEntities, 1)) /
+                  totalSpecs) *
+                  100
+              ),
+            });
+          }
         }
-      }
-    );
+      );
+    } catch (err) {
+      // An `xs:pattern` facet's pattern was rejected by the ReDoS guard
+      // (`@ifc-lite/regex-guard`): surface as a FAILED specification with
+      // the reason, never as a silent pass — see issue #4259.
+      if (!(err instanceof UnsafeRegexPatternError)) throw err;
+      result = unsafePatternResult(spec, err);
+    }
 
     specificationResults.push(result);
   }
@@ -256,11 +282,28 @@ export async function validateIDS(
   const summary = calculateSummary(specificationResults);
 
   return {
-    document,
-    modelInfo,
+    source: { kind: 'ids', document },
+    modelInfo: [modelInfo],
     timestamp: new Date(),
     summary,
     specificationResults,
+  };
+}
+
+/** Build the failed-specification result for a rejected `xs:pattern`. */
+function unsafePatternResult(
+  spec: IDSSpecification,
+  err: UnsafeRegexPatternError
+): IDSSpecificationResult {
+  return {
+    specification: spec,
+    status: 'fail',
+    applicableCount: 0,
+    passedCount: 0,
+    failedCount: 0,
+    passRate: 0,
+    entityResults: [],
+    error: `Specification could not be evaluated: ${err.message}`,
   };
 }
 
@@ -270,7 +313,7 @@ export async function validateIDS(
 async function validateSpecification(
   spec: IDSSpecification,
   accessor: IFCDataAccessor,
-  modelInfo: IDSModelInfo,
+  modelInfo: ValidationModelInfo,
   options: ValidatorOptions,
   descriptionCache: DescriptionCache,
   maybeYield: MaybeYield,
@@ -287,8 +330,8 @@ async function validateSpecification(
   const idsToCheck = maxEntities
     ? applicableIds.slice(0, maxEntities)
     : applicableIds;
-
-  // Phase 2: Check requirements for each applicable entity
+  // Phase 2: per-entity checks, built per run (specs are edited in place between runs).
+  const checks = requirementsToCheck(spec);
   const entityResults: IDSEntityResult[] = [];
   const totalEntities = idsToCheck.length;
 
@@ -306,7 +349,7 @@ async function validateSpecification(
     if ((i & 31) === 0) await maybeYield();
 
     const entityResult = validateEntityRequirements(
-      spec,
+      spec, checks,
       expressId,
       modelId,
       accessor,
@@ -356,8 +399,25 @@ async function validateSpecification(
     status = 'fail';
   }
 
-  const passRate =
-    totalEntities > 0 ? Math.floor((passedCount / totalEntities) * 100) : 100;
+  let passRate =
+    totalEntities > 0
+      ? boundedPassRate(passedCount, totalEntities)
+      : status === 'fail'
+        ? 0
+        : 100;
+
+  // `passRate` above is derived from `passedCount`/`totalEntities` alone,
+  // same as `status`'s `failedCount` branch — but `status` also fails on
+  // `cardinalityResult`, which `passRate` never sees (#5212). A spec whose
+  // matched entities ALL individually satisfy their requirements while the
+  // *set* is too large/small (e.g. `maxOccurs: 2` with 3 matches, no
+  // per-entity failures) computed `passedCount === totalEntities`, so the
+  // formula above lands on 100 even though `status` is `'fail'`. Clamp
+  // only that disagreement: a spec with genuine per-entity failures already
+  // reports a `passRate < 100` from the formula above and is left alone.
+  if (status === 'fail' && passRate === 100) {
+    passRate = 0;
+  }
 
   return {
     specification: spec,
@@ -468,7 +528,7 @@ async function findApplicableEntities(
  * Validate requirements for a single entity
  */
 function validateEntityRequirements(
-  spec: IDSSpecification,
+  spec: IDSSpecification, checks: readonly IDSRequirement[],
   expressId: number,
   modelId: string,
   accessor: IFCDataAccessor,
@@ -478,13 +538,11 @@ function validateEntityRequirements(
   const requirementResults: IDSRequirementResult[] = [];
   let allPassed = true;
 
-  for (const requirement of spec.requirements) {
+  // A prohibited specification adds a failing check per element (#7403).
+  for (const requirement of checks) {
     const result = checkRequirement(requirement, expressId, accessor, descriptionCache, translator);
     requirementResults.push(result);
-
-    if (result.status === 'fail') {
-      allPassed = false;
-    }
+    if (result.status === 'fail') allPassed = false;
   }
 
   return {
@@ -493,10 +551,13 @@ function validateEntityRequirements(
     entityType: accessor.getEntityType(expressId) || 'Unknown',
     entityName: accessor.getEntityName(expressId),
     globalId: accessor.getGlobalId(expressId),
-    passed: allPassed,
+    passed: allPassed && spec.maxOccurs !== 0,
     requirementResults,
   };
 }
+
+/** Failures meaning "could not be verified", never a prohibition's pass. */
+const UNVERIFIABLE_FAILURES: ReadonlySet<string> = new Set(['CLASSIFICATION_UNRESOLVED', 'MATERIAL_UNRESOLVED', 'PROPERTY_DATATYPE_UNKNOWN']);
 
 /**
  * Check a single requirement against an entity
@@ -510,17 +571,17 @@ function checkRequirement(
 ): IDSRequirementResult {
   const facetResult = checkFacet(requirement.facet, expressId, accessor);
 
-  // Apply optionality
+  // What cannot be verified fails even a prohibition, keeping its reason (#3996, #5224, #5227).
   let status: 'pass' | 'fail' | 'not_applicable';
   let failureReason: string | undefined;
-
-  switch (requirement.optionality) {
+  const unverifiable = UNVERIFIABLE_FAILURES.has(facetResult.failure?.type ?? '');
+  switch (unverifiable ? 'required' : requirement.optionality) {
     case 'required':
       status = facetResult.passed ? 'pass' : 'fail';
       if (!facetResult.passed) {
         failureReason = translator
           ? translator.describeFailure({
-              requirement,
+              requirement: { ...requirement, label: '' },
               status: 'fail',
               facetType: requirement.facet.type,
               checkedDescription: '',
@@ -544,11 +605,17 @@ function checkRequirement(
       } else {
         const missingFailures = new Set([
           'ATTRIBUTE_MISSING',
-          'PROPERTY_MISSING',
+          'PROPERTY_MISSING', 'PROPERTY_EMPTY', // absent value (#6117)
           'PSET_MISSING',
           'CLASSIFICATION_MISSING',
           'MATERIAL_MISSING',
           'PARTOF_RELATION_MISSING',
+          // The nested predefinedType of an entity / partOf facet is an
+          // "attribute" of the target entity — when it's wholly unset (no PredefinedType, no fallback
+          // ObjectType/parent predefinedType at all) that's the same
+          // "wholly absent" shape as ATTRIBUTE_MISSING, not "bad data".
+          'PREDEFINED_TYPE_MISSING',
+          'PARTOF_PREDEFINED_TYPE_MISSING',
         ]);
         if (
           facetResult.failure?.type &&
@@ -559,7 +626,7 @@ function checkRequirement(
           status = 'fail';
           failureReason = translator
             ? translator.describeFailure({
-                requirement,
+                requirement: { ...requirement, label: '' },
                 status: 'fail',
                 facetType: requirement.facet.type,
                 checkedDescription: '',
@@ -577,7 +644,7 @@ function checkRequirement(
       if (status === 'fail') {
         failureReason = translator
           ? translator.t('failures.prohibited', {
-              field: facetResult.actualValue || 'value',
+              field: requirement.facet.type, actual: facetResult.actualValue ?? '?',
             })
           : `Prohibited: found ${facetResult.actualValue}`;
       }
@@ -598,7 +665,11 @@ function checkRequirement(
   }
 
   return {
-    requirement,
+    // `IDSRequirement` has no `label` of its own (#5138 §5) — the
+    // generalised `RequirementResult.requirement: RequirementSummary`
+    // needs one, so it is derived here from the description already
+    // computed for this requirement rather than fabricated.
+    requirement: { ...requirement, label: checkedDescription },
     status,
     facetType: requirement.facet.type,
     checkedDescription,
@@ -652,11 +723,10 @@ function checkCardinality(
   };
 }
 
-/**
- * Calculate validation summary
- */
-function calculateSummary(
-  specificationResults: IDSSpecificationResult[]
+/** Exported (#5138 PR 3): the rule engine is a second `SpecificationResult[]`
+ *  producer needing the identical summary algorithm. */
+export function calculateSummary(
+  specificationResults: readonly SpecificationResult[]
 ): IDSValidationSummary {
   let totalSpecifications = specificationResults.length;
   let passedSpecifications = 0;
@@ -677,10 +747,18 @@ function calculateSummary(
     totalEntitiesFailed += result.failedCount;
   }
 
-  const overallPassRate =
-    totalEntitiesChecked > 0
-      ? Math.floor((totalEntitiesPassed / totalEntitiesChecked) * 100)
-      : 100;
+  let overallPassRate = boundedPassRate(totalEntitiesPassed, totalEntitiesChecked);
+
+  // Same disagreement as the per-spec `passRate` (#5212), one level up: a
+  // cardinality-failed spec whose matched entities all individually pass
+  // contributes fully to `totalEntitiesPassed` and nothing to
+  // `totalEntitiesFailed`, so the aggregate can land on 100 while
+  // `failedSpecifications > 0` in the same summary object. Clamp only that
+  // disagreement — a summary where some entity failures are already
+  // counted keeps its real (already-under-100) aggregate rate.
+  if (failedSpecifications > 0 && overallPassRate === 100) {
+    overallPassRate = 0;
+  }
 
   return {
     totalSpecifications,
@@ -691,136 +769,4 @@ function calculateSummary(
     totalEntitiesFailed,
     overallPassRate,
   };
-}
-
-/**
- * Format a failure reason without translation
- */
-function formatFailureReason(result: FacetCheckResult): string {
-  if (!result.failure) {
-    return `Expected ${result.expectedValue}, got ${result.actualValue}`;
-  }
-
-  const { type, field, actual, expected } = result.failure;
-
-  switch (type) {
-    case 'ENTITY_TYPE_MISMATCH':
-      return `Entity type "${actual}" does not match expected ${expected}`;
-    case 'PREDEFINED_TYPE_MISMATCH':
-      return `Predefined type "${actual}" does not match expected ${expected}`;
-    case 'PREDEFINED_TYPE_MISSING':
-      return `Predefined type is missing, expected ${expected}`;
-    case 'ATTRIBUTE_MISSING':
-      return `Attribute "${field}" is missing`;
-    case 'ATTRIBUTE_VALUE_MISMATCH':
-      return `Attribute "${field}" value "${actual}" does not match expected ${expected}`;
-    case 'ATTRIBUTE_PATTERN_MISMATCH':
-      return `Attribute "${field}" value "${actual}" does not match pattern ${expected}`;
-    case 'PSET_MISSING':
-      return `Property set "${field || expected}" not found`;
-    case 'PROPERTY_MISSING':
-      return `Property "${field}" not found`;
-    case 'PROPERTY_VALUE_MISMATCH':
-      return `Property "${field}" value "${actual}" does not match expected ${expected}`;
-    case 'PROPERTY_DATATYPE_MISMATCH':
-      return `Property "${field}" type "${actual}" does not match expected ${expected}`;
-    case 'PROPERTY_OUT_OF_BOUNDS':
-      return `Property "${field}" value ${actual} is out of bounds ${expected}`;
-    case 'CLASSIFICATION_MISSING':
-      return 'No classification found';
-    case 'CLASSIFICATION_SYSTEM_MISMATCH':
-      return `Classification system "${actual}" does not match expected ${expected}`;
-    case 'CLASSIFICATION_VALUE_MISMATCH':
-      return `Classification value "${actual}" does not match expected ${expected}`;
-    case 'MATERIAL_MISSING':
-      return 'No material assigned';
-    case 'MATERIAL_VALUE_MISMATCH':
-      return `Material "${actual}" does not match expected ${expected}`;
-    case 'PARTOF_RELATION_MISSING':
-      return `Not ${field} any entity`;
-    case 'PARTOF_ENTITY_MISMATCH':
-      return `Parent entity "${actual}" does not match expected ${expected}`;
-    case 'PARTOF_PREDEFINED_TYPE_MISSING':
-      return `Parent entity predefined type is missing, expected ${expected}`;
-    case 'PARTOF_PREDEFINED_TYPE_MISMATCH':
-      return `Parent entity predefined type "${actual}" does not match expected ${expected}`;
-    default:
-      return `Validation failed: ${type}`;
-  }
-}
-
-/**
- * Format a requirement description without translation
- */
-function formatRequirementDescription(requirement: IDSRequirement): string {
-  const facet = requirement.facet;
-  const optionality = requirement.optionality;
-
-  let desc: string;
-
-  switch (facet.type) {
-    case 'entity':
-      desc = `Must be ${formatConstraint(facet.name)}`;
-      if (facet.predefinedType) {
-        desc += ` with predefinedType ${formatConstraint(facet.predefinedType)}`;
-      }
-      break;
-
-    case 'attribute':
-      if (facet.value) {
-        desc = `Attribute "${formatConstraint(facet.name)}" must equal ${formatConstraint(facet.value)}`;
-      } else {
-        desc = `Attribute "${formatConstraint(facet.name)}" must exist`;
-      }
-      break;
-
-    case 'property':
-      if (facet.value) {
-        desc = `Property "${formatConstraint(facet.propertySet)}.${formatConstraint(facet.baseName)}" must equal ${formatConstraint(facet.value)}`;
-      } else {
-        desc = `Property "${formatConstraint(facet.propertySet)}.${formatConstraint(facet.baseName)}" must exist`;
-      }
-      break;
-
-    case 'classification':
-      if (facet.system && facet.value) {
-        desc = `Must have classification ${formatConstraint(facet.value)} in ${formatConstraint(facet.system)}`;
-      } else if (facet.system) {
-        desc = `Must be classified in ${formatConstraint(facet.system)}`;
-      } else if (facet.value) {
-        desc = `Must have classification ${formatConstraint(facet.value)}`;
-      } else {
-        desc = 'Must have a classification';
-      }
-      break;
-
-    case 'material':
-      if (facet.value) {
-        desc = `Must have material ${formatConstraint(facet.value)}`;
-      } else {
-        desc = 'Must have a material assigned';
-      }
-      break;
-
-    case 'partOf': {
-      const relName = facet.relation.replace('IfcRel', '').toLowerCase();
-      if (facet.entity) {
-        desc = `Must be ${relName} ${formatConstraint(facet.entity.name)}`;
-      } else {
-        desc = `Must be ${relName} some entity`;
-      }
-      break;
-    }
-
-    default:
-      desc = 'Unknown requirement';
-  }
-
-  if (optionality === 'prohibited') {
-    desc = desc.replace('Must', 'Must NOT').replace('must', 'must NOT');
-  } else if (optionality === 'optional') {
-    desc = desc.replace('Must', 'Should').replace('must', 'should');
-  }
-
-  return desc;
 }

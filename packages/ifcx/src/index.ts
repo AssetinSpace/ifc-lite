@@ -10,12 +10,15 @@
  */
 
 import type { IfcxFile, ComposedNode } from './types.js';
-import { ATTR, isTypedPropertyValue, parseV5aKey } from './types.js';
-import { composeIfcx, findRoots } from './composition.js';
+import type { IfcxParseResult, IfcxParseOptions } from './parse-result.js';
+export type { IfcxParseResult, IfcxParseOptions } from './parse-result.js';
+import { extractGeoreference } from './georeference.js';
+import { ATTR, SPATIAL_TYPES, isTypedPropertyValue, parseV5aKey } from './types.js';
+import { composeIfcx } from './composition.js';
 import { extractEntities } from './entity-extractor.js';
-import { extractProperties, routesToQuantityTable } from './property-extractor.js';
-import { extractGeometry, type MeshData } from './geometry-extractor.js';
-import { extractPointClouds, type PointCloudExtraction } from './pointcloud-extractor.js';
+import { extractProperties, mirroredFlatPropertyKeys, routesToQuantityTable } from './property-extractor.js';
+import { extractGeometry } from './geometry-extractor.js';
+import { extractPointClouds } from './pointcloud-extractor.js';
 import { buildHierarchy } from './hierarchy-builder.js';
 import {
   StringTable,
@@ -24,20 +27,23 @@ import {
   QuantityTableBuilder,
   safeUtf8Decode,
 } from '@ifc-lite/data';
-import type { SpatialHierarchy, EntityTable, PropertyTable, QuantityTable, RelationshipGraph } from '@ifc-lite/data';
+import type { QuantityTable, RelationshipGraph } from '@ifc-lite/data';
 
 // Federated composition imports
-import { LayerStack, createLayerStack, type IfcxLayer, type LayerSource } from './layer-stack.js';
-import { PathIndex, createPathIndex, parsePath, type ParsedPath, type PathEntry } from './path-resolver.js';
+import { LayerStack, createLayerStack } from './layer-stack.js';
+import { PathIndex } from './path-resolver.js';
 import {
   composeFederated,
-  type ComposeOptions,
   type FederatedCompositionResult,
-  type ComposedNodeWithSources,
 } from './federated-composition.js';
 
-// Re-export types
+// Re-exported so the IFCX version constant can be imported from the package
+// that owns the format. Defined in @ifc-lite/data for dependency reasons —
+// see the comment on IFCX_VERSION itself.
+export { IFCX_VERSION } from '@ifc-lite/data';
+
 export * from './types.js';
+export { encodeIfcxImage, IFCX_APPEARANCE, IFCX_IMAGE, IFCX_APPEARANCE_SCHEMAS, type IfcxPixels, type IfcxEncodedImage } from './appearance-wire.js';
 export { composeIfcx, findRoots, getDescendants } from './composition.js';
 export { applyTombstones, isTombstoned } from './tombstones.js';
 export { bakeLayers, type BakeOptions } from './bake.js';
@@ -116,46 +122,6 @@ export {
 } from './writer.js';
 
 /**
- * Result of parsing an IFCX file.
- * Compatible with existing ifc-lite data structures.
- */
-export interface IfcxParseResult {
-  /** Columnar entity table */
-  entities: EntityTable;
-  /** Columnar property table */
-  properties: PropertyTable;
-  /** Columnar quantity table */
-  quantities: QuantityTable;
-  /** Relationship graph */
-  relationships: RelationshipGraph;
-  /** Spatial hierarchy */
-  spatialHierarchy: SpatialHierarchy;
-  /** String table for interned strings */
-  strings: StringTable;
-  /** Pre-tessellated geometry meshes */
-  meshes: MeshData[];
-  /** Decoded point clouds (pcd::base64, points::array, points::base64) */
-  pointClouds: PointCloudExtraction[];
-  /** Mapping from IFCX path to express ID */
-  pathToId: Map<string, number>;
-  /** Mapping from express ID to IFCX path */
-  idToPath: Map<number, string>;
-  /** Schema version */
-  schemaVersion: 'IFC5';
-  /** File size in bytes */
-  fileSize: number;
-  /** Number of entities */
-  entityCount: number;
-  /** Parse time in milliseconds */
-  parseTime: number;
-}
-
-export interface IfcxParseOptions {
-  /** Progress callback */
-  onProgress?: (progress: { phase: string; percent: number }) => void;
-}
-
-/**
  * Parse an IFCX file and return data compatible with existing ifc-lite pipeline.
  */
 export async function parseIfcx(
@@ -186,6 +152,7 @@ export async function parseIfcx(
   // Phase 2: Compose ECS nodes
   options.onProgress?.({ phase: 'compose', percent: 0 });
   const composed = composeIfcx(file);
+  const georeferencing = extractGeoreference(composed);
   options.onProgress?.({ phase: 'compose', percent: 100 });
 
   // Phase 3: Extract entities
@@ -219,7 +186,7 @@ export async function parseIfcx(
   const quantities = buildQuantities(composed, pathToId, strings);
 
   const parseTime = performance.now() - startTime;
-
+  // @raw-entity-enumeration-ok parser construction reports the count of freshly composed IFCX source rows before any live mutation view exists
   return {
     entities,
     properties,
@@ -235,6 +202,7 @@ export async function parseIfcx(
     fileSize: buffer.byteLength,
     entityCount: entities.count,
     parseTime,
+    georeferencing,
   };
 }
 
@@ -322,10 +290,10 @@ function determineRelationshipType(
   return RelationshipType.ContainsElements;
 }
 
+/** The tree builder's gate, not a second copy of it: a hand-written duplicate
+ *  here decided Aggregates vs ContainsElements and had drifted from that one. */
 function isSpatialElement(typeCode: string | undefined): boolean {
-  if (!typeCode) return false;
-  const spatialTypes = ['IfcProject', 'IfcSite', 'IfcBuilding', 'IfcBuildingStorey', 'IfcSpace'];
-  return spatialTypes.includes(typeCode);
+  return typeCode ? SPATIAL_TYPES.has(typeCode) : false;
 }
 
 /**
@@ -365,13 +333,13 @@ function buildQuantities(
     // Get the IFC class to use as context for qset naming
     const ifcClass = (node.attributes.get('bsi::ifc::class') as { code?: string })?.code;
     const qsetName = ifcClass ? `Qto_${ifcClass.replace('Ifc', '')}BaseQuantities` : 'BaseQuantities';
-
+    const mirrored = mirroredFlatPropertyKeys(node.attributes); // #5376: a flat mirror of a qualified value
     for (const [key, value] of node.attributes) {
       // Same routing rule the property extractor uses to skip — the v5a
       // namespace mirrors the collab inflation dialect, typed records
       // (#1031) unwrap to their scalar — so neither table drops or
       // double-claims an attribute.
-      if (!routesToQuantityTable(key, value)) continue;
+      if (mirrored.has(key) || !routesToQuantityTable(key, value)) continue;
 
       const v5a = parseV5aKey(key);
       const propName = v5a?.name ?? key.split('::').pop() ?? '';
@@ -379,9 +347,9 @@ function buildQuantities(
 
       builder.add({
         entityId: expressId,
-        // Keep the authored set name (Qto_* or custom) when the key
-        // carries one; only heuristic-routed keys get the synthesized set.
+        // Keep the authored set name (Qto_* or custom) when the key carries one; else the synthesized set.
         qsetName: v5a ? v5a.setName : qsetName,
+        qsetGlobalId: '', // IFCX's flat model has no qset GlobalId; parity with property-extractor.ts's psetGlobalId.
         quantityName: propName,
         quantityType: getQuantityType(propName, v5a ? v5a.setName.startsWith('Qto_') : true),
         value: effective as number,
@@ -572,6 +540,7 @@ function finalizeFederatedResult(
   for (const [path, node] of compositionResult.composed) {
     composed.set(path, node as ComposedNode);
   }
+  const georeferencing = extractGeoreference(composed);
 
   // Phase 3: Extract entities
   options.onProgress?.({ phase: 'entities', percent: 0 });
@@ -610,7 +579,7 @@ function finalizeFederatedResult(
   }
 
   const parseTime = performance.now() - startTime;
-
+  // @raw-entity-enumeration-ok federated parser construction reports the count of freshly composed IFCX source rows before any live mutation view exists
   return {
     entities,
     properties,
@@ -627,6 +596,7 @@ function finalizeFederatedResult(
     entityCount: entities.count,
     parseTime,
     // Federated-specific fields
+    georeferencing,
     layerStack,
     pathIndex: compositionResult.pathIndex,
     compositionStats: {
@@ -665,37 +635,44 @@ export async function addIfcxOverlay(
 
   // Add to layer stack (at top = strongest)
   const layerStack = baseResult.layerStack;
-  layerStack.addLayer(file, overlayBuffer, overlayName, {
+  const addedLayerId = layerStack.addLayer(file, overlayBuffer, overlayName, {
     type: 'file',
     filename: overlayName,
     size: overlayBuffer.byteLength,
   });
 
-  // Re-compose with the new layer directly from the already-parsed stack.
-  // Avoid round-tripping every layer buffer back through parseFederatedIfcx
-  // (re-JSON.parsing all prior layers), which would make the k-th overlay
-  // cost O(total bytes of all layers).
-  const startTime = performance.now();
-  options.onProgress?.({ phase: 'compose', percent: 0 });
-  const compositionResult = composeFederated(layerStack, {
-    onProgress: (phase, percent) => {
-      options.onProgress?.({ phase: `compose-${phase}`, percent });
-    },
-    maxInheritDepth: options.maxInheritDepth,
-  });
-  options.onProgress?.({ phase: 'compose', percent: 100 });
+  // Failed composition or extraction must leave the previous result usable
+  // (#6824). Successful overlays keep the existing shared-stack semantics.
+  try {
+    // Re-compose with the new layer directly from the already-parsed stack.
+    // Avoid round-tripping every layer buffer back through parseFederatedIfcx
+    // (re-JSON.parsing all prior layers), which would make the k-th overlay
+    // cost O(total bytes of all layers).
+    const startTime = performance.now();
+    options.onProgress?.({ phase: 'compose', percent: 0 });
+    const compositionResult = composeFederated(layerStack, {
+      onProgress: (phase, percent) => {
+        options.onProgress?.({ phase: `compose-${phase}`, percent });
+      },
+      maxInheritDepth: options.maxInheritDepth,
+    });
+    options.onProgress?.({ phase: 'compose', percent: 100 });
 
-  // fileSize reflects the total bytes of every layer (matching parseFederatedIfcx).
-  let totalSize = 0;
-  for (const layer of layerStack.getLayers()) {
-    totalSize += layer.buffer.byteLength;
+    // fileSize reflects the total bytes of every layer (matching parseFederatedIfcx).
+    let totalSize = 0;
+    for (const layer of layerStack.getLayers()) {
+      totalSize += layer.buffer.byteLength;
+    }
+
+    return finalizeFederatedResult(
+      layerStack,
+      compositionResult,
+      totalSize,
+      startTime,
+      options
+    );
+  } catch (error) {
+    layerStack.removeLayer(addedLayerId);
+    throw error;
   }
-
-  return finalizeFederatedResult(
-    layerStack,
-    compositionResult,
-    totalSize,
-    startTime,
-    options
-  );
 }

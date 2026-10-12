@@ -1,14 +1,22 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "agentGuidance": false,
   "globalDependencies": [
+    "shared/ai/**/*.ts",
     "rust/**/*.rs",
     "rust/**/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
-    "scripts/build-wasm.sh"
+    "scripts/build-wasm.sh",
+    "tsconfig.json",
+    "tsconfig.packages.json",
+    "tsconfig.tests.base.json",
+    "scripts/typecheck-tests.mjs",
+    "scripts/lib/is-main-entry.mjs"
   ],
   "globalPassThroughEnv": [
+    "NODE_OPTIONS",
     "RUSTUP_HOME",
     "CARGO_HOME",
     "RUSTUP_TOOLCHAIN",
@@ -54,6 +62,9 @@
         "index.html"
       ],
       "env": [
+        "VITE_AUTODESK_CLIENT_ID",
+        "VITE_AUTODESK_HOSTED",
+        "VITE_CLOUD_HOSTED",
         "VITE_SERVER_URL",
         "VITE_IFC_SERVER_URL",
         "VITE_USE_SERVER",
@@ -64,6 +75,8 @@
         "VITE_POSTHOG_HOST",
         "VITE_SOURCEMAP",
         "VERCEL_GIT_COMMIT_SHA",
+        "VERCEL_DEPLOYMENT_ID",
+        "VERCEL_SKEW_PROTECTION_ENABLED",
         "GITHUB_SHA"
       ]
     },

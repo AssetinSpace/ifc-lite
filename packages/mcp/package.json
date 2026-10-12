@@ -1,7 +1,7 @@
 {
   "name": "@ifc-lite/mcp",
-  "version": "0.9.2",
-  "description": "Model Context Protocol server for ifc-lite — agent-native BIM via MCP (stdio + Streamable HTTP)",
+  "version": "0.24.1",
+  "description": "Model Context Protocol server for ifc-lite \u2014 agent-native BIM via MCP (stdio + Streamable HTTP)",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,37 +25,51 @@
     "./browser": {
       "import": "./dist/browser.js",
       "types": "./dist/browser.d.ts"
+    },
+    "./cli-args": {
+      "import": "./dist/cli-args.js",
+      "types": "./dist/cli-args.d.ts"
     }
   },
   "scripts": {
     "build": "pnpm exec tsc",
+    "typecheck": "node ../../scripts/typecheck-tests.mjs",
     "dev": "pnpm exec tsc --watch",
     "start": "node dist/cli.js",
     "test": "vitest run"
   },
   "dependencies": {
+    "@ifc-lite/ai": "workspace:^",
     "@ifc-lite/bcf": "workspace:^",
+    "@ifc-lite/cache": "workspace:^",
     "@ifc-lite/clash": "workspace:^",
     "@ifc-lite/collab": "workspace:^",
     "@ifc-lite/create": "workspace:^",
     "@ifc-lite/data": "workspace:^",
+    "@ifc-lite/diff": "workspace:^",
+    "@ifc-lite/encoding": "workspace:^",
     "@ifc-lite/export": "workspace:^",
     "@ifc-lite/extensions": "workspace:^",
+    "@ifc-lite/flow": "workspace:^",
+    "@ifc-lite/flow-nodes": "workspace:^",
     "@ifc-lite/geometry": "workspace:^",
     "@ifc-lite/ids": "workspace:^",
+    "@ifc-lite/ids-authoring": "workspace:^",
     "@ifc-lite/ifcx": "workspace:^",
     "@ifc-lite/merge": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/parser": "workspace:^",
     "@ifc-lite/query": "workspace:^",
+    "@ifc-lite/rules": "workspace:^",
     "@ifc-lite/sdk": "workspace:^",
     "@ifc-lite/viewer-core": "workspace:^",
-    "yjs": "^13.6.31"
+    "@ifc-lite/wasm": "workspace:^",
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.6.4",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.3"
   },
   "engines": {
     "node": ">=18.0.0"

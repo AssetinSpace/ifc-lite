@@ -21,16 +21,17 @@ import type { WorkspacePanelId } from '@/lib/panels/registry';
 export const TOUR_ANCHORS = {
   /** The empty-state "Load IFC" card in ViewportContainer. */
   emptyStateCard: 'empty-state-card',
-  /** PropertiesPanel root (valid docked, floating, or split). */
+  /** Information panel body, wrapped around every PropertiesPanel branch
+   *  by `renderPanelBody` (valid docked, floating, or split). */
   propertiesPanel: 'properties-panel',
-  /** HierarchyPanel root in the left slot. */
+  /** HierarchyPanel root in the left slot, on every branch (no model and
+   *  still-loading included). */
   hierarchyPanel: 'hierarchy-panel',
   /** ViewCube wrapper div (top-right viewport overlay). Card placement
    *  must stay clear of this corner - never anchor a card 'bottom' here. */
   viewcube: 'viewcube',
-  /** SectionOverlay panel root. Exists while collapsed; the position
-   *  slider itself only mounts once the panel is expanded, so anchor the
-   *  root, not the slider. */
+  /** The Section bar (`SectionToolbar`, HUD top-center) while the Section
+   *  tool is active; carries the distance field, so steps anchor here. */
   sectionPanel: 'section-panel',
   /** IDSPanel empty-state "Load IDS File" button (only while no doc). */
   idsLoad: 'ids-load',
@@ -42,6 +43,13 @@ export const TOUR_ANCHORS = {
   idsResults: 'ids-results',
   /** IDSPanel isolate-failed (EyeOff) toggle in the results actions bar. */
   idsIsolateFailed: 'ids-isolate-failed',
+  /** ValidationPanel empty-state entry cards (#5138: IDS validation /
+   *  Information validation). */
+  validationEntry: 'validation-entry',
+  /** ValidationPanel authoring state's RuleSetEditor root (#5138). */
+  ruleEditor: 'rule-editor',
+  /** IdsStudioPanel root, on both the empty state and an open document (IDS-030). */
+  idsStudioPanel: 'ids-studio-panel',
   /** ClashPanel "Detect all clashes" run button. */
   clashRun: 'clash-run',
   /** ClashPanel severity summary (only while a result exists). */
@@ -95,12 +103,10 @@ export const TOUR_ANCHORS = {
   bcfCaptureViewpoint: 'bcf-capture-viewpoint',
   /** BCFPanel header Export BCF button (disabled until a topic exists). */
   bcfExport: 'bcf-export',
-  /** RibbonToolbar tab strip (ribbon style only; the classic strip has none). */
+  /** RibbonToolbar tab strip. */
   ribbonTabs: 'ribbon-tabs',
   /** Ribbon collapse/expand chevron in the tab strip. */
   ribbonCollapse: 'ribbon-collapse',
-  /** ViewTab "Classic bar" button (only while the View tab is open). */
-  ribbonClassicSwitch: 'ribbon-classic-switch',
   /** ViewTab "Follow work" contextual-tabs toggle (View tab open). */
   ribbonFollowWork: 'ribbon-follow-work',
 } as const;
@@ -111,7 +117,7 @@ export function activityAnchor(id: WorkspacePanelId): `activity-${WorkspacePanel
   return `activity-${id}`;
 }
 
-/** MainToolbar tool button (one templated attribute serves every
+/** Ribbon tool button (one templated attribute serves every
  *  toolbar-tool mini-tour, e.g. measure, section). */
 export function toolAnchor(tool: string): `tool-${string}` {
   return `tool-${tool}`;

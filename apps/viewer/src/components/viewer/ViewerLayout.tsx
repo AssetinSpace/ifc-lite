@@ -2,35 +2,56 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { TooltipProvider } from '@/components/ui/tooltip';
+<<<<<<< HEAD
 import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '@/lib/autoload';
 import { MainToolbar } from './MainToolbar';
+=======
+import { useTranslation } from '@/i18n';
+import { styleInterpolatedValues } from '@/i18n/richInterpolate';
+>>>>>>> upstream/main
 import { MobileToolbar } from './MobileToolbar';
 import { RibbonToolbar } from './ribbon/RibbonToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
-import { PropertiesPanel } from './PropertiesPanel';
-import { AddElementPanel } from './AddElementPanel';
 import { StatusBar } from './StatusBar';
 import { ViewportContainer } from './ViewportContainer';
+import { ModelToolRail } from './model/ModelToolRail';
+import { ModelWorkspaceSplit } from './model/ModelWorkspaceSplit';
 import { KeyboardShortcutsDialog, useKeyboardShortcutsDialog, type InfoDialogTab } from './KeyboardShortcutsDialog';
+import { SettingsDialogHost } from './settings/SettingsDialog';
+import { ConfirmDialogHost } from '@/components/ui/confirm-dialog';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { ShellStoreEffects } from './ShellStoreEffects';
+import { selectHasModelsLoaded } from '@/hooks/model-presence';
 import { useActionLogger } from '@/hooks/useActionLogger';
 import { usePrivacyDisclosure } from '@/hooks/usePrivacyDisclosure';
 import { isSafeMode } from '@/lib/safe-mode';
+<<<<<<< HEAD
 import { ShieldAlert, Grip } from 'lucide-react';
 import { usePanelDetachDrag } from '@/hooks/usePanelDetachDrag';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
+=======
+import { MobileBottomSheet, useVisualViewportBottomInset } from './MobileBottomSheet';
+import { MobilePanelLauncher } from './MobilePanelLauncher';
+import { MobilePanelSheet } from './MobilePanelSheet';
+import { ShieldAlert } from 'lucide-react';
+>>>>>>> upstream/main
 import { ExtensionDockHost } from '@/components/extensions/ExtensionDockHost';
-import { useIfc } from '@/hooks/useIfc';
+import { ExtensionKeyboardBindings } from '@/components/extensions/ExtensionKeyboardBindings';
+import { useModelUrlAutoload } from '@/hooks/useModelUrlAutoload';
+import { useArtifactDeepLink } from '@/hooks/useArtifactDeepLink';
 import { useViewerStore } from '@/store';
 import { isCollabEnabled } from '@/lib/collab/config';
+import { toast } from '@/components/ui/toast';
 import { parseRoleFromToken } from '@/lib/collab/share-link';
 import { EntityContextMenu } from './EntityContextMenu';
+import { AnonymizedExportDialog } from './anonymized-export/AnonymizedExportDialog';
 import { useDuplicateShortcut } from './useDuplicateShortcut';
 import { HoverTooltip } from './HoverTooltip';
+<<<<<<< HEAD
 import { BCFPanel } from './BCFPanel';
 import { IDSPanel } from './IDSPanel';
 import { LensPanel } from './LensPanel';
@@ -44,19 +65,34 @@ import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
 import { DrawingPlanPane } from '@/components/viewer/DrawingPlanPane';
 import { DocumentsPanel } from '@/components/documents/DocumentsPanel';
 import { DocumentPane } from '@/components/documents/DocumentPane';
+=======
+import { BottomStrip } from './BottomStrip';
+import { loadBottomStripOrientation, persistBottomStripOrientation } from '@/lib/panels/bottom-strip-persistence';
+import { LEFT_PANEL_DEFAULT_SIZE } from '@/store/layoutReset';
+import { useOverlayCompositor } from './schedule/useOverlayCompositor';
+>>>>>>> upstream/main
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
+import { FlowStartupPrompt } from './flow/FlowStartupPrompt';
 import { TourHost } from '@/components/tours/TourHost';
 import { SidebarDock } from './sidebar/SidebarDock';
+import { WorkspaceMigrationNotice } from './WorkspaceMigrationNotice';
 import { FloatingPanelHost } from './dock/FloatingPanelHost';
 import { PanelWindowHost } from './dock/PanelWindowHost';
 import {
-  closeActiveAnalysisExtension,
   getAnalysisExtensionById,
   getAnalysisExtensionsSnapshot,
   subscribeAnalysisExtensions,
 } from '@/services/analysis-extensions';
+import { activeBottomPanel } from '@/lib/panels/bottom-panels';
+import { useBottomPanelFlags } from '@/hooks/useBottomPanelFlags';
+import { usePanelControls } from '@/hooks/usePanelControls';
+import { useMobileLayoutMode } from '@/hooks/useMobileLayoutMode';
+import { useThemeDocumentClass } from './useThemeDocumentClass';
+import { EVENT_OPEN_COMMAND_PALETTE } from '@/lib/tours/events';
+import { registerKeyboardCommand } from '@/lib/commands/dispatcher';
 
+<<<<<<< HEAD
 const BOTTOM_PANEL_MIN_HEIGHT = 120;
 const BOTTOM_PANEL_DEFAULT_HEIGHT = 300;
 const BOTTOM_PANEL_MAX_RATIO = 0.7; // max 70% of container
@@ -87,19 +123,29 @@ function BottomPanelGrip({ id }: { id: 'gantt' | 'script' | 'lists' }) {
     </div>
   );
 }
+=======
+/** Technical query flag rendered as code by the localized safe-mode notice. */
+const SAFE_MODE_QUERY_FLAG = '?safe=0';
+>>>>>>> upstream/main
 
 export function ViewerLayout() {
+  const { t } = useTranslation();
   // Initialize keyboard shortcuts
   useKeyboardShortcuts();
   // ⌘D / Ctrl+D to duplicate the current selection.
   useDuplicateShortcut();
-  // Bridge viewer state transitions into the extension action log
-  // so the idle pattern miner can surface one-click tool suggestions.
+  // THE writer from the overlay-layer registry into the renderer's legacy
+  // hiddenEntities / pendingColorUpdates channels. Mounted once, here, for
+  // the whole session: a second instance would keep its own ownership map and
+  // double-write. Layer owners (4D animation, charts, …) only register layers.
+  useOverlayCompositor();
+  // Bridge viewer state transitions into the extension action log so the idle pattern miner can surface one-click tool suggestions.
   useActionLogger();
   // Show the RFC §06 §7 privacy disclosure on first launch.
   usePrivacyDisclosure();
   const shortcutsDialog = useKeyboardShortcutsDialog();
 
+<<<<<<< HEAD
   // >>> AIM-FORK: extends upstream's single `?model=<URL>` autoload to a
   // comma-separated `?models=<URL>,…` federation (AIM: ASR + VZT). If upstream
   // rewrites its autoload effect this block will conflict — keep the `?models=`
@@ -153,12 +199,16 @@ export function ViewerLayout() {
     })();
   }, [autoloadAddModel]);
   // <<< AIM-FORK
+=======
+  // ?model=<URL> autoload (#5851, load errors shown) and ?panel=/artifact deep links (#6927).
+  useModelUrlAutoload();
+  useArtifactDeepLink();
+>>>>>>> upstream/main
 
-  // Deep-link collaboration join: a share link is `?room=…&t=…`. The
-  // recipient joins the room; with seed-into-room the model hydrates from the
-  // Y.Doc, so no `?model=` is needed for shared sessions. Guarded so React
-  // StrictMode's double-invoke can't join twice, and wrapped so a throw can't
-  // tear down the layout (uncaught throws in effects unmount the canvas).
+  // Deep-link collaboration join: a share link is `?room=…&t=…`. The recipient
+  // joins the room; with seed-into-room the model hydrates from the Y.Doc, so
+  // no `?model=` is needed. Guarded so StrictMode's double-invoke can't join twice,
+  // and wrapped so a throw can't tear down the layout (uncaught throws unmount the canvas).
   const collabJoinDoneRef = useRef(false);
   useEffect(() => {
     if (collabJoinDoneRef.current) return;
@@ -177,19 +227,26 @@ export function ViewerLayout() {
     }
   }, []);
 
+  // Surface a room whose geometry never arrived. The joiner sets this on the
+  // store (slices hold no UI imports); this is the one place it becomes visible,
+  // so a shared room rendering an empty scene says why instead of leaving the
+  // recipient to assume they misconfigured something.
+  const collabGeometryNotice = useViewerStore((s) => s.collabGeometryNotice);
+  useEffect(() => {
+    // Consume first: StrictMode's double-invoke then finds it already taken and
+    // cannot toast the same message twice.
+    const notice = useViewerStore.getState().consumeCollabGeometryNotice();
+    if (notice) toast.error(notice);
+  }, [collabGeometryNotice]);
+
   // Command palette state
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 
-  // Ctrl+K / Cmd+K to open command palette
+  // The shared dispatcher owns the Ctrl+K chord and text-entry exception.
   useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        setCommandPaletteOpen((prev) => !prev);
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    return registerKeyboardCommand('ui.commandPalette', () => {
+      setCommandPaletteOpen((prev) => !prev);
+    }, { allowInTextEntry: true });
   }, []);
 
   useEffect(() => {
@@ -202,24 +259,20 @@ export function ViewerLayout() {
       else shortcutsDialog.toggle();
     };
 
-    window.addEventListener('ifc-lite:open-command-palette', openCommandPalette);
+    window.addEventListener(EVENT_OPEN_COMMAND_PALETTE, openCommandPalette);
     window.addEventListener('ifc-lite:show-shortcuts', showShortcuts);
     return () => {
-      window.removeEventListener('ifc-lite:open-command-palette', openCommandPalette);
+      window.removeEventListener(EVENT_OPEN_COMMAND_PALETTE, openCommandPalette);
       window.removeEventListener('ifc-lite:show-shortcuts', showShortcuts);
     };
   }, [shortcutsDialog]);
 
-  // Initialize theme on mount
-  const theme = useViewerStore((s) => s.theme);
-  // Desktop toolbar style (issue #1686): classic strip or tabbed ribbon.
-  const toolbarStyle = useViewerStore((s) => s.toolbarStyle);
   const isMobile = useViewerStore((s) => s.isMobile);
-  const setIsMobile = useViewerStore((s) => s.setIsMobile);
   const leftPanelCollapsed = useViewerStore((s) => s.leftPanelCollapsed);
   const rightPanelCollapsed = useViewerStore((s) => s.rightPanelCollapsed);
   const setLeftPanelCollapsed = useViewerStore((s) => s.setLeftPanelCollapsed);
   const setRightPanelCollapsed = useViewerStore((s) => s.setRightPanelCollapsed);
+<<<<<<< HEAD
   const bcfPanelVisible = useViewerStore((s) => s.bcfPanelVisible);
   const setBcfPanelVisible = useViewerStore((s) => s.setBcfPanelVisible);
   const activeTool = useViewerStore((s) => s.activeTool);
@@ -246,32 +299,52 @@ export function ViewerLayout() {
   // The right pane is owned by the sidebar (#1208); here we only need to know
   // which BOTTOM panel (Script / Schedule / Lists) is docked vs detached, so the
   // bottom strip doesn't render a panel that is floating (#1201) or popped out.
+=======
+  // Which bottom panel the flags say is open (table precedence), and whether
+  // it is actually docked here rather than floating / popped out.
+  const bottomPanel = activeBottomPanel(useBottomPanelFlags());
+  // The right pane is owned by the sidebar (#1208); here we only need to know which
+  // BOTTOM panel (Script / Schedule / Lists) is docked vs detached, so the bottom strip skips a floating (#1201) or popped-out one.
+>>>>>>> upstream/main
   const floatingPanels = useViewerStore((s) => s.floatingPanels);
   const poppedOutIds = useViewerStore((s) => s.poppedOutIds);
   const detachedIds = useMemo(
     () => new Set<string>([...floatingPanels.map((p) => p.id), ...poppedOutIds]),
     [floatingPanels, poppedOutIds],
   );
-  const ganttDocked = ganttPanelVisible && !detachedIds.has('gantt');
-  const scriptDocked = scriptPanelVisible && !detachedIds.has('script');
-  const listDocked = listPanelVisible && !detachedIds.has('lists');
+  const dockedBottomPanel = bottomPanel && !detachedIds.has(bottomPanel) ? bottomPanel : null;
+
+  // Side-by-side 2D/3D layout preset (#5515): a persisted dock-side choice
+  // ("does Drawing go beside the viewport or below it") that only takes
+  // effect while Drawing is the actual docked panel — switching the strip's
+  // tab to anything else falls back to the normal bottom dock for it, same
+  // as detaching Drawing itself already does above.
+  const [stripOrientation, setStripOrientation] = useState(() => loadBottomStripOrientation());
+  const toggleStripOrientation = useCallback(() => {
+    setStripOrientation((prev) => {
+      const next = prev === 'side' ? 'bottom' : 'side';
+      persistBottomStripOrientation(next);
+      return next;
+    });
+  }, []);
+  const sideBySideDrawing = stripOrientation === 'side' && dockedBottomPanel === 'drawing';
+
+  // The narrow layout's single-panel sheet lives in `MobilePanelSheet`; the
+  // desktop bottom strip below still needs the close action and the extension.
+  const { closePanel } = usePanelControls();
   const analysisExtensionState = useSyncExternalStore(
     subscribeAnalysisExtensions,
     getAnalysisExtensionsSnapshot,
     getAnalysisExtensionsSnapshot,
   );
   const activeAnalysisExtension = getAnalysisExtensionById(analysisExtensionState.activeId);
-  const activeRightAnalysisExtension = (activeAnalysisExtension?.placement ?? 'right') === 'right'
-    ? activeAnalysisExtension
-    : null;
   const activeBottomAnalysisExtension = activeAnalysisExtension?.placement === 'bottom'
     ? activeAnalysisExtension
     : null;
 
-  // Panel refs for programmatic collapse/expand (command palette, keyboard shortcuts).
-  // The right region is now the unified sidebar (#1208), which owns its own
-  // collapse/hide state in `sidebarSlice`; only the left hierarchy pane is a
-  // react-resizable Panel here.
+  // Panel ref for programmatic collapse/expand (command palette, keyboard
+  // shortcuts). The right region is the unified sidebar (#1208), which owns its
+  // own collapse/hide state in `sidebarSlice`; only the left hierarchy pane is a react-resizable Panel here.
   const leftPanelRef = useRef<PanelImperativeHandle>(null);
 
   // Sync store state → left Panel collapse/expand on desktop
@@ -281,7 +354,10 @@ export function ViewerLayout() {
     if (leftPanelCollapsed && !panel.isCollapsed()) panel.collapse();
     else if (!leftPanelCollapsed && panel.isCollapsed()) panel.expand();
   }, [leftPanelCollapsed]);
+  const layoutResetEpoch = useViewerStore((s) => s.layoutResetEpoch); // "Reset layout" (#5854) restores the pane width
+  useEffect(() => { if (layoutResetEpoch > 0) leftPanelRef.current?.resize(`${LEFT_PANEL_DEFAULT_SIZE}%`); }, [layoutResetEpoch]);
 
+<<<<<<< HEAD
   // D-072 split view: the 2D plan Panel is always mounted (so ViewportContainer
   // never remounts / loses its WebGPU renderer) and collapses/expands with the
   // `underlaySplitView` flag, like the left hierarchy panel above.
@@ -365,10 +441,11 @@ export function ViewerLayout() {
 
   // Bottom panel resize state (pixel height, persisted in ref to avoid re-renders during drag)
   const [bottomHeight, setBottomHeight] = useState(BOTTOM_PANEL_DEFAULT_HEIGHT);
+=======
+>>>>>>> upstream/main
   const containerRef = useRef<HTMLDivElement>(null);
-  const isDraggingRef = useRef(false);
-  const cleanupRef = useRef<(() => void) | null>(null);
 
+<<<<<<< HEAD
   // Cleanup drag listeners on unmount
   useEffect(() => {
     return () => { cleanupRef.current?.(); };
@@ -420,70 +497,59 @@ export function ViewerLayout() {
   // On iOS Safari with bottom URL bar, dvh/innerHeight INCLUDES the URL bar area,
   // so anything at `bottom: 0` lands behind it. visualViewport.height excludes
   // the URL bar overlay, giving us the real visible bottom.
+=======
+  // Track the gap between the layout viewport (innerHeight) and the visual
+  // viewport. On iOS Safari with bottom URL bar, dvh/innerHeight INCLUDES the
+  // URL bar area, so `bottom: 0` lands behind it; visualViewport.height excludes it.
+>>>>>>> upstream/main
   const bottomViewportInset = useVisualViewportBottomInset();
 
-  // Hide mobile floating buttons when the empty-state "Load IFC" card is showing.
-  const { models, geometryResult } = useIfc();
-  const hasModelsLoaded = models.size > 0 || ((geometryResult?.meshes?.length ?? 0) > 0);
+  // Hide mobile floating buttons when the empty-state "Load IFC" card shows.
+  // A boolean selector, not `useIfc()`: that hook subscribes to `models` and
+  // `geometryResult`, so every geometry update re-rendered the whole layout (#6232).
+  const hasModelsLoaded = useViewerStore(selectHasModelsLoaded);
 
-  // Detect mobile viewport — use both width check AND touch capability
-  useEffect(() => {
-    const checkMobile = () => {
-      const narrowScreen = window.innerWidth < 768;
-      const hasTouchScreen = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-      const mobile = narrowScreen || (hasTouchScreen && window.innerWidth < 1024);
-      setIsMobile(mobile);
-      // Auto-collapse panels on mobile
-      if (mobile) {
-        setLeftPanelCollapsed(true);
-        setRightPanelCollapsed(true);
-      }
-    };
+  // Mobile/desktop mode; collapses the panels only when ENTERING mobile (#5837).
+  useMobileLayoutMode();
 
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
-  }, [setIsMobile, setLeftPanelCollapsed, setRightPanelCollapsed]);
-
-  // Keep DOM class in sync when theme changes (initial class is set by inline script in index.html)
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark');
-    document.documentElement.classList.toggle('colorful', theme === 'colorful');
-  }, [theme]);
-
-
+  useThemeDocumentClass();
   const safeMode = isSafeMode();
-
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex flex-col h-screen h-[100dvh] w-screen overflow-hidden bg-background text-foreground">
+        <ExtensionKeyboardBindings />
+        <ShellStoreEffects />
         {safeMode && (
-          <div className="flex items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1 text-[11px] text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1 text-2xs text-amber-700 dark:text-amber-300">
             <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
             <span>
-              Safe mode: extensions and the active flavor are not loaded for this
-              session. Append <code className="font-mono">?safe=0</code> or reload
-              without the flag to resume.
+              {styleInterpolatedValues(t, 'shellChrome.layout.safeModeNotice', [
+                ['flag', <code key="flag" className="font-mono">{SAFE_MODE_QUERY_FLAG}</code>],
+              ])}
             </span>
           </div>
         )}
-        {/* Keyboard Shortcuts Dialog */}
         <KeyboardShortcutsDialog open={shortcutsDialog.open} onClose={shortcutsDialog.close} initialTab={shortcutsDialog.tab} />
-
-        {/* Global Overlays */}
+        <SettingsDialogHost />
+        <ConfirmDialogHost />
+        {/* Global dialogs above, overlays below */}
         <EntityContextMenu />
         <HoverTooltip />
         <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
         <SearchModal />
         <TourHost />
-
-        {/* Main Toolbar — compact MobileToolbar on mobile; on desktop the
-            user picks classic strip vs tabbed ribbon (issue #1686). */}
+        <FlowStartupPrompt />
+        {/* Trigger-less: this instance exists so the entity context menu's
+            "Export anonymized…" (which only sets `anonymizedExportRequested`,
+            no trigger of its own) has a mounted dialog regardless of whether the export toolbar
+            dropdown is open. Same host pattern as `FlavorDialog` in
+            `StatusBar.tsx`; `toolbar/export-commands.ts` owns the `trigger` one. */}
+        <AnonymizedExportDialog surface="context_menu" />
+        {/* The compact mobile controls and the desktop ribbon share command homes. */}
         {isMobile
           ? <MobileToolbar />
-          : toolbarStyle === 'ribbon'
-            ? <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />
-            : <MainToolbar onShowShortcuts={shortcutsDialog.toggle} />}
+          : <RibbonToolbar onShowShortcuts={shortcutsDialog.toggle} />}
+        <WorkspaceMigrationNotice />
 
         {/* Main Content Area - Desktop Layout */}
         {!isMobile && (
@@ -496,7 +562,7 @@ export function ViewerLayout() {
                   {/* Left Panel - Hierarchy */}
                   <Panel
                     id="left-panel"
-                    defaultSize={22}
+                    defaultSize={LEFT_PANEL_DEFAULT_SIZE}
                     minSize={10}
                     collapsible
                     collapsedSize={0}
@@ -518,6 +584,7 @@ export function ViewerLayout() {
 
                   <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
 
+<<<<<<< HEAD
                   {/* Center - Viewport (nested split: 2D plan | 3D). The 2D
                       Panel is collapsible so ViewportContainer stays mounted. */}
                   <Panel id="viewport-panel" defaultSize={78} minSize={30}>
@@ -567,6 +634,45 @@ export function ViewerLayout() {
                         <DocumentPane />
                       </Panel>
                     </PanelGroup>
+=======
+                  {/* Center - Viewport */}
+                  <Panel id="viewport-panel" defaultSize={100 - LEFT_PANEL_DEFAULT_SIZE} minSize={30}>
+                    {/* data-floating-snap-bounds: edge-docked floating panels
+                        (#1201) snap to THIS region, not the whole window, so a
+                        dock never hides under the toolbar (its own close control
+                        with it) or over the hierarchy / sidebar (#1245). */}
+                    <div data-floating-snap-bounds className="h-full w-full overflow-hidden relative flex">
+                      {/* Model workspace (#6232): its tool rail, then the Plan ‖ 3D split. */}
+                      <ModelToolRail />
+                      <ModelWorkspaceSplit>
+                      {sideBySideDrawing ? (
+                        // Side-by-side 2D/3D preset (#5515): the drawing docks
+                        // beside the 3D view instead of below it, in its own
+                        // resizable split — same docked BottomStrip instance
+                        // (tabs, maximize, close), just placed here instead of
+                        // spanning the strip below.
+                        <PanelGroup orientation="horizontal" className="h-full w-full">
+                          <Panel id="viewport-3d-panel" defaultSize="60%" minSize="20%">
+                            <ViewportContainer />
+                          </Panel>
+                          <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
+                          <Panel id="drawing-side-panel" defaultSize="40%" minSize="20%">
+                            <BottomStrip
+                              dockedPanel={dockedBottomPanel}
+                              analysisExtension={null}
+                              containerRef={containerRef}
+                              closePanel={closePanel}
+                              orientation="side"
+                              onToggleOrientation={toggleStripOrientation}
+                            />
+                          </Panel>
+                        </PanelGroup>
+                      ) : (
+                        <ViewportContainer />
+                      )}
+                      </ModelWorkspaceSplit>
+                    </div>
+>>>>>>> upstream/main
                   </Panel>
                 </PanelGroup>
               </div>
@@ -575,36 +681,17 @@ export function ViewerLayout() {
               <SidebarDock />
             </div>
 
-            {/* Bottom Panel - Lists / Script / Gantt / analysis ext (custom resizable).
-                Launched from the sidebar rail but docked here (their home region).
-                A panel that's been dragged out to float / another screen is skipped. */}
-            {(listDocked || scriptDocked || ganttDocked || !!activeBottomAnalysisExtension) && (
-              <div data-detach-root style={{ height: bottomHeight, flexShrink: 0 }} className="relative">
-                {/* Drag handle (resize height) */}
-                <div
-                  className="absolute inset-x-0 top-0 h-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-row-resize z-10"
-                  onMouseDown={handleResizeStart}
-                />
-                <div className="h-full w-full overflow-hidden border-t pt-1.5 flex flex-col">
-                  {/* Detach grip — drag to float / pop the bottom panel onto another
-                      screen (hidden for analysis extensions, which own their chrome). */}
-                  {!activeBottomAnalysisExtension && (
-                    <BottomPanelGrip id={ganttDocked ? 'gantt' : scriptDocked ? 'script' : 'lists'} />
-                  )}
-                  <div className="flex-1 min-h-0 overflow-hidden">
-                    {activeBottomAnalysisExtension ? (
-                      activeBottomAnalysisExtension.renderPanel({ onClose: closeActiveAnalysisExtension })
-                    ) : ganttDocked ? (
-                      <GanttPanel onClose={() => setGanttPanelVisible(false)} />
-                    ) : scriptDocked ? (
-                      <ScriptPanel onClose={() => setScriptPanelVisible(false)} />
-                    ) : (
-                      <ListPanel onClose={() => setListPanelVisible(false)} />
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
+            {/* Bottom strip — Schedule / Script / Lists / analysis ext. Launched from the
+                sidebar rail but docked here (their home region); a panel dragged out to
+                float / another screen, or side-by-side (#5515), is skipped. */}
+            <BottomStrip
+              dockedPanel={sideBySideDrawing ? null : dockedBottomPanel}
+              analysisExtension={activeBottomAnalysisExtension}
+              containerRef={containerRef}
+              closePanel={closePanel}
+              orientation="bottom"
+              onToggleOrientation={toggleStripOrientation}
+            />
 
             {/* Floating / docked workspace-panel windows (#1201) */}
             <FloatingPanelHost />
@@ -641,8 +728,8 @@ export function ViewerLayout() {
 
             {/* Backdrop overlay when sheet is open */}
             {(!leftPanelCollapsed || !rightPanelCollapsed) && (
-              <div
-                className="absolute inset-0 bg-black/40 z-30 animate-in fade-in duration-200"
+              <button type="button" aria-label={t('shellChrome.layout.closePanelsAriaLabel')}
+                className="absolute inset-0 z-30 border-0 bg-black/40 p-0 animate-in fade-in duration-200"
                 onClick={() => {
                   setLeftPanelCollapsed(true);
                   setRightPanelCollapsed(true);
@@ -653,7 +740,7 @@ export function ViewerLayout() {
             {/* Mobile Bottom Sheet - Hierarchy */}
             {!leftPanelCollapsed && (
               <MobileBottomSheet
-                title="Hierarchy"
+                title={t('shellChrome.layout.hierarchyLabel')}
                 bottomInset={bottomViewportInset}
                 onClose={() => setLeftPanelCollapsed(true)}
               >
@@ -661,6 +748,7 @@ export function ViewerLayout() {
               </MobileBottomSheet>
             )}
 
+<<<<<<< HEAD
             {/* Mobile Bottom Sheet - Properties, BCF, IDS, or Lists */}
             {!rightPanelCollapsed && (
               <MobileBottomSheet
@@ -710,39 +798,15 @@ export function ViewerLayout() {
                 )}
               </MobileBottomSheet>
             )}
+=======
+            {/* Mobile Bottom Sheet — whichever single panel is open (`MobilePanelSheet`). */}
+            <MobilePanelSheet bottomInset={bottomViewportInset} analysisExtension={activeAnalysisExtension ?? null} />
+>>>>>>> upstream/main
 
-            {/* Mobile Floating Buttons — top-left, brutalist vocabulary (tight radii, visible
-                borders, uppercase caption) matching panel headers across the app.
-                Hidden in the empty state so the "Load IFC" card stays unobstructed. */}
+            {/* Mobile Floating Buttons: Hierarchy, Properties and the Panels list
+                (#5853). Hidden in the empty state so the "Load IFC" card stays unobstructed. */}
             {leftPanelCollapsed && rightPanelCollapsed && hasModelsLoaded && (
-              <div className="absolute top-4 left-4 flex flex-col gap-2.5 z-20">
-                <button
-                  className="flex flex-col items-center gap-1 group touch-manipulation"
-                  onClick={() => {
-                    setRightPanelCollapsed(true);
-                    setLeftPanelCollapsed(false);
-                  }}
-                  aria-label="Open Hierarchy"
-                >
-                  <span className="grid place-items-center min-h-[44px] min-w-[44px] bg-background/90 backdrop-blur-sm border border-border rounded-md group-active:bg-foreground group-active:text-background transition-colors">
-                    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h10M4 18h7" /></svg>
-                  </span>
-                  <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground leading-none">Hierarchy</span>
-                </button>
-                <button
-                  className="flex flex-col items-center gap-1 group touch-manipulation"
-                  onClick={() => {
-                    setLeftPanelCollapsed(true);
-                    setRightPanelCollapsed(false);
-                  }}
-                  aria-label="Open Properties"
-                >
-                  <span className="grid place-items-center min-h-[44px] min-w-[44px] bg-background/90 backdrop-blur-sm border border-border rounded-md group-active:bg-foreground group-active:text-background transition-colors">
-                    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
-                  </span>
-                  <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground leading-none">Properties</span>
-                </button>
-              </div>
+              <MobilePanelLauncher bottomInset={bottomViewportInset} />
             )}
           </div>
         )}
@@ -765,6 +829,7 @@ export function ViewerLayout() {
     </TooltipProvider>
   );
 }
+<<<<<<< HEAD
 
 /**
  * Tracks the gap between the layout viewport (innerHeight) and the visual viewport.
@@ -951,3 +1016,5 @@ function MobileBottomSheet({
     </div>
   );
 }
+=======
+>>>>>>> upstream/main

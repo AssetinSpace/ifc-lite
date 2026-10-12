@@ -4,10 +4,11 @@
 
 import { ToolRegistry } from './types.js';
 import { discoveryTools } from './discovery.js';
-import { queryTools } from './query.js';
+import { queryTools } from './query-tools.js';
 import { geometryTools } from './geometry.js';
 import { clashTools } from './clash.js';
 import { validationTools } from './validation.js';
+import { checkRulesTools } from './check-rules.js';
 import { mutationTools } from './mutate.js';
 import { bcfTools } from './bcf.js';
 import { bsddTools } from './bsdd.js';
@@ -16,6 +17,12 @@ import { exportTools } from './export.js';
 import { viewerTools } from './viewer.js';
 import { draftLayerTools } from './layer.js';
 import { layerReviewTools } from './layer-review.js';
+import { costTools } from './cost.js';
+import { structuralTools } from './structural.js';
+import { flowTools } from './flow.js';
+import { idsAuthoringTools } from './ids-authoring.js';
+import { idsAuthoringModelTools } from './ids-authoring-model.js';
+import { idsSchemaTools } from './ids-schema.js';
 
 /** Agent draft-layer family (06-agents.md): draft lifecycle + review loop. */
 export const layerTools = [...draftLayerTools, ...layerReviewTools];
@@ -29,12 +36,19 @@ export {
   geometryTools,
   clashTools,
   validationTools,
+  checkRulesTools,
   mutationTools,
   bcfTools,
   bsddTools,
   diffTools,
   exportTools,
   viewerTools,
+  costTools,
+  structuralTools,
+  flowTools,
+  idsAuthoringTools,
+  idsAuthoringModelTools,
+  idsSchemaTools,
 };
 export { resetLayerWorkspace, getLayerWorkspace, disposeLayerWorkspace } from './layer-store.js';
 
@@ -50,12 +64,19 @@ export function buildDefaultToolRegistry(): ToolRegistry {
   registry.registerAll(geometryTools);
   registry.registerAll(clashTools);
   registry.registerAll(validationTools);
+  registry.registerAll(checkRulesTools);
   registry.registerAll(mutationTools);
   registry.registerAll(bcfTools);
   registry.registerAll(bsddTools);
   registry.registerAll(diffTools);
   registry.registerAll(exportTools);
   registry.registerAll(viewerTools);
+  registry.registerAll(costTools);
+  registry.registerAll(structuralTools);
+  registry.registerAll(flowTools);
+  registry.registerAll(idsAuthoringTools);
+  registry.registerAll(idsAuthoringModelTools);
+  registry.registerAll(idsSchemaTools);
   registry.registerAll(layerTools);
   return registry;
 }

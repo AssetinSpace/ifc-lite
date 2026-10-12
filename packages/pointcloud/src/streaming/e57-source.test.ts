@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, it, expect } from 'vitest';
-import { E57StreamingSource } from './e57-source.js';
+import { E57StreamingSource, inspectE57SpatialMetadata } from './e57-source.js';
 import { decodeE57 } from '../formats/e57.js';
 import { logicalToPhysical, physicalToLogical } from '../formats/e57-page.js';
 import type { DecodedPointChunk } from '../types.js';
@@ -65,8 +65,12 @@ function buildDataPackets(points: TestPoint[], pointsPerPacket: number): Uint8Ar
 
 /** Inflate a logical byte stream into the physical (CRC-paged) form —
  *  the exact inverse of `stripPageCrc`. CRC tails are left zeroed (the
- *  decoder never validates them). */
-function inflateToPhysical(logical: Uint8Array, pageSize: number): Uint8Array {
+ *  decoder never validates them).
+ *
+ *  The return type is pinned to `Uint8Array<ArrayBuffer>` (not the default
+ *  `ArrayBufferLike`) because the result is handed straight to `new Blob([…])`,
+ *  and `BlobPart` excludes `SharedArrayBuffer`-backed views. */
+function inflateToPhysical(logical: Uint8Array, pageSize: number): Uint8Array<ArrayBuffer> {
   const payloadPerPage = pageSize - 4;
   const fullPages = Math.floor(logical.length / payloadPerPage);
   const tail = logical.length - fullPages * payloadPerPage;
@@ -82,7 +86,18 @@ function inflateToPhysical(logical: Uint8Array, pageSize: number): Uint8Array {
 /** Build a complete, CRC-paged single-scan E57 file as a Blob. */
 function buildE57(
   points: TestPoint[],
-  opts: { pageSize?: number; pointsPerPacket?: number; emptyData3D?: boolean } = {},
+  opts: {
+    pageSize?: number;
+    pointsPerPacket?: number;
+    emptyData3D?: boolean;
+    /** Per-scan pose (rotation + translation), E57 §7.2.2. */
+    pose?: { rotation: [number, number, number, number]; translation: [number, number, number] };
+    /** Drop the `coordinateMetadata` element entirely (genuinely non-georeferenced file). */
+    omitCoordinateMetadata?: boolean;
+    /** Override the XML `recordCount` attribute independent of `points.length`,
+     *  to simulate a scan whose binary section under-delivers what it declares. */
+    recordCountOverride?: number;
+  } = {},
 ): {
   blob: Blob;
   physical: Uint8Array;
@@ -101,12 +116,25 @@ function buildE57(
       + `<colorGreen type="Integer" minimum="0" maximum="255"/>`
       + `<colorBlue type="Integer" minimum="0" maximum="255"/>`
     : '';
+  const poseXml = opts.pose
+    ? `<pose type="Structure">`
+      + `<rotation type="Structure"><w type="Float">${opts.pose.rotation[0]}</w>`
+      + `<x type="Float">${opts.pose.rotation[1]}</x><y type="Float">${opts.pose.rotation[2]}</y>`
+      + `<z type="Float">${opts.pose.rotation[3]}</z></rotation>`
+      + `<translation type="Structure"><x type="Float">${opts.pose.translation[0]}</x>`
+      + `<y type="Float">${opts.pose.translation[1]}</y><z type="Float">${opts.pose.translation[2]}</z></translation>`
+      + `</pose>`
+    : '';
+  const coordinateMetadataXml = opts.omitCoordinateMetadata
+    ? ''
+    : `<coordinateMetadata type="String">PROJCRS["LV95",ID["EPSG",2056]],VERTCRS["LN02",ID["EPSG",5729]]</coordinateMetadata>`;
   const xml = `<?xml version="1.0" encoding="UTF-8"?>`
     + `<e57Root type="Structure">`
+    + coordinateMetadataXml
     + `<data3D type="Vector">`
     + (opts.emptyData3D ? '' : `<vectorChild type="Structure">`
       + `<guid type="String">{scan-1}</guid>`
-      + `<points type="CompressedVector" fileOffset="${logicalToPhysical(sectionLogicalOffset, pageSize)}" recordCount="${points.length}">`
+      + `<points type="CompressedVector" fileOffset="${logicalToPhysical(sectionLogicalOffset, pageSize)}" recordCount="${opts.recordCountOverride ?? points.length}">`
       + `<prototype type="Structure">`
       + `<cartesianX type="Float" precision="single"/>`
       + `<cartesianY type="Float" precision="single"/>`
@@ -114,6 +142,7 @@ function buildE57(
       + colorProto
       + `</prototype>`
       + `</points>`
+      + poseXml
       + `</vectorChild>`)
     + `</data3D>`
     + `</e57Root>`;
@@ -249,6 +278,100 @@ describe('E57StreamingSource', () => {
     points.push({ x: i * 0.5, y: i * 0.25 - 5, z: -i, r: i % 256, g: (i * 2) % 256, b: (i * 3) % 256 });
   }
 
+  it('publishes declared coordinateMetadata before the first point chunk (#5048)', async () => {
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8 });
+    const info = await new E57StreamingSource(blob).open();
+    expect(info.spatialMetadata).toEqual({
+      horizontalId: 'EPSG:2056', verticalId: 'EPSG:5729',
+      wkt: 'PROJCRS["LV95",ID["EPSG",2056]],VERTCRS["LN02",ID["EPSG",5729]]',
+      provenance: 'E57 coordinateMetadata',
+    });
+  });
+
+  it('preflights CRS metadata without decoding a point chunk (#5048)', async () => {
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8 });
+    await expect(inspectE57SpatialMetadata(blob)).resolves.toEqual({
+      horizontalId: 'EPSG:2056', verticalId: 'EPSG:5729',
+      wkt: 'PROJCRS["LV95",ID["EPSG",2056]],VERTCRS["LN02",ID["EPSG",5729]]',
+      provenance: 'E57 coordinateMetadata',
+    });
+  });
+
+  it('cancels E57 CRS preflight before opening a bounded XML read (#5048)', async () => {
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8 });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(inspectE57SpatialMetadata(blob, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('refuses a hostile declared XML length before allocating or decoding (#5048)', async () => {
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8 });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    // Header is inside page 0, and xmlLogicalLength is u64 at byte 32.
+    new DataView(bytes.buffer).setBigUint64(32, 1024n * 1024n * 1024n, true);
+    await expect(inspectE57SpatialMetadata(new Blob([bytes]))).rejects.toThrow('safety limit');
+  });
+
+  it('a complete file with genuinely no coordinateMetadata returns undefined quietly (#5203 pin ii)', async () => {
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8, omitCoordinateMetadata: true });
+    await expect(inspectE57SpatialMetadata(blob)).resolves.toBeUndefined();
+    const info = await new E57StreamingSource(blob).open();
+    expect(info.spatialMetadata).toBeUndefined();
+  });
+
+  describe('#5203 — truncated E57 must report truncation, not "no CRS"', () => {
+    // A single, large page keeps physical byte offsets identical to
+    // logical ones (no CRC-page interleaving to account for), so the
+    // truncation point can be found by a plain string search on the
+    // decoded physical bytes — mirroring the issue's executed repro.
+    function buildTruncatedBeforeClosingTag(cutBytesBeforeTag: number) {
+      const { physical } = buildE57(points, { pageSize: 8192, pointsPerPacket: 8 });
+      const text = new TextDecoder().decode(physical);
+      const closeIdx = text.indexOf('</coordinateMetadata>');
+      expect(closeIdx).toBeGreaterThan(0);
+      const truncatedLen = closeIdx - cutBytesBeforeTag;
+      expect(truncatedLen).toBeGreaterThan(0);
+      const truncatedPhysical = physical.slice(0, truncatedLen);
+      // Sanity: the header still declares the FULL original logical size —
+      // exactly the "declared 1024, blob.size 203" shape from the issue.
+      expect(truncatedPhysical.length).toBeLessThan(physical.length);
+      return new Blob([truncatedPhysical]);
+    }
+
+    it('inspectE57SpatialMetadata throws, naming expected vs. actual bytes, on a truncated blob', async () => {
+      const blob = buildTruncatedBeforeClosingTag(10);
+      await expect(inspectE57SpatialMetadata(blob)).rejects.toThrow(/truncated/i);
+      await expect(inspectE57SpatialMetadata(blob)).rejects.toThrow(/expects \d+ bytes.*got \d+/is);
+    });
+
+    it('E57StreamingSource.open() throws the same truncation error, not a silent CRS drop', async () => {
+      const blob = buildTruncatedBeforeClosingTag(10);
+      await expect(new E57StreamingSource(blob).open()).rejects.toThrow(/truncated/i);
+    });
+
+    it('a complete file with a CRS still returns it (no false positive from the guard)', async () => {
+      const blob = buildTruncatedBeforeClosingTag(10);
+      // Control: the SAME builder, undamaged, must still resolve the CRS —
+      // proves the truncation guard doesn't fire on a healthy read.
+      const { blob: fullBlob } = buildE57(points, { pageSize: 8192, pointsPerPacket: 8 });
+      expect(blob.size).toBeLessThan(fullBlob.size);
+      await expect(inspectE57SpatialMetadata(fullBlob)).resolves.toMatchObject({
+        horizontalId: 'EPSG:2056',
+        provenance: 'E57 coordinateMetadata',
+      });
+    });
+  });
+
+  it('tolerates a scan whose declared recordCount exceeds what the binary section backs — unchanged by #5203 (point-data reads stay non-strict)', async () => {
+    // Mirrors the documented policy this fix must NOT disturb: an
+    // over-reported recordCount on the point-data path trims output
+    // instead of throwing. Only the XML metadata reads became strict.
+    const { blob } = buildE57(points, { pageSize: 256, pointsPerPacket: 8, recordCountOverride: points.length + 500 });
+    const src = new E57StreamingSource(blob);
+    const chunks = await drain(src, 200_000);
+    expect(totalPoints(chunks)).toBe(points.length);
+  });
+
   it('streams positions + colours identical to the whole-file decoder', async () => {
     const { blob, physical } = buildE57(points, { pageSize: 256, pointsPerPacket: 8 });
     const reference = decodeE57(physical);
@@ -381,5 +504,73 @@ describe('E57StreamingSource', () => {
     const { blob } = buildE57([], { pageSize: 256, emptyData3D: true });
     const src = new E57StreamingSource(blob);
     await expect(src.open()).rejects.toThrow(/no Data3D scans/);
+  });
+});
+
+describe('E57StreamingSource originOffset (extends #1804 to E57)', () => {
+  // Survey/GNSS-scale coordinates — the exact case an E57 without a scan
+  // pose (a single unregistered absolute-coordinate export) carries.
+  const surveyPoints: TestPoint[] = [
+    { x: 500_012.345, y: 5_000_006.789, z: 104.321 },
+    { x: 500_013.5, y: 5_000_007.25, z: 105.0 },
+  ];
+
+  it('matches the whole-file decoder with the same originOffset, no pose', async () => {
+    const { blob, physical } = buildE57(surveyPoints, { pageSize: 256, pointsPerPacket: 8 });
+    const originOffset: readonly [number, number, number] = [500_000, 5_000_000, 100];
+    const reference = decodeE57(physical, originOffset)!;
+    expect(reference).not.toBeNull();
+
+    const src = new E57StreamingSource(blob, { originOffset });
+    const chunks = await drain(src, 200_000);
+    expect(mergePositions(chunks)).toEqual(Array.from(reference.positions));
+    // And it's actually small (offset applied), not raw ~5e5/5e6 magnitude.
+    expect(Math.abs(mergePositions(chunks)[0])).toBeLessThan(100);
+  });
+
+  it('composes originOffset with a per-scan pose the same as the whole-file decoder', async () => {
+    // Local (scan-frame) cartesian small; pose translation carries the scan
+    // to survey-scale — the case that exercises the pose/offset interaction.
+    const localPoints: TestPoint[] = [{ x: 1, y: 2, z: 3 }, { x: -1, y: 0, z: 5 }];
+    const { blob, physical } = buildE57(localPoints, {
+      pageSize: 256,
+      pointsPerPacket: 8,
+      pose: {
+        rotation: [Math.SQRT1_2, 0, 0, Math.SQRT1_2], // 90° about Z
+        translation: [500_012.345, 5_000_006.789, 104.321],
+      },
+    });
+    const originOffset: readonly [number, number, number] = [500_000, 5_000_000, 100];
+
+    const reference = decodeE57(physical, originOffset)!;
+    expect(reference).not.toBeNull();
+    // Small residual, not survey-scale — proves the offset landed on the
+    // translation (post-rotation), not naively on the pre-rotation local
+    // cartesian.
+    expect(Math.abs(reference.positions[0])).toBeLessThan(100);
+
+    const src = new E57StreamingSource(blob, { originOffset });
+    const chunks = await drain(src, 200_000);
+    expect(mergePositions(chunks)).toEqual(Array.from(reference.positions));
+
+    // And matches decodeE57's un-offset positions minus the offset exactly
+    // in shape: streamed-with-offset + offset ≈ streamed-without-offset.
+    const srcNoOffset = new E57StreamingSource(blob);
+    const chunksNoOffset = await drain(srcNoOffset, 200_000);
+    const withOff = mergePositions(chunks);
+    const withoutOff = mergePositions(chunksNoOffset);
+    for (let i = 0; i < withOff.length; i += 3) {
+      expect(withOff[i] + originOffset[0]).toBeCloseTo(withoutOff[i], 0);
+      expect(withOff[i + 1] + originOffset[1]).toBeCloseTo(withoutOff[i + 1], 0);
+      expect(withOff[i + 2] + originOffset[2]).toBeCloseTo(withoutOff[i + 2], 0);
+    }
+  });
+
+  it('absent originOffset is bit-identical to today (undefined default)', async () => {
+    const { blob: blobA } = buildE57(surveyPoints, { pageSize: 256, pointsPerPacket: 8 });
+    const { blob: blobB } = buildE57(surveyPoints, { pageSize: 256, pointsPerPacket: 8 });
+    const a = await drain(new E57StreamingSource(blobA), 200_000);
+    const b = await drain(new E57StreamingSource(blobB, { originOffset: undefined }), 200_000);
+    expect(mergePositions(a)).toEqual(mergePositions(b));
   });
 });

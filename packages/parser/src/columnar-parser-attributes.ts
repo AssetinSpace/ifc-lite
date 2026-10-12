@@ -11,6 +11,20 @@
 
 import type { EntityRef } from './types.js';
 import { decodeIfcString } from '@ifc-lite/encoding';
+import { isIndexableExpressId } from './express-id.js';
+import { opensComment, skipComment, skipTrivia } from './step-lexing.js';
+import { EntityExtractor } from './entity-extractor.js';
+import { getRootAttrIndices } from './columnar-parser-root-attributes.js';
+
+/** Does `ref`'s byte range contain a `/*` comment opener? Cheap linear scan,
+ *  only run on a record `findQuotedAttrRange` already failed to read. */
+function hasCommentOpener(buffer: Uint8Array, ref: EntityRef): boolean {
+    const end = ref.byteOffset + ref.byteLength - 1;
+    for (let p = ref.byteOffset; p < end; p++) {
+        if (buffer[p] === 0x2f && buffer[p + 1] === 0x2a) return true;
+    }
+    return false;
+}
 
 /**
  * Find the byte range of a quoted string at a specific attribute position in STEP entity bytes.
@@ -58,8 +72,12 @@ export function findQuotedAttrRange(
 
     // Skip whitespace — including \n/\r: STEP records may wrap attributes
     // across source lines, so a quoted attr can start on a new line
-    // (schependomlaan storey/covering-type names).
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // (schependomlaan storey/covering-type names). Form feed (0x0C) and
+    // vertical tab (0x0B) are included too, kept in sync with isSpaceByte
+    // in step-lexing.ts (#3733): without them, a GlobalId/Name preceded by
+    // either byte silently fails to match here and this function returns
+    // null, the same drop shape the entity scanners had.
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
 
     // Check for quoted string
     if (pos >= end || buffer[pos] !== 0x27 /* ' */) return null;
@@ -80,7 +98,59 @@ export function findQuotedAttrRange(
 }
 
 /**
+ * True unless the attribute at `attrIndex` is the IFC "not present" token
+ * `$`. False (not true) when the record's attribute list is too short to
+ * reach `attrIndex` at all, matching how `entity.get(N).is_some_and(|a|
+ * !a.is_null())` reads a missing attribute on the Rust export side
+ * (`rust/export/src/model.rs`) — an absent slot means "no value", not
+ * "assume present".
+ *
+ * Used for `Representation` (index 6) on `IfcProduct` descendants: GlobalId,
+ * OwnerHistory, Name, Description, ObjectType, ObjectPlacement,
+ * Representation — `IfcProduct` is the last ancestor in the chain to declare
+ * an attribute before this one, so every subtype (`IfcElement`, `IfcWall`,
+ * `IfcBuildingElementProxy`, `IfcSpatialElement`, …) inherits `Representation`
+ * at this exact position; subtypes only append attributes after it. Callers
+ * are responsible for only calling this on an `IfcProduct` descendant.
+ *
+ * ISO 10303-21 allows a `/* ... *\/` comment anywhere whitespace is legal,
+ * including between attributes and right before the target value — a
+ * comma inside an earlier comment must not count as a delimiter either, or
+ * the scan lands on the wrong slot entirely. Both `skipCommas` (below) and
+ * the final approach to `attrIndex` use `step-lexing.ts`'s comment-aware
+ * `skipTrivia`/`opensComment`/`skipComment` — the same helpers the
+ * tokenizer uses — rather than a second, partial comment lexer: a raw
+ * six-byte whitespace test here previously read `,/* omitted *\/$,` as
+ * landing ON the `/` and reported the attribute present (#4725 review).
+ */
+export function hasAttrValueAt(
+    buffer: Uint8Array,
+    entityStart: number,
+    entityLen: number,
+    attrIndex: number,
+): boolean {
+    const end = entityStart + entityLen;
+    let pos = entityStart;
+    while (pos < end && buffer[pos] !== 0x28 /* ( */) pos++;
+    if (pos >= end) return false;
+    pos++; // skip '('
+    pos = skipCommas(buffer, pos, end, attrIndex);
+    const trivia = skipTrivia(buffer, pos, end);
+    pos = trivia.next;
+    if (trivia.stop || pos >= end) return false;
+    return buffer[pos] !== 0x24 /* $ */;
+}
+
+/**
  * Skip N commas at depth 0 in STEP bytes.
+ *
+ * Comment-aware: a `/* ... *\/` comment is legal wherever whitespace is
+ * legal in a record's attribute list, so a comma or quote INSIDE one must
+ * not be read as a delimiter or a string opener. Comments are skipped
+ * whole via `step-lexing.ts`'s `opensComment`/`skipComment` (the same
+ * comment scanner the tokenizer uses) before the comma/paren/quote checks
+ * run, so `(...,#165,/* a, b *\/$,...)` still lands the `$` at the slot
+ * right after `#165`, not one early from the comma inside the comment.
  */
 export function skipCommas(buffer: Uint8Array, start: number, end: number, count: number): number {
     let pos = start;
@@ -89,14 +159,21 @@ export function skipCommas(buffer: Uint8Array, start: number, end: number, count
     let inString = false;
     while (pos < end && remaining > 0) {
         const ch = buffer[pos];
-        if (ch === 0x27) {
-            if (inString && pos + 1 < end && buffer[pos + 1] === 0x27) { pos += 2; continue; }
-            inString = !inString;
-        } else if (!inString) {
-            if (ch === 0x28) depth++;
-            else if (ch === 0x29) depth--;
-            else if (ch === 0x2C && depth === 0) remaining--;
+        if (inString) {
+            if (ch === 0x27 && pos + 1 < end && buffer[pos + 1] === 0x27) { pos += 2; continue; }
+            if (ch === 0x27) inString = false;
+            pos++;
+            continue;
         }
+        if (ch === 0x27) { inString = true; pos++; continue; }
+        if (opensComment(buffer, pos, end)) {
+            const next = skipComment(buffer, pos, end);
+            pos = next < 0 ? end : next;
+            continue;
+        }
+        if (ch === 0x28) depth++;
+        else if (ch === 0x29) depth--;
+        else if (ch === 0x2C && depth === 0) remaining--;
         pos++;
     }
     return pos;
@@ -104,7 +181,10 @@ export function skipCommas(buffer: Uint8Array, start: number, end: number, count
 
 /** Read a #ID entity reference as a number. Returns -1 if not an entity ref. */
 export function readRefId(buffer: Uint8Array, pos: number, end: number): [number, number] {
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // Kept in sync with isSpaceByte in step-lexing.ts (#3733): form feed
+    // (0x0C) and vertical tab (0x0B) are legal separators too, or a ref
+    // preceded by either silently reads as "no reference here" (-1).
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
     if (pos < end && buffer[pos] === 0x23) {
         pos++;
         let num = 0;
@@ -112,6 +192,26 @@ export function readRefId(buffer: Uint8Array, pos: number, end: number): [number
             num = num * 10 + (buffer[pos] - 0x30);
             pos++;
         }
+        // `num * 10 + digit` overflows to Infinity only past ~309 digits, but
+        // it stops meaning anything long before that: doubles lose integer
+        // precision past 2^53 (~16 digits), so `#100000000000000001` and
+        // `#100000000000000002` accumulate to the SAME value, and the 32-bit
+        // express-id columns below truncate anything above 2^32 so that
+        // `#4294967297` lands on `#1`. `isIndexableExpressId` is the single
+        // home for that bound (express-id.ts, #3395).
+        // Guarding at each accumulator (here, and both `StepTokenizer` scans,
+        // and the inline scan worker) rather than only when the entity is
+        // extracted: this is the byte-level path that builds the
+        // property/relationship indexes, so an unguarded overflow here keyed a
+        // pset under a record the entity index had already refused —
+        // `extractPropertiesOnDemand(store, Infinity)` returned a real pset for
+        // an entity whose own GlobalId and Name were unreadable.
+        //
+        // `-1` is this function's existing "no reference here" sentinel and
+        // every caller already tests it (`if (relating < 0) return null`,
+        // `if (id >= 0) ids.push(id)`). `pos` is still returned advanced past
+        // the digits so scanning continues from the right place.
+        if (!isIndexableExpressId(num)) return [-1, pos];
         return [num, pos];
     }
     return [-1, pos];
@@ -119,13 +219,14 @@ export function readRefId(buffer: Uint8Array, pos: number, end: number): [number
 
 /** Read a list of entity refs (#id1,#id2,...) or a single #id. Returns [ids, newPos]. */
 export function readRefList(buffer: Uint8Array, pos: number, end: number): [number[], number] {
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D)) pos++;
+    // Kept in sync with isSpaceByte in step-lexing.ts (#3733).
+    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
     const ids: number[] = [];
 
     if (pos < end && buffer[pos] === 0x28) {
         pos++;
         while (pos < end && buffer[pos] !== 0x29) {
-            while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x2C)) pos++;
+            while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B || buffer[pos] === 0x2C)) pos++;
             if (pos < end && buffer[pos] === 0x23) {
                 const [id, np] = readRefId(buffer, pos, end);
                 if (id >= 0) ids.push(id);
@@ -143,7 +244,7 @@ export function readRefList(buffer: Uint8Array, pos: number, end: number): [numb
 }
 
 /**
- * Batch extract GlobalId (attr[0]) and Name (attr[2]) for many entities using
+ * Batch extract schema-declared GlobalId and Name for many entities using
  * only 2 TextDecoder.decode() calls total (one for all GlobalIds, one for all Names).
  *
  * This is ~100x faster than calling extractEntity() per entity for large batches
@@ -155,14 +256,21 @@ export async function batchExtractGlobalIdAndName(
     buffer: Uint8Array,
     refs: EntityRef[],
     yieldIfNeeded?: () => Promise<void>,
-): Promise<Map<number, { globalId: string; name: string }>> {
-    const result = new Map<number, { globalId: string; name: string }>();
+): Promise<Map<number, { globalId: string; name: string | undefined }>> {
+    const result = new Map<number, { globalId: string; name: string | undefined }>();
     if (refs.length === 0) return result;
     const CHUNK_SIZE = 2048;
 
     // Phase 1: Scan byte ranges for GlobalId and Name positions (no string allocation)
     const gidRanges: Array<[number, number]> = []; // [start, end) for each entity
     const nameRanges: Array<[number, number]> = [];
+    // `null` ($) vs `[start, start]` ('') both concatenate to zero bytes
+    // below, so capture the distinction here before it's lost (#4930).
+    const nameFound: boolean[] = [];
+    // `findQuotedAttrRange` has no `/* … */` trivia skip (pre-existing, both
+    // attrs), so a comment before GlobalId/Name is a false miss here — flag
+    // it for the slow-path re-parse below rather than trusting `null`.
+    const commentSuspect: boolean[] = [];
     const validIndices: number[] = []; // indices into refs for entities with valid ranges
 
     for (let i = 0; i < refs.length; i++) {
@@ -170,11 +278,19 @@ export async function batchExtractGlobalIdAndName(
             await yieldIfNeeded();
         }
         const ref = refs[i];
-        const gidRange = findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, 0);
-        const nameRange = findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, 2);
+        const schema = getRootAttrIndices(ref.type);
+        // Known roots keep the same 0/2 fast path. Known non-roots must not
+        // project Name as GlobalId; unknown vendor types retain the existing
+        // explicit IfcRoot-position policy used by on-demand extraction.
+        const gidIndex = schema.known ? schema.globalId : 0;
+        const nameIndex = schema.known ? schema.name : 2;
+        const gidRange = gidIndex < 0 ? null : findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, gidIndex);
+        const nameRange = nameIndex < 0 ? null : findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, nameIndex);
 
         gidRanges.push(gidRange ?? [0, 0]);
         nameRanges.push(nameRange ?? [0, 0]);
+        nameFound.push(nameRange !== null);
+        commentSuspect.push(((gidIndex >= 0 && gidRange === null) || (nameIndex >= 0 && nameRange === null)) && hasCommentOpener(buffer, ref));
         validIndices.push(i);
     }
 
@@ -237,7 +353,25 @@ export async function batchExtractGlobalIdAndName(
         // name like `John''s Wall` would render with the literal doubled quote.
         result.set(ref.expressId, {
             globalId: gids[i] || '',
-            name: rawName ? decodeIfcString(rawName.replace(/''/g, "'")) : '',
+            name: nameFound[i]
+                ? (rawName ? decodeIfcString(rawName.replace(/''/g, "'")) : '')
+                : undefined,
+        });
+    }
+
+    // Phase 5: re-parse the (rare) comment-blind misses with the real
+    // tokenizer instead of trusting the fast path's false "absent".
+    let fallback: EntityExtractor | undefined;
+    for (let i = 0; i < validIndices.length; i++) {
+        if (!commentSuspect[i]) continue;
+        const ref = refs[validIndices[i]];
+        const attrs = (fallback ??= new EntityExtractor(buffer)).extractEntity(ref)?.attributes ?? [];
+        const schema = getRootAttrIndices(ref.type);
+        const globalId = attrs[schema.known ? schema.globalId : 0];
+        const name = attrs[schema.known ? schema.name : 2];
+        result.set(ref.expressId, {
+            globalId: typeof globalId === 'string' ? globalId : '',
+            name: typeof name === 'string' ? name : undefined,
         });
     }
 

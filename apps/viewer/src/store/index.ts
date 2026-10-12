@@ -2,16 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Combined Zustand store for viewer state
- *
- * This file combines all domain-specific slices into a single store.
- * Each slice manages a specific domain of state (loading, selection, etc.)
- */
+/** Combined Zustand store. Domain slices own their state and actions. */
 
+import { registerWorkflowArtifactInvalidation } from '../lib/flow/artifact-lifetime.js';
+import { createAppearanceSlice, type AppearanceSlice } from './slices/appearanceSlice.js';
 import { create } from 'zustand';
-
-// Import slices
+import { createViewerActions, type ViewerActions } from './createViewerActions.js';
 import { createLoadingSlice, type LoadingSlice } from './slices/loadingSlice.js';
 import { createSelectionSlice, type SelectionSlice } from './slices/selectionSlice.js';
 import { createVisibilitySlice, type VisibilitySlice } from './slices/visibilitySlice.js';
@@ -19,30 +15,47 @@ import { createUISlice, type UISlice } from './slices/uiSlice.js';
 import { createHoverSlice, type HoverSlice } from './slices/hoverSlice.js';
 import { createCameraSlice, type CameraSlice } from './slices/cameraSlice.js';
 import { createSectionSlice, type SectionSlice } from './slices/sectionSlice.js';
-export { customPlaneCenter, loadLastSectionMode } from './slices/sectionSlice.js';
-export type { LastSectionMode } from './slices/sectionSlice.js';
+import { registerMutationViewStoreBinding } from './mutation-view-store-binding.js';
+export { customPlaneCenter, loadLastSectionMode, type LastSectionMode } from './slices/sectionSlice.js';
 import { createMeasurementSlice, type MeasurementSlice } from './slices/measurementSlice.js';
 import { createDataSlice, type DataSlice } from './slices/dataSlice.js';
 import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
 import { createMutationSlice, type MutationSlice } from './slices/mutationSlice.js';
+<<<<<<< HEAD
 import { createDrawing2DSlice, getDefaultDisplayOptions, type Drawing2DSlice } from './slices/drawing2DSlice.js';
 // >>> AIM-FORK: fork-only store slices — D-072 underlays, D-075 documents, D-076 identifier links
 import { createDrawingUnderlaySlice, type DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 import { createDocumentsSlice, type DocumentsSlice } from './slices/documentsSlice.js';
 import { createIdentifierLinksSlice, type IdentifierLinksSlice } from './slices/identifierLinksSlice.js';
 // <<< AIM-FORK
+=======
+import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSlice.js';
+>>>>>>> upstream/main
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
+import { createValidationDraftSlice, type ValidationDraftSlice } from './slices/validationDraftSlice.js';
+import { createIdsStudioSlice, type IdsStudioSlice } from './slices/idsStudioSlice.js';
+import { createManualValidationSlice, type ManualValidationSlice } from './slices/manualValidationSlice.js';
+import { createValidationReportsSlice, type ValidationReportsSlice } from './slices/validationReportsSlice.js';
 import { createExtensionsSlice, type ExtensionsSlice } from './slices/extensionsSlice.js';
+import { createSourcesSlice, type SourcesSlice } from './slices/sourcesSlice.js';
+import { createSceneStateSlice, type SceneStateSlice } from './slices/sceneStateSlice.js';
 import { createListSlice, type ListSlice } from './slices/listSlice.js';
+import { createChartSlice, type ChartSlice } from './slices/chartSlice.js';
+import { createFlowSlice, type FlowSlice } from './slices/flowSlice.js';
+import { createDocumentSlice, type DocumentSlice } from './slices/documentSlice.js';
 import { createPinboardSlice, type PinboardSlice } from './slices/pinboardSlice.js';
 import { createLensSlice, type LensSlice } from './slices/lensSlice.js';
 import { createClashSlice, type ClashSlice } from './slices/clashSlice.js';
+import { createSavedComparisonsSlice, type SavedComparisonsSlice } from './slices/savedComparisonsSlice.js';
+import { createSavedClashReportsSlice, type SavedClashReportsSlice } from './slices/savedClashReportsSlice.js';
 import { createCompareSlice, type CompareSlice } from './slices/compareSlice.js';
+import { createCompareRunsSlice, type CompareRunsSlice } from './slices/compareRunsSlice.js';
 import { createDockSlice, type DockSlice } from './slices/dockSlice.js';
 import { createSidebarSlice, type SidebarSlice } from './slices/sidebarSlice.js';
-import { isBottomPanel, type WorkspacePanelId, type BottomPanelId } from '@/lib/panels/registry';
+import { createDrawingInspectorSlice, type DrawingInspectorSlice } from './slices/drawingInspectorSlice.js';
+import { withToolTelemetry } from './uiTelemetry.js';
 import { createScriptSlice, type ScriptSlice } from './slices/scriptSlice.js';
 import { createChatSlice, type ChatSlice } from './slices/chatSlice.js';
 import { createCesiumSlice, type CesiumSlice } from './slices/cesiumSlice.js';
@@ -54,18 +67,23 @@ import { createOverlaySlice, type OverlaySlice } from './slices/overlaySlice.js'
 import { createSearchSlice, type SearchSlice } from './slices/searchSlice.js';
 import { createAnnotationsSlice, type AnnotationsSlice } from './slices/annotationsSlice.js';
 import { createCollabSlice, type CollabSlice } from './slices/collabSlice.js';
-import { createAddElementSlice, type AddElementSlice } from './slices/addElementSlice.js';
-import { createSplitToolSlice, type SplitToolSlice } from './slices/splitToolSlice.js';
+import { createAuthoringSessionSlice, type AuthoringSessionSlice } from './slices/authoringSessionSlice.js';
+import { createAuthoringDefaultsSlice, type AuthoringDefaultsSlice } from './slices/authoringDefaultsSlice.js';
 import { createLevelDisplaySlice, type LevelDisplaySlice } from './slices/levelDisplaySlice.js';
-import { createPointCloudSlice, type PointCloudSlice, POINT_CLOUD_DEFAULTS } from './slices/pointCloudSlice.js';
+import { createStoreyContextSlice, type StoreyContextSlice } from './slices/storeyContextSlice.js';
+import { createModelPlacementSlice, type ModelPlacementSlice } from './slices/modelPlacementSlice.js';
+import { createPointCloudSlice, type PointCloudSlice } from './slices/pointCloudSlice.js';
+import { createScanDetectionSlice, type ScanDetectionSlice } from './slices/scanDetectionSlice.js';
 import { createUnitDisplaySlice, type UnitDisplaySlice } from './slices/unitDisplaySlice.js';
 import { createSpaceMouseSlice, type SpaceMouseSlice } from './slices/spaceMouseSlice.js';
 import { createLayerStackSlice, type LayerStackSlice } from './slices/layerStackSlice.js';
 import { createZonesSlice, type ZonesSlice } from './slices/zonesSlice.js';
-import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
-
-// Import constants for reset function
-import { CAMERA_DEFAULTS, SECTION_PLANE_DEFAULTS, UI_DEFAULTS, getPersistedTypeVisibility, getPersistedTypeViewMode } from './constants.js';
+import { createModelTagsSlice, type ModelTagsSlice } from './slices/modelTagsSlice.js';
+import { withPlacementHistory } from './placement-history.js';
+import { withVisibilityOwnershipInvalidation } from './visibility-invalidation.js';
+import { withStoreChurnCounters } from './perf-churn.js';
+import { registerSidebarExclusivity, registerHierarchyLeftSync, registerDrawingInspectorSheetSync, reconcileInitialStoreSync } from './store-sync.js';
+import { registerOverlayThemeSync } from '@/lib/viewport-ui/overlay-theme-sync';
 
 // Re-export types for consumers
 export type * from './types.js';
@@ -73,7 +91,7 @@ export type * from './types.js';
 // Explicitly re-export multi-model types that need to be imported by name
 export type { EntityRef, SchemaVersion, FederatedModel, MeasurementConstraintEdge, OrthogonalAxis, SectionCapStyle, SectionCapHatchId, SectionPlane, SectionPlaneAxis } from './types.js';
 export type { HierarchyMode } from './slices/uiSlice.js';
-export type { RibbonTabId, ToolbarStyle } from './constants.js';
+export type { RibbonTabId } from './constants.js';
 
 // Re-export utility functions for entity references
 export { entityRefToString, stringToEntityRef, entityRefEquals, isIfcxDataStore } from './types.js';
@@ -83,36 +101,32 @@ export { resolveEntityRef, resolveGlobalId } from './resolveEntityRef.js';
 export { fromGlobalIdFromModels, toGlobalIdFromModels, toGlobalIdForRef } from './globalId.js';
 export type { ForwardModelMapLike } from './globalId.js';
 
-// Re-export Drawing2D types
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
 export type { UnderlayDrawing, UnderlayCalibrationDraft, DrawingUnderlaySlice } from './slices/drawingUnderlaySlice.js';
 export type { ViewerDocument, ViewerDocumentKind, DocTab, DocTabView, DocumentEvent, DocumentsSlice } from './slices/documentsSlice.js';
 export type { IdentifierLinksSlice, IdentifierIndexStatus } from './slices/identifierLinksSlice.js';
 
-// Re-export Sheet types
 export type { SheetState } from './slices/sheetSlice.js';
-
-// Re-export Collab types
 export type { CollabSlice, CollabRole, CollabStatus, StartCollabOptions } from './slices/collabSlice.js';
-
-// Re-export BCF types
 export type { BCFSlice, BCFSliceState } from './slices/bcfSlice.js';
 
-// Re-export IDS types
-export type { IDSSlice, IDSSliceState, IDSDisplayOptions, IDSFilterMode } from './slices/idsSlice.js';
+export type { IdsStudioSlice, IdsStudioView } from './slices/idsStudioSlice.js';
+export type { IDSSlice, IDSSliceState, IDSDisplayOptions, IDSFilterMode, IDSFocusMode } from './slices/idsSlice.js';
 
-// Re-export List types
+// Re-export List / Chart / Flow / Document / Pinboard types
 export type { ListSlice } from './slices/listSlice.js';
-
-// Re-export Pinboard types
+export type { ChartSlice, ChartFocusMode } from './slices/chartSlice.js';
+export type { FlowSlice } from './slices/flowSlice.js';
+export type { DocumentSlice } from './slices/documentSlice.js';
 export type { PinboardSlice } from './slices/pinboardSlice.js';
 
 // Re-export Lens types
-export type { LensSlice, Lens, LensRule, LensCriteria } from './slices/lensSlice.js';
+export type { LensSlice, Lens, LensRule } from './slices/lensSlice.js';
 export type { CompareSlice, CompareResult } from './slices/compareSlice.js';
 export type { LayerStackSlice, LayerStackEntry, LayerStackDiffResult, LayerAuthorKind } from './slices/layerStackSlice.js';
 export type { DockSlice, FloatingPanelState, SnapZone } from './slices/dockSlice.js';
 export type { SidebarSlice, SidebarMode, SidebarLayoutSnapshot } from './slices/sidebarSlice.js';
+export type { DrawingInspectorSlice, DrawingInspectorTab } from './slices/drawingInspectorSlice.js';
 
 // Re-export Script types
 export type { ScriptSlice } from './slices/scriptSlice.js';
@@ -138,9 +152,7 @@ export {
   parseIsoDate,
 } from './slices/scheduleSlice.js';
 export { resolveScheduleSourceModelId } from './slices/schedule-edit-helpers.js';
-
-// Combined store type
-export type ViewerState = LoadingSlice &
+export type ViewerState = AppearanceSlice & LoadingSlice &
   SelectionSlice &
   VisibilitySlice &
   UISlice &
@@ -158,14 +170,22 @@ export type ViewerState = LoadingSlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
+  IdsStudioSlice &
+  ValidationDraftSlice &
+  ManualValidationSlice &
+  ValidationReportsSlice &
   ListSlice &
+  ChartSlice &
+  FlowSlice &
+  DocumentSlice &
   PinboardSlice &
   LensSlice &
-  ClashSlice &
-  CompareSlice &
+  ClashSlice & SavedClashReportsSlice &
+  CompareSlice & SavedComparisonsSlice & CompareRunsSlice &
   LayerStackSlice &
   DockSlice &
   SidebarSlice &
+  DrawingInspectorSlice &
   ScriptSlice &
   ChatSlice &
   CesiumSlice &
@@ -177,64 +197,29 @@ export type ViewerState = LoadingSlice &
   SearchSlice &
   AnnotationsSlice &
   CollabSlice &
-  AddElementSlice &
-  SplitToolSlice &
-  LevelDisplaySlice &
-  PointCloudSlice &
-  UnitDisplaySlice &
-  SpaceMouseSlice &
-  ZonesSlice &
-  ExtensionsSlice & {
-    resetViewerState: () => void;
-    /**
-     * Open one right-side analysis panel and close the others, so the chosen
-     * panel is always the topmost/active one. The right panel renders a single
-     * mutually-exclusive chain (lens → clash → ids → bcf → extensions), so
-     * leaving a sibling flag set would keep the higher-precedence panel on top
-     * (the cause of "I have to close clash before I see BCF"). Also un-collapses
-     * the right panel. Routed through by the toolbar, command palette, and the
-     * BCF overlay so every entry point behaves identically.
-     */
-    openWorkspacePanel: (panel: Exclude<WorkspacePanelId, 'properties'>) => void;
-    /**
-     * Show a workspace panel docked in the sidebar, un-floating / re-docking it
-     * first if it was popped out (#1200/#1201/#1208). Accepts `properties` (the
-     * Information fallback, shown by closing every other panel) on top of the
-     * analysis + tool panels `openWorkspacePanel` handles. Shared by the
-     * activity bar, the Alt+N shortcuts, the command palette and the
-     * floating / window hosts' re-dock action.
-     */
-    showWorkspacePanel: (panel: WorkspacePanelId) => void;
-    /**
-     * Toggle a sidebar panel: if it is the active docked panel, close it back
-     * to Information; otherwise open it. The single entry point the activity
-     * bar, toolbar and command palette use so a second click always closes.
-     */
-    toggleWorkspacePanel: (panel: WorkspacePanelId) => void;
-    /**
-     * Toggle a bottom-strip panel (Script / Schedule / Lists). These are
-     * launched from the same sidebar rail but open in the BOTTOM panel —
-     * mutually exclusive among themselves, independent of the single-tenant
-     * right pane (so a side panel + a bottom panel can be open at once).
-     */
-    toggleBottomPanel: (panel: BottomPanelId) => void;
-    /**
-     * Open a panel in its home region: side panels dock in the right pane,
-     * Script / Schedule / Lists open in the bottom strip. The rail and Alt+N
-     * route through here so each panel lands where it belongs.
-     */
-    openPanelInHome: (panel: WorkspacePanelId) => void;
-  };
+  AuthoringSessionSlice & AuthoringDefaultsSlice &
+  LevelDisplaySlice & StoreyContextSlice &
+  PointCloudSlice & ScanDetectionSlice & ModelPlacementSlice &
+  UnitDisplaySlice & SpaceMouseSlice & ZonesSlice & ModelTagsSlice &
+  ExtensionsSlice & SourcesSlice & SceneStateSlice & ViewerActions;
 
 /**
- * Main viewer store combining all slices
+ * Main viewer store combining all slices.
+ *
+ * `withVisibilityOwnershipInvalidation` wraps the store's `set` (and its
+ * `setState`) so that no slice — present or future — can replace
+ * `isolatedEntities` / `ghostExceptEntities` without dropping the
+ * visibility-ownership records that write makes stale. See
+ * `store/visibility-invalidation.ts` for why that is a middleware rather than a
+ * helper each writing action remembers to call. `withStoreChurnCounters`
+ * (outermost) counts writes and subscriber notifications under ?perfTrace=1 (#6957).
  */
-const createViewerStore = () => create<ViewerState>()((...args) => ({
+const createViewerStore = () => create<ViewerState>()(withStoreChurnCounters(withVisibilityOwnershipInvalidation(withPlacementHistory((...args) => ({
   // Spread all slices
   ...createLoadingSlice(...args),
   ...createSelectionSlice(...args),
   ...createVisibilitySlice(...args),
-  ...createUISlice(...args),
+  ...withToolTelemetry(createUISlice)(...args),
   ...createHoverSlice(...args),
   ...createCameraSlice(...args),
   ...createSectionSlice(...args),
@@ -249,14 +234,24 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
+  ...createIdsStudioSlice(...args),
+  ...createValidationDraftSlice(...args), ...createManualValidationSlice(...args),
+  ...createValidationReportsSlice(...args),
   ...createListSlice(...args),
+  ...createChartSlice(...args),
+  ...createFlowSlice(...args),
+  ...createDocumentSlice(...args),
   ...createPinboardSlice(...args),
   ...createLensSlice(...args),
   ...createClashSlice(...args),
+  ...createSavedClashReportsSlice(...args),
   ...createCompareSlice(...args),
+  ...createSavedComparisonsSlice(...args),
+  ...createCompareRunsSlice(...args),
   ...createLayerStackSlice(...args),
   ...createDockSlice(...args),
   ...createSidebarSlice(...args),
+  ...createDrawingInspectorSlice(...args),
   ...createScriptSlice(...args),
   ...createChatSlice(...args),
   ...createCesiumSlice(...args),
@@ -268,15 +263,20 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createSearchSlice(...args),
   ...createAnnotationsSlice(...args),
   ...createCollabSlice(...args),
-  ...createAddElementSlice(...args),
-  ...createSplitToolSlice(...args),
-  ...createLevelDisplaySlice(...args),
+  ...createAuthoringSessionSlice(...args), ...createAuthoringDefaultsSlice(...args),
+  ...createLevelDisplaySlice(...args), ...createStoreyContextSlice(...args),
   ...createPointCloudSlice(...args),
+  ...createScanDetectionSlice(...args),
+  ...createModelPlacementSlice(...args),
   ...createUnitDisplaySlice(...args),
   ...createSpaceMouseSlice(...args),
   ...createZonesSlice(...args),
+  ...createModelTagsSlice(...args),
   ...createExtensionsSlice(...args),
+  ...createSourcesSlice(...args), ...createSceneStateSlice(...args),
+  ...createAppearanceSlice(...args),
 
+<<<<<<< HEAD
   // Reset all viewer state when loading new file
   // Note: Does NOT clear models - use clearAllModels() for that
   resetViewerState: () => {
@@ -714,12 +714,17 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
     }
   },
 }));
+=======
+  ...createViewerActions(...args),
+})))));
+>>>>>>> upstream/main
 
 const STORE_SINGLETON_KEY = '__ifc_lite_viewer_store__';
 const globalStoreRegistry = globalThis as typeof globalThis & {
   [STORE_SINGLETON_KEY]?: ReturnType<typeof createViewerStore>;
 };
 
+<<<<<<< HEAD
 /**
  * The six per-panel visibility flags that drive the single-tenant sidebar,
  * paired with their registry id. `properties` has no flag — it is the
@@ -797,6 +802,8 @@ function registerHierarchyLeftSync(store: ReturnType<typeof createViewerStore>):
   });
 }
 
+=======
+>>>>>>> upstream/main
 export function getViewerStoreApi() {
   const existing = globalStoreRegistry[STORE_SINGLETON_KEY];
   if (existing) return existing;
@@ -804,15 +811,11 @@ export function getViewerStoreApi() {
   globalStoreRegistry[STORE_SINGLETON_KEY] = store;
   registerSidebarExclusivity(store);
   registerHierarchyLeftSync(store);
-  // Initial reconcile: a persisted panel flag (e.g. scriptPanelVisible) can be
-  // true at load before any change fires the subscription, so seed the docked
-  // panel from the current flags rather than leaving it on the fallback.
-  const init = store.getState();
-  const initialActive = SIDEBAR_PANEL_FLAGS.find(([flag]) => init[flag])?.[1];
-  if (initialActive) init.setSidebarActivePanel(initialActive);
-  // A persisted "Hierarchy hidden" never fired the subscription above, so seed
-  // the collapsed left slot from it on load (#1267).
-  if (init.sidebarHiddenIds.includes('hierarchy')) init.setLeftPanelCollapsed(true);
+  registerDrawingInspectorSheetSync(store);
+  registerMutationViewStoreBinding(store); // views read their model's CURRENT store, not the partial one (#5672)
+  registerOverlayThemeSync(store); // `--overlay-*` on <html> follow `theme` in every app that holds the store (#5490)
+  registerWorkflowArtifactInvalidation(store);
+  reconcileInitialStoreSync(store);
   return store;
 }
 

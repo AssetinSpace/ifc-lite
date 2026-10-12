@@ -7,7 +7,7 @@
  *
  * Topics live inside a per-session BCF project that's lazy-created on first
  * write. We keep the project per ToolContext (server-wide, not per-model)
- * so an agent can collect issues across federated models, then export a
+ * so an agent can collect topics across federated models, then export a
  * single .bcfzip via `bcf_export`.
  */
 
@@ -25,7 +25,7 @@ import {
   type BCFTopic,
 } from '@ifc-lite/bcf';
 import type { Tool } from './types.js';
-import { okResult } from './util.js';
+import { fmtInt, okResult } from './util.js';
 import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
 
@@ -59,8 +59,17 @@ const bcfTopicList: Tool = {
   handler(input, ctx) {
     const project = getProject(ctx.registry);
     const filter = input.status as string | undefined;
+    // Case-insensitive: BCF status strings are conventionally Title Case
+    // ('Open', 'In Progress', 'Closed'), but an agent has no way to know
+    // the exact casing a topic was created with. An exact `===` match here
+    // (the previous behaviour) silently returned an empty list for a
+    // differently-cased filter — indistinguishable from "no matching
+    // topics" — instead of the topics that actually matched. Mirrors the
+    // case-insensitive statusFilter already used for BCF markers in
+    // `@ifc-lite/bcf`'s `computeMarkers3D`.
+    const filterLower = filter?.toLowerCase();
     const topics = Array.from(project.topics.values())
-      .filter((t) => !filter || t.topicStatus === filter)
+      .filter((t) => !filterLower || (t.topicStatus ?? '').toLowerCase() === filterLower)
       .map((t) => ({ guid: t.guid, title: t.title, status: t.topicStatus, type: t.topicType, priority: t.priority, comments: t.comments.length }));
     return okResult(`${topics.length} topic(s).`, { count: topics.length, topics });
   },
@@ -204,7 +213,7 @@ const bcfExport: Tool = {
     const blob = (await writeBCF(project)) as unknown as Blob;
     const buffer = Buffer.from(await blob.arrayBuffer());
     await writeFile(filePath, buffer);
-    return okResult(`Wrote BCF (${buffer.length.toLocaleString()} bytes, ${project.topics.size} topic(s)) to ${filePath}.`, {
+    return okResult(`Wrote BCF (${fmtInt(buffer.length)} bytes, ${project.topics.size} topic(s)) to ${filePath}.`, {
       filePath,
       bytes: buffer.length,
       topicCount: project.topics.size,

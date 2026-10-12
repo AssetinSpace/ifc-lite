@@ -19,6 +19,7 @@
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import { getMapUnitScale } from './cesium-placement';
+import { ifcToViewerAxes } from './coordinate-frame';
 
 /**
  * Minimum geometry Z (metres, IFC world frame) at or above which the model's
@@ -41,17 +42,23 @@ export const NEAR_ZERO_ORTHOGONAL_HEIGHT_METERS = 1;
  * Lowest geometry Z of the model in metres, in the IFC world frame.
  *
  * `coordinateInfo.originalBounds` is in the renderer's Y-up frame (vertical =
- * `y`) and has the origin shift and the wasm RTC offset subtracted, so both
- * are folded back in - the exact reconstruction `computeModelCenterInIfcMeters`
- * (reproject.ts) uses for the KMZ placement itself. The RTC offset is stored
- * in IFC Z-up, so its `z` component is the vertical one.
+ * `y`) and is ALREADY in the world frame - the producer
+ * (`createCoordinateInfo`, utils/localParsingUtils.ts) clones the raw mesh
+ * bounds into it and derives `shiftedBounds = originalBounds - originShift`
+ * from it, not the other way round. So only the wasm RTC offset needs to be
+ * folded back in here; adding the origin shift on top of `originalBounds`
+ * would double-count it. This mirrors `computeModelCenterInIfcMeters`
+ * (reproject.ts), where the shift is added to `shiftedBounds` and net cancels
+ * against `originalBounds`. The RTC offset is stored in IFC Z-up, so its `z`
+ * component is the vertical one.
  */
 export function modelMinZMeters(coordinateInfo: CoordinateInfo | undefined): number | null {
   const minY = coordinateInfo?.originalBounds?.min?.y;
   if (minY === undefined || !Number.isFinite(minY)) return null;
-  const shiftY = coordinateInfo?.originShift?.y ?? 0;
-  const rtcYupY = coordinateInfo?.wasmRtcOffset?.z ?? 0;
-  const minZ = minY + shiftY + rtcYupY;
+  const rtcYupY = ifcToViewerAxes(
+    coordinateInfo?.wasmRtcOffset ?? { x: 0, y: 0, z: 0 },
+  ).y;
+  const minZ = minY + rtcYupY;
   return Number.isFinite(minZ) ? minZ : null;
 }
 
