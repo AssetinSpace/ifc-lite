@@ -7,6 +7,7 @@ import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { join, isAbsolute } from 'path';
 import { ViewerBenchmarkPage, ViewerBenchmarkMetrics } from './viewer-benchmark-page';
 import { readGpuHealth, type GpuHealth } from './gpu-health';
+import { withBenchmarkFailureDiagnostics } from './benchmark-failure-diagnostics';
 import { measureInteractionCommits, type InteractionCommits } from './interaction-commits';
 
 interface ViewerBenchmarkResult {
@@ -20,10 +21,9 @@ interface ViewerBenchmarkResult {
     uploadMode: 'timed' | 'count';
   };
   metrics: ViewerBenchmarkMetrics;
-  /** #6956: where each span-capable metric came from, and any span/regex disagreement. */
+  /** #7005: whether each metric had a canonical load span. */
   loadTrace: {
     sources: Partial<Record<string, string>>;
-    disagreements: Array<{ metric: string; span: number; regex: number; toleranceMs: number }>;
   };
   /** #6957: pinned worker count, structural counters and the long-frame summary of the load. */
   loadCounters: ReturnType<ViewerBenchmarkPage['getLoadCounters']>;
@@ -70,8 +70,8 @@ function loadBaseline(): Baseline {
   if (existsSync(baselinePath)) {
     try {
       return JSON.parse(readFileSync(baselinePath, 'utf-8'));
-    } catch (e) {
-      console.warn('Failed to load baseline, starting fresh');
+    } catch (error) {
+      console.warn('Failed to load baseline, starting fresh', error);
       return {};
     }
   }
@@ -177,13 +177,13 @@ test.describe('Viewer Performance Benchmarks', () => {
       const timeoutMs = fileSizeMB > 200 ? 600000 : fileSizeMB > 50 ? 300000 : 180000; // 10min / 5min / 3min
 
       console.log(`Waiting for completion (timeout: ${timeoutMs / 1000}s)...`);
-      await benchmarkPage.waitForCompletion(timeoutMs);
-
-      // Extract metrics
-      const metrics = benchmarkPage.getMetrics();
-      // #6957: structural counters keep moving after the load root ends
-      // (deferred GPU uploads), so record them once they have settled.
-      await benchmarkPage.settleLoadCounters();
+      const metrics = await withBenchmarkFailureDiagnostics(benchmarkPage, fileName, async () => {
+        await benchmarkPage.waitForCompletion(timeoutMs);
+        const metrics = benchmarkPage.getMetrics();
+        // #6957: deferred GPU uploads keep counters moving after the root ends.
+        await benchmarkPage.settleLoadCounters();
+        return metrics;
+      });
 
       // Get baseline for this file
       const countCohort = benchmarkPage.getUploadMode() === 'count';
@@ -307,7 +307,6 @@ test.describe('Viewer Performance Benchmarks', () => {
         metrics,
         loadTrace: {
           sources: benchmarkPage.getMetricSources(),
-          disagreements: benchmarkPage.getSpanRegexDisagreements(),
         },
         loadCounters: benchmarkPage.getLoadCounters(),
         gpuHealth,
@@ -333,13 +332,10 @@ test.describe('Viewer Performance Benchmarks', () => {
       expect(metrics.streamCompleteMs).not.toBeNull();
       expect(metrics.totalMeshes).toBeGreaterThan(0);
 
-      // #6956: the span tree is the primary source now; on the reference
-      // fixture every metric both sources report must agree within rounding,
-      // so the regex fallback can be retired without moving any number.
+      // #7005: timing comes exclusively from the canonical span tree.
       if (fileName === 'AC20-FZK-Haus.ifc') {
         expect(benchmarkPage.getLoadTrace(), 'viewer exposed no load-trace span tree').not.toBeNull();
         expect(benchmarkPage.getMetricSources().streamCompleteMs).toBe('span');
-        expect(benchmarkPage.getSpanRegexDisagreements()).toEqual([]);
         // #6957: the load carried its structural counters and frame summary.
         const { counters } = benchmarkPage.getLoadCounters();
         // GPU counters are not asserted: they need a WebGPU device, which a

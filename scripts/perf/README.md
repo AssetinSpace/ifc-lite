@@ -289,7 +289,11 @@ rendered vs idle frames (a frame that called `getCurrentTexture`), and
   `onSubmittedWorkDone` latency. Absolute frame time drifts between sessions,
   so pass `--dist-base <base build>` for counterbalanced base/branch pairs and
   read the paired ratio. Serialise timed runs:
-  `flock /tmp/ifclite-perf.lock npx tsx scripts/perf/frame-gpu-rig.mts tests/models/ara3d/AC20-FZK-Haus.ifc --pairs 3`.
+  `flock /tmp/ifclite-perf.lock npx tsx scripts/perf/frame-gpu-rig.mts tests/models/ara3d/AC20-FZK-Haus.ifc --pairs 3 --branch-revision <built-revision>`.
+  With `--dist-base`, also pass `--base-revision <base-built-revision>`. Both
+  revisions must include #6979 and are recorded before host/browser work. This
+  checks source ancestry; retain independent build/hash receipts binding each
+  dist to its declared revision. Offline `--plan` and `--summarize` need no revisions.
 
 ## Viewer JS is gated on raw bytes, not brotli (#7007)
 
@@ -373,9 +377,10 @@ Viewer load milestones are now named spans (`@ifc-lite/load-trace`): one tree
 per load across the main thread and the geometry workers, mirrored into User
 Timing as `ifc:<name>` and readable as `window.__IFC_LITE_LOAD_TRACE__` under
 `?perfTrace=1`. The viewer benchmark reads its timing metrics from that tree
-and keeps the console regexes only as a fallback; on FZK the two must agree
-within the logs' rounding, which the spec asserts. Use the span tree, not log
-lines, for any new load-time metric. Tracing off is not a lever: the disabled
+exclusively after the follow-up release (#7005). The transitional console
+regexes and agreement comparator have been removed. Mesh/entity counts and
+render diagnostics remain available, but no console timing/completion enters
+a sample. Use the span tree for any new load-time metric. Tracing off is not a lever: the disabled
 trace is a no-op object, about 2 ns per instrumented call in Node, against
 roughly 25 calls per load.
 
@@ -1493,7 +1498,8 @@ are timed in JS. Diagnose there with:
   **user-facing** truth (time-to-first-paint, time-to-complete).
 - **Console `[stream]` timeline** (`packages/geometry/src/geometry-parallel.ts`)
   and `[useIfc] TOTAL LOAD TIME` lines: `meta @`, `styles @`, `entity-index @`,
-  worker-ready, first-batch. The CI benchmark scrapes these.
+  worker-ready, first-batch. These are diagnostics; CI timing and readiness
+  use canonical load-trace spans. Count-only console fields remain available.
 - **`?perfMem=1`** -> `memoryAccounting` `[mem-summary]` (JS heap, per-worker WASM
   heap, geometry bytes, transport bytes; `apps/viewer/src/lib/perf/memoryAccounting.ts`).
 - **CI viewer benchmark** (`.github/workflows/benchmark.yml`, advisory): 6 load
@@ -1540,6 +1546,21 @@ cp scripts/perf/browser-corpus.example.json scripts/perf/browser-corpus.local.js
 # edit browser-corpus.local.json with real absolute paths, then:
 scripts/perf/browser-cold-ab.sh --corpus scripts/perf/browser-corpus.local.json
 ```
+
+**Span-only release boundary (#7005):** the migration shipped in v10.4.0;
+the follow-up package release at `7eeffbb960596669f1a4cb5e0d01e980999e20f6`
+was published by [the original release run](https://github.com/LTplus-AG/ifc-lite/actions/runs/38333269170).
+The harness now refuses source revisions older than #6979
+(`272ebd8615d038dc20dd8aec4e3bb88d1acf9fa7`). The wrapper checks both sources
+before building. Direct frozen-dist runs must pass `--branch-revision <sha>`
+and, with `--dist-base`, `--base-revision <sha>`; these resolved identities are
+saved in `source-revisions.json`. Fetch the migration's Git history first.
+These declarations do not authenticate arbitrary dist bytes: retain the matching
+build/hash receipt. Runtime completion still requires valid spans, loader success,
+renderer finalization and an allocated canvas. Missing traces cannot fall back
+to logs. Console mesh/entity/file-size counts and steady-state render diagnostics
+remain; no console timing or completion value is accepted. Legacy timing fields
+without a canonical span remain null. This removal makes no speed claim.
 
 **What "cold" means, precisely:** each sample gets a brand-new
 `chromium.launch()` (no persistent profile) closed completely before the next

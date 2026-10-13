@@ -6,11 +6,10 @@ import { metadataCompletionSpan } from './metadata-render-readiness.js';
 
 /**
  * Benchmark metrics read from the viewer's load-trace span tree (#6956)
- * instead of console regexes. The span names are the ones
+ * without console timing fallbacks. The span names are the ones
  * `apps/viewer/src/hooks/useIfcLoader.ts` and
  * `packages/geometry/src/geometry-parallel.ts` record; each metric keeps the
- * meaning (and epoch) of the console line it replaces, so a span value and a
- * regex value of the same load agree to within rounding.
+ * meaning and epoch established by the migration.
  *
  * Kept structural (no import of @ifc-lite/load-trace): the snapshot crosses
  * `page.evaluate` as plain JSON.
@@ -98,29 +97,26 @@ const MILESTONES: ReadonlyArray<[string, SpanMetricKey]> = [
   ['parser.failed', 'metadataFailedMs'],
 ];
 
-/**
- * Rounding each side can carry: the console lines print whole ms (`toFixed(0)`
- * / `Math.round`), except the final summary, which prints seconds to 0.1 s.
- */
-export const SPAN_REGEX_TOLERANCE_MS: Readonly<Record<SpanMetricKey, number>> = {
-  totalWallClockMs: 100,
-  fileReadMs: 2,
-  firstBatchWaitMs: 2,
-  firstAppendGeometryBatchMs: 2,
-  firstVisibleGeometryMs: 2,
-  streamCompleteMs: 2,
-  geometryStreamingMs: 2,
-  metadataStartMs: 2,
-  spatialReadyMs: 2,
-  metadataCompleteMs: 2,
-  metadataFailedMs: 2,
-};
-
 const first = (snapshot: LoadTraceSnapshotJson, name: string) =>
   snapshot.spans.find((s) => s.name === name && s.end !== null);
 
 export function metricsFromLoadTrace(snapshot: LoadTraceSnapshotJson | null): SpanMetrics {
-  if (!snapshot) return {};
+  if (!snapshot) throw new Error('Missing benchmark load trace: a viewer built after #6979 is required (#7005)');
+  if (!Number.isFinite(snapshot.start) || (snapshot.end !== null &&
+      (!Number.isFinite(snapshot.end) || snapshot.end < snapshot.start)) || !Array.isArray(snapshot.spans)) {
+    throw new Error('Invalid benchmark load trace root');
+  }
+  for (const span of snapshot.spans) {
+    if (!span || typeof span.name !== 'string' || !Number.isFinite(span.start) || (span.end !== null &&
+        (!Number.isFinite(span.end) || span.end < span.start))) throw new Error('Invalid benchmark load span');
+    // Match the serialized readiness callback's loader clock contract.
+    // scene.finalize is independently awaited and can follow trace.finish.
+    if (span.end !== null && snapshot.end !== null &&
+        ['parser.complete', 'cache.storeReady', 'geometry.streamComplete'].includes(span.name) &&
+        (span.start < snapshot.start || span.end > snapshot.end)) {
+      throw new Error('Invalid benchmark span clock relationship: loader completion outside load root');
+    }
+  }
   const out: SpanMetrics = {};
   if (snapshot.end !== null) out.totalWallClockMs = Math.round(snapshot.end - snapshot.start);
   const read = first(snapshot, 'file.read');
@@ -136,28 +132,6 @@ export function metricsFromLoadTrace(snapshot: LoadTraceSnapshotJson | null): Sp
   const firstBatch = first(snapshot, 'geometry.firstBatch');
   if (pool && firstBatch) out.firstBatchWaitMs = Math.round(firstBatch.end! - pool.start);
   if (out.streamCompleteMs !== undefined) out.geometryStreamingMs = out.streamCompleteMs;
-  return out;
-}
-
-export interface SpanRegexDisagreement {
-  metric: SpanMetricKey;
-  span: number;
-  regex: number;
-  toleranceMs: number;
-}
-
-/** Metrics present on both sides whose values differ by more than the rounding allowance. */
-export function compareSpanAndRegexMetrics(
-  span: SpanMetrics,
-  regex: Partial<Record<SpanMetricKey, number | null>>,
-): SpanRegexDisagreement[] {
-  const out: SpanRegexDisagreement[] = [];
-  for (const metric of SPAN_METRIC_KEYS) {
-    const s = span[metric];
-    const r = regex[metric];
-    if (s === undefined || r === null || r === undefined) continue;
-    const toleranceMs = SPAN_REGEX_TOLERANCE_MS[metric];
-    if (Math.abs(s - r) > toleranceMs) out.push({ metric, span: s, regex: r, toleranceMs });
-  }
+  if (Object.values(out).some(value => !Number.isFinite(value) || value < 0)) throw new Error('Invalid benchmark span clock relationship');
   return out;
 }

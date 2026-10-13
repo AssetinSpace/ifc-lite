@@ -3,8 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // #6956: the viewer benchmark reads its timing metrics from the viewer's
-// load-trace span tree (window.__IFC_LITE_LOAD_TRACE__) first and falls back
-// to the console regexes only for what the tree does not carry.
+// load-trace span tree (window.__IFC_LITE_LOAD_TRACE__) exclusively (#7005).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tsImport } from 'tsx/esm/api';
@@ -45,11 +44,12 @@ const SNAPSHOT = {
     { id: 6, name: 'geometry.firstVisible', thread: 'main', start: 1000, end: 1201, parentId: null, milestone: true },
     { id: 7, name: 'parser.complete', thread: 'main', start: 1000, end: 1261, parentId: null, milestone: true },
     { id: 8, name: 'geometry.streamComplete', thread: 'main', start: 1000, end: 1301, parentId: null, milestone: true },
+    { id: 10, name: 'scene.finalize', thread: 'main', start: 1350, end: 1400 },
     { id: 9, name: 'shard.scan', thread: 'geom-0', start: 1060, end: 1070, parentId: 1 },
   ],
 };
 
-function fakePage(snapshot) {
+function fakePage(snapshot, canvasReady = true) {
   const listeners = [];
   const initScripts = [];
   return {
@@ -72,18 +72,18 @@ function fakePage(snapshot) {
         g.__IFC_LITE_LOAD_TRACE__ = { latest: () => snapshot };
         try { return fn(arg); } finally { delete g.__IFC_LITE_LOAD_TRACE__; }
       }
-      return true;
+      return canvasReady;
     },
   };
 }
 
-async function measure(snapshot, timeoutMs = 5_000) {
-  const page = fakePage(snapshot);
+async function measure(snapshot, timeoutMs = 5_000, logs = LOGS, requireMetadataRender = false, canvasReady = true) {
+  const page = fakePage(snapshot, canvasReady);
   const bench = new ViewerBenchmarkPage(page);
   await bench.setup();
-  for (const line of LOGS) page.emit(line);
+  for (const line of logs) page.emit(line);
   await bench.loadFile('AC20-FZK-Haus.ifc', false);
-  await bench.waitForCompletion(timeoutMs);
+  await bench.waitForCompletion(timeoutMs, requireMetadataRender);
   return { page, metrics: bench.getMetrics() };
 }
 
@@ -118,6 +118,7 @@ test('#6956 timing metrics come from the load-trace span tree when the viewer ex
   // Counts the span tree does not carry still come from the console lines.
   assert.equal(metrics.totalMeshes, 317);
   assert.equal(metrics.totalBatches, 4);
+  assert.equal(metrics.firstBatchMeshes, 106);
   assert.equal(metrics.drawCalls, 10);
 });
 
@@ -130,21 +131,13 @@ test('#6956 the benchmark turns the viewer tracer on before the app boots', asyn
   delete g.__IFC_LITE_PERF_TRACE;
 });
 
-test('#6956 without a span tree the console regexes still supply every metric', async () => {
-  const { metrics } = await measure(null);
-  assert.equal(metrics.totalWallClockMs, 400);
-  assert.equal(metrics.fileReadMs, 12);
-  assert.equal(metrics.firstBatchWaitMs, 90);
-  assert.equal(metrics.firstVisibleGeometryMs, 200);
-  assert.equal(metrics.streamCompleteMs, 300);
-  assert.equal(metrics.metadataCompleteMs, 260);
+test('#7005 console timings cannot rescue a missing load trace', async () => {
+  await assert.rejects(measure(null, 25), /Missing benchmark load trace/);
 });
 
 test('#6979 load completion comes from the span tree: an open load root is not complete, whatever the console says', async () => {
   // Every console completion line is present (LOGS); only the root span is still open.
-  const { metrics } = await measure({ ...SNAPSHOT, end: null }, 300);
-  assert.equal(metrics.canvasHasContent, false);
-  assert.equal(metrics.renderCompleteMs, null);
+  await assert.rejects(measure({ ...SNAPSHOT, end: null }, 25), /Timed out/);
 });
 
 test('#6979 an ended load root completes the load', async () => {
@@ -190,4 +183,86 @@ test('#7036 attribute-free JSON uses fresh parser timing without inventing cache
   assert.equal(metricsFromLoadTrace(snapshot).metadataCompleteMs, 20);
   const cacheOnly = { ...snapshot, spans: [{ name: 'cache.storeReady', thread: 'main', start: 110, end: 120 }] };
   assert.equal(metricsFromLoadTrace(cacheOnly).metadataCompleteMs, undefined);
+});
+
+
+test('#7005 valid spans complete and provide timing without any console lines', async () => {
+  const { metrics } = await measure(SNAPSHOT, 25, []);
+  assert.equal(metrics.totalWallClockMs, 403);
+  assert.equal(metrics.streamCompleteMs, 301);
+  assert.equal(metrics.metadataCompleteMs, 261);
+  assert.equal(metrics.canvasHasContent, true);
+  assert.equal(metrics.totalMeshes, null);
+});
+
+test('#7005 absent optional timings stay null despite persuasive console timings', async () => {
+  const partial = { ...SNAPSHOT, spans: SNAPSHOT.spans.filter(span => span.name !== 'file.read') };
+  const { metrics } = await measure(partial, 25, [...LOGS,
+    '[useIfc] Model opened at 123ms', 'Total wait (WASM): 999ms', 'Total process (JS): 222ms',
+    '[IfcParser] Fast scan: 500 entities in 888ms', '[ColumnarParser] Parsed 500 entities in 777ms',
+  ]);
+  for (const key of ['fileReadMs', 'modelOpenMs', 'wasmWaitMs', 'jsProcessMs', 'entityScanMs', 'dataModelParseMs']) assert.equal(metrics[key], null, key);
+  assert.equal(metrics.entityCount, 500);
+  assert.equal(metrics.dataModelEntityCount, 500);
+});
+
+for (const end of [NaN, Infinity, -1]) {
+  test(`#7005 invalid root timing ${end} cannot fall back to console`, async () => {
+    await assert.rejects(measure({ ...SNAPSHOT, end }, 25), /Invalid benchmark/);
+  });
+}
+test('#7005 malformed span timing and reversed pool clock are refused', () => {
+  assert.throws(() => metricsFromLoadTrace({ ...SNAPSHOT, spans: [null] }), /Invalid benchmark load span/);
+  assert.throws(() => metricsFromLoadTrace({ ...SNAPSHOT, spans: [{ name: 'file.read', start: 4, end: 3 }] }), /Invalid benchmark/);
+  assert.throws(() => metricsFromLoadTrace({ ...SNAPSHOT, spans: [
+    { name: 'geometry.pool', start: 1200, end: null },
+    { name: 'geometry.firstBatch', start: 1000, end: 1100 },
+  ] }), /Invalid benchmark span clock/);
+});
+
+test('#7005 deferred renderer completion may follow the loader root', async () => {
+  const snapshot = { ...SNAPSHOT, end: 1320 };
+  const { metrics } = await measure(snapshot, 100);
+  assert.equal(metrics.totalWallClockMs, 320);
+  assert.equal(metrics.canvasHasContent, true);
+  await assert.rejects(measure({ ...snapshot, spans: snapshot.spans.map(span =>
+    span.name === 'scene.finalize' ? { ...span, end: null } : span) }, 25, LOGS, true), /Timed out/);
+});
+
+for (const name of ['parser.complete', 'cache.storeReady', 'geometry.streamComplete']) {
+  for (const boundary of ['before', 'after']) {
+   test(`#7005 ${name} cannot complete ${boundary} the loader root`, async () => {
+     const snapshot = { ...SNAPSHOT, spans: [
+       ...SNAPSHOT.spans.filter(span => span.name !== name),
+       { name, thread: 'main', start: boundary === 'before' ? SNAPSHOT.start - 1 : SNAPSHOT.start,
+         end: boundary === 'after' ? SNAPSHOT.end + 1 : SNAPSHOT.end },
+     ] };
+     assert.throws(() => metricsFromLoadTrace(snapshot), /loader completion outside load root/);
+     await assert.rejects(measure(snapshot, 25), /Loader completion outside load root/);
+   });
+  }
+}
+
+
+test('#7005 default root completion preserves partial metrics while cold readiness rejects empty spans', async () => {
+  const snapshot = { ...SNAPSHOT, spans: [] };
+  const { metrics } = await measure(snapshot, 25, LOGS);
+  assert.equal(metrics.totalWallClockMs, 403);
+  assert.equal(metrics.streamCompleteMs, null, 'console completion cannot manufacture missing span timing');
+  assert.equal(metrics.metadataRenderReadyMs, null, 'root completion makes no cold readiness claim');
+  await assert.rejects(measure(snapshot, 25, LOGS, true), /Timed out awaiting metadata/);
+});
+
+test('#7005 default and cold modes retain their distinct renderer and root requirements', async () => {
+  const noFinalize = { ...SNAPSHOT, spans: SNAPSHOT.spans.filter(span => span.name !== 'scene.finalize') };
+  assert.equal((await measure(noFinalize, 25)).metrics.totalWallClockMs, 403);
+  await assert.rejects(measure(noFinalize, 25, LOGS, true), /Timed out/);
+  const openRoot = { ...SNAPSHOT, end: null };
+  await assert.rejects(measure(openRoot, 25), /Timed out awaiting ended load root/);
+  const cold = await measure(openRoot, 25, LOGS, true);
+  assert.equal(cold.metrics.totalWallClockMs, null);
+  assert.equal(cold.metrics.streamCompleteMs, 301);
+  for (const requireMetadataRender of [false, true]) {
+    await assert.rejects(measure(SNAPSHOT, 25, LOGS, requireMetadataRender, false), /Timed out/);
+  }
 });
