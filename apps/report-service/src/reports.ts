@@ -23,6 +23,7 @@ export interface ReportRow {
   custom_nda: { status: string; message: string } | null;
   issue_url: string | null;
   fingerprint: string;
+  publication_hold?: boolean;
 }
 export interface UploadRow {
   id: string;
@@ -36,13 +37,18 @@ export interface UploadRow {
   authorizations: Record<string, number>;
   expires_at: Date;
 }
+// Every existing-report receipt uses the same durable publication hold projection.
+const RECEIPT_REPORT_SELECT = `SELECT r.*, (r.status='submitted' AND EXISTS(
+  SELECT 1 FROM report_publication_intents i WHERE i.report_id=r.id
+)) AS publication_hold FROM model_reports r`;
+
 export async function ownedReport(
   db: Db,
   id: string,
   owner: Session,
 ): Promise<ReportRow> {
   const r = await db.query<ReportRow>(
-    "SELECT * FROM model_reports WHERE id=$1 AND session_id=$2 AND expires_at>now()",
+    `${RECEIPT_REPORT_SELECT} WHERE id=$1 AND session_id=$2 AND expires_at>now()`,
     [id, owner.id],
   );
   requireCondition(
@@ -57,6 +63,7 @@ export function receipt(r: ReportRow): ReportReceipt {
   return {
     id: r.id,
     status: r.status,
+    ...(r.publication_hold ? { publicationHold: "review_required" as const } : {}),
     ...(r.issue_url ? { issueUrl: r.issue_url } : {}),
   };
 }
@@ -71,7 +78,7 @@ export async function createReport(
       owner.admission,
     ]);
     const existing = await tx.query<ReportRow>(
-      "SELECT * FROM model_reports WHERE session_id=$1 AND client_key=$2",
+      `${RECEIPT_REPORT_SELECT} WHERE session_id=$1 AND client_key=$2`,
       [owner.id, input.clientRequestId],
     );
     if (existing.rows[0]) return receipt(existing.rows[0]);
@@ -119,7 +126,7 @@ export async function submitReport(
 ): Promise<ReportReceipt> {
   return transaction(db, async (tx) => {
     const result = await tx.query<ReportRow>(
-      "SELECT * FROM model_reports WHERE id=$1 AND session_id=$2 AND expires_at>now() FOR UPDATE",
+      `${RECEIPT_REPORT_SELECT} WHERE id=$1 AND session_id=$2 AND expires_at>now() FOR UPDATE`,
       [id, owner.id],
     );
     const report = result.rows[0];
