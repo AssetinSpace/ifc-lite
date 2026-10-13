@@ -401,6 +401,8 @@ Hosts must call `abandon(token)` when native evaluation throws, and use `abandon
 
 Native Review `modelIds` selects whole captured target sets independently of current authorization. A wholly permitted capture outside the request is omitted; a capture spanning requested and excluded models is refused as a whole. Permission revocation remains fail-closed after source hashing. Hash reuse follows the actual source object, including models that share a host owner. An older delayed proof cannot revive a newer same-context capture after retention eviction.
 
+Native capture admission and portable reads share the existing text budget: object-property names and string values both count toward 1,048,576 UTF-16 code units, with a 16,384 UTF-16 code-unit limit per key or value. A report that exceeds it is refused as `capture-bound` at native `finish`; the independent analysis report is retained by its producer, and the Review capture records unknown inventory rather than silently truncating it.
+
 ### Portable report contracts
 
 The Review entry point shares the viewer's existing `SavedAnalysisRun` and
@@ -412,3 +414,18 @@ legacy sampled fingerprints. A valid payload remains historical evidence:
 validation does not make its execution attested, its freshness current, or its
 manual answers the result of a native evaluation. The codecs perform no save
 or model mutation.
+
+
+For supplied history, pass `createNativeReviewIdentityTable(store)` with each
+`NativeReviewModel` and call
+`readPortableReview(captures, liveModels, request, allowed)`. The request accepts
+`savedAnalysisRuns` and `savedValidationReports`. The reader verifies full source
+SHA-256 and duplicate-checked identity columns under current owner, revision and
+permission leases. Legacy or ambiguous evidence remains explicitly unbound.
+`records` retains original bounded native facts; `bindings` describes identity
+proof separately. Imported findings stay historical and not evaluated, with
+incomplete native coverage. No analysis, editor, persistence or scene mutation
+is performed.
+
+Portable `bounds` describe the supplied finding inventory, while cards and totals describe only the visible rows. A zero row limit retains the original records and reports hidden findings. Saved omissions, source gaps, truncated clash/IDS evaluation, or missing failed detail keep complete inventory and omission counts unknown and `presentationComplete` false; imported evidence never establishes complete native coverage.
+Non-IDS saved report kinds retain their original records but expose `unsupported-kind` binding and no projected findings; a matching model source alone does not certify manual element identity or evaluation.
