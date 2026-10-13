@@ -4,8 +4,28 @@
 
 import pg, { type PoolClient } from "pg";
 export type Db = Pick<pg.Pool, "query" | "connect">;
-export function openDatabase(url: string): pg.Pool {
-  return new pg.Pool({ connectionString: url, max: 6 });
+export function openDatabase(url: string, onConnectionError?: () => void): pg.Pool {
+  const pool = new pg.Pool({ connectionString: url, max: 6 });
+  const observed = new WeakSet<object>();
+  let fatalNotified = false;
+  const connectionFailed = (error: unknown): void => {
+    // pg-pool forwards the same Error from an idle Client onto the Pool, adding
+    // private client/config details. Never print it or retain it strongly.
+    if (typeof error === "object" && error !== null) {
+      if (observed.has(error)) return;
+      observed.add(error);
+    }
+    console.error("[report-service] database connection failed");
+    if (!fatalNotified) {
+      fatalNotified = true;
+      onConnectionError?.();
+    }
+  };
+  pool.on("error", connectionFailed);
+  // pg-pool removes its own idle error listener during checkout. Install a
+  // persistent listener before handing each new client to any transaction.
+  pool.on("connect", client => { client.on("error", connectionFailed); });
+  return pool;
 }
 export async function transaction<T>(
   db: Db,
