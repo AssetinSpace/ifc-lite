@@ -8,7 +8,9 @@ import {
   extractQuantitiesOnDemand,
   extractTypePropertiesOnDemand,
   extractTypeEntityOwnProperties,
+  extractTypeEntityOwnQuantities,
   extractMaterialPropertiesForMaterialId,
+  getInheritanceChainAcrossSchemas,
   mergeInheritedPropertySets,
 } from '@ifc-lite/parser';
 import { RelationshipType, exactTypeName } from '@ifc-lite/data';
@@ -30,36 +32,54 @@ import { resolveEntityMeasureScales, type EntityMeasureScales } from './units.js
  *   2. Predefined property sets (IfcDoorPanelProperties etc.) where
  *      the entity's schema-defined attributes act as property names.
  *   3. Inherited property sets from `IfcRelDefinesByType`, predefined
- *      ones on the type included.
+ *      ones and quantity sets on the type included.
  *
  * Measure-typed properties are converted to base SI units per the
  * ENTITY'S OWN OWNING `IFCPROJECT`'s declared units — see
  * `resolveEntityMeasureScales` — so IDS literals (always metre / m² / m³)
  * compare correctly even for an entity belonging to a later `IFCPROJECT`
  * in a multi-project (federated-merge) file.
+ *
+ * `writtenWithoutUnit`, when given, receives by identity each entry that a
+ * correction cannot edit in place (#7542, see property-overlay-resolver.ts).
+ * The viewer writes a correction through `MutablePropertyView.setProperty`.
+ * It edits a property that the entity's own property sets hold in place, and
+ * keeps its `Unit`. For any other entry the view has nothing to edit, so the
+ * correction becomes a new property with no unit. Such an entry is read and
+ * written in the entity's project unit, whatever its own `Unit`. These are
+ * every quantity (the entity's own, and a type object's own) and every entry
+ * the entity inherits through `IfcRelDefinesByType`.
  */
 export function collectAllPropertySets(
   store: IfcDataStore,
-  expressId: number
+  expressId: number,
+  writtenWithoutUnit?: Set<object>
 ): PropertySetInfo[] {
   const own: PropertySetInfo[] = [];
   const scales = resolveEntityMeasureScales(store, expressId);
 
   appendInstancePropertySets(store, expressId, scales, own);
+  const firstQuantitySet = own.length;
   appendQuantitySets(store, expressId, scales, own);
+  addEntries(own, writtenWithoutUnit, firstQuantitySet);
   appendPredefinedPropertySets(store, expressId, scales, own);
-  appendMaterialOwnPropertySets(store, expressId, scales, own);
+  const typeName = resolveEntityTypeName(store, expressId);
+  appendMaterialOwnPropertySets(store, expressId, typeName, scales, own);
 
+  const inherited = inheritedPropertySets(store, expressId, scales);
+  addEntries(inherited, writtenWithoutUnit);
   // Merged per property, not per set — see `mergeInheritedPropertySets`.
-  const out = mergeInheritedPropertySets(
-    own,
-    inheritedPropertySets(store, expressId, scales),
-  );
+  const out = mergeInheritedPropertySets(own, inherited);
 
   if (out.length === 0) {
-    appendTypeEntityOwnProperties(store, expressId, scales, out);
+    return typeEntityOwnSets(store, expressId, typeName, scales, writtenWithoutUnit);
   }
   return out;
+}
+
+/** Adds the entries of `sets[from..]` to `into`, when given. */
+function addEntries(sets: PropertySetInfo[], into: Set<object> | undefined, from = 0): void {
+  if (into) for (let i = from; i < sets.length; i++) for (const p of sets[i].properties) into.add(p);
 }
 
 function appendInstancePropertySets(
@@ -109,23 +129,33 @@ function appendQuantitySets(
   }
   if (!quantities || quantities.length === 0) return;
 
-  for (const qset of quantities) {
-    out.push({
-      name: qset.name,
-      properties: (qset.quantities || []).map((q) =>
-        projectProperty(
-          {
-            name: q.name,
-            value: q.value,
-            type: undefined,
-            dataType: idsDataTypeForQuantity(q.type),
-            ...quantityOwnUnit(q),
-          },
-          scales
-        )
-      ),
-    });
-  }
+  for (const qset of quantities) out.push(quantitySetInfo(qset, scales));
+}
+
+/** The quantity-set shape both the parser's on-demand readers and the
+ *  prebuilt `QuantityTable` return. */
+interface QuantitySetRecord {
+  name: string;
+  quantities?: ReadonlyArray<{ name: string; type: number; value: number }>;
+}
+
+/** One `IfcElementQuantity` as a property set, its values in base SI. */
+function quantitySetInfo(qset: QuantitySetRecord, scales: EntityMeasureScales): PropertySetInfo {
+  return {
+    name: qset.name,
+    properties: (qset.quantities || []).map((q) =>
+      projectProperty(
+        {
+          name: q.name,
+          value: q.value,
+          type: undefined,
+          dataType: idsDataTypeForQuantity(q.type),
+          ...quantityOwnUnit(q),
+        },
+        scales
+      )
+    ),
+  };
 }
 
 /**
@@ -163,10 +193,11 @@ function quantityOwnUnit(quantity: object): Pick<RawProp, 'unit' | 'unitSiScale'
 function appendMaterialOwnPropertySets(
   store: IfcDataStore,
   expressId: number,
+  typeName: string | undefined,
   scales: EntityMeasureScales,
   out: PropertySetInfo[]
 ): void {
-  if (resolveEntityTypeName(store, expressId)?.toUpperCase() !== 'IFCMATERIAL') return;
+  if (typeName?.toUpperCase() !== 'IFCMATERIAL') return;
 
   const groups = extractMaterialPropertiesForMaterialId(store, expressId);
   for (const group of groups) {
@@ -186,12 +217,13 @@ function appendMaterialOwnPropertySets(
  * -level entities like `IfcMaterial` resolve to `'Unknown'` there) to
  * `entityIndex.byId`. Mirrors `createDataAccessor`'s `getEntityType`;
  * duplicated rather than threaded through as a parameter because only
- * this one caller needs a raw type check ahead of the accessor existing.
+ * `collectAllPropertySets` needs a raw type check ahead of the accessor
+ * existing. It reads it once, for the material and the type-object checks.
  */
 function resolveEntityTypeName(store: IfcDataStore, expressId: number): string | undefined {
   const fromTable = store.entities ? exactTypeName(store.entities, expressId) : undefined;
   if (fromTable && fromTable !== 'Unknown') return fromTable;
-  // @raw-entity-enumeration-ok point lookup for one source record to guard the parsed material-owned-property projection; this helper projects source property sets and is not a live candidate/type enumeration
+  // @raw-entity-enumeration-ok point lookup for one source record to guard the parsed material-owned-property and type-object quantity projections; this helper projects source property sets and is not a live candidate/type enumeration
   const entry = store.entityIndex?.byId?.get(expressId);
   if (!entry) return undefined;
   return typeof entry === 'object' && 'type' in entry ? String((entry as { type: unknown }).type) : undefined;
@@ -209,11 +241,25 @@ function inheritedPropertySets(
   const inheritedPsets =
     extractTypePropertiesOnDemand(store, expressId)?.properties ??
     typePropertySetsFromTable(store, expressId);
+  // The type's quantity sets are inherited like its property sets (#7542):
+  // `IfcTypeObject.HasPropertySets` holds both. Same two parse paths. The type
+  // is resolved here and read once per type (`typeOwnQuantitySets`), so a
+  // typed element whose type holds no quantity set adds next to no work.
+  const sourceTypeId = store.source?.length
+    ? store.relationships?.getRelated?.(expressId, RelationshipType.DefinesByType, 'inverse')?.[0]
+    : undefined;
+  const inheritedQsets =
+    sourceTypeId !== undefined
+      ? typeOwnQuantitySets(store, sourceTypeId)
+      : typeQuantitySetsFromTable(store, expressId);
 
-  const inherited: PropertySetInfo[] = inheritedPsets.map((pset) => ({
-    name: pset.name,
-    properties: (pset.properties || []).map((p) => projectProperty(p as RawProp, scales)),
-  }));
+  const inherited = typeObjectSets(
+    inheritedPsets.map((pset) => ({
+      name: pset.name,
+      properties: (pset.properties || []).map((p) => projectProperty(p as RawProp, scales)),
+    })),
+    inheritedQsets.map((qset) => quantitySetInfo(qset, scales)),
+  );
   // The type's predefined property sets (IfcDoorLiningProperties, ...) are
   // inherited the same way (#7395). One sharing a name with an ordinary type
   // set adds the properties that set lacks, rather than being dropped.
@@ -230,42 +276,108 @@ function inheritedPropertySets(
   return inherited;
 }
 
-/** Type-inherited property sets for server-parsed stores: resolve the element's
- *  IfcTypeProduct via IfcRelDefinesByType, then read the prebuilt table for
- *  that type id (server materialises type sets under the type's own id — see
- *  serverDataModel's TYPEHASPROPERTYSETS merge). [] for WASM stores, which the
- *  source-backed extractor already handled. */
+/**
+ * A type object's property sets and quantity sets as one list (#7542). A
+ * quantity set named like one of the type's property sets adds the quantities
+ * that set lacks, and the property set keeps a same-named item: the per-item
+ * rule `mergeInheritedPropertySets` applies between an occurrence and its type.
+ * Listed separately, the property set would fail every requirement on the
+ * quantity set's items and the other way round, since IDS requires every set
+ * matching the facet's `propertySet` to satisfy it. A quantity set with no such
+ * property set is kept as its own set, so two same-named quantity sets stay two.
+ */
+function typeObjectSets(psets: PropertySetInfo[], qsets: PropertySetInfo[]): PropertySetInfo[] {
+  return mergeInheritedPropertySets(psets, qsets);
+}
+
+/** Server-parsed stores (no `source`) only: the element's IfcTypeProduct, via
+ *  IfcRelDefinesByType, whose sets the server materialises in the prebuilt
+ *  tables under the type's own id (serverDataModel's TYPEHASPROPERTYSETS
+ *  merge). Undefined for WASM stores, whose type sets the source-backed
+ *  extractors already resolved, so the table fallbacks never run there. */
+function serverTypeId(store: IfcDataStore, expressId: number): number | undefined {
+  if (store.source && store.source.length > 0) return undefined;
+  return store.relationships?.getRelated?.(expressId, RelationshipType.DefinesByType, 'inverse')?.[0];
+}
+
+/** Type-inherited property sets for server-parsed stores (#1787): the prebuilt
+ *  property table for the type id. [] for WASM stores. */
 function typePropertySetsFromTable(
   store: IfcDataStore,
   expressId: number
 ): Array<{ name: string; properties: RawProp[] }> {
-  // Server-parsed stores only — a WASM store has a `source` buffer and its type
-  // sets were already resolved by extractTypePropertiesOnDemand above, so this
-  // never runs there (no behaviour change on the WASM path).
-  if (store.source && store.source.length > 0) return [];
-  const typeIds =
-    store.relationships?.getRelated?.(
-      expressId,
-      RelationshipType.DefinesByType,
-      'inverse'
-    ) || [];
-  if (typeIds.length === 0) return [];
-  const psets = store.properties?.getForEntity?.(typeIds[0]);
+  const typeId = serverTypeId(store, expressId);
+  if (typeId === undefined) return [];
+  const psets = store.properties?.getForEntity?.(typeId);
   return (psets ?? []) as unknown as Array<{ name: string; properties: RawProp[] }>;
 }
 
-/** A type object's own `HasPropertySets`, converted to SI like any other
- *  property set (#7395). */
-function appendTypeEntityOwnProperties(
+/** Type-inherited quantity sets for server-parsed stores (#7542): the prebuilt
+ *  quantity table for the type id. [] for WASM stores. */
+function typeQuantitySetsFromTable(store: IfcDataStore, expressId: number): QuantitySetRecord[] {
+  const typeId = serverTypeId(store, expressId);
+  if (typeId === undefined) return [];
+  return store.quantities?.getForEntity?.(typeId) ?? [];
+}
+
+/** A type object's own `HasPropertySets`, property and quantity sets
+ *  (#7542), converted to SI like any other property set (#7395). Every entity
+ *  without a set of its own reaches this, mostly geometry, so the quantity
+ *  sets are read only for a type object (`isTypeObjectClass`) and without the
+ *  memo below. The quantities go to `writtenWithoutUnit`, as every quantity
+ *  does: see `collectAllPropertySets`. */
+function typeEntityOwnSets(
   store: IfcDataStore,
   expressId: number,
+  typeName: string | undefined,
   scales: EntityMeasureScales,
-  out: PropertySetInfo[]
-): void {
-  for (const pset of extractTypeEntityOwnProperties(store, expressId)) {
-    out.push({
-      name: pset.name,
-      properties: (pset.properties || []).map((p) => projectProperty(p as RawProp, scales)),
-    });
+  writtenWithoutUnit: Set<object> | undefined
+): PropertySetInfo[] {
+  const psets = extractTypeEntityOwnProperties(store, expressId).map((pset) => ({
+    name: pset.name,
+    properties: (pset.properties || []).map((p) => projectProperty(p as RawProp, scales)),
+  }));
+  if (!isTypeObjectClass(typeName)) return psets;
+  const qsets = extractTypeEntityOwnQuantities(store, expressId).map((qset) => quantitySetInfo(qset, scales));
+  addEntries(qsets, writtenWithoutUnit);
+  return typeObjectSets(psets, qsets);
+}
+
+const typeObjectByClass = new Map<string, boolean>();
+
+/** Whether a class is an `IfcTypeObject`: the check
+ *  `extractTypeEntityOwnQuantities` makes, kept per class name. */
+function isTypeObjectClass(typeName: string | undefined): boolean {
+  if (!typeName) return false;
+  let known = typeObjectByClass.get(typeName);
+  if (known === undefined) {
+    known = getInheritanceChainAcrossSchemas(typeName).includes('IfcTypeObject');
+    typeObjectByClass.set(typeName, known);
   }
+  return known;
+}
+
+type TypeOwnQuantitySets = ReturnType<typeof extractTypeEntityOwnQuantities>;
+const typeOwnQuantityCache = new WeakMap<IfcDataStore, Map<number, TypeOwnQuantitySets>>();
+
+/**
+ * The quantity sets an occurrence inherits from its type, read from the source
+ * once per store and type (#7542). Every occurrence of the type asks, so
+ * without the memo each one would decode the type entity again, also when the
+ * type holds no quantity set. Only a type reached through `IfcRelDefinesByType`
+ * gets an entry. Safe to share: the reader derives only from the immutable
+ * source and entity index, and `quantitySetInfo` copies what it projects.
+ */
+function typeOwnQuantitySets(store: IfcDataStore, typeId: number): TypeOwnQuantitySets {
+  let byType = typeOwnQuantityCache.get(store);
+  if (!byType) {
+    byType = new Map();
+    typeOwnQuantityCache.set(store, byType);
+  }
+  let sets = byType.get(typeId);
+  if (!sets) {
+    sets = extractTypeEntityOwnQuantities(store, typeId);
+    byType.set(typeId, sets);
+  }
+  return sets;
 }
