@@ -13,6 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { clearApiKeys, getApiKeys, updateApiKeys } from '@/services/api-keys';
 import { captureRequest } from '@/test/ai-eval-capture';
+import { sendsSamplingParams } from '@/lib/llm/models';
 
 const task = { id: 'clash-summary', scene: 'clash-rev-b', prompt: 'Summarize the most severe clashes and where they occur' };
 const comparable = (system: string) => system.replace(/"capturedAt":"[^"]+"/g, '');
@@ -32,6 +33,15 @@ test('#6928 proxy, Anthropic and both OpenAI APIs capture one route-neutral requ
     assert.deepEqual(request.messages, proxy.messages, 'the OpenAI system or developer entry is not left in the conversation');
     assert.equal(request.maxOutputTokens, proxy.maxOutputTokens);
   }
+  // Sequential: each capture swaps the global fetch and the stored keys.
+  const accepts: Record<string, boolean> = {};
+  for (const model of ['claude-sonnet-5-5', 'claude-haiku-4-5-20251001']) {
+    const result = await captureRequest(task, model);
+    assert.ok('request' in result, `${model} was captured`);
+    accepts[model] = result.request.sentTemperature;
+  }
+  assert.deepEqual(accepts, Object.fromEntries(Object.keys(accepts).map(model => [model, sendsSamplingParams(model)])), 'temperature follows the viewer model flag');
+  assert.deepEqual(new Set(Object.values(accepts)), new Set([true, false]), 'both branches are exercised');
   const { anthropicKey, openaiKey } = getApiKeys();
   assert.deepEqual([anthropicKey, openaiKey], ['', ''], 'the capture placeholder is not left stored');
 });
