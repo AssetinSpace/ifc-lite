@@ -924,6 +924,16 @@ jobs:
           # geometry_pool.rs is on main, ordinary whole-change revert resumes.
           elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/processing/src/geometry_pool.rs | grep -Fxq 'rust/processing/src/geometry_pool.rs'; then
             oracle_args+=(--mutation tests/evidence/geometry-pool-7673/stack-size.oracle.patch)
+          # #7676: the upload admission change adds ApiError::UploadTimeout, which
+          # its tests name, so a whole-change revert cannot compile them
+          # (INCONCLUSIVE). Keep the type and break ONLY the behaviour: the
+          # stall/trickle deadline and its idle cap never fire, the decode and
+          # the hash run on the async worker, the admission guard stays in the
+          # handler instead of riding them, the stream's data-model fill takes
+          # a second slot, and corrupt gzip/.ifcZIP streams answer 500. Once
+          # upload.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/server/src/routes/parse/upload.rs | grep -Fxq 'apps/server/src/routes/parse/upload.rs'; then
+            oracle_args+=(--mutation tests/evidence/upload-admission-7676/behaviour.oracle.patch)
           fi
           node scripts/check-test-revert-oracle.mjs "${oracle_args[@]}"
           # #7512: observe cleanup independently of scoped admission/schema.
