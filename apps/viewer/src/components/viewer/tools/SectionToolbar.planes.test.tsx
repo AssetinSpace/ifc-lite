@@ -227,6 +227,18 @@ describe('adding, choosing and removing planes (#7545)', () => {
     assert.deepEqual(chipNames(), ['A']);
   });
 
+  it('Delete on a chip removes its plane and leaves the focus on the chip that took over', async () => {
+    renderTool();
+    click(buttonByText(bar(), 'Down (Z)'));
+    addPlane('Side (X)');
+    act(() => chips()[1]!.focus());
+    press(chips()[1]!, 'Delete');
+    await new Promise((r) => setTimeout(r, 10)); // the focus moves on a timer, outside React's act scope
+    assert.deepEqual(chipNames(), ['A']);
+    // A boolean, not the nodes: a failing deepEqual on DOM elements walks their React fibers and never returns.
+    assert.ok(document.activeElement === selectedChip(), 'focus is on the selected chip, not dropped to the page');
+  });
+
   it('arrow keys move the selection AND the focus between chips and wrap, key after key', () => {
     renderTool();
     click(buttonByText(bar(), 'Down (Z)'));
