@@ -29,9 +29,32 @@
     {
       "id": "DX2",
       "title": "Supported shared headless entry point",
-      "status": "pending",
+      "status": "in_progress",
       "acceptance": "Open/query/edit/export/close through a documented library API; CLI and MCP reuse common implementation with existing behavior preserved",
-      "pullRequests": []
+      "pullRequests": [],
+      "subtasks": [
+        {
+          "title": "Move existing live-overlay query readers beneath MCP into SDK",
+          "status": "verified"
+        },
+        {
+          "title": "Move backend and add open/query/edit/export/close factory",
+          "status": "pending"
+        },
+        {
+          "title": "Adopt shared read adapter in CLI and remove superseded helpers",
+          "status": "pending"
+        }
+      ],
+      "checks": {
+        "sharedReads": "SDK 39 passed; MCP 48 passed, 1 skipped",
+        "typecheck": "root pnpm typecheck passed; all 4184 test files audited",
+        "documentation": "472 snippets compiled",
+        "moduleSize": "passed; retired one obsolete allowlist row",
+        "knip": "ran; repository-wide unused declarations/configuration findings remain; retired reader files removed and one moved unused internal type export removed",
+        "nodeConsumer": "Fresh Node resolver imports @ifc-lite/sdk/headless and queries the committed one-wall IFC sample",
+        "readOracle": "Ordinary full revert against parent OBSERVED: 42 baseline tests pass; the public Node consumer fails an assertion after SDK export removal; restoration verified"
+      }
     },
     {
       "id": "DX3",
@@ -50,9 +73,23 @@
     {
       "id": "DX5",
       "title": "Consumer artifact workflows and scaffold compatibility",
-      "status": "pending",
+      "status": "in_progress",
       "acceptance": "Fresh external consumer installs packed artifacts and proves workflows; scaffold dependency combinations tested together in CI",
-      "pullRequests": []
+      "pullRequests": [],
+      "subtasks": [
+        {
+          "title": "Public SDK headless entry point works in a fresh Node process",
+          "status": "verified"
+        },
+        {
+          "title": "External install from packed artifacts exercises complete workflows",
+          "status": "pending"
+        },
+        {
+          "title": "Scaffolder selects and tests a compatible dependency set",
+          "status": "pending"
+        }
+      ]
     },
     {
       "id": "DX6",
