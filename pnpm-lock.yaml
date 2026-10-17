@@ -190,7 +190,7 @@ importers:
         specifier: ^0.132.1
         version: 0.132.1(zod@4.6.6)
       '@assetinspace/design-kit':
-        specifier: https://github.com/AssetinSpace/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz
+        specifier: https://github.com/Menezeris/design-kit/archive/d41bbbb0472923d1cdc5104565a423898b7a7a1b.tar.gz
         version: https://codeload.github.com/Menezeris/design-kit/tar.gz/d41bbbb0472923d1cdc5104565a423898b7a7a1b
       '@aws-sdk/client-s3':
         specifier: ^3.1148.0
