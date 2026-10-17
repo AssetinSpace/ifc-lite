@@ -297,6 +297,8 @@ fork's current counts as baseline rows instead of rewriting that UI in the same 
 | `check-icon-button-adoption` | `BASELINE` in the script (`AIM-FORK` block) | `<Button size="icon">` in the same panels |
 | `check-module-size` | `scripts/module-size-allowlist.txt` | fork files over 400 lines, and upstream files the wiring grew |
 | `check-agents-md-size` | `scripts/agents-md-budget.txt` | the fork section in `AGENTS.md` and `packages/collab-server/AGENTS.md` |
+| `check-jsx-a11y` | `scripts/jsx-a11y-baseline.json` | role-based `group` / `radio` widgets and the clickable identifier-link box in the underlay / identifier-link / view-mode UI |
+| `check-type-scale` | `scripts/type-scale-baseline.json` | `text-[Npx]` in the AIM card, documents, underlay and identifier-link panels (upstream itself is at zero) |
 | ribbon command guard (`command-labels.guard.test.tsx`) | `rawByTab` (`AIM-FORK` row) | `documents: 3` — the 3D / 2D / Split buttons of the fork's Documents tab, which have no surface-command id yet |
 
 They ratchet **down**: moving a panel's copy into `catalogues/aim-fork.en.ts`, switching to

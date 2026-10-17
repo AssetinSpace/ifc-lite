@@ -20,6 +20,7 @@
 import { useMemo } from 'react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 import { useViewerStore } from '@/store';
 import { useViewMode, type ViewMode } from '@/hooks/useViewMode';
 import { viewModeDisabledReason } from '@/hooks/viewModeCore';
@@ -37,6 +38,7 @@ export const VIEW_MODES: ReadonlyArray<{ id: ViewMode; label: string; title: str
  */
 export function StoreyPicker({ className }: { className?: string } = {}) {
   const { mode, setStorey, storeys, activeStorey } = useViewMode();
+  const { t } = useTranslation();
   if (mode === '3d') return null;
   return (
     <select
@@ -48,7 +50,7 @@ export function StoreyPicker({ className }: { className?: string } = {}) {
         if (storey) setStorey(storey);
       }}
     >
-      {!activeStorey && <option value="" />}
+      {!activeStorey && <option value="" aria-label={t('aimFork.viewMode.noStorey')} />}
       {storeys.map((s) => (
         <option key={s.key} value={s.key}>
           {s.name}
