@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -48,8 +48,9 @@ import { loadBottomStripOrientation, persistBottomStripOrientation } from '@/lib
 import { LEFT_PANEL_DEFAULT_SIZE } from '@/store/layoutReset';
 import { useOverlayCompositor } from './schedule/useOverlayCompositor';
 // >>> AIM-FORK: D-072 2D plan pane + D-075 document tabs pane in the center split
-import { DrawingPlanPane } from '@/components/viewer/DrawingPlanPane';
-import { DocumentPane } from '@/components/documents/DocumentPane';
+// Lazy: the 2D plan and document panes (pdf.js surfaces) are off the boot path.
+const DrawingPlanPane = lazy(() => import('@/components/viewer/DrawingPlanPane').then((m) => ({ default: m.DrawingPlanPane })));
+const DocumentPane = lazy(() => import('@/components/documents/DocumentPane').then((m) => ({ default: m.DocumentPane })));
 // <<< AIM-FORK
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
@@ -413,7 +414,7 @@ export function ViewerLayout() {
                           document Panels are collapsible so ViewportContainer stays mounted. */}
                       <PanelGroup orientation="horizontal" className="h-full w-full">
                         <Panel id="drawing-plan-panel" defaultSize={0} minSize={20} collapsible collapsedSize={0} panelRef={planePanelRef}>
-                          <DrawingPlanPane />
+                          <Suspense fallback={null}><DrawingPlanPane /></Suspense>
                         </Panel>
                         <PanelResizeHandle
                           className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${underlaySplitView && !underlayPlanFull ? '' : 'hidden'}`}
@@ -451,7 +452,7 @@ export function ViewerLayout() {
                           className={`w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize ${docPaneVisible ? '' : 'hidden'}`}
                         />
                         <Panel id="document-pane-panel" defaultSize={0} minSize={20} collapsible collapsedSize={0} panelRef={docPanelRef} onResize={onDocPaneResize}>
-                          <DocumentPane />
+                          <Suspense fallback={null}><DocumentPane /></Suspense>
                         </Panel>
                       </PanelGroup>
                       {/* <<< AIM-FORK */}
@@ -495,7 +496,7 @@ export function ViewerLayout() {
                 (tap the plan to jump the 3D camera, exit to return). */}
             {underlaySplitView && (
               <div className="absolute inset-0 z-40 bg-background">
-                <DrawingPlanPane />
+                <Suspense fallback={null}><DrawingPlanPane /></Suspense>
               </div>
             )}
 
@@ -506,7 +507,7 @@ export function ViewerLayout() {
                 and this pane has no own exit besides closing all tabs. */}
             {docPaneOpen && !underlaySplitView && (
               <div className="absolute inset-0 z-40 bg-background">
-                <DocumentPane />
+                <Suspense fallback={null}><DocumentPane /></Suspense>
               </div>
             )}
 

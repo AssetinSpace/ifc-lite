@@ -64,6 +64,10 @@ const CHUNK_LABEL_KEYS = {
   'RTE GPU witness': 'viewerShell.chunkLabel.rteGpuWitness',
   'Saved runs': 'compareAnalysis.reconcile.savedTitle',
   "What's New tab": 'keyboardShortcuts.tabs.whatsNew',
+  // >>> AIM-FORK: lazy fork-only panels (D-072, D-075), named by their panel titles
+  'Drawing underlays panel': 'aimFork.panel.drawingUnderlay',
+  'Documents panel': 'aimFork.panel.documents',
+  // <<< AIM-FORK
 } as const satisfies Record<string, TranslationKey>;
 
 type ChunkLabel = keyof typeof CHUNK_LABEL_KEYS;

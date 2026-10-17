@@ -39,12 +39,12 @@ import { PanelModelGate } from '@/components/viewer/PanelModelGate';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
 import { loadIdsStudioRuntime } from '@/lib/ids-studio/runtime-loader';
 import { useViewerStore } from '@/store';
-// >>> AIM-FORK: fork-only panels (D-072, D-075). Eager on purpose: pdf.js stays
-// out of the initial bundle regardless (the rasterizer dynamic-imports
-// pdfjs-dist on first use), and a lazy() chunk here produced a rolldown
-// chunk-order cycle that broke react-dom's CJS interop at startup.
-import { DrawingUnderlayPanel } from '@/components/viewer/DrawingUnderlayPanel';
-import { DocumentsPanel } from '@/components/documents/DocumentsPanel';
+// >>> AIM-FORK: fork-only panels (D-072, D-075), lazy like the upstream panels
+// below so they stay off the boot path (perf ratchet viewer-entry/eager-js).
+// An earlier bundler build broke react-dom's CJS interop on a lazy chunk here;
+// the e2e boot smoke covers that the current one does not.
+const DrawingUnderlayPanel = lazy(() => import('@/components/viewer/DrawingUnderlayPanel').then((m) => ({ default: m.DrawingUnderlayPanel })));
+const DocumentsPanel = lazy(() => import('@/components/documents/DocumentsPanel').then((m) => ({ default: m.DocumentsPanel })));
 // <<< AIM-FORK
 // Lazy: the Layers panel pulls in @ifc-lite/merge (engine + blake3); a
 // dynamic chunk keeps it out of the initial bundle until first opened.
@@ -217,8 +217,8 @@ function panelBody(id: WorkspacePanelId, onClose: () => void): ReactNode {
     case 'idsStudio': return <IdsStudioPanelBody />;
     case 'changeSets': return <ChangeSetPanel onClose={onClose} />;
     // >>> AIM-FORK: fork-only panels
-    case 'drawing-underlay': return <DrawingUnderlayPanel onClose={onClose} />;
-    case 'documents': return <DocumentsPanel onClose={onClose} />;
+    case 'drawing-underlay': return <ChunkErrorBoundary label="Drawing underlays panel"><Suspense fallback={null}><DrawingUnderlayPanel onClose={onClose} /></Suspense></ChunkErrorBoundary>;
+    case 'documents': return <ChunkErrorBoundary label="Documents panel"><Suspense fallback={null}><DocumentsPanel onClose={onClose} /></Suspense></ChunkErrorBoundary>;
     // <<< AIM-FORK
   }
 }

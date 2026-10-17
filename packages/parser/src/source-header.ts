@@ -178,11 +178,15 @@ function isIdent(c: string | undefined): boolean {
  * The twin of `find_keyword_then` in `rust/core/src/parser/header_scan.rs`,
  * pinned by `rust/core/tests/fixtures/step_header_read_vectors.json`.
  */
+// >>> AIM-FORK: result key `then` renamed to `thenAt`. An object with a `then`
+// key looks like a thenable (an `await` would call it); oxlint's
+// unicorn/no-thenable is an error and keeps Lint red upstream as well.
 function findKeywordThen(
   text: string,
   keyword: string,
   then: '(' | ';',
-): { start: number; then: number } | undefined {
+): { start: number; thenAt: number } | undefined {
+// <<< AIM-FORK
   const scan = new StepTextScan(text);
   for (let i = 0; i + keyword.length <= text.length; i++) {
     const skip = skipLexical(scan, text, i);
@@ -206,7 +210,7 @@ function findKeywordThen(
         if (comment === undefined || comment.stop) return undefined;
         at = comment.next;
       }
-      if (text[at] === then) return { start: i, then: at };
+      if (text[at] === then) return { start: i, thenAt: at }; // AIM-FORK: thenAt
     }
   }
   return undefined;
@@ -222,7 +226,7 @@ function extractRecordArgs(text: string, keyword: string): string | null {
   const hit = findKeywordThen(text, keyword, '(');
   if (hit === undefined) return null;
   const scan = new StepTextScan(text);
-  const start = hit.then;
+  const start = hit.thenAt; // AIM-FORK: thenAt
   let depth = 0;
   for (let i = start; i < text.length; i++) {
     const skip = skipLexical(scan, text, i);

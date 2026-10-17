@@ -55,6 +55,15 @@ export interface StoreyPlanFrame {
 /** A placement `Axis` is treated as vertical within this of unit +Z. */
 const VERTICAL_EPS = 1e-6;
 
+// >>> AIM-FORK: restores the #7306 live bound that #7825 dropped (red upstream too)
+/**
+ * Live (mutation-view) reads refuse a storey chain longer than this: a frame
+ * read on every pointer move must not do unbounded work over overlay records
+ * (#7306). Source-only reads stay unbounded (D27, #7791).
+ */
+const MAX_LIVE_STOREY_PLACEMENTS = 256;
+// <<< AIM-FORK
+
 /** The frame of a storey that carries no placement at all: no transform. */
 const IDENTITY_FRAME: StoreyPlanFrame = { origin: [0, 0], axisX: [1, 0] };
 
@@ -99,6 +108,7 @@ export function storeyPlanFrame(
   if (numericAttr(storey.attributes[5]) === null) return IDENTITY_FRAME; // ObjectPlacement
   const chain = storeyPlacementChain(store, extractor, overlay, storeyExpressId);
   if (!chain || chain.size === 0) return null;
+  if (view && chain.size > MAX_LIVE_STOREY_PLACEMENTS) return null; // AIM-FORK: #7306
   for (const placementId of chain.keys()) {
     if (!placementIsInPlan(store, extractor, placementId, overlay)) return null;
   }

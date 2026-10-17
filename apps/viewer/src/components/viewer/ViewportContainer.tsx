@@ -29,7 +29,7 @@ import { ToolOverlays } from './ToolOverlays';
 import { ZoneOverlay, ZoneAssignmentSyncMount } from './tools/ZoneOverlay';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
 // >>> AIM-FORK: Reality Capture pin billboard (D-073)
-import { CapturePinLayer } from '../../aim/CapturePinLayer';
+const CapturePinLayer = lazy(() => import('../../aim/CapturePinLayer').then((m) => ({ default: m.CapturePinLayer })));
 // <<< AIM-FORK
 import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { MeasurementSceneLayer } from './scene/MeasurementSceneLayer';
@@ -37,9 +37,10 @@ import { BasepointOverlay } from './BasepointOverlay';
 import { SceneOverlayRoot } from '@/components/viewport-ui/scene';
 import { DrawingRuntimeHost } from './drawing/DrawingRuntimeHost';
 // >>> AIM-FORK: drawing-underlay calibration / split-view overlays (D-072)
-import { CalibrationOverlay3D } from './CalibrationOverlay3D';
-import { DrawingLocationOverlay3D } from './DrawingLocationOverlay3D';
-import { CalibrationPdfOverlay } from './CalibrationPdfOverlay';
+// Lazy: none of them draws anything until an underlay is calibrated or placed.
+const CalibrationOverlay3D = lazy(() => import('./CalibrationOverlay3D').then((m) => ({ default: m.CalibrationOverlay3D })));
+const DrawingLocationOverlay3D = lazy(() => import('./DrawingLocationOverlay3D').then((m) => ({ default: m.DrawingLocationOverlay3D })));
+const CalibrationPdfOverlay = lazy(() => import('./CalibrationPdfOverlay').then((m) => ({ default: m.CalibrationPdfOverlay })));
 // <<< AIM-FORK
 import { BCFOverlay } from './bcf/BCFOverlay';
 import { CesiumOverlay } from './CesiumOverlay';
@@ -856,7 +857,7 @@ export function ViewportContainer() {
         <AnnotationLayer />
         {/* >>> AIM-FORK: Reality Capture pin billboard (D-073) — AIM-owned layer,
             same overlay root as AnnotationLayer so it re-projects over the scene. */}
-        <CapturePinLayer />
+        <Suspense fallback={null}><CapturePinLayer /></Suspense>
         {/* <<< AIM-FORK */}
         <CollabPresenceLayer />
         {bcfOverlayVisible && <BCFOverlay />}
@@ -885,9 +886,11 @@ export function ViewportContainer() {
       {/* >>> AIM-FORK: D-072 overlays — calibration A/B markers + line over the picked
           model points, the split-view location marker mirroring the 2D plan pane,
           and the large calibration PDF surface for precise picking. */}
-      <CalibrationOverlay3D />
-      <DrawingLocationOverlay3D />
-      <CalibrationPdfOverlay />
+      <Suspense fallback={null}>
+        <CalibrationOverlay3D />
+        <DrawingLocationOverlay3D />
+        <CalibrationPdfOverlay />
+      </Suspense>
       {/* <<< AIM-FORK */}
     </div>
   );
