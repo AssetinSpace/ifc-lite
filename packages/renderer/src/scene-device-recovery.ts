@@ -15,10 +15,8 @@ import { composeInstancedOverrideColor } from './instanced-override-color.js';
 import { BATCH_CONSTANTS } from './constants.js';
 import { createSceneBatchShell } from './scene-batch-upload.js';
 import { createStaticGpuBuffer } from './gpu-static-upload.js';
-// >>> AIM-FORK: recovery rebuilds instanced entity boxes (#4226 e2e)
-import { worldAabbFromPieces } from './scene-geometry.js';
-import type { BoundingBox } from './scene-raycaster.js';
-// <<< AIM-FORK
+import { worldAabbFromPieces } from './scene-geometry.js'; // AIM-FORK: #4226
+import type { BoundingBox } from './scene-raycaster.js'; // AIM-FORK: #4226
 import { retainedStreamingFragments } from './scene-streaming-recovery.js';
 import type { ModelTranslations } from './model-translation.js';
 
@@ -78,10 +76,8 @@ export interface SceneRecoveryHost {
   meshDataMap: Map<number, MeshData[]>;
   colorOverrides: ReadonlyMap<number, readonly [number, number, number, number]> | null;
   appearanceAccessState?: unknown;
-  // >>> AIM-FORK: `releasedEntityBounds` + `boundingBoxes` for the instanced box rebuild below (#4226)
-  modelTranslations: Pick<ModelTranslations, 'registerDrawable' | 'get' | 'getYaw' | 'placeInstances' | 'releasedEntityBounds'>;
-  boundingBoxes: Map<number, BoundingBox>;
-  // <<< AIM-FORK
+  modelTranslations: Pick<ModelTranslations, 'registerDrawable' | 'get' | 'getYaw' | 'placeInstances' | 'releasedEntityBounds'>; // AIM-FORK: +releasedEntityBounds
+  boundingBoxes: Map<number, BoundingBox>; // AIM-FORK: #4226
   dropAllPartialCaches(): void;
   releaseColorOverrideGpu(): void;
   releaseTexturedMeshTexture(mesh: Pick<TexturedMesh, 'texture' | 'sharedTextureKey'>): void;
@@ -335,12 +331,8 @@ function restoreInstancedTemplates(host: SceneRecoveryHost, device: GPUDevice): 
   }
   for (const [eid, occurrences] of host.instancedEntityMap) {
     if (host.instanceSuppression.has(eid)) continue;
-    // >>> AIM-FORK: rebuild, do not grow, the entity box. A model move while the
-    // device was absent skipped the refold (no GPU template), so the cached box
-    // still holds the pre-move pose; unioning the moved occurrences into it left
-    // every instanced box spanning both poses and frameBuildingExtent aimed
-    // between them (#4226 e2e). Same reset as placeSceneInstances, CPU matrices
-    // untouched (#6993).
+    // >>> AIM-FORK: rebuild, not grow, the box: a move while the device was absent
+    // skipped the refold, so unioning kept the pre-move pose too (#4226). CPU matrices untouched (#6993).
     const flat = host.meshDataMap.has(eid) ? worldAabbFromPieces(host.meshDataMap.get(eid)!) : host.modelTranslations.releasedEntityBounds(eid);
     if (flat) host.boundingBoxes.set(eid, flat); else host.boundingBoxes.delete(eid);
     // <<< AIM-FORK

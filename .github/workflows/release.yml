@@ -723,7 +723,10 @@ jobs:
     needs: release
     # Fail closed when a failed/cancelled release leaves the output unset. An
     # ordinary non-release push writes the explicit literal `false`.
-    if: always() && needs.release.outputs.verify != 'false'
+    # >>> AIM-FORK: the release job above only runs upstream, so on the fork its output is
+    # unset and this fail-closed gate would verify a publish that never happens.
+    if: github.repository == 'LTplus-AG/ifc-lite' && always() && needs.release.outputs.verify != 'false'
+    # <<< AIM-FORK
     runs-on: ubuntu-latest
     # Bounded on purpose. The retry budget below is per PACKAGE and the walk
     # is sequential: 40-odd packages x 11 waits x 20s is over two hours with
@@ -761,7 +764,9 @@ jobs:
   verify-scaffold-cohort:
     name: Verify published scaffold cohorts
     needs: [release, verify-npm-publish]
-    if: always() && needs.release.outputs.verify != 'false' && needs.verify-npm-publish.result == 'success'
+    # >>> AIM-FORK: upstream-only like the release job
+    if: github.repository == 'LTplus-AG/ifc-lite' && always() && needs.release.outputs.verify != 'false' && needs.verify-npm-publish.result == 'success'
+    # <<< AIM-FORK
     uses: ./.github/workflows/test-templates.yml
     permissions:
       contents: read
@@ -775,7 +780,10 @@ jobs:
   verify-crates-publish:
     name: Verify crates.io publish
     needs: release
-    if: always() && needs.release.outputs.verify != 'false'
+    # >>> AIM-FORK: the release job above only runs upstream, so on the fork its output is
+    # unset and this fail-closed gate would verify a publish that never happens.
+    if: github.repository == 'LTplus-AG/ifc-lite' && always() && needs.release.outputs.verify != 'false'
+    # <<< AIM-FORK
     runs-on: ubuntu-latest
     # Same reasoning as the npm job: 7 crates x 11 waits x 20s is ~26 minutes
     # of pure waiting during a registry outage, plus an artifact download per

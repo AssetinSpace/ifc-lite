@@ -253,7 +253,7 @@ so they **skip** on our fork instead of failing red:
 
 | Workflow | Job(s) | Why it can't run here |
 |---|---|---|
-| `.github/workflows/release.yml` | `release` | Publishes to npm/crates + opens the changesets version PR; needs `RELEASE_PAT` + OIDC trusted publishers the fork lacks (fails at checkout: "token not supplied"). |
+| `.github/workflows/release.yml` | `release`, `verify-npm-publish`, `verify-scaffold-cohort`, `verify-crates-publish` | Publishes to npm/crates + opens the changesets version PR; needs `RELEASE_PAT` + OIDC trusted publishers the fork lacks (fails at checkout: "token not supplied"). |
 | `.github/workflows/docs.yml` | `build`, `deploy` | Deploys docs to GitHub Pages; the fork has no Pages site (`configure-pages` → 404 "Get Pages site failed"). |
 | `.github/workflows/docker.yml` | `docker` | Publishes the server container; the fork embeds the viewer via Vercel and doesn't ship it (also wants a Depot runner). |
 | `.github/workflows/issue-queue.yml` | `issue-queue`, `issue-queue-merge-group` | Upstream's steering gate (PR must close a `ready` issue or carry `unqueued`); the fork has no such triage. |

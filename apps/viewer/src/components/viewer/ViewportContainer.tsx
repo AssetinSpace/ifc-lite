@@ -36,8 +36,7 @@ import { MeasurementSceneLayer } from './scene/MeasurementSceneLayer';
 import { BasepointOverlay } from './BasepointOverlay';
 import { SceneOverlayRoot } from '@/components/viewport-ui/scene';
 import { DrawingRuntimeHost } from './drawing/DrawingRuntimeHost';
-// >>> AIM-FORK: drawing-underlay calibration / split-view overlays (D-072)
-// Lazy: none of them draws anything until an underlay is calibrated or placed.
+// >>> AIM-FORK: drawing-underlay overlays (D-072); lazy, nothing draws until an underlay is calibrated or placed
 const CalibrationOverlay3D = lazy(() => import('./CalibrationOverlay3D').then((m) => ({ default: m.CalibrationOverlay3D })));
 const DrawingLocationOverlay3D = lazy(() => import('./DrawingLocationOverlay3D').then((m) => ({ default: m.DrawingLocationOverlay3D })));
 const CalibrationPdfOverlay = lazy(() => import('./CalibrationPdfOverlay').then((m) => ({ default: m.CalibrationPdfOverlay })));
@@ -883,9 +882,7 @@ export function ViewportContainer() {
       <ZoneAssignmentSyncMount />
       <DrawingRuntimeHost mergedGeometry={mergedGeometryResult} computedIsolatedIds={computedIsolatedIds} />
       <Toaster variant="absolute" />
-      {/* >>> AIM-FORK: D-072 overlays — calibration A/B markers + line over the picked
-          model points, the split-view location marker mirroring the 2D plan pane,
-          and the large calibration PDF surface for precise picking. */}
+      {/* >>> AIM-FORK: D-072 overlays: calibration A/B markers, split-view location marker, calibration PDF surface */}
       <Suspense fallback={null}>
         <CalibrationOverlay3D />
         <DrawingLocationOverlay3D />
