@@ -4,18 +4,21 @@
 
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
+import { resolveNpmCommand, isMissingNpmArtifact } from './npm-command.js';
+import { hasWorkerFiles, publishedWorkerAssetsPresent } from './published-worker-assets.js';
 
 /** Cache of npm-resolved versions to avoid redundant registry queries. */
 const versionCache = new Map<string, string>();
 const publishedVersionsCache = new Map<string, Set<string>>();
+const dependenciesCache = new Map<string, Record<string, string>>();
+const artifactCache = new Map<string, boolean>();
 const VALID_PACKAGE_NAME = /^(?:@[\w.-]+\/)?[\w.-]+$/;
 const NPM_TIMEOUT_MS = 30000;
 const MAX_VERSION_CANDIDATES = 10;
 
 function readJsonFromNpm(args: string[]): unknown {
-  const command = process.platform === 'win32' ? process.env.ComSpec ?? 'cmd.exe' : 'npm';
-  const commandArgs = process.platform === 'win32' ? ['/d', '/s', '/c', 'npm', ...args] : args;
+  const { command, args: commandArgs } = resolveNpmCommand(args);
   const result = execFileSync(command, commandArgs, {
     stdio: 'pipe',
     timeout: NPM_TIMEOUT_MS,
@@ -45,25 +48,70 @@ function extractPinnedVersion(range: string): string | null {
 }
 
 function getVersionDependencies(packageName: string, version: string): Record<string, string> {
-  const json = readJsonFromNpm(['view', `${packageName}@${version}`, 'dependencies', '--json']);
+  const key = `${packageName}@${version}`;
+  const cached = dependenciesCache.get(key);
+  if (cached) return cached;
+  const json = readJsonFromNpm(['view', key, 'dependencies', '--json']);
   if (!json || typeof json !== 'object' || Array.isArray(json)) {
     return {};
   }
-  return json as Record<string, string>;
+  const dependencies = json as Record<string, string>;
+  dependenciesCache.set(key, dependencies);
+  return dependencies;
+}
+
+/**
+ * Is the version's own tarball actually downloadable?
+ *
+ * A version can be `dist-tags.latest`, be listed in the packument, and
+ * advertise a `dist.tarball` that 404s -- a publish that registered the
+ * version without storing the artifact. `@ifc-lite/server-client@3.1.0` was
+ * exactly that, so every `--template server` scaffold died at `npm install`
+ * with a 404 on a URL npm itself had handed it (#5570).
+ *
+ * `npm pack --dry-run` is the probe rather than a raw HTTP request because it
+ * resolves through npm's own registry, proxy and auth config, and writes
+ * nothing. Only an explicit "not there" answer rejects a candidate: a network
+ * failure or an auth wall must not silently push the scaffold back onto an
+ * older version, so anything else is treated as "cannot tell, assume fine".
+ */
+function isTarballFetchable(packageName: string, version: string): boolean {
+  const key = `${packageName}@${version}`;
+  const cached = artifactCache.get(key);
+  if (cached !== undefined) return cached;
+  const args = ['pack', `${packageName}@${version}`, '--dry-run', '--json'];
+  const { command, args: commandArgs } = resolveNpmCommand(args);
+  const result = spawnSync(command, commandArgs, { encoding: 'utf-8', timeout: NPM_TIMEOUT_MS });
+  if (result.status === 0) {
+    const metadata: unknown = JSON.parse(result.stdout || '[]');
+    const valid = !hasWorkerFiles(metadata) || publishedWorkerAssetsPresent(packageName, version);
+    artifactCache.set(key, valid);
+    return valid;
+  }
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  return !isMissingNpmArtifact(output);
 }
 
 function isInstallablePublishedVersion(packageName: string, version: string): boolean {
-  const dependencies = getVersionDependencies(packageName, version);
-
-  for (const [dependencyName, dependencyRange] of Object.entries(dependencies)) {
-    if (!dependencyName.startsWith('@ifc-lite/')) continue;
-    const pinnedVersion = extractPinnedVersion(dependencyRange);
-    if (!pinnedVersion) continue;
-    if (!getPublishedVersions(dependencyName).has(pinnedVersion)) {
-      return false;
+  // Iterative: registry dependency graphs can contain cycles or shared subgraphs.
+  const queue: Array<[string, string]> = [[packageName, version]];
+  const seen = new Set<string>();
+  for (let index = 0; index < queue.length; index++) {
+    const [name, candidate] = queue[index];
+    const key = `${name}@${candidate}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (seen.size > 128) throw new Error('Scaffold dependency validation exceeds 128 package versions');
+    const dependencies = getVersionDependencies(name, candidate);
+    for (const [dependencyName, dependencyRange] of Object.entries(dependencies)) {
+      if (!dependencyName.startsWith('@ifc-lite/')) continue;
+      const pinnedVersion = extractPinnedVersion(dependencyRange);
+      if (!pinnedVersion) continue;
+      if (!getPublishedVersions(dependencyName).has(pinnedVersion)) return false;
+      queue.push([dependencyName, pinnedVersion]);
     }
+    if (!isTarballFetchable(name, candidate)) return false;
   }
-
   return true;
 }
 
@@ -99,6 +147,13 @@ export function getPackageVersion(packageName: string): string {
     );
   }
 }
+
+/** Pin the selected, inspected release so npm cannot reselect a rejected newer one. */
+export function getPinnedPackageVersion(packageName: string): string {
+  return getPackageVersion(packageName).replace(/^\^/, '');
+}
+
+export const MODULE_WORKER_CONFIG = `  // Published geometry workers are ES modules and may split chunks.\n  worker: { format: 'es' },\n`;
 
 /**
  * Rewrite the viewer's package.json so it works as a standalone project:

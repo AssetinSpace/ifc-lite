@@ -7,9 +7,13 @@
 //! Provides unified implementations for parsing IFC placement and direction entities,
 //! eliminating code duplication across processors.
 
+use crate::math::tol;
 use crate::error::{Error, Result};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use nalgebra::{Matrix4, Point3, Vector3};
+
+mod placement_2d;
+pub(crate) use placement_2d::parse_axis2_placement_2d;
 
 /// Parse IfcAxis2Placement3D into transformation matrix
 ///
@@ -83,25 +87,13 @@ pub(crate) fn build_axis2_matrix(
     // guard lives here once). A zero Axis falls back to +Z; a zero RefDirection
     // routes into the parallel-axis fallback below.
     let z_axis_final = z_axis
-        .try_normalize(1e-9)
+        .try_normalize(tol::AXIS_MIN_LEN)
         .unwrap_or_else(|| Vector3::new(0.0, 0.0, 1.0));
     let x_axis_normalized = x_axis
-        .try_normalize(1e-9)
+        .try_normalize(tol::AXIS_MIN_LEN)
         .unwrap_or_else(|| Vector3::new(1.0, 0.0, 0.0));
 
-    // Ensure X is orthogonal to Z (project X onto plane perpendicular to Z)
-    let dot_product = x_axis_normalized.dot(&z_axis_final);
-    let x_axis_orthogonal = x_axis_normalized - z_axis_final * dot_product;
-    let x_axis_final = if x_axis_orthogonal.norm() > 1e-6 {
-        x_axis_orthogonal.normalize()
-    } else {
-        // X and Z are parallel or nearly parallel - use a default perpendicular direction
-        if z_axis_final.z.abs() < 0.9 {
-            Vector3::new(0.0, 0.0, 1.0).cross(&z_axis_final).normalize()
-        } else {
-            Vector3::new(1.0, 0.0, 0.0).cross(&z_axis_final).normalize()
-        }
-    };
+    let x_axis_final = crate::axis_projection::perpendicular_x_axis(z_axis_final, x_axis_normalized);
 
     // Y axis is cross product of Z and X (right-hand rule: Y = Z × X)
     let y_axis = z_axis_final.cross(&x_axis_final).normalize();
@@ -149,6 +141,11 @@ pub fn parse_cartesian_point(
         .resolve_ref(point_attr)?
         .ok_or_else(|| Error::geometry("Failed to resolve cartesian point".to_string()))?;
 
+    parse_decoded_cartesian_point(&point_entity)
+}
+
+/// Parse a point already decoded by a caller that must verify its IFC type.
+pub(crate) fn parse_decoded_cartesian_point(point_entity: &DecodedEntity) -> Result<Point3<f64>> {
     if point_entity.ifc_type != IfcType::IfcCartesianPoint {
         return Err(Error::geometry(format!(
             "Expected IfcCartesianPoint, got {}",
@@ -386,33 +383,35 @@ mod tests {
         assert!((m[(2, 0)] - 0.0).abs() < 1e-9);
     }
 
+    // An Axis-only placement (RefDirection `$`, or the attribute missing) on
+    // each world axis: the frame the renderer draws. #5922: the viewer's
+    // compare reader (`apps/viewer/src/lib/compare/worldPlacement.test.ts`)
+    // pins the SAME table, so a change to this fill must move both.
     #[test]
-    fn parse_axis2_placement_3d_defaults_ref_direction_when_only_axis_given() {
-        // Axis is explicitly (0,1,0); RefDirection attribute is missing
-        // (only 2 of 3 attributes present), so it must default to world X
-        // (1,0,0), which is already orthogonal to (0,1,0) here.
-        let content = "\
-#1=IFCCARTESIANPOINT((0.0,0.0,0.0));
-#2=IFCDIRECTION((0.0,1.0,0.0));
-#3=IFCAXIS2PLACEMENT3D(#1,#2);";
-        let mut decoder = EntityDecoder::new(content);
-        let placement = decoder.decode_by_id(3).unwrap();
-        assert_eq!(placement.attributes.len(), 2, "test fixture sanity check");
-
-        let m = parse_axis2_placement_3d(&placement, &mut decoder).unwrap();
-
-        // Z axis is the custom (0,1,0) -> column 2.
-        assert!((m[(0, 2)] - 0.0).abs() < 1e-9);
-        assert!((m[(1, 2)] - 1.0).abs() < 1e-9);
-        assert!((m[(2, 2)] - 0.0).abs() < 1e-9);
-        // X axis defaults to world (1,0,0), already orthogonal -> column 0.
-        assert!((m[(0, 0)] - 1.0).abs() < 1e-9);
-        assert!((m[(1, 0)] - 0.0).abs() < 1e-9);
-        assert!((m[(2, 0)] - 0.0).abs() < 1e-9);
-        // Y = Z x X = (0,1,0) x (1,0,0) = (0,0,-1) -> column 1.
-        assert!((m[(0, 1)] - 0.0).abs() < 1e-9);
-        assert!((m[(1, 1)] - 0.0).abs() < 1e-9);
-        assert!((m[(2, 1)] - (-1.0)).abs() < 1e-9);
+    fn parse_axis2_placement_3d_axis_only_frames_on_world_axes() {
+        type V = [f64; 3];
+        let cases: [(V, V, V); 6] = [
+            // (Axis, local X, local Y = Z x X)
+            ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            ([-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+            ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ([0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ];
+        for ((axis, x, y), tail) in cases.iter().flat_map(|c| [(c, ",$"), (c, "")]) {
+            let content = format!(
+                "#1=IFCCARTESIANPOINT((0.0,0.0,0.0));\n#2=IFCDIRECTION(({:?},{:?},{:?}));\n#3=IFCAXIS2PLACEMENT3D(#1,#2{tail});",
+                axis[0], axis[1], axis[2]
+            );
+            let mut decoder = EntityDecoder::new(&content);
+            let placement = decoder.decode_by_id(3).unwrap();
+            let m = parse_axis2_placement_3d(&placement, &mut decoder).unwrap();
+            for i in 0..3 {
+                assert!((m[(i, 0)] - x[i]).abs() < 1e-9, "Axis {axis:?}{tail}: X = {:?}", m.column(0));
+                assert!((m[(i, 1)] - y[i]).abs() < 1e-9, "Axis {axis:?}{tail}: Y = {:?}", m.column(1));
+            }
+        }
     }
 
     #[test]

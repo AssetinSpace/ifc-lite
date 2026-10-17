@@ -1,0 +1,51 @@
+{
+  "family": "bundle",
+  "description": "Transfer and boot size of what the viewer ships, measured by scripts/perf-ratchet/measure-bundle.mjs from the build job's artifacts: brotli (quality 11, node zlib) of the engine WASM, and raw bytes of the viewer's main entry chunk and of every JS file dist/index.html loads eagerly (eager bytes are the blocking ceiling, #7002). Viewer JS is gated raw because brotli-11 of it jumps by ~0.5% on a same-length timestamp change; its brotli sizes are reported, not gated (#7007). Raising a ceiling is a human PR with a justification (docs/guide/performance.md, 'Perf ratchet ceilings'); lowering is the daily perf-ratchet-lower.yml job.",
+  "entries": [
+    {
+      "id": "engine-wasm-brotli",
+      "metric": "brotli-bytes",
+      "unit": "bytes",
+      "description": "packages/wasm/pkg/ifc-lite_bg.wasm, the single-thread engine bundle",
+      "ceiling": 2247626,
+      "tolerance": {
+        "kind": "relative",
+        "value": 0.005
+      },
+      "provenance": {
+        "commit": "d8c110166a07e494be45e509e31db2c614b31217",
+        "measuredAt": "2026-10-16T14:09:08.304Z"
+      }
+    },
+    {
+      "id": "viewer-entry-js-bytes",
+      "metric": "raw-bytes",
+      "unit": "bytes",
+      "description": "raw size of the single <script type=\"module\" src> chunk of apps/viewer/dist/index.html",
+      "ceiling": 3148299,
+      "tolerance": {
+        "kind": "relative",
+        "value": 0.001
+      },
+      "provenance": {
+        "commit": "f40c2582ef9195e7fcf9690c96932cf4cc72b94a",
+        "measuredAt": "2026-10-17T18:15:00.000Z"
+      }
+    },
+    {
+      "id": "viewer-eager-js-bytes",
+      "metric": "raw-bytes",
+      "unit": "bytes",
+      "description": "summed raw size of every JS file dist/index.html loads eagerly: the module <script src> plus <link rel=modulepreload>",
+      "ceiling": 19313997,
+      "tolerance": {
+        "kind": "relative",
+        "value": 0.001
+      },
+      "provenance": {
+        "commit": "f40c2582ef9195e7fcf9690c96932cf4cc72b94a",
+        "measuredAt": "2026-10-17T18:15:00.000Z"
+      }
+    }
+  ]
+}

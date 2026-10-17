@@ -41,18 +41,30 @@ git grep -n ">>> AIM-FORK" -- apps/ packages/
 | File | Blocks | What we add |
 |---|---|---|
 | `apps/viewer/index.html` | 4 | branded title, assetin favicons, Inter font, brand colours (D-070) |
-| `apps/viewer/src/main.tsx` | 1 | assetin design-kit import order — tokens first (D-070) |
-| `apps/viewer/src/App.tsx` | 2 | `import { AimBridge }` + `<AimBridge />` mount |
-| `apps/viewer/src/components/viewer/ViewerLayout.tsx` | 1 | `?models=` federated autoload (extends upstream's `?model=`) |
-| `apps/viewer/src/components/viewer/PropertiesPanel.tsx` | 4 | AIM \| IFC inspector tabs + `<AimCard />`, native content wrapped (D-077) |
+| `apps/viewer/src/bootstrap.tsx` | 1 | assetin design-kit import order — tokens first, after `index.css` (D-070; upstream moved the entry imports here from `main.tsx`) |
+| `apps/viewer/src/App.tsx` | 2 | `import { AimBridge }` + `<AimBridge />` mount inside `SourceHostProvider` |
+| `apps/viewer/src/hooks/useModelUrlAutoload.ts` | 3 | `?models=` federated autoload + origin allowlist (`lib/autoload.ts`), `AUTOLOAD_COMPLETE_EVENT` for AimBridge |
+| `apps/viewer/src/components/viewer/ViewerLayout.tsx` | 6 | D-072 2D plan pane + D-075 document pane in the center split (around upstream's `ModelWorkspaceSplit`), view-mode effects |
+| `apps/viewer/src/components/viewer/MobileBottomSheet.tsx` | 1 | `z-50` so sheets sit above the full-screen plan/document overlays |
+| `apps/viewer/src/components/viewer/MobileToolbar.tsx` | 2 | `<ViewModeSwitcher />` (D-075) |
+| `apps/viewer/src/components/viewer/PropertiesPanel.tsx` | 7 | AIM \| IFC inspector tabs + `<AimCard />`, native content wrapped, mobile scroll host (D-077) |
 | `apps/viewer/src/components/viewer/HierarchyPanel.tsx` | 2 | AIM tree decorations — row → IFC GlobalId → badge counts (D-077) |
-| `apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx` | 5 | AIM badge icons + per-GUID counts (D-077) |
-| `apps/viewer/src/components/viewer/ViewportContainer.tsx` | 2 | Reality Capture pin billboard (D-073) |
-| `apps/viewer/src/components/viewer/MainToolbar.tsx` | 4 | Drawing Underlays panel toggle (D-072) + `<ViewModeSwitcher />` (D-075) |
+| `apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx` | 4 | AIM badge icons + per-GUID counts (D-077) |
+| `apps/viewer/src/components/viewer/Viewport.tsx` | 2 | `useDrawingUnderlay` (D-072) |
+| `apps/viewer/src/components/viewer/ViewportContainer.tsx` | 4 | Reality Capture pin layer (D-073), calibration / split-view overlays (D-072) |
+| `apps/viewer/src/components/viewer/viewport-render-options.ts` | 2 | drawing-view storey cut wins over the Section clip (`aim/underlayCut.ts`, D-072) |
+| `apps/viewer/src/components/viewer/selectionHandlers.ts` | 2 | underlay calibration model-point pick (`aim/underlayPick.ts`, D-072) |
+| `apps/viewer/src/components/viewer/useMouseControls.ts` | 2 | drawing view: drag pans; Ctrl/Cmd+wheel moves the cut while it is active (D-072) |
+| `apps/viewer/src/hooks/useFloorplanView.ts` | 2 | `StoreyInfo` alias + projection/camera selectors for the drawing / split / 2D views (D-072, D-075) |
 | `apps/viewer/src/components/viewer/ribbon/RibbonToolbar.tsx` | 3 | fork-only **Documents** ribbon tab — strip entry + band mount (D-072/D-075) |
 | `apps/viewer/src/store/constants.ts` | 1 | `'documents'` added to `RibbonTabId` |
 | `apps/viewer/src/store/index.ts` | 1 | fork-only store slices (underlays D-072, documents D-075, identifier links D-076) |
+| `apps/viewer/src/store/teardown-registry.ts` | 2 | the fork slices' session-reset teardowns (`slices/*Slice.teardown.ts`) |
+| `apps/viewer/src/store/store-sync.ts` | 1 | fork panels in `SIDEBAR_PANEL_FLAGS` |
+| `apps/viewer/src/store/createViewerActions.ts` | 2 | fork panel flags in `openWorkspacePanel` / properties reveal |
 | `apps/viewer/src/lib/panels/registry.ts` | 3 | fork-only workspace panels `drawing-underlay` + `documents`, appended last |
+| `apps/viewer/src/lib/panels/renderPanelBody.tsx` | 2 | bodies of the two fork panels |
+| `apps/viewer/src/i18n/en.ts` | 2 | fork catalogue `catalogues/aim-fork.en.ts` (panel titles, `ribbon.tab.documents`) |
 | `packages/renderer/src/index.ts` | 5 | generic external-overlay hook + registry — **upstream-PR candidate** |
 | `packages/collab-server/src/bin.ts` | 3 | fail-closed startup guard (replaces upstream's warn-only block) |
 
@@ -244,36 +256,55 @@ so they **skip** on our fork instead of failing red:
 | `.github/workflows/release.yml` | `release` | Publishes to npm/crates + opens the changesets version PR; needs `RELEASE_PAT` + OIDC trusted publishers the fork lacks (fails at checkout: "token not supplied"). |
 | `.github/workflows/docs.yml` | `build`, `deploy` | Deploys docs to GitHub Pages; the fork has no Pages site (`configure-pages` → 404 "Get Pages site failed"). |
 | `.github/workflows/docker.yml` | `docker` | Publishes the server container; the fork embeds the viewer via Vercel and doesn't ship it (also wants a Depot runner). |
+| `.github/workflows/issue-queue.yml` | `issue-queue`, `issue-queue-merge-group` | Upstream's steering gate (PR must close a `ready` issue or carry `unqueued`); the fork has no such triage. |
+| `.github/workflows/test.yml` | step *Refuse a release commit that still carries changesets* | Guards upstream's npm release; every sync moves versions and carries upstream's pending changesets, so it can only fail here. |
 
 If we ever want these on the fork: for docs, enable GitHub Pages (Settings → Pages → build
 from Actions) and drop the guard; for releases/docker, set up our own publish targets first.
 
 ## Depot runners → ubuntu-latest on the fork
 
-Upstream runs the heavy CI jobs on **Depot** managed runners (`depot-ubuntu-24.04-4`), which
-don't exist on the fork — so those jobs sit **queued forever** (`runner_id 0`) and the PR never
-goes green. The affected jobs in `.github/workflows/test.yml` (`Build packages + WASM`,
-`Rust tests`, `Geometry watertightness census`) select their runner by repository:
+Until the 2026-10 sync upstream ran its heavy CI jobs on **Depot** runners
+(`depot-ubuntu-24.04-4`), which don't exist on the fork (jobs sat queued forever), so the fork
+guarded each `runs-on` by repository. Upstream has since moved routine CI off Depot: `test.yml`
+now picks `ubuntu-latest` unless `vars.SELF_HOSTED_CI == 'true'`, which the fork doesn't set,
+so those guards were dropped in that sync. What stays fork-only:
 
-```
-runs-on: ${{ github.repository == 'LTplus-AG/ifc-lite' && 'depot-ubuntu-24.04-4' || 'ubuntu-latest' }}
-```
+- the from-source wasm compile forces **thin LTO** (`CARGO_PROFILE_RELEASE_LTO`) so FAT LTO
+  doesn't OOM `ubuntu-latest` — same fix as `scripts/vercel-build.sh`;
+- `docker.yml` keeps its upstream-only `if:` (see the table above).
 
-The from-source wasm compile additionally forces **thin LTO** on the fork
-(`CARGO_PROFILE_RELEASE_LTO`) so FAT-LTO doesn't OOM the smaller `ubuntu-latest` runner —
-same fix as `scripts/vercel-build.sh`. Upstream keeps Depot + FAT LTO unchanged.
-
-> **Check this on every sync that touches `test.yml`.** A *new* upstream job on a Depot runner
-> arrives unguarded and hangs the whole PR silently — no failure, just a check that never
-> finishes. `Geometry watertightness census` arrived exactly that way in the 2026-08-01 sync.
-> After a sync, grep for the unguarded form:
+> **Check this on every sync that touches workflows.** A new upstream job on a runner the fork
+> lacks arrives unguarded and hangs the whole PR silently — no failure, just a check that never
+> finishes. After a sync, grep for the forms that only exist upstream:
 >
 > ```bash
-> grep -rn "runs-on: depot" .github/workflows/
+> grep -rn "runs-on: depot\|depot-ubuntu" .github/workflows/
 > ```
 >
-> Every hit must either carry the repository-conditional `runs-on` above, or sit in a job whose
-> `if:` already restricts it to upstream (that is how `docker.yml` is handled).
+> Every hit must either carry a repository-conditional `runs-on`, or sit in a job whose `if:`
+> already restricts it to upstream (that is how `docker.yml` is handled).
+
+## Upstream ratchets that carry fork rows
+
+Upstream gates new code with per-file ratchets. The fork-owned UI (D-072 underlays, D-075
+documents, D-076 identifier links) predates several of them, so the 2026-10 sync recorded the
+fork's current counts as baseline rows instead of rewriting that UI in the same PR:
+
+| Gate | File | Fork rows |
+|---|---|---|
+| `check-i18n-literals` | `scripts/i18n-literals-baseline.json` | hardcoded English in the underlay / documents / identifier-link panels |
+| `check-icon-button-adoption` | `BASELINE` in the script (`AIM-FORK` block) | `<Button size="icon">` in the same panels |
+| `check-module-size` | `scripts/module-size-allowlist.txt` | fork files over 400 lines, and upstream files the wiring grew |
+| `check-agents-md-size` | `scripts/agents-md-budget.txt` | the fork section in `AGENTS.md` and `packages/collab-server/AGENTS.md` |
+| `check-jsx-a11y` | `scripts/jsx-a11y-baseline.json` | role-based `group` / `radio` widgets and the clickable identifier-link box in the underlay / identifier-link / view-mode UI |
+| `check-type-scale` | `scripts/type-scale-baseline.json` | `text-[Npx]` in the AIM card, documents, underlay and identifier-link panels (upstream itself is at zero) |
+| perf ratchet `bundle` | `tests/perf-ratchets/bundle.json` (`viewer-entry-js-bytes`, `viewer-eager-js-bytes`) | raised in the 2026-10 sync by the fork's boot-path code (~32 kB entry, ~70 kB eager): the AIM bridge and slices, and the AIM-FORK wiring in PropertiesPanel / Viewport / HierarchyPanel / ViewportContainer. Panels, panes and overlays are `lazy()` (−100 kB); the daily lowering job only lowers it again |
+| ribbon command guard (`command-labels.guard.test.tsx`) | `rawByTab` (`AIM-FORK` row) | `documents: 3` — the 3D / 2D / Split buttons of the fork's Documents tab, which have no surface-command id yet |
+
+They ratchet **down**: moving a panel's copy into `catalogues/aim-fork.en.ts`, switching to
+`IconButton`, or splitting a file lowers its row (`--update`). Never raise a row for new fork
+code without saying why in the PR.
 
 ## Conventions (don't drift)
 

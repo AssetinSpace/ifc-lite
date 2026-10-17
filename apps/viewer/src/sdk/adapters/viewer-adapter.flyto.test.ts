@@ -70,7 +70,9 @@ test('flyTo skips refs whose model is not loaded, does not frame when none resol
   const viewer = createViewerAdapter(store);
 
   viewer.flyTo([ref('ghost', 1)]);
-  assert.equal(framed.length, 0);
+  // Upstream hands the (empty) id set to frameEntities, which returns early on
+  // no ids (Viewport.tsx), so "does not frame" means no id reaches the camera.
+  assert.deepEqual(framed.flat(), []);
 
   viewer.flyTo([ref('ghost', 1), ref('asr', 7)]);
   assert.deepEqual(framed.at(-1), [7]);

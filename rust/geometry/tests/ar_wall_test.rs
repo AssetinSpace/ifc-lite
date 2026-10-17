@@ -4,19 +4,25 @@
 
 //! Standalone test for AR file wall geometry issues.
 //! Tests wall 1NmE6Wndr2xhGbWU4qRRfr which has elongated openings and far points.
+//!
+//! NOTE: `tests/models/local/AR.ifc` is a private local model — it is not in
+//! `tests/models/manifest.json`, so `pnpm fixtures` cannot supply it and these
+//! tests can never run in CI. They are `#[ignore]` so that is explicit rather
+//! than reading as three passing tests (same convention as `test_infra_rtc.rs`).
+//! With the model in place, run:
+//! `cargo test -p ifc-lite-geometry --test ar_wall_test -- --ignored`
 
 use ifc_lite_core::{EntityDecoder, EntityScanner};
-use ifc_lite_geometry::{calculate_normals, csg::ClippingProcessor, GeometryRouter, Mesh};
+use ifc_lite_geometry::{calculate_normals, csg::ClippingProcessor, GeometryRouter, GroupCut, Mesh};
 use rustc_hash::FxHashMap;
-use std::fs;
 
-const AR_FILE_PATH: &str = "../../tests/models/local/AR.ifc";
+/// Private local model (not in the manifest): `local_fixture_text` never gates.
+const AR_FIXTURE: &str = "local/AR.ifc";
 const TARGET_GUID: &str = "1NmE6Wndr2xhGbWU4qRRfr";
 
 /// Load AR file content
 fn load_ar_file() -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(AR_FILE_PATH);
-    fs::read_to_string(&path).ok()
+    ifc_lite_testkit::local_fixture_text(AR_FIXTURE)
 }
 
 /// Find entity ID by GUID
@@ -141,6 +147,7 @@ fn analyze_mesh(mesh: &Mesh, name: &str) {
 }
 
 #[test]
+#[ignore = "fixture tests/models/local/AR.ifc is not in the manifest and is not downloadable; supply it locally and run with --ignored"]
 fn test_ar_wall_geometry() {
     let content = match load_ar_file() {
         Some(c) => c,
@@ -253,6 +260,7 @@ fn test_ar_wall_geometry() {
 
 /// Test to diagnose NaN normals issue
 #[test]
+#[ignore = "fixture tests/models/local/AR.ifc is not in the manifest and is not downloadable; supply it locally and run with --ignored"]
 fn test_ar_wall_nan_normals_diagnosis() {
     let content = match load_ar_file() {
         Some(c) => c,
@@ -413,6 +421,7 @@ fn test_ar_wall_nan_normals_diagnosis() {
 }
 
 #[test]
+#[ignore = "fixture tests/models/local/AR.ifc is not in the manifest and is not downloadable; supply it locally and run with --ignored"]
 fn test_csg_subtraction_preserves_normals() {
     let content = match load_ar_file() {
         Some(c) => c,
@@ -490,7 +499,7 @@ fn test_csg_subtraction_preserves_normals() {
     let result = clipper.subtract_mesh(&wall_mesh, &opening_mesh);
 
     match result {
-        Ok(result_mesh) => {
+        GroupCut::Cut(result_mesh) | GroupCut::Retessellated(result_mesh) => {
             println!("CSG result:");
             println!(
                 "  positions: {}, normals: {}",
@@ -515,8 +524,8 @@ fn test_csg_subtraction_preserves_normals() {
                 "All normals should be finite after CSG"
             );
         }
-        Err(e) => {
-            println!("CSG failed (may be expected for some cases): {}", e);
+        GroupCut::Rejected(why) => {
+            println!("CSG rejected (may be expected for some cases): {why:?}");
         }
     }
 }

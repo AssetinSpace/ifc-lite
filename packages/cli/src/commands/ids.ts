@@ -4,14 +4,32 @@
 
 /**
  * ifc-lite ids <file.ifc> <rules.ids> [options]
+ * ifc-lite ids <audit|lint|fmt|diff> …
  *
- * Validate an IFC file against IDS (Information Delivery Specification) rules.
+ * Validate an IFC file against IDS (Information Delivery Specification)
+ * rules, or run one of the IDS authoring subcommands on an IDS file.
  */
 
 import { readFile } from 'node:fs/promises';
-import { createHeadlessContext } from '../loader.js';
 import { printJson, hasFlag, getFlag, fatal } from '../output.js';
 import { createDataAccessor } from '@ifc-lite/ids/bridge';
+import { idsAuditCommand, idsLintCommand } from './ids-audit-lint.js';
+import { idsDiffCommand } from './ids-diff.js';
+import { idsExplainCommand } from './ids-explain.js';
+import { idsFmtCommand } from './ids-fmt.js';
+
+/**
+ * Authoring subcommands. A first argument with one of these names is the
+ * subcommand, never a model path: validation needs a model file AND an IDS
+ * file, and a model file named `lint` (no extension) is not a real input.
+ */
+const SUBCOMMANDS: Record<string, (args: string[]) => Promise<void>> = {
+  audit: idsAuditCommand,
+  lint: idsLintCommand,
+  fmt: idsFmtCommand,
+  diff: idsDiffCommand,
+  explain: idsExplainCommand,
+};
 
 interface ValidatorSummary {
   totalSpecifications: number;
@@ -23,14 +41,39 @@ interface ValidatorSummary {
   overallPassRate: number;
 }
 
+/** Flags that consume the following argument, so it is never mistaken for a
+ *  positional file path. `--locale de file.ifc rules.ids` would otherwise
+ *  have the naive `args.filter(a => !a.startsWith('-'))` idiom swallow `de`
+ *  as `ifcPath` (see diff.ts's `VALUE_FLAGS` / mcp.ts's `MCP_VALUE_FLAGS`
+ *  for the same fix applied elsewhere in this package). */
+const VALUE_FLAGS = new Set(['--locale']);
+
+function idsPositionals(args: string[]): string[] {
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith('-')) {
+      if (VALUE_FLAGS.has(arg)) i++;
+      continue;
+    }
+    positional.push(arg);
+  }
+  return positional;
+}
+
 export async function idsCommand(args: string[]): Promise<void> {
-  const positional = args.filter(a => !a.startsWith('-'));
+  const sub = Object.hasOwn(SUBCOMMANDS, args[0] ?? '') ? SUBCOMMANDS[args[0]] : undefined;
+  if (sub) return sub(args.slice(1));
+  const positional = idsPositionals(args);
   if (positional.length < 2) fatal('Usage: ifc-lite ids <file.ifc> <rules.ids> [--json]');
 
   const [ifcPath, idsPath] = positional;
   const jsonOutput = hasFlag(args, '--json');
   const locale = (getFlag(args, '--locale') ?? 'en') as 'en' | 'de' | 'fr';
 
+  // Loaded on demand: the model loader pulls in the geometry/wasm stack,
+  // which the IDS-only subcommands above never need.
+  const { createHeadlessContext } = await import('../loader.js');
   const { bim, store } = await createHeadlessContext(ifcPath);
 
   // Read IDS file
@@ -66,7 +109,19 @@ export async function idsCommand(args: string[]): Promise<void> {
   if (jsonOutput) {
     // Keep the established machine-readable summary shape.
     const summary = bim.ids.summarize(report);
-    printJson({ summary, report });
+    // A ruleset declaring zero specifications evaluated nothing -- reporting
+    // that as a pass would hide an empty ruleset behind a green check (same
+    // rationale as the `error` status in delivery-checks.ts). Surface it as
+    // an explicit field, not only in prose, so a --json consumer can branch
+    // on it without parsing a message string.
+    const emptyRuleset = summary.totalSpecifications === 0;
+    printJson({ summary, report, ...(emptyRuleset ? { error: 'declares zero specifications' } : {}) });
+    // Mirror the human-readable path's exit-code contract: a CI pipeline
+    // driving this command with --json (the shape any script would pick)
+    // must see a non-zero exit on a genuine IDS failure. Without this the
+    // JSON path always exited 0 -- a validation failure printed to stdout
+    // but reported as success to the shell.
+    process.exitCode = emptyRuleset || summary.failedSpecifications > 0 ? 1 : 0;
     return;
   }
 
@@ -79,6 +134,15 @@ export async function idsCommand(args: string[]): Promise<void> {
   process.stdout.write(`  Specifications: ${summary.passedSpecifications}/${summary.totalSpecifications} passed\n`);
   process.stdout.write(`  Entities:       ${summary.totalEntitiesPassed}/${summary.totalEntitiesChecked} passed\n`);
   process.stdout.write(`  Failed:         ${summary.totalEntitiesFailed} entities in ${summary.failedSpecifications} specs\n`);
+
+  // Zero specifications means nothing was evaluated -- distinguish that
+  // from a genuine pass/fail so a caller does not have to guess which
+  // problem it is looking at (same guard as delivery-checks.ts).
+  if (summary.totalSpecifications === 0) {
+    process.stdout.write(`\n  Result: ERROR (declares zero specifications)\n\n`);
+    process.exitCode = 1;
+    return;
+  }
 
   const exitCode = summary.failedSpecifications > 0 ? 1 : 0;
   process.stdout.write(`\n  Result: ${exitCode === 0 ? 'PASS' : 'FAIL'}\n\n`);

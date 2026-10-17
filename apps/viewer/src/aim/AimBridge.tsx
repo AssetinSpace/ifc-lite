@@ -22,6 +22,8 @@ import { useEffect, useRef, useState } from 'react';
 import { parsePlacement, serializePlacement } from '@ifc-lite/drawing-underlay';
 import { useBim } from '../sdk/BimProvider.js';
 import { useViewerStore } from '../store/index.js';
+import { toGlobalIdFromModels } from '../store/globalId.js';
+import { selectPickedGlobalId } from '../components/viewer/viewport-selection.js';
 import { AUTOLOAD_COMPLETE_EVENT, parseAutoloadUrls } from '../lib/autoload.js';
 import {
   SOURCE,
@@ -95,6 +97,25 @@ export function AimBridge() {
           programmaticSelectionRef.current = new Set(refs.map((r) => `${r.modelId}:${r.expressId}`));
           bim.viewer.select(refs);
           bim.viewer.flyTo(refs);
+          break;
+        }
+        case 'SELECT': {
+          // Výber ako klik myšou (D-082): tá istá cesta ako klik vo viewporte
+          // (`selectPickedGlobalId`), panel vlastností a priblíženie kamery.
+          // Selekcia sa zámerne NEoznačí ako programová — ENTITY_SELECTED musí
+          // ísť hostovi, aby AIM kartu dotiahol rovnakým tokom ako po kliku.
+          const state = useViewerStore.getState();
+          const [ref] = resolveGuids(state.models, [e.data.guid]);
+          if (!ref) return;
+          // Oranžové FOCUS ofarbenie by prekrylo selekčné zvýraznenie.
+          if (focusedRef.current.length > 0) {
+            bim.viewer.resetColors(focusedRef.current);
+            focusedRef.current = [];
+          }
+          programmaticSelectionRef.current = null;
+          selectPickedGlobalId(toGlobalIdFromModels(state.models, ref.modelId, ref.expressId));
+          useViewerStore.getState().openPanelInHome('properties', 'programmatic');
+          bim.viewer.flyTo([ref]);
           break;
         }
         case 'HIGHLIGHT_FILTER': {

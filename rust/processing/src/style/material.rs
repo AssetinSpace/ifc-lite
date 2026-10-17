@@ -31,7 +31,7 @@ const MAX_MATERIAL_RESOLVE_DEPTH: u8 = 4;
 
 /// Build the `element id → material colours` map: every colour each element
 /// inherits from its associated material(s), in resolution order. The single
-/// general-path fallback picks the first opaque colour ([`pick_opaque_first`]);
+/// general-path fallback is [`element_material_fallback_color`];
 /// the opening sub-mesh path alternates transparent/opaque
 /// ([`pick_material_style_for_submesh`]) to split glass vs frame.
 ///
@@ -94,6 +94,21 @@ pub fn pick_opaque_first(colors: &[[f32; 4]]) -> Option<[f32; 4]> {
             .copied()
             .unwrap_or(colors[0]),
     )
+}
+
+/// THE element-level material fallback colour: what an element with no
+/// representation-level style renders in, from its material colour list
+/// ([`build_element_material_colors`]). The first opaque colour, else the
+/// first colour, so a window listing `[glass, frame]` falls back to its frame.
+///
+/// One rule for every pipeline (PROCESSING-4, #7691): the native orchestrator
+/// and canonical appearance resolve it in process, and the browser pre-pass
+/// folds it into the `styleIds`/`styleColors` wire that `processGeometryBatch`
+/// reads back per element. The wire used to carry the first colour instead,
+/// so the same element fell back to glass in the viewer and to frame on the
+/// server.
+pub fn element_material_fallback_color(colors: &[[f32; 4]]) -> Option<[f32; 4]> {
+    pick_opaque_first(colors)
 }
 
 /// Pick a material colour for one sub-mesh, alternating preference so a window
@@ -162,7 +177,7 @@ pub fn build_material_style_index(
                 continue;
             };
             // IfcStyledRepresentation : IfcRepresentation — Items is attr 3.
-            for styled_item_id in extract_refs_from_list(&styled_repr, 3) {
+            for styled_item_id in styled_repr.get_refs(3).unwrap_or_default() {
                 if let Some(&color) = orphan_styled_items.get(&styled_item_id) {
                     material_styles.entry(material_id).or_default().push(color);
                 }
@@ -191,7 +206,7 @@ fn resolve_material_ids_inner(
     match entity.ifc_type {
         IfcType::IfcMaterial => vec![material_select_id],
         // IfcMaterialList.Materials (attr 0)
-        IfcType::IfcMaterialList => extract_refs_from_list(&entity, 0),
+        IfcType::IfcMaterialList => entity.get_refs(0).unwrap_or_default(),
         // IfcMaterialLayerSetUsage.ForLayerSet (attr 0) → IfcMaterialLayerSet
         IfcType::IfcMaterialLayerSetUsage => entity
             .get_ref(0)
@@ -220,7 +235,7 @@ fn extract_nested_material_ids(
     decoder: &mut EntityDecoder,
 ) -> Vec<u32> {
     let mut materials = Vec::new();
-    for container_id in extract_refs_from_list(entity, container_list_attr_idx) {
+    for container_id in entity.get_refs(container_list_attr_idx).unwrap_or_default() {
         if let Ok(container) = decoder.decode_by_id(container_id) {
             if let Some(mat_id) = container.get_ref(material_attr_idx) {
                 materials.push(mat_id);
@@ -228,14 +243,6 @@ fn extract_nested_material_ids(
         }
     }
     materials
-}
-
-fn extract_refs_from_list(entity: &DecodedEntity, index: usize) -> Vec<u32> {
-    entity
-        .get(index)
-        .and_then(|attr| attr.as_list())
-        .map(|list| list.iter().filter_map(|v| v.as_entity_ref()).collect())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -5,19 +5,31 @@
 //! Placement and transformation: axis placement parsing, coordinate transforms, RTC offset.
 
 mod grid;
+mod grid_frame;
 mod linear;
+pub(crate) mod mapped;
 mod mesh_world;
+pub(crate) use mesh_world::LARGE_MAPPED_ORIGIN_M;
+pub(crate) mod operator;
+
 mod parsers;
+mod walk;
+
+#[cfg(test)]
+#[path = "placement_depth_tests.rs"]
+mod placement_depth_tests;
 
 use super::GeometryRouter;
+use crate::math::mat4;
 use crate::{Mesh, Result, SubMeshCollection};
-use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
+use ifc_lite_core::{DecodedEntity, EntityDecoder};
 use nalgebra::Matrix4;
 
 static LOCAL_FRAME_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
-/// Test/harness-only: force [`local_frame_enabled`] on/off, or `None` for the
-/// target default. Mirrors `rect_fast::param_set_enabled_override`. The
+/// Test/harness-only: force the target/env fallback on/off, or `None` for the
+/// target default. A router constructed with an explicit frame policy does not
+/// consult this process-global hook. Mirrors `rect_fast::param_set_enabled_override`. The
 /// mesh-output determinism manifest uses it to run native and wasm with the
 /// SAME flag state (wasm defaults ON, native defaults OFF below), so the two
 /// targets' outputs are comparable byte-for-byte.
@@ -40,8 +52,8 @@ pub fn local_frame_set_enabled_override(v: Option<bool>) {
 /// local frame. Consumers reconstruct world = `MeshData.origin` + position.
 /// Default is ON for wasm (the precision-critical viewer path, whose renderer
 /// consumes `origin`) and OFF for native, where `IFC_LITE_LOCAL_FRAME=1` opts
-/// in. Env/cfg default read once and cached; the
-/// [`local_frame_set_enabled_override`] hook takes precedence on every call.
+/// in. Env/cfg default read once and cached. An explicit per-router policy takes
+/// precedence; otherwise [`local_frame_set_enabled_override`] selects this fallback.
 pub(crate) fn local_frame_enabled() -> bool {
     match LOCAL_FRAME_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => return false,
@@ -79,38 +91,25 @@ pub(crate) fn instancing_enabled() -> bool {
     true
 }
 
-/// Flatten a nalgebra `Matrix4<f64>` into a **column-major** `[f64; 16]` for the
-/// [`EntityDecoder`] placement-transform memo. `Matrix4::as_slice` is already
-/// column-major length 16, and [`Matrix4::from_column_slice`] reconstructs it
-/// bit-for-bit (an f64 round-trip is exact), so the memo is byte-identical to
-/// recomputing the transform. Distinct from [`mat4_to_row_major`], which is the
-/// row-major GPU-instancing convention.
-#[inline]
-fn mat4_to_col_array(m: &Matrix4<f64>) -> [f64; 16] {
-    *m.as_slice()
-        .first_chunk::<16>()
-        .expect("Matrix4<f64> as_slice is exactly 16 elements")
-}
-
-/// Flatten a column-major nalgebra `Matrix4<f64>` into a row-major `[f64; 16]`
-/// (the [`crate::mesh::InstanceMeta`] convention; matches a GPU mat4 fed row-by-row).
-pub(crate) fn mat4_to_row_major(m: &Matrix4<f64>) -> [f64; 16] {
-    [
-        m[(0, 0)], m[(0, 1)], m[(0, 2)], m[(0, 3)],
-        m[(1, 0)], m[(1, 1)], m[(1, 2)], m[(1, 3)],
-        m[(2, 0)], m[(2, 1)], m[(2, 2)], m[(2, 3)],
-        m[(3, 0)], m[(3, 1)], m[(3, 2)], m[(3, 3)],
-    ]
-}
-
 impl GeometryRouter {
+    pub(super) fn local_frame_enabled(&self) -> bool {
+        self.local_frame_enabled.unwrap_or_else(local_frame_enabled)
+    }
+
     /// Apply local placement transformation to mesh
+    ///
+    /// Welds the source vertices FIRST (#4103). This is the last point at which
+    /// the vertices are still in the object frame, and the weld keys on raw f32
+    /// bits, so welding after the bake makes the merge depend on where the
+    /// element sits and leaves two occurrences of one representation with
+    /// different buffers. See `crate::mesh_weld`'s module doc.
     pub(super) fn apply_placement(
         &self,
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
         mesh: &mut Mesh,
     ) -> Result<()> {
+        crate::mesh_weld::weld_mesh(mesh);
         let placement_attr = match element.get(5) {
             Some(attr) if !attr.is_null() => attr,
             _ => {
@@ -141,7 +140,7 @@ impl GeometryRouter {
         // Only fires when processing already marked this mesh instanceable (so the
         // metadata exists); a no-op otherwise, keeping the flat path untouched.
         if let Some(im) = mesh.instance_meta.as_mut() {
-            im.transform = mat4_to_row_major(&transform);
+            im.transform = mat4::from_na(&transform);
         }
         self.transform_mesh_world(mesh, &transform);
         Ok(())
@@ -152,12 +151,20 @@ impl GeometryRouter {
     /// instances of one shared geometry land at their own positions.
     /// (Moved here from `processing.rs` — placement logic lives with the other
     /// placement appliers, and `processing.rs` sits at its ratchet budget.)
+    ///
+    /// Welds each sub-mesh's source vertices first, for the reason
+    /// [`Self::apply_placement`] gives. Every per-style channel (plain, layered,
+    /// textured) converges here, so one loop covers them all, and the sub-mesh
+    /// weld carries `SubMesh::uvs` through the same remap.
     pub(super) fn apply_submesh_placement(
         &self,
         sub_meshes: &mut SubMeshCollection,
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<()> {
+        for sub in &mut sub_meshes.sub_meshes {
+            crate::mesh_weld::weld_sub_mesh(sub);
+        }
         // ObjectPlacement translation is in file units (e.g. mm) but geometry is
         // scaled to metres, so the transform MUST be scaled to match.
         if let Some(placement_attr) = element.get(5) {
@@ -175,7 +182,7 @@ impl GeometryRouter {
                     // always correct (placement IS baked into the vertices below), so the
                     // dedup made it look like repeated geometry was "missing".
                     if instancing_enabled() {
-                        let row_major = mat4_to_row_major(&transform);
+                        let row_major = mat4::from_na(&transform);
                         for sub in &mut sub_meshes.sub_meshes {
                             if let Some(im) = sub.mesh.instance_meta.as_mut() {
                                 im.transform = row_major;
@@ -205,130 +212,58 @@ impl GeometryRouter {
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<Matrix4<f64>> {
+        Ok(self.get_placement_transform_from_element_with_status(element, decoder)?.0)
+    }
+
+    /// Return the placement and whether the shared depth guard truncated its
+    /// parent chain. Exact geometry descriptions must not report the partial
+    /// transform as a complete world placement.
+    pub(super) fn get_placement_transform_from_element_with_status(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<(Matrix4<f64>, bool)> {
         // Get ObjectPlacement (attribute 5)
         let placement_attr = match element.get(5) {
             Some(attr) if !attr.is_null() => attr,
-            _ => return Ok(Matrix4::identity()), // No placement
+            _ => return Ok((Matrix4::identity(), false)), // No placement
         };
 
         let placement = match decoder.resolve_ref(placement_attr)? {
             Some(p) => p,
-            None => return Ok(Matrix4::identity()),
+            None => return Ok((Matrix4::identity(), false)),
         };
 
-        // Recursively get combined transform from placement hierarchy
-        self.get_placement_transform(&placement, decoder)
+        let walk = self.get_placement_transform_with_depth(&placement, decoder, 0)?;
+        Ok((walk.transform, walk.truncated))
     }
 
-    /// Recursively resolve placement hierarchy
-    ///
-    /// Uses a depth limit (100) to prevent stack overflow on malformed files
-    /// with circular placement references or extremely deep hierarchies.
-    pub(super) fn get_placement_transform(
+    /// Exact counterpart to `resolve_scaled_placement`: refuses a world
+    /// placement when the shared reference-walk guard truncated its chain.
+    pub fn resolve_scaled_placement_strict(
         &self,
-        placement: &DecodedEntity,
+        element: &DecodedEntity,
         decoder: &mut EntityDecoder,
-    ) -> Result<Matrix4<f64>> {
-        self.get_placement_transform_with_depth(placement, decoder, 0)
+    ) -> Result<[f64; 16]> {
+        self.admit_placement_scale()?;
+        if let Some(attr) = element.get(5).filter(|attr| !attr.is_null()) {
+            if decoder.resolve_ref(attr)?.is_none() {
+                return Err(crate::Error::geometry(format!(
+                    "ObjectPlacement for #{} cannot be resolved",
+                    element.id
+                )));
+            }
+        }
+        let (mut transform, truncated) =
+            self.get_placement_transform_from_element_with_status(element, decoder)?;
+        if truncated {
+            return Err(crate::Error::geometry(format!(
+                "placement chain for #{} exceeded maximum depth",
+                element.id
+            )));
+        }
+        self.scale_transform(&mut transform);
+        Ok(mat4::col_major_array(&transform))
     }
 
-    /// Internal helper with depth tracking to prevent stack overflow.
-    /// Keep low for WASM — each frame uses ~2KB+ of stack with Matrix4<f64> locals.
-    const MAX_PLACEMENT_DEPTH: usize = 32;
-
-    pub(super) fn get_placement_transform_with_depth(
-        &self,
-        placement: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-        depth: usize,
-    ) -> Result<Matrix4<f64>> {
-        // Depth limit to prevent stack overflow on circular references or deep hierarchies
-        if depth > Self::MAX_PLACEMENT_DEPTH {
-            return Ok(Matrix4::identity());
-        }
-
-        // Per-worker placement-transform memo. For a well-formed acyclic IFC
-        // placement DAG the composed world transform is a pure function of
-        // `placement.id`, so returning a cached result is byte-identical — and
-        // it collapses the repeated work: storey/building placements shared by
-        // thousands of elements compose once per worker, not once per element.
-        // Only the REAL computed transforms below (local/linear/grid) are
-        // cached, never the depth-guard/identity fallbacks, so a cache hit is
-        // depth-independent (the depth guard only bites on chains deeper than
-        // MAX_PLACEMENT_DEPTH or cycles, which never reach a cache write).
-        if let Some(m) = decoder.get_placement_transform_cached(placement.id) {
-            return Ok(Matrix4::from_column_slice(&m));
-        }
-
-        // IfcLinearPlacement is the IFC4x3 placement used by infrastructure
-        // models to put products at a station along an alignment / gradient
-        // curve. Without dedicated handling, every linearly-placed element
-        // (signals, referents, signs on a railway alignment) falls back to
-        // identity here and piles up at world origin — the exact symptom
-        // reported in issue #859 on the `linear-placement-of-signal` fixture.
-        //
-        // Attribute layout (IFC4x3):
-        //   0 PlacementRelTo (IfcObjectPlacement, optional) — same as IfcLocalPlacement
-        //   1 RelativePlacement (IfcAxis2PlacementLinear) — required, samples the curve
-        //   2 CartesianPosition (IfcAxis2Placement3D, optional) — pre-baked world fallback
-        if placement.ifc_type == IfcType::IfcLinearPlacement {
-            let result = self.resolve_linear_placement_with_depth(placement, decoder, depth)?;
-            decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
-            return Ok(result);
-        }
-
-        // IfcGridPlacement positions a product on a grid-axis intersection
-        // instead of a local coordinate system. Without dedicated handling
-        // every grid-placed element (columns laid out on a structural grid)
-        // falls back to identity here and stacks at the world origin — the
-        // exact symptom reported in issue #883 on the `ifcgrid` fixture.
-        if placement.ifc_type == IfcType::IfcGridPlacement {
-            let result = self.resolve_grid_placement_with_depth(placement, decoder, depth)?;
-            decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
-            return Ok(result);
-        }
-
-        if placement.ifc_type != IfcType::IfcLocalPlacement {
-            return Ok(Matrix4::identity());
-        }
-
-        // Get parent transform first (attribute 0: PlacementRelTo)
-        let parent_transform = if let Some(parent_attr) = placement.get(0) {
-            if !parent_attr.is_null() {
-                if let Some(parent) = decoder.resolve_ref(parent_attr)? {
-                    self.get_placement_transform_with_depth(&parent, decoder, depth + 1)?
-                } else {
-                    Matrix4::identity()
-                }
-            } else {
-                Matrix4::identity()
-            }
-        } else {
-            Matrix4::identity()
-        };
-
-        // Get local transform (attribute 1: RelativePlacement)
-        let local_transform = if let Some(rel_attr) = placement.get(1) {
-            if !rel_attr.is_null() {
-                if let Some(rel) = decoder.resolve_ref(rel_attr)? {
-                    if rel.ifc_type == IfcType::IfcAxis2Placement3D {
-                        self.parse_axis2_placement_3d(&rel, decoder)?
-                    } else {
-                        Matrix4::identity()
-                    }
-                } else {
-                    Matrix4::identity()
-                }
-            } else {
-                Matrix4::identity()
-            }
-        } else {
-            Matrix4::identity()
-        };
-
-        // Compose: parent * local
-        let result = parent_transform * local_transform;
-        decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
-        Ok(result)
-    }
 }

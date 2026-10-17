@@ -22,33 +22,10 @@
 use ifc_lite_core::{EntityDecoder, EntityScanner, IfcType};
 use ifc_lite_geometry::GeometryRouter;
 
-const FIXTURE: &str = "../../tests/models/issues/828_sectioned-solid.ifc";
-
-/// See `issue_820_trimmed_curve_planeangleunit::lfs_pointer_prefix` for
-/// why this string is built at runtime instead of being a string literal.
-fn lfs_pointer_prefix() -> String {
-    format!("version {}{}", "https://git-lfs.github.com/", "spec/")
-}
+const FIXTURE: &str = "issues/828_sectioned-solid.ifc";
 
 fn read_fixture() -> Option<String> {
-    match std::fs::read_to_string(FIXTURE) {
-        Ok(s) if s.starts_with(&lfs_pointer_prefix()) => {
-            eprintln!(
-                "skipping issue-828 regression: fixture at {FIXTURE} is a Git LFS \
-                 pointer — run `pnpm fixtures` from the repo root to download it",
-            );
-            None
-        }
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "skipping issue-828 regression: fixture missing at {FIXTURE} — \
-                 run `pnpm fixtures` from the repo root to download it",
-            );
-            None
-        }
-        Err(e) => panic!("failed to read fixture {FIXTURE}: {e}"),
-    }
+    ifc_lite_testkit::fixture_text(FIXTURE)
 }
 
 /// Entity #69 is the canonical example from the issue — a 134 m bridge

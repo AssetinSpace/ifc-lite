@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 /* ═══════════════════════════════════════════════════════════════════════════
    AIM-FORK: assetin brand theme (design kit D-070)
 
@@ -52,7 +56,10 @@
   --color-secondary: var(--ds-gray-100);
   --color-secondary-foreground: var(--ds-text-strong);
   --color-muted: var(--ds-gray-100);
-  --color-muted-foreground: var(--ds-text-muted);
+  /* --ds-text-muted (gray-500) is AA only on white: 4.39:1 on --color-muted
+     and 4.4:1 on the page background. Muted UI text sits on both (compare
+     panel chips, #6921 axe), so the shadcn token takes the next step down. */
+  --color-muted-foreground: var(--ds-gray-600);
   --color-accent: var(--ds-brand-green-soft);
   --color-accent-foreground: var(--ds-primary-hover);
   --color-border: var(--ds-border);
@@ -94,4 +101,13 @@
 html,
 body {
   font-family: var(--ds-font-sans);
+}
+
+/* Inter sets ~3% wider than the system UI fonts upstream's layout is tuned
+   for, so the default hierarchy panel clipped storey names like
+   "Dachgeschoss" (#5394 e2e: 96px shown of 99px). Inter's own dynamic metrics
+   track 14px text tighter; -0.01em gives the names back their width without
+   touching upstream's row layout. */
+.hierarchy-item {
+  letter-spacing: -0.01em;
 }

@@ -10,6 +10,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { capturePointer } from '@/lib/pointer-capture';
 
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 16;
@@ -91,7 +92,7 @@ export function ImageDocumentView({ url, name }: ImageDocumentViewProps) {
           panY: pan.y,
         };
       }
-      e.currentTarget.setPointerCapture(e.pointerId);
+      capturePointer(e.currentTarget, e.pointerId);
     },
     [zoom, pan],
   );

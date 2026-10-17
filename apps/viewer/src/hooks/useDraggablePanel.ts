@@ -80,10 +80,17 @@ export function useDraggablePanel(
       const maxLeft = Math.max(0, (parent?.clientWidth ?? window.innerWidth) - el.offsetWidth);
       const maxTop = Math.max(0, (parent?.clientHeight ?? window.innerHeight) - el.offsetHeight);
 
+      // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+      // A real mousedown always reports its pressed button; a buttonless move
+      // after one means the mouseup was released outside this document.
+      const pressed = e.buttons !== 0;
+      // <<< AIM-FORK
       const move = (ev: MouseEvent) => {
+        // >>> AIM-FORK
         // Mouseup outside this document (iframe embedding) never arrives —
         // end the stuck drag on the first buttonless move.
-        if (ev.buttons === 0) { up(); return; }
+        if (pressed && ev.buttons === 0) { up(); return; }
+        // <<< AIM-FORK
         const left = Math.max(0, Math.min(maxLeft, startRef.current.left + ev.clientX - startRef.current.x));
         const top = Math.max(0, Math.min(maxTop, startRef.current.top + ev.clientY - startRef.current.y));
         setPosition({ top, left });

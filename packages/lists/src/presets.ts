@@ -22,7 +22,7 @@ function makePreset(
     createdAt: 0,
     updatedAt: 0,
     entityTypes,
-    conditions: [],
+    groups: [],
     columns,
   };
 }
@@ -111,6 +111,7 @@ export const LIST_PRESETS: ListDefinition[] = [
     [IfcTypeEnum.IfcSpace],
     [
       attr('Name'),
+      attr('LongName'),
       attr('Description'),
       attr('ObjectType'),
       prop('Pset_SpaceCommon', 'Category'),
@@ -131,6 +132,7 @@ export const LIST_PRESETS: ListDefinition[] = [
     ],
     [
       attr('Name'),
+      attr('LongName'),
       attr('Class'),
       attr('Description'),
       attr('ObjectType'),

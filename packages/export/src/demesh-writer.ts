@@ -25,7 +25,7 @@
  * path).
  */
 
-import { EntityExtractor, getAllAttributesForEntity, type IfcDataStore } from '@ifc-lite/parser';
+import { EntityExtractor, getAttributeNamesAcrossSchemas, type IfcDataStore } from '@ifc-lite/parser';
 import { pruneReplacedSubgraphs } from './demesh-prune.js';
 import { stepReal } from './step-serialization.js';
 
@@ -104,6 +104,7 @@ export function applySimplifiedGeometry(
     throw new Error('applySimplifiedGeometry: store has no source buffer');
   }
   const source = store.source;
+  // @raw-entity-enumeration-ok the writer selects original source geometry before authoring its replacement into the editor overlay
   const byId = store.entityIndex.byId;
   const extractor = new EntityExtractor(source);
   const decimals = options.coordinateDecimals ?? 6;
@@ -282,9 +283,13 @@ function findBodyContextId(
 }
 
 function findAttrIndex(typeName: string, attrName: string): number | null {
-  const attrs = getAllAttributesForEntity(typeName);
-  if (!attrs || attrs.length === 0) return null;
-  const idx = attrs.findIndex((a) => a?.name === attrName);
+  // Cross-schema union, not just the parser's IFC4-pinned registry —
+  // otherwise IFC4X3-only leaves (IfcSignal, IfcPavement, IfcCourse, …)
+  // resolve zero attributes and every element of that type is silently
+  // skipped as 'no-representation-attribute' (#2032).
+  const names = getAttributeNamesAcrossSchemas(typeName);
+  if (!names || names.length === 0) return null;
+  const idx = names.indexOf(attrName);
   return idx >= 0 ? idx : null;
 }
 

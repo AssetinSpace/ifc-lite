@@ -52,6 +52,7 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Fail fast and readably: without the PAT the run dies much later, at the
       # push, with a message that reads like a permissions bug in this file.

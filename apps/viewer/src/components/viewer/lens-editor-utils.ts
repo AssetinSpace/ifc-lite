@@ -3,10 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import type { Lens, LensRule, AutoColorSpec } from '@/store/slices/lensSlice';
-// Import the value directly from the source package (not via the slice) to avoid
-// a circular value import: lensSlice imports the helpers from this module.
-import { AUTO_COLOR_SOURCES } from '@ifc-lite/lens';
-
+import { isFilterRule, type FilterRule } from '@ifc-lite/rules';
 /**
  * Build the {@link Lens} to persist from an auto-color editor session.
  *
@@ -29,69 +26,68 @@ export function buildAutoColorLensToSave(
   };
 }
 
+/** Copy shared groups and unreadable saved data without aliasing the source. */
+export function cloneLensRules(rules: readonly LensRule[]): LensRule[] {
+  return rules.map((r) => ({
+    ...r,
+    ...(r.groups ? { groups: structuredClone(r.groups) } : {}),
+    ...(r.unreadableLegacy ? { unreadableLegacy: structuredClone(r.unreadableLegacy) } : {}),
+  }));
+}
+
 /**
  * Build an editable copy of a lens.
  *
- * The copy gets a fresh id, a "(copy)" suffix, and (crucially) drops the
- * `builtin` flag so it can be edited and deleted — duplicating a built-in
- * preset is how the user gets an editable starting point (e.g. add CLADDING
- * to a copy of "Building Envelope"). Rule ids are regenerated and the
- * criteria object is cloned so editing the copy never mutates the source. (#1403)
+ * The copy gets a fresh id and a "(copy)" suffix, drops the builtin flag,
+ * and deep-clones group filters so edits cannot mutate the source (#1403).
  */
 export function duplicateLensConfig(lens: Lens, generateId: () => string): Lens {
   const newId = generateId();
   const copy: Lens = {
     id: newId,
     name: `${lens.name} (copy)`,
-    rules: lens.rules.map((r, i) => ({
-      ...r,
-      id: `${newId}-rule-${i}`,
-      criteria: { ...r.criteria },
-    })),
+    rules: cloneLensRules(lens.rules).map((r, i) => ({ ...r, id: `${newId}-rule-${i}` })),
   };
   if (lens.autoColor) copy.autoColor = { ...lens.autoColor };
+  if (lens.capturedScope) copy.capturedScope = structuredClone(lens.capturedScope);
   return copy;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+/** Empty chip presets must not turn a saved Lens into an inert filter. */
+function isConfiguredFilterRule(rule: FilterRule): boolean {
+  if (!isFilterRule(rule)) return false;
+  switch (rule.kind) {
+    case 'model':
+    case 'ifcType':
+    case 'predefinedType':
+    case 'globalId': return Array.isArray(rule.values) && rule.values.length > 0;
+    case 'storey': return (Array.isArray(rule.values) && rule.values.length > 0)
+      || (Array.isArray(rule.refs) && rule.refs.length > 0);
+    case 'modelTag': return rule.op === 'untagged'
+      || (Array.isArray(rule.tagIds) && rule.tagIds.length > 0);
+    case 'name':
+    case 'material':
+    case 'type':
+    case 'parent': return typeof rule.value === 'string' && rule.value.trim().length > 0;
+    case 'classification':
+    case 'group': return typeof rule.value === 'string' &&
+      (rule.op === 'isSet' || rule.op === 'isNotSet' || rule.value.trim().length > 0);
+    case 'elevation': return typeof rule.value === 'number' && Number.isFinite(rule.value);
+    case 'attribute': return typeof rule.name === 'string' && rule.name.trim().length > 0;
+    case 'property': return typeof rule.propertyName === 'string' && rule.propertyName.trim().length > 0;
+    case 'quantity': return typeof rule.quantityName === 'string' && rule.quantityName.trim().length > 0
+      && typeof rule.value === 'number' && Number.isFinite(rule.value);
+    case 'modelFact': return true;
+    default: return false;
+  }
 }
 
-/** Validate a single rule from imported JSON before it enters the store. A
- *  malformed rule (e.g. `null`, or missing criteria) would otherwise break
- *  rule rendering and matching. */
-function isImportableRule(item: unknown): item is LensRule {
-  if (!isRecord(item)) return false;
-  return typeof item.id === 'string'
-    && typeof item.name === 'string'
-    && typeof item.enabled === 'boolean'
-    && isRecord(item.criteria)
-    && typeof item.criteria.type === 'string'
-    && typeof item.action === 'string'
-    && typeof item.color === 'string';
-}
-
-/** Validate an auto-color spec from imported JSON (source must be a known
- *  source; the optional name fields must be strings if present). */
-function isImportableAutoColor(item: unknown): item is AutoColorSpec {
-  if (!isRecord(item)) return false;
-  if (typeof item.source !== 'string'
-    || !(AUTO_COLOR_SOURCES as readonly string[]).includes(item.source)) return false;
-  if (item.psetName !== undefined && typeof item.psetName !== 'string') return false;
-  if (item.propertyName !== undefined && typeof item.propertyName !== 'string') return false;
-  return true;
-}
-
-/** A single lens shape accepted by the JSON importer. Rules and the optional
- *  auto-color spec are fully shape-checked so a hand-edited/corrupt file cannot
- *  push malformed entries (`rules: [null]`, `autoColor: []`) into the store. */
-function isImportableLens(item: unknown): item is { id?: unknown; name: string; rules: LensRule[]; autoColor?: AutoColorSpec } {
-  if (!isRecord(item)) return false;
-  return typeof item.name === 'string'
-    && item.name.length > 0
-    && Array.isArray(item.rules)
-    && item.rules.every(isImportableRule)
-    && (item.autoColor === undefined || isImportableAutoColor(item.autoColor));
+/** Save configured shared filters or preserved unreadable source data. */
+export function isRuleValid(rule: LensRule): boolean {
+  if (rule.unreadableLegacy) return true;
+  return Array.isArray(rule.groups) && rule.groups.length > 0 &&
+    rule.groups.every((group) => Array.isArray(group?.rules) && group.rules.length > 0 &&
+      group.rules.every(isConfiguredFilterRule));
 }
 
 /**
@@ -106,50 +102,6 @@ export function reserveUniqueId(base: string, taken: Set<string>): string {
   while (taken.has(id)) id = `${base}-${n++}`;
   taken.add(id);
   return id;
-}
-
-/**
- * Merge JSON-imported lenses into the existing set with **upsert-by-id**
- * semantics: a lens whose id already exists is replaced in place (its name,
- * rules, and autoColor are updated); a lens with a new or missing id is
- * appended as a fresh custom lens.
- *
- * This is what makes the export → edit-JSON → re-import round-trip actually
- * work. The previous importer skipped any id that already existed, so
- * re-importing an exported file (which always carries the existing ids,
- * including the built-ins) silently did nothing. (#1403)
- *
- * The `builtin` flag of an existing lens is preserved on replace, so a
- * re-imported built-in stays a built-in override rather than turning into a
- * duplicate custom lens. Order is preserved: replaced lenses keep their
- * position, new ones are appended.
- */
-export function mergeImportedLenses(
-  existing: readonly Lens[],
-  imported: readonly unknown[],
-  generateId: (index: number) => string,
-): Lens[] {
-  const byId = new Map<string, Lens>(existing.map((l) => [l.id, l]));
-  const order: string[] = existing.map((l) => l.id);
-
-  imported.forEach((item, i) => {
-    if (!isImportableLens(item)) return;
-    const id = typeof item.id === 'string' && item.id.length > 0 ? item.id : generateId(i);
-    const prior = byId.get(id);
-    const merged: Lens = {
-      id,
-      name: item.name,
-      rules: item.rules,
-      builtin: prior?.builtin ?? false,
-    };
-    if (item.autoColor) {
-      merged.autoColor = { ...item.autoColor };
-    }
-    if (!byId.has(id)) order.push(id);
-    byId.set(id, merged);
-  });
-
-  return order.map((id) => byId.get(id)!);
 }
 
 /**

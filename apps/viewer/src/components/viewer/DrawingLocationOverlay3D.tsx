@@ -26,7 +26,7 @@ import {
 } from '@ifc-lite/drawing-underlay';
 import { useViewerStore } from '@/store';
 import { getGlobalRenderer } from '@/hooks/useBCF';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 
 const MARKER_COLOR = '#10b981'; // emerald-500, matches the 2D pane marker
 

@@ -31,8 +31,10 @@ import { VIEW_MODES, StoreyPicker } from '@/components/viewer/ViewModeSwitcher';
 import {
   RibbonGroup,
   RibbonGroupDivider,
-  RibbonLargeButton,
+  RibbonContentLargeButton,
 } from '@/components/viewer/ribbon/primitives';
+import { RibbonCommandLargeButton } from '@/components/viewer/ribbon/command-button';
+import type { SurfaceCommandContext } from '@/components/viewer/surface-commands';
 
 /** Ribbon icons for the view modes, keyed by the shared `VIEW_MODES` ids. */
 const MODE_ICONS = {
@@ -51,23 +53,29 @@ export function DocumentsRibbonTab() {
 
   const { mode, setMode, storeys } = useViewMode();
   const disabledReason = viewModeDisabledReason({ calibrating, storeyCount: storeys.length });
+  // The library buttons run the same registered `panel:*` commands as the
+  // command palette (surface-commands-panels.ts), so ribbon and palette share
+  // one label and one action.
+  const commandContext: Omit<SurfaceCommandContext, 'surface'> = {
+    activateRightPanel: (panel) => useViewerStore.getState().toggleWorkspacePanel(panel, 'ribbon'),
+  };
 
   return (
     <>
       <RibbonGroup label="Library">
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="panel:documents"
           icon={Files}
-          label="Documents"
           tooltip="Project documents (PDFs & images) — open as tabs"
           active={documentsPanelVisible}
-          onClick={() => useViewerStore.getState().toggleWorkspacePanel('documents')}
+          commandContext={commandContext}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="panel:drawing-underlay"
           icon={MapIcon}
-          label="Underlays"
           tooltip="Drawing underlays — georeferenced PDF plans"
           active={underlayPanelVisible}
-          onClick={() => useViewerStore.getState().toggleWorkspacePanel('drawing-underlay')}
+          commandContext={commandContext}
         />
       </RibbonGroup>
 
@@ -77,10 +85,12 @@ export function DocumentsRibbonTab() {
           shape: identical modes, identical gating, identical storey picker. */}
       <RibbonGroup label="View mode">
         {VIEW_MODES.map((m) => (
-          <RibbonLargeButton
+          <RibbonContentLargeButton
             key={m.id}
             icon={MODE_ICONS[m.id]}
-            label={m.label}
+            contentLabel={m.label}
+            contentSource="extension"
+            contentId={`aim-view-mode:${m.id}`}
             tooltip={disabledReason ?? m.title}
             active={mode === m.id}
             disabled={disabledReason !== null}

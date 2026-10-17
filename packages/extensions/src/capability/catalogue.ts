@@ -52,6 +52,10 @@ const ENTRIES: CapabilityCatalogueEntry[] = [
 
   // ----- network
   { scope: 'network', action: 'fetch', requiresTarget: true, description: 'Fetch from URLs matching the listed host pattern.', baseRisk: 'red' },
+  { scope: 'network', action: 'ai', requiresTarget: false, description: 'Send graph data to the AI model provider the host is configured with.', baseRisk: 'red' },
+
+  // ----- secret
+  { scope: 'secret', action: 'read', requiresTarget: true, description: 'Read the named secret from the host environment (CLI/MCP only — never available in the viewer).', baseRisk: 'red' },
 
   // ----- command
   { scope: 'command', action: 'invoke', requiresTarget: true, description: 'Invoke other extensions\' commands matching the listed id pattern.', baseRisk: 'yellow' },

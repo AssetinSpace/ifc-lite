@@ -3,29 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Production-path helpers shared by the fixture-driven void suites:
-//! fixture loading, `IfcRelVoidsElement` indexing exactly as
+//! `IfcRelVoidsElement` indexing exactly as
 //! `process_geometry_batch` does it, and the ray-cast machinery used to
 //! prove a wall actually has a hole at each opening footprint.
 
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
 use rustc_hash::FxHashMap;
-use std::fs;
-use std::path::PathBuf;
-
-/// Resolve a fixture path relative to the workspace root.
-pub fn fixture_path(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(relative)
-}
-
-/// Load a fixture if present; return `None` so callers can skip gracefully.
-pub fn load_fixture(relative: &str) -> Option<String> {
-    let path = fixture_path(relative);
-    fs::read_to_string(&path).ok()
-}
 
 /// Find the express ID of an entity by GUID (attribute index 0).
 pub fn find_entity_by_guid(content: &str, guid: &str) -> Option<u32> {

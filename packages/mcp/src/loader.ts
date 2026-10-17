@@ -7,16 +7,14 @@
  * mounts a `HeadlessLikeBackend` on top of the resulting `IfcDataStore`,
  * and produces a `LoadedModel` ready to drop into the registry.
  *
- * We don't pull in `@ifc-lite/cli`'s `HeadlessBackend` directly because that
- * package depends on `@ifc-lite/viewer-core` which is browser-shaped. Instead
- * we re-implement the small subset of `BimBackend` the MCP tools actually use
- * (model + query + selection + spatial + export + mutate). All the renderer
- * methods are no-ops, which is fine — agents never call them through MCP.
+ * The SDK owns the shared headless backend. This adapter supplies MCP's
+ * native geometry preparation and registry/file-loading behavior.
  */
 
 import { readFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
-import { IfcParser, unwrapIfcZipView, type IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, validateStepInput, type IfcDataStore } from '@ifc-lite/parser';
+import { sourceModelIdentity } from '@ifc-lite/cache';
 import { createBimContext, type BimContext } from '@ifc-lite/sdk';
 import type { LoadedModel } from './context.js';
 import { HeadlessLikeBackend } from './headless-backend.js';
@@ -37,20 +35,21 @@ export async function loadIfcModel(filePath: string, opts: LoadIfcOptions = {}):
     }
   }
 
-  let buffer = await readFile(absolute);
-  if (buffer.byteLength === 0) {
-    throw new Error(`'${absolute}' is empty (0 bytes)`);
-  }
+  const buffer = await readFile(absolute);
+  const loaded = await loadIfcModelFromBytes(buffer, basename(absolute), opts.modelId, absolute);
+  return { ...loaded, filePath: absolute };
+}
 
-  // Transparent .ifcZIP unwrap (issue #1494) — cheap magic-byte no-op for an
-  // ordinary .ifc file.
-  buffer = Buffer.from(await unwrapIfcZipView(buffer));
-
-  // Cheap signature check; full parser also bails on malformed STEP.
-  const headerSnippet = buffer.subarray(0, Math.min(buffer.byteLength, 256)).toString('ascii');
-  if (!headerSnippet.includes('ISO-10303-21')) {
-    throw new Error(`'${absolute}' is not a valid IFC/STEP file`);
-  }
+/**
+ * Parse IFC bytes already in memory (a flow's `model.openFromSource`) into a
+ * `LoadedModel` — the same unwrap, signature check and parser setup as
+ * {@link loadIfcModel}, which reads the file and calls this. `label` names the
+ * source in errors; it defaults to `name`.
+ */
+export async function loadIfcModelFromBytes(bytes: Uint8Array, name: string, modelId?: string, label = name): Promise<LoadedModel> {
+  // Preserve this existing loader's recovery behavior; new parseModel sessions
+  // validate complete envelopes. A partial scan still carries scanWarnings.
+  const buffer = Buffer.from(await validateStepInput(bytes, label, { envelope: 'signature' }));
 
   const parser = new IfcParser();
   // The parser writes progress to console.* — silence it during MCP loads
@@ -60,34 +59,42 @@ export async function loadIfcModel(filePath: string, opts: LoadIfcOptions = {}):
   console.log = (): void => undefined;
   console.warn = (): void => undefined;
   let store: IfcDataStore;
+  // Kept, not silenced with the console: a `scan:` line says the model is
+  // missing records, which the caller has to hear (#7610).
+  const scanWarnings: string[] = [];
   try {
     const arrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,
       buffer.byteOffset + buffer.byteLength,
     ) as ArrayBuffer;
-    store = await parser.parseColumnar(arrayBuffer);
+    store = await parser.parseColumnar(arrayBuffer, {
+      onDiagnostic: (m) => { if (m.startsWith('scan: ')) scanWarnings.push(m); },
+    });
     store.fileSize = buffer.byteLength;
   } finally {
     console.log = origLog;
     console.warn = origWarn;
   }
 
-  const id = opts.modelId ?? deriveModelId(basename(absolute));
-  const backend = new HeadlessLikeBackend(store, basename(absolute), id);
+  const id = modelId ?? deriveModelId(name);
+  const backend = new HeadlessLikeBackend(store, name, id);
   const bim: BimContext = createBimContext({ backend });
 
   return {
     id,
-    name: basename(absolute),
+    name,
     bim,
     store,
     backend,
-    filePath: absolute,
+    // Computed from the POST-unwrap bytes, so an .ifcZIP is fingerprinted by
+    // the STEP it contains — the viewer's rule (#5138).
+    sourceFingerprint: sourceModelIdentity(name, buffer),
+    ...(scanWarnings.length > 0 ? { scanWarnings } : {}),
     loadedAt: Date.now(),
   };
 }
 
-function deriveModelId(name: string): string {
+export function deriveModelId(name: string): string {
   // Strip extension, replace spaces with underscores, lowercase. Keeps the
   // ID URL-safe so it round-trips through `Mcp-Session-Id` headers and
   // resource URIs.

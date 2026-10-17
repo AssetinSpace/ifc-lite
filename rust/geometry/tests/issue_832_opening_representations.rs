@@ -30,7 +30,7 @@ use ifc_lite_geometry::GeometryRouter;
 use rustc_hash::FxHashMap;
 use voids_common::production::fold_origin;
 
-const FIXTURE: &str = "../../tests/models/issues/832_opening_representations.ifc";
+const FIXTURE: &str = "issues/832_opening_representations.ifc";
 
 /// (wall_id, opening_id, label).  Wall #222 is the broken one in the screenshot.
 const WALLS: &[(u32, u32, &str)] = &[
@@ -57,17 +57,7 @@ fn authored_opening_bounds(wall_id: u32) -> ((f32, f32, f32), (f32, f32, f32)) {
 }
 
 fn read_fixture() -> Option<String> {
-    match std::fs::read_to_string(FIXTURE) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "skipping issue-832 regression: fixture missing at {FIXTURE} — \
-                 add it from the issue attachment"
-            );
-            None
-        }
-        Err(e) => panic!("failed to read fixture {FIXTURE}: {e}"),
-    }
+    ifc_lite_testkit::fixture_text(FIXTURE)
 }
 
 fn mesh_bounds(mesh: &ifc_lite_geometry::Mesh) -> ([f32; 3], [f32; 3]) {

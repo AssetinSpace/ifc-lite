@@ -19,20 +19,10 @@
 use ifc_lite_core::{has_geometry_by_name, EntityDecoder, IfcType};
 use ifc_lite_geometry::GeometryRouter;
 
-const FIXTURE: &str = "../../tests/models/issues/844_terrain_and_alignment.ifc";
+const FIXTURE: &str = "issues/844_terrain_and_alignment.ifc";
 
 fn read_fixture() -> Option<String> {
-    match std::fs::read_to_string(FIXTURE) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "skipping issue-844 regression: fixture missing at {FIXTURE} — \
-                 run `pnpm fixtures` to fetch it"
-            );
-            None
-        }
-        Err(e) => panic!("failed to read fixture {FIXTURE}: {e}"),
-    }
+    ifc_lite_testkit::fixture_text(FIXTURE)
 }
 
 #[test]

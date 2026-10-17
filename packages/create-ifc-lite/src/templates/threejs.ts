@@ -4,14 +4,15 @@
 
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getPackageVersion } from '../utils/config-fixers.js';
+import { getPinnedPackageVersion, MODULE_WORKER_CONFIG } from '../utils/config-fixers.js';
+import { writeGitignore } from '../utils/gitignore.js';
 
 /**
  * Scaffold a Three.js IFC viewer project using @ifc-lite/geometry.
  * No WebGPU required — renders via Three.js WebGLRenderer.
  */
 export function createThreejsTemplate(targetDir: string, projectName: string) {
-  const geometryVersion = getPackageVersion('@ifc-lite/geometry');
+  const geometryVersion = getPinnedPackageVersion('@ifc-lite/geometry');
 
   // package.json
   writeFileSync(join(targetDir, 'package.json'), JSON.stringify({
@@ -23,7 +24,7 @@ export function createThreejsTemplate(targetDir: string, projectName: string) {
       dev: 'vite',
       build: 'tsc && vite build',
       preview: 'vite preview',
-      postinstall: 'node ./scripts/fix-ifc-lite-geometry-worker.mjs',
+      typecheck: 'tsc --noEmit',
     },
     dependencies: {
       '@ifc-lite/geometry': geometryVersion,
@@ -45,7 +46,7 @@ export function createThreejsTemplate(targetDir: string, projectName: string) {
       strict: true,
       esModuleInterop: true,
       skipLibCheck: true,
-      outDir: 'dist',
+      noEmit: true,
     },
     include: ['src'],
   }, null, 2));
@@ -54,12 +55,7 @@ export function createThreejsTemplate(targetDir: string, projectName: string) {
   writeFileSync(join(targetDir, 'vite.config.ts'), `import { defineConfig } from 'vite';
 
 export default defineConfig({
-  // @ifc-lite ships ES-module geometry workers; emit them as ESM so a
-  // production build never trips over Rollup's IIFE worker default.
-  worker: {
-    format: 'es',
-  },
-  optimizeDeps: {
+${MODULE_WORKER_CONFIG}  optimizeDeps: {
     exclude: ['@ifc-lite/wasm'],
   },
   server: {
@@ -95,7 +91,7 @@ export default defineConfig({
     <header>
       <h1>${projectName}</h1>
       <input type="file" id="file-input" accept=".ifc" />
-      <span id="status">Drop an IFC file to view</span>
+      <span id="status">Choose an IFC file to view</span>
     </header>
     <div id="canvas-container">
       <canvas id="viewer"></canvas>
@@ -108,25 +104,6 @@ export default defineConfig({
 
   // src/
   mkdirSync(join(targetDir, 'src'));
-  mkdirSync(join(targetDir, 'scripts'));
-
-  // scripts/fix-ifc-lite-geometry-worker.mjs
-  writeFileSync(join(targetDir, 'scripts', 'fix-ifc-lite-geometry-worker.mjs'), `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
-
-const entryPath = path.join(process.cwd(), 'node_modules', '@ifc-lite', 'geometry', 'dist', 'index.js');
-
-if (!existsSync(entryPath)) {
-  process.exit(0);
-}
-
-const source = readFileSync(entryPath, 'utf8');
-const patched = source.replace(/geometry\\.worker\\.ts/g, 'geometry.worker.js');
-
-if (patched !== source) {
-  writeFileSync(entryPath, patched);
-}
-`);
 
   // src/ifc-to-threejs.ts
   writeFileSync(join(targetDir, 'src', 'ifc-to-threejs.ts'), `import * as THREE from 'three';
@@ -154,6 +131,11 @@ export function meshDataToThree(mesh: MeshData): THREE.Mesh {
   });
 
   const threeMesh = new THREE.Mesh(geometry, material);
+  // Fold the per-element local frame: \`positions\` are relative to \`origin\`,
+  // so the world position of vertex i is origin + positions[3i..3i+3]. Most
+  // elements carry one (it is what keeps building-scale coordinates inside f32
+  // precision); dropping it scatters every element to its local offset.
+  if (mesh.origin) threeMesh.position.fromArray(mesh.origin);
   threeMesh.userData.expressId = mesh.expressId;
   return threeMesh;
 }
@@ -270,12 +252,14 @@ fileInput.addEventListener('change', async () => {
         status.textContent = file.name + ' — ' + event.totalMeshes + ' meshes';
       }
     }
-  } catch (err: any) {
-    status.textContent = 'Error: ' + err.message;
+  } catch (err) {
+    status.textContent = 'Error: ' + (err instanceof Error ? err.message : String(err));
     console.error(err);
   }
 });
 `);
+
+  writeGitignore(targetDir);
 
   // README
   writeFileSync(join(targetDir, 'README.md'), `# ${projectName}
@@ -285,11 +269,13 @@ Three.js IFC viewer using [IFC-Lite](https://github.com/LTplus-AG/ifc-lite).
 ## Quick Start
 
 \`\`\`bash
-npm install
+npm ci
 npm run dev
 \`\`\`
 
-Open http://localhost:3000 and drop an IFC file.
+Open the URL Vite prints (http://localhost:5173 by default) and pick an IFC file.
+
+No IFC file handy? [AC20-FZK-Haus.ifc](https://github.com/LTplus-AG/ifc-lite/releases/download/fixtures-v1/d42ab0dee01173106c16cd823b4614efe188fa15dd65195d95b9879bec59acc5) is a small public test model.
 
 ## Learn More
 

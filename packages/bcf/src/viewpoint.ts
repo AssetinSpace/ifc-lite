@@ -14,10 +14,14 @@ import type {
   BCFPerspectiveCamera,
   BCFOrthogonalCamera,
   BCFClippingPlane,
-  BCFPoint,
   BCFDirection,
 } from './types.js';
 import { generateUuid } from '@ifc-lite/encoding';
+import { usableTargetDistance } from './numeric.js';
+import { sectionPlaneToClippingPlane, clippingPlaneToSectionPlane } from './section-plane-conversion.js';
+
+// The one-plane conversion lives beside this file; the public path stays `viewpoint.js`.
+export { sectionPlaneToClippingPlane, clippingPlaneToSectionPlane };
 
 // ============================================================================
 // Camera State Types (matching ifc-lite viewer)
@@ -36,6 +40,16 @@ export interface ViewerCameraState {
   isOrthographic?: boolean;
   /** Orthographic scale (view-to-world) */
   orthoScale?: number;
+  /**
+   * Viewport aspect ratio (width / height). REQUIRED to write BCF 3.0:
+   * v3_0/visinfo.xsd makes `<AspectRatio>` a mandatory child of both camera
+   * types and `writer-camera.ts` refuses to invent one, so without this field
+   * no viewpoint this package produced could be written as 3.0 at all -- and
+   * `writeBCF` throws for the whole archive on the first such camera, so one
+   * captured viewpoint meant no export (#3612). Optional because 2.1 has no
+   * such element; leave it unset rather than assert a view nobody had.
+   */
+  aspectRatio?: number;
 }
 
 export interface ViewerSectionPlane {
@@ -75,12 +89,12 @@ export interface ViewerBounds {
  *   BCF.z = Viewer.y   (viewer Y up = BCF Z up)
  */
 
-type Point3D = { x: number; y: number; z: number };
+export type Point3D = { x: number; y: number; z: number };
 
 /**
  * Convert from viewer coordinates (Y-up) to BCF coordinates (Z-up)
  */
-function viewerToBcfCoords(p: Point3D): Point3D {
+export function viewerToBcfCoords(p: Point3D): Point3D {
   return {
     x: p.x,
     y: -p.z,
@@ -91,7 +105,7 @@ function viewerToBcfCoords(p: Point3D): Point3D {
 /**
  * Convert from BCF coordinates (Z-up) to viewer coordinates (Y-up)
  */
-function bcfToViewerCoords(p: Point3D): Point3D {
+export function bcfToViewerCoords(p: Point3D): Point3D {
   return {
     x: p.x,
     y: p.z,
@@ -143,6 +157,7 @@ export function cameraToPerspective(camera: ViewerCameraState): BCFPerspectiveCa
     cameraDirection: direction,
     cameraUpVector: upVector,
     fieldOfView: Math.max(1, Math.min(179, fieldOfView)), // Clamp to valid range
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -183,6 +198,7 @@ export function cameraToOrthogonal(
     cameraDirection: direction,
     cameraUpVector: upVector,
     viewToWorldScale,
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -201,11 +217,23 @@ export function perspectiveToCamera(
   camera: BCFPerspectiveCamera,
   targetDistance = 10
 ): ViewerCameraState {
+  // The caller's reference distance is the viewer's live `camera.getDistance()`,
+  // which is raw by contract — `@ifc-lite/renderer` reports a malformed pose
+  // instead of hiding it. So once the camera is broken by any route, this
+  // multiplication turned every *restored* viewpoint into `viewPoint +
+  // direction * NaN`, and restoring a known-good viewpoint — the obvious way
+  // out — silently failed to repair anything (#2466). Falling back to the
+  // documented default is one guard at the sink every restore path funnels
+  // through, rather than one guard per app-layer consumer; there are six of
+  // those, and guarding them individually is the arrangement that produced
+  // this gap.
+  const distance = usableTargetDistance(targetDistance, 10);
+
   // Calculate target in BCF coordinates
   const bcfTarget = {
-    x: camera.cameraViewPoint.x + camera.cameraDirection.x * targetDistance,
-    y: camera.cameraViewPoint.y + camera.cameraDirection.y * targetDistance,
-    z: camera.cameraViewPoint.z + camera.cameraDirection.z * targetDistance,
+    x: camera.cameraViewPoint.x + camera.cameraDirection.x * distance,
+    y: camera.cameraViewPoint.y + camera.cameraDirection.y * distance,
+    z: camera.cameraViewPoint.z + camera.cameraDirection.z * distance,
   };
 
   // Convert to viewer coordinates (Y-up)
@@ -222,6 +250,15 @@ export function perspectiveToCamera(
     up: viewerUp,
     fov,
     isOrthographic: false,
+    // Carried back so the conversion pair is lossless in both directions.
+    // NOT for the viewer's apply path: `useBCF`'s `applyCameraState` never
+    // pushes an aspect ratio into the renderer (the viewport owns that) and
+    // `getCameraState` reads a fresh one, so nothing there depends on this.
+    // It matters for a caller that reads a viewpoint, edits the camera state,
+    // and writes it back -- `perspectiveToCamera` -> `cameraToPerspective`
+    // would otherwise silently drop the field and make the result unwritable
+    // as BCF 3.0. The tests pin the round trip, not a viewer scenario.
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -234,11 +271,14 @@ export function orthogonalToCamera(
   camera: BCFOrthogonalCamera,
   targetDistance = 10
 ): ViewerCameraState {
+  // Same sink, same reasoning as `perspectiveToCamera` (#2466).
+  const distance = usableTargetDistance(targetDistance, 10);
+
   // Calculate target in BCF coordinates
   const bcfTarget = {
-    x: camera.cameraViewPoint.x + camera.cameraDirection.x * targetDistance,
-    y: camera.cameraViewPoint.y + camera.cameraDirection.y * targetDistance,
-    z: camera.cameraViewPoint.z + camera.cameraDirection.z * targetDistance,
+    x: camera.cameraViewPoint.x + camera.cameraDirection.x * distance,
+    y: camera.cameraViewPoint.y + camera.cameraDirection.y * distance,
+    z: camera.cameraViewPoint.z + camera.cameraDirection.z * distance,
   };
 
   // Convert to viewer coordinates (Y-up)
@@ -253,120 +293,7 @@ export function orthogonalToCamera(
     fov: Math.PI / 4, // Default FOV for ortho (not used)
     isOrthographic: true,
     orthoScale: camera.viewToWorldScale,
-  };
-}
-
-// ============================================================================
-// Section Plane Conversion
-// ============================================================================
-
-/**
- * Convert viewer section plane to BCF clipping plane
- *
- * ifc-lite uses percentage position (0-100) along an axis.
- * BCF uses absolute location and direction in world coordinates (Z-up).
- */
-export function sectionPlaneToClippingPlane(
-  sectionPlane: ViewerSectionPlane,
-  bounds: ViewerBounds
-): BCFClippingPlane | null {
-  if (!sectionPlane.enabled) {
-    return null;
-  }
-
-  // Calculate absolute position from percentage (in viewer coordinates)
-  const t = sectionPlane.position / 100;
-
-  let viewerLocation: Point3D;
-  let viewerDirection: Point3D;
-
-  switch (sectionPlane.axis) {
-    case 'down': // Y axis (viewer up/down)
-      viewerLocation = {
-        x: (bounds.min.x + bounds.max.x) / 2,
-        y: bounds.min.y + t * (bounds.max.y - bounds.min.y),
-        z: (bounds.min.z + bounds.max.z) / 2,
-      };
-      viewerDirection = sectionPlane.flipped ? { x: 0, y: 1, z: 0 } : { x: 0, y: -1, z: 0 };
-      break;
-
-    case 'front': // Z axis (viewer depth)
-      viewerLocation = {
-        x: (bounds.min.x + bounds.max.x) / 2,
-        y: (bounds.min.y + bounds.max.y) / 2,
-        z: bounds.min.z + t * (bounds.max.z - bounds.min.z),
-      };
-      viewerDirection = sectionPlane.flipped ? { x: 0, y: 0, z: 1 } : { x: 0, y: 0, z: -1 };
-      break;
-
-    case 'side': // X axis
-      viewerLocation = {
-        x: bounds.min.x + t * (bounds.max.x - bounds.min.x),
-        y: (bounds.min.y + bounds.max.y) / 2,
-        z: (bounds.min.z + bounds.max.z) / 2,
-      };
-      viewerDirection = sectionPlane.flipped ? { x: 1, y: 0, z: 0 } : { x: -1, y: 0, z: 0 };
-      break;
-  }
-
-  // Convert to BCF coordinates (Z-up)
-  return {
-    location: viewerToBcfCoords(viewerLocation),
-    direction: viewerToBcfCoords(viewerDirection),
-  };
-}
-
-/**
- * Convert BCF clipping plane to viewer section plane
- *
- * Determines the closest axis and calculates percentage position.
- * Converts from BCF coordinates (Z-up) to viewer coordinates (Y-up).
- */
-export function clippingPlaneToSectionPlane(
-  plane: BCFClippingPlane,
-  bounds: ViewerBounds
-): ViewerSectionPlane {
-  // Convert from BCF coordinates to viewer coordinates
-  const viewerLocation = bcfToViewerCoords(plane.location);
-  const viewerDirection = bcfToViewerCoords(plane.direction);
-
-  // Determine primary axis based on direction (in viewer coordinates)
-  const absX = Math.abs(viewerDirection.x);
-  const absY = Math.abs(viewerDirection.y);
-  const absZ = Math.abs(viewerDirection.z);
-
-  let axis: 'down' | 'front' | 'side';
-  let position: number;
-  let flipped: boolean;
-
-  if (absY >= absX && absY >= absZ) {
-    // Y axis dominant (down) in viewer
-    axis = 'down';
-    const range = bounds.max.y - bounds.min.y;
-    position = range > 0 ? ((viewerLocation.y - bounds.min.y) / range) * 100 : 50;
-    flipped = viewerDirection.y > 0;
-  } else if (absZ >= absX) {
-    // Z axis dominant (front) in viewer
-    axis = 'front';
-    const range = bounds.max.z - bounds.min.z;
-    position = range > 0 ? ((viewerLocation.z - bounds.min.z) / range) * 100 : 50;
-    flipped = viewerDirection.z > 0;
-  } else {
-    // X axis dominant (side)
-    axis = 'side';
-    const range = bounds.max.x - bounds.min.x;
-    position = range > 0 ? ((viewerLocation.x - bounds.min.x) / range) * 100 : 50;
-    flipped = viewerDirection.x > 0;
-  }
-
-  // Clamp position to valid range
-  position = Math.max(0, Math.min(100, position));
-
-  return {
-    axis,
-    position,
-    enabled: true,
-    flipped,
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -384,6 +311,12 @@ export function clippingPlaneToSectionPlane(
 export function createViewpoint(options: {
   camera: ViewerCameraState;
   sectionPlane?: ViewerSectionPlane;
+  /**
+   * Every cutting plane that is on, as the viewer clips with them (several planes keep only what ALL
+   * of them keep). Each enabled one becomes an entry of `clippingPlanes`, in this order. When given
+   * it takes the place of `sectionPlane`.
+   */
+  sectionPlanes?: ViewerSectionPlane[];
   bounds?: ViewerBounds;
   snapshot?: string;
   snapshotData?: Uint8Array;
@@ -395,6 +328,7 @@ export function createViewpoint(options: {
   const {
     camera,
     sectionPlane,
+    sectionPlanes,
     bounds,
     snapshot,
     snapshotData,
@@ -415,11 +349,13 @@ export function createViewpoint(options: {
     viewpoint.perspectiveCamera = cameraToPerspective(camera);
   }
 
-  // Add clipping plane
-  if (sectionPlane?.enabled && bounds) {
-    const clippingPlane = sectionPlaneToClippingPlane(sectionPlane, bounds);
-    if (clippingPlane) {
-      viewpoint.clippingPlanes = [clippingPlane];
+  // Add clipping planes: one entry per enabled plane
+  if (bounds) {
+    const clippingPlanes = (sectionPlanes ?? (sectionPlane ? [sectionPlane] : []))
+      .map((plane) => sectionPlaneToClippingPlane(plane, bounds))
+      .filter((plane): plane is BCFClippingPlane => plane !== null);
+    if (clippingPlanes.length > 0) {
+      viewpoint.clippingPlanes = clippingPlanes;
     }
   }
 
@@ -434,7 +370,24 @@ export function createViewpoint(options: {
   // Add components
   const hasSelection = selectedGuids && selectedGuids.length > 0;
   const hasHidden = hiddenGuids && hiddenGuids.length > 0;
-  const hasVisible = visibleGuids && visibleGuids.length > 0;
+  // `visibleGuids` is an ISOLATION ALLOWLIST and is meaningfully nullable:
+  // omitted means "no isolation channel is active, everything is visible",
+  // while an EMPTY array means one IS active and currently matches nothing --
+  // the viewer is showing an empty viewport, and the viewpoint has to say so.
+  // A `.length > 0` test here collapses the two and writes a viewpoint
+  // claiming the whole model is visible. Same distinction `isEntityVisible`
+  // in `packages/renderer/src/entity-visibility.ts` draws for `isolatedIds`.
+  // `hiddenGuids` below is a BLOCKLIST, where empty and absent both correctly
+  // mean "hide nothing", so it keeps its length test.
+  //
+  // When BOTH are supplied the allowlist wins and the blocklist is not
+  // written. That is deliberate and lossless, not a dropped input: BCF's
+  // `<Visibility>` carries a single `DefaultVisibility` flag, so only one of
+  // the two modes can be expressed at all -- and an allowlist already hides
+  // everything outside itself, `hiddenGuids` included. `visibleGuids: []`
+  // (isolate nothing) hides the whole model, which likewise satisfies any
+  // blocklist. Pinned by "lets an isolation allowlist subsume hiddenGuids".
+  const hasVisible = visibleGuids != null;
   const hasColoring = coloredGuids && coloredGuids.length > 0;
 
   if (hasSelection || hasHidden || hasVisible || hasColoring) {
@@ -479,14 +432,27 @@ export function extractViewpointState(
   targetDistance = 10
 ): {
   camera?: ViewerCameraState;
+  /** The first clipping plane (what a single-plane reader wants). */
   sectionPlane?: ViewerSectionPlane;
+  /** Every clipping plane of the viewpoint, in order; a viewpoint with none has none. */
+  sectionPlanes?: ViewerSectionPlane[];
   selectedGuids: string[];
   hiddenGuids: string[];
-  visibleGuids: string[]; // For isolation mode (defaultVisibility=false)
+  // For isolation mode (defaultVisibility=false). `null` means the viewpoint
+  // carries no isolation channel at all (show everything); a non-null array
+  // -- EMPTY included -- means isolation WAS active in the captured
+  // viewpoint, down to "matched nothing". Collapsing an empty array from a
+  // spec-valid `<Visibility DefaultVisibility="false"/>` with no
+  // `<Exceptions>` (a real BCF viewer isolating to nothing) into the same
+  // shape as "no isolation" misreads a captured empty viewport as an
+  // unfiltered one -- the read-side half of the write-side fix in
+  // `createViewpoint`'s `hasVisible`, above.
+  visibleGuids: string[] | null;
   coloredGuids: { color: string; guids: string[] }[];
 } {
   let camera: ViewerCameraState | undefined;
   let sectionPlane: ViewerSectionPlane | undefined;
+  let sectionPlanes: ViewerSectionPlane[] | undefined;
 
   // Extract camera
   if (viewpoint.perspectiveCamera) {
@@ -497,7 +463,8 @@ export function extractViewpointState(
 
   // Extract section plane
   if (viewpoint.clippingPlanes && viewpoint.clippingPlanes.length > 0 && bounds) {
-    sectionPlane = clippingPlaneToSectionPlane(viewpoint.clippingPlanes[0], bounds);
+    sectionPlanes = viewpoint.clippingPlanes.map((plane) => clippingPlaneToSectionPlane(plane, bounds));
+    sectionPlane = sectionPlanes[0];
   }
 
   // Extract selected GUIDs
@@ -512,15 +479,22 @@ export function extractViewpointState(
 
   // Extract visibility GUIDs
   const hiddenGuids: string[] = [];
-  const visibleGuids: string[] = [];
+  let visibleGuids: string[] | null = null;
   if (viewpoint.components?.visibility) {
     const { defaultVisibility, exceptions } = viewpoint.components.visibility;
+    // `defaultVisibility === false` is what the BCF schema uses to mean
+    // "isolation mode" -- set it regardless of whether `exceptions` is
+    // present, so an isolation that matches nothing (no `<Exceptions>`
+    // element, or an empty one) still comes back as `[]`, not `null`.
+    if (defaultVisibility === false) {
+      visibleGuids = [];
+    }
     if (exceptions) {
       for (const comp of exceptions) {
         if (comp.ifcGuid) {
           if (defaultVisibility === false) {
             // Isolation mode: exceptions are the visible entities
-            visibleGuids.push(comp.ifcGuid);
+            visibleGuids!.push(comp.ifcGuid);
           } else {
             // Normal mode: exceptions are the hidden entities
             hiddenGuids.push(comp.ifcGuid);
@@ -549,6 +523,7 @@ export function extractViewpointState(
   return {
     camera,
     sectionPlane,
+    sectionPlanes,
     selectedGuids,
     hiddenGuids,
     visibleGuids,

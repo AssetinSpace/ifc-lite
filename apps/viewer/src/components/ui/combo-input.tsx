@@ -28,6 +28,10 @@ export interface ComboInputProps {
   /** Cap rendered suggestions (filtering still scans all options). */
   maxRendered?: number;
   'aria-label'?: string;
+  /** Forwarded to the underlying `<input>` — lets `<Field>` label it via `htmlFor`/`id` (#5812). */
+  id?: string;
+  'aria-describedby'?: string;
+  'aria-invalid'?: boolean | 'true' | 'false';
 }
 
 interface Anchor { left: number; top: number; width: number }
@@ -40,6 +44,9 @@ export function ComboInput({
   className,
   maxRendered = 50,
   'aria-label': ariaLabel,
+  id,
+  'aria-describedby': ariaDescribedBy,
+  'aria-invalid': ariaInvalid,
 }: ComboInputProps) {
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
@@ -94,6 +101,9 @@ export function ComboInput({
     <>
       <Input
         ref={inputRef}
+        id={id}
+        aria-describedby={ariaDescribedBy}
+        aria-invalid={ariaInvalid}
         value={value}
         placeholder={placeholder}
         onChange={(e) => { onChange(e.target.value); setOpen(true); }}
@@ -133,7 +143,7 @@ export function ComboInput({
           // so selecting a value doesn't also close the whole modal.
           style={{ position: 'fixed', left: anchor.left, top: anchor.top + 4, minWidth: anchor.width, pointerEvents: 'auto' }}
           onPointerDown={(e) => e.stopPropagation()}
-          className="z-[120] max-h-60 w-max max-w-[20rem] overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-800 dark:bg-zinc-950"
+          className="popover-surface z-[120] max-h-60 w-max max-w-[20rem] overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-800 dark:bg-zinc-950"
         >
           {filtered.map((o, i) => (
             <button

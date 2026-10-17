@@ -8,13 +8,17 @@
  */
 
 import { useEffect, type MutableRefObject } from 'react';
-import type { Renderer } from '@ifc-lite/renderer';
+import { isEntityVisible, type Renderer } from '@ifc-lite/renderer';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 import { useViewerStore, type SectionPlane } from '@/store';
 import { goHomeFromStore } from '@/store/homeView';
 import { presetViewRotation } from '@/lib/preset-view-orientation';
-import { eventKey, isTextEntryTarget } from '@/lib/keyboard-event';
+import { eventKey, WALK_MOVEMENT_KEYS } from '@/lib/keyboard-event';
+import { dispatchKeyboardDown, registerKeyboardBinding, registerKeyboardCommand, registerKeyboardKeyUp } from '@/lib/commands/dispatcher';
 import { getEntityBounds } from '../../utils/viewportUtils.js';
+import { flySpeedStore } from './flySpeedStore.js';
+import { createWalkController, type WalkController } from './walk/walkController.js';
+import { viewerEntityType } from './walk/walkEntityType.js';
 
 export interface UseKeyboardControlsParams {
   rendererRef: MutableRefObject<Renderer | null>;
@@ -40,28 +44,20 @@ export interface UseKeyboardControlsParams {
 }
 
 /** Keys that trigger continuous movement (arrow keys + WASD + shift for sprint) */
-const MOVEMENT_KEYS = new Set([
-  'arrowup', 'arrowdown', 'arrowleft', 'arrowright',
-  'w', 's', 'a', 'd', 'shift',
-]);
+const MOVEMENT_KEYS = new Set([...WALK_MOVEMENT_KEYS, 'shift']);
 
 export function useKeyboardControls(params: UseKeyboardControlsParams): void {
   const {
     rendererRef,
     isInitialized,
     keyboardHandlersRef,
-    firstPersonModeRef,
     geometryBoundsRef,
     coordinateInfoRef,
     geometryRef,
     selectedEntityIdRef,
     hiddenEntitiesRef,
     isolatedEntitiesRef,
-    selectedModelIndexRef,
-    clearColorRef,
     activeToolRef,
-    sectionPlaneRef,
-    sectionRangeRef,
     updateCameraRotationRealtime,
     calculateScale,
   } = params;
@@ -81,73 +77,65 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       renderer.requestRender();
     };
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (isTextEntryTarget(e)) {
+    // Walk mode: a physics walker owns the camera while the Walk tool is active.
+    let walk: WalkController | null = null;
+    const syncWalk = (tool: string) => {
+      if (tool === 'walk' && !walk) {
+        walk = createWalkController(
+          renderer,
+          (id) => isEntityVisible(id, hiddenEntitiesRef.current, isolatedEntitiesRef.current),
+          () => useViewerStore.getState().mutationVersion,
+          viewerEntityType,
+        );
+      } else if (tool !== 'walk' && walk) {
+        walk.dispose();
+        walk = null;
+      }
+    };
+    syncWalk(useViewerStore.getState().activeTool);
+    const unsubscribeTool = useViewerStore.subscribe((state) => syncWalk(state.activeTool));
+    const holdWalkKey = (key: string) => (event: KeyboardEvent) => {
+      if (!walk || event.repeat) return;
+      walk.setKey(key, true);
+    };
+
+    const startMovement = (event: KeyboardEvent) => {
+      const key = eventKey(event);
+      if (key === null) return false;
+      if (walk) {
+        walk.setKey(key, true);
         return;
       }
-
-      // Browsers may dispatch a key event with no `key` (autofill, synthetic
-      // events) — see lib/keyboard-event.ts. Nothing below could match such an
-      // event, so skipping it is behaviour-preserving.
-      const key = eventKey(e);
-      if (key === null) return;
-
       keyState[key] = true;
-
-      // Start movement loop when a movement key is pressed
       if (MOVEMENT_KEYS.has(key) && !moveLoopRunning) {
         moveLoopRunning = true;
         keyboardMove();
       }
+    };
 
-      // Preset views - set view and re-render
-      const setViewAndRender = (view: 'top' | 'bottom' | 'front' | 'back' | 'left' | 'right') => {
-        // Match the viewcube: when the Cesium world-context basemap is rendering,
-        // TOP/BOTTOM read north-up rather than following the building's IfcSite
-        // axes (#1532). cesiumAvailable guards a stale cesiumEnabled after georef
-        // disappears.
-        const { cesiumEnabled, cesiumAvailable } = useViewerStore.getState();
-        const rotation = presetViewRotation(
-          view,
-          coordinateInfoRef.current?.buildingRotation,
-          cesiumEnabled && cesiumAvailable,
-        );
-        camera.setPresetView(view, geometryBoundsRef.current, rotation);
-        renderScene();
-        updateCameraRotationRealtime(camera.getRotation());
+    const setViewAndRender = (view: 'top' | 'bottom' | 'front' | 'back' | 'left' | 'right') => {
+      // Match the viewcube, including Cesium north-up when its basemap is live.
+      const { cesiumEnabled, cesiumAvailable } = useViewerStore.getState();
+      const rotation = presetViewRotation(view, coordinateInfoRef.current?.buildingRotation, cesiumEnabled && cesiumAvailable);
+      camera.setPresetView(view, geometryBoundsRef.current, rotation);
+      renderScene();
+      updateCameraRotationRealtime(camera.getRotation());
+      calculateScale();
+    };
+
+    const frameSelection = () => {
+      // Use the same multi-selection callback as the toolbar (#1133). The
+      // direct bounds fallback matters when a renderer lacks that callback.
+      const state = useViewerStore.getState();
+      const hasSelection = state.selectedEntityIds.size > 0 || selectedEntityIdRef.current !== null;
+      if (hasSelection && state.cameraCallbacks.frameSelection) {
+        state.cameraCallbacks.frameSelection();
+      } else if (selectedEntityIdRef.current !== null) {
+        const bounds = getEntityBounds(geometryRef.current, selectedEntityIdRef.current);
+        if (bounds) camera.frameBounds(bounds.min, bounds.max, 300);
         calculateScale();
-      };
-
-      if (e.key === '1') setViewAndRender('top');
-      if (e.key === '2') setViewAndRender('bottom');
-      if (e.key === '3') setViewAndRender('front');
-      if (e.key === '4') setViewAndRender('back');
-      if (e.key === '5') setViewAndRender('left');
-      if (e.key === '6') setViewAndRender('right');
-
-      // Frame selection (F) - zoom to fit selection, or fit all if nothing selected
-      if (e.key === 'f' || e.key === 'F') {
-        const selectedId = selectedEntityIdRef.current;
-        if (selectedId !== null) {
-          const bounds = getEntityBounds(geometryRef.current, selectedId);
-          if (bounds) {
-            camera.frameBounds(bounds.min, bounds.max, 300);
-          }
-        } else {
-          camera.zoomExtent(geometryBoundsRef.current.min, geometryBoundsRef.current.max, 300);
-        }
-        calculateScale();
-      }
-
-      // Home view (H) - reset to isometric
-      if (e.key === 'h' || e.key === 'H') {
-        goHomeFromStore();
-      }
-
-      // Fit all / Zoom extents (Z)
-      if (e.key === 'z' || e.key === 'Z') {
-        camera.zoomExtent(geometryBoundsRef.current.min, geometryBoundsRef.current.max, 300);
-        calculateScale();
+      } else {
+        state.cameraCallbacks.fitAll?.();
       }
     };
 
@@ -161,6 +149,7 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       // but still fall through to the held-key check, which is idempotent.
       const key = eventKey(e);
       if (key !== null) keyState[key] = false;
+      if (key !== null) walk?.setKey(key, false);
 
       // Stop movement loop when no movement keys are held
       const anyHeld = Array.from(MOVEMENT_KEYS).some(k => keyState[k]);
@@ -173,33 +162,25 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       }
     };
 
-    keyboardHandlersRef.current.handleKeyDown = handleKeyDown;
-    keyboardHandlersRef.current.handleKeyUp = handleKeyUp;
-
     const keyboardMove = () => {
       if (aborted || !moveLoopRunning) return;
 
-      let moved = false;
-      const isWalkMode = activeToolRef.current === 'walk';
-
-      if (isWalkMode) {
-        // Walk mode: arrow keys + WASD move on horizontal plane
-        // Up/W = forward, Down/S = backward, Left/A = strafe left, Right/D = strafe right
-        const fwd = (keyState['arrowup'] || keyState['w'] ? 1 : 0) + (keyState['arrowdown'] || keyState['s'] ? -1 : 0);
-        const strafe = (keyState['arrowleft'] || keyState['a'] ? -1 : 0) + (keyState['arrowright'] || keyState['d'] ? 1 : 0);
-        if (fwd !== 0 || strafe !== 0) {
-          const sprint = keyState['shift'] ? 2 : 1;
-          camera.moveFirstPerson(fwd * sprint, strafe * sprint, 0);
-          moved = true;
-        }
-      } else {
-        // Normal mode: arrow keys pan the view
-        const panSpeed = 5;
-        if (keyState['arrowup']) { camera.pan(0, -panSpeed, false); moved = true; }
-        if (keyState['arrowdown']) { camera.pan(0, panSpeed, false); moved = true; }
-        if (keyState['arrowleft']) { camera.pan(panSpeed, 0, false); moved = true; }
-        if (keyState['arrowright']) { camera.pan(-panSpeed, 0, false); moved = true; }
+      // A right-button flight owns the camera: a key held from before the press
+      // would otherwise add walk/pan movement on top of the fly speed (#4868
+      // review). Stand down but keep the loop alive, so key-ups still clear and
+      // a still-held key resumes once the flight ends.
+      if (flySpeedStore.get().active) {
+        moveFrameId = requestAnimationFrame(keyboardMove);
+        return;
       }
+
+      // Arrow keys pan the view (walking is the walk controller's).
+      let moved = false;
+      const panSpeed = 5;
+      if (keyState['arrowup']) { camera.pan(0, -panSpeed, false); moved = true; }
+      if (keyState['arrowdown']) { camera.pan(0, panSpeed, false); moved = true; }
+      if (keyState['arrowleft']) { camera.pan(panSpeed, 0, false); moved = true; }
+      if (keyState['arrowright']) { camera.pan(-panSpeed, 0, false); moved = true; }
 
       if (moved) {
         renderScene();
@@ -207,8 +188,29 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       moveFrameId = requestAnimationFrame(keyboardMove);
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    const isWalkMode = () => activeToolRef.current === 'walk';
+    const registrations = [
+      registerKeyboardCommand('walk.move', startMovement, { active: isWalkMode, ignoreModifiers: true }),
+      registerKeyboardCommand('walk.moveArrows', startMovement, { active: isWalkMode, ignoreModifiers: true }),
+      registerKeyboardCommand('camera.pan', startMovement, { active: () => !isWalkMode(), ignoreModifiers: true }),
+      registerKeyboardBinding({ id: 'walk.sprint', when: 'tool.walk', layer: 'tool', keys: [{ key: 'shift', shift: true }], active: isWalkMode, run: startMovement }),
+      // A tap can start and end between two physics ticks: queue it, as well as holding it.
+      registerKeyboardCommand('walk.jump', (event) => { if (!event.repeat) walk?.queueJump(); holdWalkKey(' ')(event); }, { active: isWalkMode, ignoreModifiers: true }),
+      registerKeyboardCommand('walk.crouch', holdWalkKey('z'), { active: isWalkMode, ignoreModifiers: true }),
+      registerKeyboardCommand('walk.toggleCollision', (event) => { if (!event.repeat) walk?.togglePhysics(); }, { active: isWalkMode }),
+      registerKeyboardCommand('camera.viewTop', () => { setViewAndRender('top'); }),
+      registerKeyboardCommand('camera.viewBottom', () => { setViewAndRender('bottom'); }),
+      registerKeyboardCommand('camera.viewFront', () => { setViewAndRender('front'); }),
+      registerKeyboardCommand('camera.viewBack', () => { setViewAndRender('back'); }),
+      registerKeyboardCommand('camera.viewLeft', () => { setViewAndRender('left'); }),
+      registerKeyboardCommand('camera.viewRight', () => { setViewAndRender('right'); }),
+      registerKeyboardCommand('camera.frameSelection', () => { frameSelection(); }),
+      registerKeyboardCommand('camera.home', () => { goHomeFromStore(); }),
+      registerKeyboardCommand('camera.fitAll', () => { useViewerStore.getState().cameraCallbacks.fitAll?.(); }),
+      registerKeyboardKeyUp(handleKeyUp),
+    ];
+    keyboardHandlersRef.current.handleKeyDown = dispatchKeyboardDown;
+    keyboardHandlersRef.current.handleKeyUp = handleKeyUp;
 
     return () => {
       aborted = true;
@@ -216,8 +218,12 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       if (moveFrameId !== null) {
         cancelAnimationFrame(moveFrameId);
       }
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      for (const unregister of registrations) unregister();
+      unsubscribeTool();
+      walk?.dispose();
+      walk = null;
+      keyboardHandlersRef.current.handleKeyDown = null;
+      keyboardHandlersRef.current.handleKeyUp = null;
     };
   }, [isInitialized]);
 }

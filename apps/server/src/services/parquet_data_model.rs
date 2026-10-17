@@ -5,12 +5,12 @@
 //! Parquet serialization for IFC data model (entities, properties, relationships, spatial hierarchy).
 
 use crate::services::data_model::{
-    ClassificationAssociation, DataModel, DocumentAssociation, EntityMetadata, MaterialAssociation,
+    ClassificationAssociation, DataModel, DocumentAssociation, EntityMetadata,
     PropertySet, QuantitySet, Relationship, SpatialHierarchyData, SpatialNode,
 };
 use arrow::array::builder::ListBuilder;
 use arrow::array::UInt32Builder;
-use arrow::array::{BooleanArray, Float64Array, StringArray, UInt16Array, UInt32Array};
+use arrow::array::{BooleanArray, StringArray, UInt16Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -20,6 +20,10 @@ use rayon::prelude::*;
 use std::io::Cursor;
 use std::sync::Arc;
 use thiserror::Error;
+
+#[path = "parquet_data_model_materials.rs"]
+mod materials;
+use materials::serialize_materials_table;
 
 /// Errors during data model Parquet serialization.
 #[derive(Debug, Error)]
@@ -32,6 +36,12 @@ pub enum DataModelParquetError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The data model hit a size budget during extraction ([`DataModel::refused`]).
+    #[error("data model refused: {0}")]
+    Refused(String),
+    /// A section over the `u32` length prefix of the wire format.
+    #[error(transparent)]
+    Framing(#[from] crate::services::ParquetError),
 }
 
 /// Serialize data model to Parquet format.
@@ -46,6 +56,9 @@ pub enum DataModelParquetError {
 pub fn serialize_data_model_to_parquet(
     data_model: &DataModel,
 ) -> Result<Vec<u8>, DataModelParquetError> {
+    if let Some(reason) = &data_model.refused {
+        return Err(DataModelParquetError::Refused(reason.clone()));
+    }
     // Serialize all tables in parallel using rayon
     let (entities_data, ((properties_data, quantities_data), (relationships_data, spatial_data))) =
         rayon::join(
@@ -91,25 +104,36 @@ pub fn serialize_data_model_to_parquet(
     let documents_data = documents_data?;
 
     // Write format: [entities_len][entities_data][properties_len][properties_data][quantities_len][quantities_data][relationships_len][relationships_data][spatial_len][spatial_data][classifications_len][...][materials_len][...][documents_len][...]
-    let mut result = Vec::new();
-    result.extend_from_slice(&(entities_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&entities_data);
-    result.extend_from_slice(&(properties_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&properties_data);
-    result.extend_from_slice(&(quantities_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&quantities_data);
-    result.extend_from_slice(&(relationships_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&relationships_data);
-    result.extend_from_slice(&(spatial_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&spatial_data);
-    result.extend_from_slice(&(classifications_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&classifications_data);
-    result.extend_from_slice(&(materials_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&materials_data);
-    result.extend_from_slice(&(documents_data.len() as u32).to_le_bytes());
-    result.extend_from_slice(&documents_data);
+    // Each length is a wire-format u32: `check_u32_len` refuses a section past
+    // 4 GiB instead of writing a wrapped prefix that would misframe every later
+    // table on the client (#7675, SERVER-14).
+    let sections: [(&str, &[u8]); 8] = [
+        ("entities", &entities_data),
+        ("properties", &properties_data),
+        ("quantities", &quantities_data),
+        ("relationships", &relationships_data),
+        ("spatial", &spatial_data),
+        ("classifications", &classifications_data),
+        ("materials", &materials_data),
+        ("documents", &documents_data),
+    ];
+    check_section_lengths(sections.iter().map(|(name, bytes)| (*name, bytes.len())))?;
+    let mut result = Vec::with_capacity(sections.iter().map(|(_, bytes)| 4 + bytes.len()).sum());
+    for (_, bytes) in sections {
+        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        result.extend_from_slice(bytes);
+    }
 
     Ok(result)
+}
+
+/// Every section's length against the `u32` wire prefix, by length alone, so
+/// the guard is testable without a 4 GiB section (#7675, SERVER-14).
+fn check_section_lengths<'a>(lengths: impl Iterator<Item = (&'a str, usize)>) -> Result<(), DataModelParquetError> {
+    for (name, len) in lengths {
+        crate::services::parquet::check_u32_len(name, len)?;
+    }
+    Ok(())
 }
 
 /// Serialize classification associations table.
@@ -147,55 +171,6 @@ fn serialize_classifications_table(
             Arc::new(StringArray::from(identifications)),
             Arc::new(StringArray::from(names)),
             Arc::new(StringArray::from(locations)),
-        ],
-    )?;
-
-    write_parquet_batch(batch)
-}
-
-/// Serialize material associations table.
-fn serialize_materials_table(
-    rows: &[MaterialAssociation],
-) -> Result<Vec<u8>, DataModelParquetError> {
-    let count = rows.len();
-    let mut element_ids = Vec::with_capacity(count);
-    let mut set_names: Vec<Option<String>> = Vec::with_capacity(count);
-    let mut layer_indices = Vec::with_capacity(count);
-    let mut material_names = Vec::with_capacity(count);
-    let mut thicknesses: Vec<Option<f64>> = Vec::with_capacity(count);
-    let mut ventilated: Vec<Option<bool>> = Vec::with_capacity(count);
-    let mut categories: Vec<Option<String>> = Vec::with_capacity(count);
-
-    for row in rows {
-        element_ids.push(row.element_id);
-        set_names.push(row.set_name.clone());
-        layer_indices.push(row.layer_index);
-        material_names.push(row.material_name.clone());
-        thicknesses.push(row.thickness);
-        ventilated.push(row.is_ventilated);
-        categories.push(row.category.clone());
-    }
-
-    let schema = Schema::new(vec![
-        Field::new("element_id", DataType::UInt32, false),
-        Field::new("set_name", DataType::Utf8, true),
-        Field::new("layer_index", DataType::UInt32, false),
-        Field::new("material_name", DataType::Utf8, false),
-        Field::new("thickness", DataType::Float64, true),
-        Field::new("is_ventilated", DataType::Boolean, true),
-        Field::new("category", DataType::Utf8, true),
-    ]);
-
-    let batch = RecordBatch::try_new(
-        Arc::new(schema),
-        vec![
-            Arc::new(UInt32Array::from(element_ids)),
-            Arc::new(StringArray::from(set_names)),
-            Arc::new(UInt32Array::from(layer_indices)),
-            Arc::new(StringArray::from(material_names)),
-            Arc::new(Float64Array::from(thicknesses)),
-            Arc::new(BooleanArray::from(ventilated)),
-            Arc::new(StringArray::from(categories)),
         ],
     )?;
 
@@ -344,6 +319,7 @@ fn serialize_properties_table(
         String,
         String,
         Option<String>,
+        bool,
         Option<String>,
     );
     let rows: Vec<Row> = property_sets
@@ -369,6 +345,7 @@ fn serialize_properties_table(
                         prop.property_value.clone(),
                         prop.property_type.clone(),
                         prop.data_type.clone(),
+                        prop.data_type_mixed,
                         values_json,
                     ))
                 })
@@ -382,15 +359,17 @@ fn serialize_properties_table(
     let mut property_values = Vec::with_capacity(rows.len());
     let mut property_types = Vec::with_capacity(rows.len());
     let mut data_types = Vec::with_capacity(rows.len());
+    let mut data_types_mixed = Vec::with_capacity(rows.len());
     let mut values_jsons = Vec::with_capacity(rows.len());
 
-    for (pset_id, pset_name, prop_name, prop_value, prop_type, data_type, values_json) in rows {
+    for (pset_id, pset_name, prop_name, prop_value, prop_type, data_type, data_type_mixed, values_json) in rows {
         pset_ids.push(pset_id);
         pset_names.push(pset_name);
         property_names.push(prop_name);
         property_values.push(prop_value);
         property_types.push(prop_type);
         data_types.push(data_type);
+        data_types_mixed.push(data_type_mixed);
         values_jsons.push(values_json);
     }
 
@@ -405,6 +384,9 @@ fn serialize_properties_table(
         Field::new("data_type", DataType::Utf8, true),
         // JSON-encoded candidate array (data-model cache bumped to v5).
         Field::new("values_json", DataType::Utf8, true),
+        // IfcPropertyTableValue: no single data_type by design (#5224,
+        // data-model cache bumped to v7).
+        Field::new("data_type_mixed", DataType::Boolean, false),
     ]);
 
     let batch = RecordBatch::try_new(
@@ -417,6 +399,7 @@ fn serialize_properties_table(
             Arc::new(StringArray::from(property_types)),
             Arc::new(StringArray::from(data_types)),
             Arc::new(StringArray::from(values_jsons)),
+            Arc::new(BooleanArray::from(data_types_mixed)),
         ],
     )?;
 
@@ -494,25 +477,38 @@ fn serialize_relationships_table(
     let count = relationships.len();
 
     // Build arrays in parallel
-    let results: Vec<(String, u32, u32)> = relationships
+    let results: Vec<(String, u32, u32, u32)> = relationships
         .par_iter()
-        .map(|rel| (rel.rel_type.clone(), rel.relating_id, rel.related_id))
+        .map(|rel| {
+            (
+                rel.rel_type.clone(),
+                rel.relating_id,
+                rel.related_id,
+                rel.rel_id,
+            )
+        })
         .collect();
 
     let mut rel_types = Vec::with_capacity(count);
     let mut relating_ids = Vec::with_capacity(count);
     let mut related_ids = Vec::with_capacity(count);
+    let mut rel_ids = Vec::with_capacity(count);
 
-    for (rel_type, relating_id, related_id) in results {
+    for (rel_type, relating_id, related_id, rel_id) in results {
         rel_types.push(rel_type);
         relating_ids.push(relating_id);
         related_ids.push(related_id);
+        rel_ids.push(rel_id);
     }
 
+    // `rel_id` is appended last (data-model v6 payload, issue #3860): an older
+    // client reads the three columns it knows by name and ignores this one,
+    // and a newer client treats it as absent when an older server omits it.
     let schema = Schema::new(vec![
         Field::new("rel_type", DataType::Utf8, false),
         Field::new("relating_id", DataType::UInt32, false),
         Field::new("related_id", DataType::UInt32, false),
+        Field::new("rel_id", DataType::UInt32, false),
     ]);
 
     let batch = RecordBatch::try_new(
@@ -521,6 +517,7 @@ fn serialize_relationships_table(
             Arc::new(StringArray::from(rel_types)),
             Arc::new(UInt32Array::from(relating_ids)),
             Arc::new(UInt32Array::from(related_ids)),
+            Arc::new(UInt32Array::from(rel_ids)),
         ],
     )?;
 

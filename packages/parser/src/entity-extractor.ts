@@ -6,10 +6,14 @@
  * Entity extractor - parses full entity content from STEP format
  */
 
-import { createLogger } from '@ifc-lite/data';
-import { decodeIfcString } from '@ifc-lite/encoding';
+import { createLogger, isCompleteStepNumericLiteral } from '@ifc-lite/data';
+import { decodeIfcString, stepStringLiteralEnd } from '@ifc-lite/encoding';
+import { isIndexableExpressId } from './express-id.js';
+import { entityParameters } from './step-entity-parameters.js';
+import { StepTextScan } from './step-lexing.js';
+import { STEP_TRIVIA } from './step-trivia.js';
 import type { IfcEntity, EntityRef } from './types.js';
-import { safeUtf8Decode } from '@ifc-lite/data';
+import { asSourceBytes, type IfcSourceBytes } from './source-bytes.js';
 
 export type { IfcEntity };
 
@@ -17,6 +21,21 @@ const log = createLogger('EntityExtractor');
 
 /** Maximum recursion depth for parsing nested structures (prevents DoS via deeply nested data) */
 const MAX_PARSE_DEPTH = 100;
+
+/**
+ * `#ID = TYPE(attr1, attr2, ...)`, with STEP trivia (whitespace and/or a
+ * `/* ... *​/` comment, #3789) tolerated between the type name and its `(`.
+ * Compiled once: `extractEntity` is on the hot path for every entity in a
+ * model.
+ */
+const ENTITY_RECORD_RE = new RegExp(`^#(\\d+)\\s*=\\s*(\\w+)${STEP_TRIVIA}\\(`);
+
+/**
+ * `TYPE(inner)` for a positional typed-value attribute, same trivia
+ * tolerance as {@link ENTITY_RECORD_RE}. Case-insensitive and dot-all
+ * (`is`) to match the regex it replaces.
+ */
+const TYPED_VALUE_RE = new RegExp(`^([A-Z][A-Z0-9_]*)${STEP_TRIVIA}\\((.+)\\)$`, 'is');
 
 /**
  * Is this raw source token a bare STEP enumeration token (`.USERDEFINED.`,
@@ -44,10 +63,16 @@ function isBareEnumToken(token: string): boolean {
 }
 
 export class EntityExtractor {
-  private buffer: Uint8Array;
+  private source: IfcSourceBytes;
 
-  constructor(buffer: Uint8Array) {
-    this.buffer = buffer;
+  /**
+   * Accepts either a raw buffer or an {@link IfcSourceBytes}. Widening here
+   * rather than at the call sites is deliberate: this constructor has 52 call
+   * sites, and every one of them only ever wanted "decode this byte range"
+   * (#2183).
+   */
+  constructor(buffer: Uint8Array | IfcSourceBytes) {
+    this.source = asSourceBytes(buffer);
   }
 
   /**
@@ -55,8 +80,7 @@ export class EntityExtractor {
    */
   extractEntity(ref: EntityRef): IfcEntity | null {
     try {
-      const entityText = safeUtf8Decode(
-        this.buffer,
+      const entityText = this.source.decodeUtf8(
         ref.byteOffset,
         ref.byteOffset + ref.byteLength,
       );
@@ -66,12 +90,28 @@ export class EntityExtractor {
       // source lines still match — `.` stops at the first newline and made
       // extractEntity return null for ANY multi-line STEP record (lost
       // storey/covering names + the on-demand attribute fallback).
-      const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\(([\s\S]*)\)/);
+      // Trivia (whitespace and/or a comment) between the type name and `(`
+      // mirrors the Rust tokenizer's `ws` before its typed-value/entity
+      // paren (#3205): a STEP writer's line wrap, or a `/* ... */` comment,
+      // can land exactly there (e.g. `IFCSURFACESTYLERENDERING\r\n(#4,0.)`),
+      // and without it this regex returned null, silently hiding the
+      // entity from every downstream extractor keyed on extractEntity.
+      const match = entityText.match(ENTITY_RECORD_RE);
       if (!match) return null;
 
+      // `\d+` guarantees this is not NaN, but not that the id fits the 32-bit
+      // express-id columns every store below keys on: ids above 2^32 truncate
+      // mod 2^32 and collide with a real low id, and ids past 2^53 collide with
+      // each other while still accumulating. Refuse the record either way; see
+      // express-id.ts (#3395).
       const expressId = parseInt(match[1], 10);
-      const type = match[2];
-      const paramsText = match[3];
+      if (!isIndexableExpressId(expressId)) return null;
+      // STEP entity keywords are case-insensitive. The scan ref is already
+      // canonical, but this legacy eager adapter re-reads the record and must
+      // not reintroduce the file's spelling into EntityIndexBuilder.byType.
+      const type = match[2].toUpperCase();
+      const paramsText = entityParameters(entityText, match[0].length);
+      if (paramsText === undefined) return null;
 
       // Parse attributes (simplified - handles basic types)
       const { attributes, enumAttrIndices } = this.parseAttributes(paramsText);
@@ -108,51 +148,13 @@ export class EntityExtractor {
     // Kind is decided on the RAW token, before parseAttributeValue strips
     // quotes, so `'.USERDEFINED.'` (a genuine string) is never flagged (#1799).
     let enumAttrIndices: number[] | undefined;
-    let depth = 0;
-    let current = '';
-    let inString = false;
-
-    for (let i = 0; i < paramsText.length; i++) {
-      const char = paramsText[i];
-
-      if (char === "'") {
-        if (inString) {
-          // Check for escaped quote ('') - STEP uses doubled quotes
-          if (i + 1 < paramsText.length && paramsText[i + 1] === "'") {
-            current += "''"; // Keep the escaped quote
-            i++; // Skip next quote
-            continue;
-          }
-          inString = false;
-        } else {
-          inString = true;
-        }
-        current += char;
-      } else if (inString) {
-        current += char;
-      } else if (char === '(') {
-        depth++;
-        current += char;
-      } else if (char === ')') {
-        depth--;
-        current += char;
-      } else if (char === ',' && depth === 0) {
-        // End of attribute
-        const token = current.trim();
-        if (isBareEnumToken(token)) (enumAttrIndices ??= []).push(attributes.length);
-        attributes.push(this.parseAttributeValue(token));
-        current = '';
-      } else {
-        current += char;
-      }
-    }
-
-    // Add last attribute
-    const lastToken = current.trim();
-    if (lastToken) {
-      if (isBareEnumToken(lastToken)) (enumAttrIndices ??= []).push(attributes.length);
-      attributes.push(this.parseAttributeValue(lastToken));
-    }
+    const tokens = splitTopLevelItems(paramsText);
+    tokens.forEach((token, index) => {
+      // A trailing empty token is not an attribute; an empty slot (`,,`) is.
+      if (!token && index === tokens.length - 1) return;
+      if (isBareEnumToken(token)) (enumAttrIndices ??= []).push(attributes.length);
+      attributes.push(this.parseAttributeValue(token));
+    });
 
     return { attributes, enumAttrIndices };
   }
@@ -179,7 +181,13 @@ export class EntityExtractor {
     // e.g. an IFCLABEL/IFCTEXT string an authoring tool broke across physical
     // lines — is still unwrapped. Without it the match fails and the raw
     // `IFCLABEL('...')` literal (mis-typed as a plain string) leaks to callers.
-    const typedValueMatch = value.match(/^([A-Z][A-Z0-9_]*)\((.+)\)$/is);
+    // Trivia between the type name and `(` handles the same wrap (or an
+    // embedded comment) landing there instead of inside the value (e.g.
+    // `IFCPOSITIVELENGTHMEASURE\r\n(1.)`); without it this fell through to
+    // the plain-string branch below, and a downstream conversion-unit reader
+    // (unit-extractor.ts) then defaulted an unreadable ValueComponent to
+    // conversionValue 1.0 instead of the real one.
+    const typedValueMatch = value.match(TYPED_VALUE_RE);
     if (typedValueMatch) {
       const typeName = typedValueMatch[1];
       const innerValue = typedValueMatch[2].trim();
@@ -194,60 +202,20 @@ export class EntityExtractor {
         return []; // Empty list
       }
 
-      // Parse list items (comma-separated)
-      const items: any[] = [];
-      let parenDepth = 0;
-      let current = '';
-      let inString = false;
-
-      for (let i = 0; i < listContent.length; i++) {
-        const char = listContent[i];
-
-        if (char === "'") {
-          if (inString) {
-            // Check for escaped quote ('') - STEP uses doubled quotes
-            if (i + 1 < listContent.length && listContent[i + 1] === "'") {
-              current += "''"; // Keep the escaped quote
-              i++; // Skip next quote
-              continue;
-            }
-            inString = false;
-          } else {
-            inString = true;
-          }
-          current += char;
-        } else if (inString) {
-          current += char;
-        } else if (char === '(') {
-          parenDepth++;
-          current += char;
-        } else if (char === ')') {
-          parenDepth--;
-          current += char;
-        } else if (char === ',' && parenDepth === 0) {
-          // End of item
-          const itemValue = current.trim();
-          if (itemValue) {
-            items.push(this.parseAttributeValue(itemValue, depth + 1));
-          }
-          current = '';
-        } else {
-          current += char;
-        }
-      }
-
-      // Add last item
-      if (current.trim()) {
-        items.push(this.parseAttributeValue(current.trim(), depth + 1));
-      }
-
-      return items;
+      // Parse list items (comma-separated); an empty item is skipped.
+      return splitTopLevelItems(listContent)
+        .filter((item) => item)
+        .map((item) => this.parseAttributeValue(item, depth + 1));
     }
 
     // Reference: #123
     if (value.startsWith('#')) {
       const id = parseInt(value.substring(1), 10);
-      return isNaN(id) ? null : id;
+      // An out-of-contract reference is a dangling reference, not a number to
+      // carry: `Infinity` names no entity, two ids past 2^53 accumulate to the
+      // same double and would resolve to the same wrong entity, and an id above
+      // 2^32 can never be indexed at all (express-id.ts, #3395).
+      return isIndexableExpressId(id) ? id : null;
     }
 
     // String: 'text'
@@ -258,13 +226,99 @@ export class EntityExtractor {
       return decodeIfcString(raw);
     }
 
-    // Number
-    const num = parseFloat(value);
-    if (!isNaN(num)) {
-      return num;
+    // Number.
+    //
+    // Number.isFinite, not !isNaN: a STEP real whose exponent overflows the
+    // IEEE-754 double range (`1.0E400`) parses to `Infinity`, and
+    // `isNaN(Infinity)` is `false`, so a guard of only `!isNaN` would admit
+    // it. From the property table a non-finite number reaches every writer,
+    // where `JSON.stringify(Infinity)` is `null` — the file loses the value
+    // with no diagnostic anywhere along the way.
+    //
+    // `isCompleteStepNumericLiteral`, not just `parseFloat`: `parseFloat`
+    // accepts any leading numeric prefix and silently discards the rest, so a
+    // corrupted literal with a dropped comma between two reals — `1.52.3` —
+    // parses as `1.52` with no error, and `1.5abc` parses as `1.5`. The
+    // overflow guard above catches a token that is a complete, valid literal
+    // naming an unrepresentable number; it says nothing about a token that
+    // was never a complete literal to begin with. Requiring the STEP
+    // REAL/INTEGER grammar match cover the *whole* token, not just yield a
+    // finite prefix, closes that second hole without disturbing the first.
+    //
+    // Falling through preserves the literal as the raw token (the branch
+    // below), which is what this function already does for every other token
+    // it cannot represent as a number. That keeps the data the file actually
+    // contained — a reader can still see `1.0E400` or `1.52.3`. Rejecting the
+    // attribute outright would drop data the file did contain; clamping would
+    // invent a value; truncating to the parseable prefix (`1.52.3` -> `1.52`)
+    // would invent a DIFFERENT value indistinguishable downstream from a real
+    // one — the exact failure this branch exists to avoid.
+    //
+    // This is NOT by itself enough to say "nothing is silently dropped".
+    // Preserving the string only helps consumers whose value type admits a
+    // string — the property table's `PropertyValue` union does. A consumer
+    // whose field is typed `number` sees the preserved string fail its
+    // `typeof x === 'number'` test and falls back to whatever default it has,
+    // which is how `quantity-collect` and `georef-extractor` turned an
+    // unreadable value into a plausible `0`. Absence is detectable; a zero
+    // easting is a coordinate. Both now refuse and warn instead of
+    // substituting — see `isOverflowingNumericLiteral` and
+    // `isMalformedNumericLiteral` in `attribute-helpers.ts`, combined in
+    // `isUnrepresentableNumericValue`, and its call sites. Any NEW
+    // `number`-typed consumer of this function's output owes the same
+    // decision, for BOTH hazards this comment now describes, not just the
+    // overflow one it used to describe alone.
+    if (isCompleteStepNumericLiteral(value)) {
+      const num = parseFloat(value);
+      if (Number.isFinite(num)) {
+        return num;
+      }
     }
 
-    // Enumeration or other identifier
+    // Enumeration, non-finite numeric literal, malformed numeric literal, or
+    // other identifier: the raw token.
     return value;
   }
+}
+
+/**
+ * The trimmed top-level items of STEP parameter text, split at commas outside
+ * parentheses, string literals and comments; the last item is returned even
+ * when empty. A literal ends by the one shared rule, `stepStringLiteralEnd`:
+ * `''` and a `\S\` PAGE operand are text, so `'Para \S\' 5'` is one value
+ * (#7589). Comments use the `StepTextScan` rule source-header.ts shares, so a
+ * comment's `,`, `'`, `(` or `)` is not structure: `#1=IFCWALL('a', /* b, c *\/ $)`
+ * is one attribute pair (#3673's follow-up). A comment collapses to one space,
+ * so tokens it sits between (`5/* c *\/6`) are not spliced into one. An
+ * unterminated literal runs to the end of the text.
+ */
+function splitTopLevelItems(text: string): string[] {
+  const items: string[] = [];
+  const scan = new StepTextScan(text);
+  let depth = 0;
+  let current = '';
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === "'") {
+      const close = stepStringLiteralEnd(text, i);
+      const skipped = close < 0 ? text.length : close;
+      current += text.slice(i, skipped);
+      i = skipped - 1;
+      continue;
+    }
+    const comment = char === '/' ? scan.skipLexicalAt(i) : -1;
+    if (comment > i) {
+      current += ' ';
+      i = comment - 1;
+    } else if (char === ',' && depth === 0) {
+      items.push(current.trim());
+      current = '';
+    } else {
+      if (char === '(') depth++;
+      else if (char === ')') depth--;
+      current += char;
+    }
+  }
+  items.push(current.trim());
+  return items;
 }

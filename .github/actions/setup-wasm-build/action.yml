@@ -9,7 +9,8 @@
 # docs/architecture/pure-rust-csg-kernel.md), so this is just the pinned
 # Rust nightly + wasm-pack + the cargo cache.
 #
-# Used by test.yml, release.yml, sdk-canary.yml and benchmark.yml so they
+# Used by test.yml, release.yml, sdk-canary.yml, benchmark.yml and
+# export-schema-conformance.yml (#5942) so they
 # stay in lock-step — a toolchain change here updates all of them at once,
 # instead of one drifting (which is how sdk-canary once shipped without a
 # toolchain piece and went red on an unrelated PR).
@@ -20,6 +21,24 @@ inputs:
   cache-prefix:
     description: 'Swatinem/rust-cache prefix-key, to namespace the cargo cache per workflow'
     required: true
+  # ONE CACHE PER WORKFLOW, WRITTEN FROM MAIN, READ BY EVERY PR (CI redesign,
+  # step 1; the same shape test.yml's Rust jobs adopted in #4511). Without
+  # `shared-key` rust-cache keys on the job AND the git ref, so every PR branch
+  # wrote its own copy: measured at 46 caches / 10.96 GB against a 10 GB
+  # budget, with `semver` alone at 19 x 269 MB and `build` at 19 x 142 MB,
+  # while `main` itself held NO rust-tests cache -- the one every PR could
+  # have restored from. With `shared-key: main` every caller of this action
+  # restores `<prefix>-main-<lockfile hash>`, and `save-if` defaults to
+  # writing it only from a push to main or a merge-queue batch, so PRs
+  # restore and never save. Footprint ~3.1 GB, x2 during a lockfile turnover.
+  shared-key:
+    description: 'Swatinem/rust-cache shared-key; every ref restores this one key'
+    required: false
+    default: main
+  save-if:
+    description: 'Swatinem/rust-cache save-if; by default only a push to main or a merge_group batch writes the cache'
+    required: false
+    default: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
 
 runs:
   using: composite
@@ -34,13 +53,59 @@ runs:
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         prefix-key: ${{ inputs.cache-prefix }}
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if }}
 
-    - name: Install wasm-pack
-      uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
-      with:
-        # Pinned, not `latest`: `latest` makes the action hit the GitHub releases
-        # API on every run to resolve the newest version, which intermittently
-        # returns an HTML rate-limit page instead of JSON ("Unexpected token '<'")
-        # and fails the WASM build for reasons unrelated to the change under test.
-        # A fixed version is reproducible and skips the lookup entirely.
-        version: v0.15.0
+    # Downloaded directly rather than via jetli/wasm-pack-action, which always
+    # fetched the x86_64 archive: on ubuntu-24.04-arm it reported success and
+    # the first `wasm-pack build` then died with "Syntax error: Unterminated
+    # quoted string" (the shell trying to run an x86 ELF, #7137). Pick the
+    # musl archive for the host arch, verify it against the SHA256 pinned
+    # below (GitHub's asset digest for the wasm-bindgen/wasm-pack v0.15.0
+    # release), and run `wasm-pack --version` so a binary that cannot execute
+    # fails HERE, in setup, not in the build. Pinned, not `latest`: resolving
+    # `latest` hit the releases API every run and intermittently got an HTML
+    # rate-limit page back. To bump: change WASM_PACK_VERSION and BOTH digests
+    # (`gh api repos/wasm-bindgen/wasm-pack/releases/tags/<v> --jq
+    # '.assets[] | [.name, .digest] | @tsv'`).
+    - name: Install wasm-pack (host arch, checksum-verified)
+      shell: bash
+      env:
+        WASM_PACK_VERSION: v0.15.0
+        WASM_PACK_SHA256_X86_64: c09f971ecaed9a2efc80fdcea7a00ef6b53c7fadc8c57d1f61b53a6aa66b668a
+        WASM_PACK_SHA256_AARCH64: e17ef0806381c3a0acb9c9ddad643a49facaa5a2ecf657a421d4d8f3357a24b7
+      run: |
+        set -euo pipefail
+        if [ "$(uname -s)" != "Linux" ]; then
+          echo "::error::setup-wasm-build installs the linux-musl wasm-pack only; got $(uname -s)" >&2
+          exit 1
+        fi
+        case "$(uname -m)" in
+          x86_64 | amd64) arch=x86_64; sha256="$WASM_PACK_SHA256_X86_64" ;;
+          aarch64 | arm64) arch=aarch64; sha256="$WASM_PACK_SHA256_AARCH64" ;;
+          *)
+            echo "::error::no pinned wasm-pack ${WASM_PACK_VERSION} archive for host arch $(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+        name="wasm-pack-${WASM_PACK_VERSION}-${arch}-unknown-linux-musl"
+        url="https://github.com/wasm-bindgen/wasm-pack/releases/download/${WASM_PACK_VERSION}/${name}.tar.gz"
+        dest="${RUNNER_TEMP}/wasm-pack-${WASM_PACK_VERSION}-${arch}"
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        echo "Downloading $url"
+        curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+          --output "$dest/${name}.tar.gz" "$url"
+        echo "${sha256}  $dest/${name}.tar.gz" | sha256sum --check --strict
+        tar -xzf "$dest/${name}.tar.gz" -C "$dest" --strip-components=1 "${name}/wasm-pack"
+        chmod +x "$dest/wasm-pack"
+        rm -f "$dest/${name}.tar.gz"
+        # Fail in setup if the binary cannot run on this host (wrong arch,
+        # truncated, wrong libc) and if it is not the pinned version.
+        reported="$("$dest/wasm-pack" --version)"
+        echo "$reported"
+        if [ "$reported" != "wasm-pack ${WASM_PACK_VERSION#v}" ]; then
+          echo "::error::expected 'wasm-pack ${WASM_PACK_VERSION#v}', got '$reported'" >&2
+          exit 1
+        fi
+        echo "$dest" >> "$GITHUB_PATH"

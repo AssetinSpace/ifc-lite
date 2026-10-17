@@ -57,6 +57,47 @@ describe('EntityTable.build()', () => {
   });
 });
 
+describe('getName vs getNameOrUndefined — absent Name vs explicit "" (#4930)', () => {
+  it('an absent Name ($ at parse time) and an explicit "" round-trip to different string-table indices', () => {
+    const strings = new StringTable();
+    const builder = new EntityTableBuilder(2, strings);
+    builder.add(1, 'IFCWALL', '0AbsentGid0000000000AA', undefined, '', '', false, false);
+    builder.add(2, 'IFCWALL', '0EmptyGid00000000000AA', '', '', '', false, false);
+    const table = builder.build();
+
+    // `getName`'s contract is unchanged: both fold to '' for display.
+    expect(table.getName(1)).toBe('');
+    expect(table.getName(2)).toBe('');
+
+    // `getNameOrUndefined` is the one accessor that keeps them apart.
+    expect(table.getNameOrUndefined?.(1)).toBeUndefined();
+    expect(table.getNameOrUndefined?.(2)).toBe('');
+
+    // The underlying interned index actually differs: NULL_INDEX (-1) reads
+    // back from the Uint32Array column as its unsigned bit pattern.
+    expect(table.name[0]).toBe(0xffffffff);
+    expect(table.name[1]).toBe(0); // index 0 is the canonical interned ''.
+  });
+
+  it('an unknown expressId is undefined via getNameOrUndefined, same as getName is ""', () => {
+    const { table } = buildSampleTable();
+    expect(table.getName(999999)).toBe('');
+    expect(table.getNameOrUndefined?.(999999)).toBeUndefined();
+  });
+
+  it('the distinction survives the entityTableToColumns / entityTableFromColumns cache round-trip', () => {
+    const strings = new StringTable();
+    const builder = new EntityTableBuilder(2, strings);
+    builder.add(1, 'IFCWALL', '', undefined, '', '', false, false);
+    builder.add(2, 'IFCWALL', '', '', '', '', false, false);
+    const table = builder.build();
+    const rebuilt = entityTableFromColumns(entityTableToColumns(table), strings);
+
+    expect(rebuilt.getNameOrUndefined?.(1)).toBeUndefined();
+    expect(rebuilt.getNameOrUndefined?.(2)).toBe('');
+  });
+});
+
 describe('entityTableToColumns / entityTableFromColumns round-trip', () => {
   it('preserves every public lookup', () => {
     const { strings, table } = buildSampleTable();
@@ -106,5 +147,126 @@ describe('entityTableToColumns / entityTableFromColumns round-trip', () => {
 
     const rebuilt = entityTableFromColumns(columns, strings);
     expect(rebuilt.expressId.buffer).toBe(table.expressId.buffer);
+  });
+});
+
+describe('EntityTable GlobalId index', () => {
+  // The sample table's entity 401 carries an EMPTY GlobalId (the IFC file
+  // omitted it, or the row is a non-rooted entity). Without the emptiness
+  // guard on the index build, '' maps to a real expressId and every BCF
+  // lookup of a missing GUID resolves to whatever entity happened to be
+  // last with a blank GlobalId.
+  it('never indexes the empty GlobalId', () => {
+    const { table } = buildSampleTable();
+    expect(table.getExpressIdByGlobalId('')).toBe(-1);
+  });
+
+  it('still indexes every non-empty GlobalId', () => {
+    const { table } = buildSampleTable();
+    expect(table.getExpressIdByGlobalId('0YvCT2_$X3_xJG3rzD8L_8')).toBe(101);
+    expect(table.getExpressIdByGlobalId('3qqCT2_$X3_xJG3rzD8L_8')).toBe(301);
+  });
+
+  it('keeps the empty GlobalId unindexed through the columns round-trip', () => {
+    const { strings, table } = buildSampleTable();
+    const rebuilt = entityTableFromColumns(entityTableToColumns(table), strings);
+    expect(rebuilt.getExpressIdByGlobalId('')).toBe(-1);
+    expect(rebuilt.getExpressIdByGlobalId('1abCT2_$X3_xJG3rzD8L_8')).toBe(102);
+  });
+});
+
+describe('EntityTable typeRanges derived from interleaved columns', () => {
+  // `entityTableFromColumns` derives typeRanges only when the caller omits
+  // them (worker-transport rebuild). IFC streams interleave types freely,
+  // and the range for a type is [firstRow, lastRow+1] — NOT the number of
+  // rows of that type, which only coincides when each type is contiguous
+  // and starts at row 0. The sample table above is fully contiguous, so it
+  // cannot tell the two apart; this fixture interleaves deliberately.
+  function interleaved() {
+    const strings = new StringTable();
+    const builder = new EntityTableBuilder(8, strings);
+    builder.add(1, 'IFCWALL', 'gid-1', 'W1', '', '', false, false); // row 0
+    builder.add(2, 'IFCSPACE', 'gid-2', 'S1', '', '', false, false); // row 1
+    builder.add(3, 'IFCWALL', 'gid-3', 'W2', '', '', false, false); // row 2
+    builder.add(4, 'IFCSPACE', 'gid-4', 'S2', '', '', false, false); // row 3
+    builder.add(5, 'IFCWALL', 'gid-5', 'W3', '', '', false, false); // row 4
+    return { strings, table: builder.build() };
+  }
+
+  it('spans first row to last row + 1 for an interleaved type', () => {
+    const { strings, table } = interleaved();
+    const columns = entityTableToColumns(table);
+    delete (columns as { typeRanges?: unknown }).typeRanges;
+    const rebuilt = entityTableFromColumns(columns, strings);
+
+    // IfcWall occupies rows 0, 2, 4 -> [0, 5); IfcSpace rows 1, 3 -> [1, 4).
+    expect(rebuilt.typeRanges.get(IfcTypeEnum.IfcWall)).toEqual({ start: 0, end: 5 });
+    expect(rebuilt.typeRanges.get(IfcTypeEnum.IfcSpace)).toEqual({ start: 1, end: 4 });
+  });
+
+  it('produces a range that contains every row of that type', () => {
+    const { strings, table } = interleaved();
+    const columns = entityTableToColumns(table);
+    delete (columns as { typeRanges?: unknown }).typeRanges;
+    const rebuilt = entityTableFromColumns(columns, strings);
+
+    for (const [type, range] of rebuilt.typeRanges) {
+      for (let row = 0; row < rebuilt.count; row++) {
+        if (rebuilt.typeEnum[row] === type) {
+          expect(row).toBeGreaterThanOrEqual(range.start);
+          expect(row).toBeLessThan(range.end);
+        }
+      }
+    }
+  });
+
+  it('prefers supplied typeRanges over the derived ones', () => {
+    const { strings, table } = interleaved();
+    const columns = entityTableToColumns(table);
+    columns.typeRanges = new Map([[IfcTypeEnum.IfcWall, { start: 7, end: 9 }]]);
+    const rebuilt = entityTableFromColumns(columns, strings);
+    expect(rebuilt.typeRanges.get(IfcTypeEnum.IfcWall)).toEqual({ start: 7, end: 9 });
+  });
+
+  // The builder produces `typeRanges` too, and NOTHING made the two producers
+  // agree: `entityTableFromColumns` derives [firstRow, lastRow+1] (pinned
+  // above) while `EntityTableBuilder.build()` used `start + count`, which is
+  // the row COUNT, not the span. They coincide for every contiguous type —
+  // which every other fixture in this file is — so only an interleaved one
+  // can tell them apart, and the same interleaved fixture was only ever read
+  // back through the derived path (its `typeRanges` deleted first).
+  it('builder typeRanges match the derived ones for an interleaved type', () => {
+    const { strings, table } = interleaved();
+    const columns = entityTableToColumns(table);
+    delete (columns as { typeRanges?: unknown }).typeRanges;
+    const derived = entityTableFromColumns(columns, strings);
+
+    for (const [type, range] of derived.typeRanges) {
+      expect(table.typeRanges.get(type)).toEqual(range);
+    }
+  });
+
+  // The invariant behind that agreement, asserted directly against the
+  // BUILDER's map: a type's range must contain every row of that type.
+  // `start + count` put IfcWall's last row (4) outside [0, 3).
+  it('builder typeRanges contain every row of that type', () => {
+    const { table } = interleaved();
+    for (const [type, range] of table.typeRanges) {
+      for (let row = 0; row < table.count; row++) {
+        if (table.typeEnum[row] === type) {
+          expect(row).toBeGreaterThanOrEqual(range.start);
+          expect(row).toBeLessThan(range.end);
+        }
+      }
+    }
+  });
+
+  it('getByType stays exact for interleaved types (index, not range, decides)', () => {
+    const { strings, table } = interleaved();
+    const columns = entityTableToColumns(table);
+    delete (columns as { typeRanges?: unknown }).typeRanges;
+    const rebuilt = entityTableFromColumns(columns, strings);
+    expect(rebuilt.getByType(IfcTypeEnum.IfcWall)).toEqual([1, 3, 5]);
+    expect(rebuilt.getByType(IfcTypeEnum.IfcSpace)).toEqual([2, 4]);
   });
 });

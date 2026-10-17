@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { ActivityBar } from './ActivityBar';
 import { SidebarPanelHost } from './SidebarPanelHost';
 
@@ -28,6 +29,7 @@ const MIN_WIDTH_PCT = 14;
 const MAX_WIDTH_PCT = 60;
 
 export function SidebarDock() {
+  const { t } = useTranslation();
   const mode = useViewerStore((s) => s.sidebarMode);
   const widthPct = useViewerStore((s) => s.sidebarWidthPct);
   const setSidebarWidthPct = useViewerStore((s) => s.setSidebarWidthPct);
@@ -58,12 +60,19 @@ export function SidebarDock() {
       const parent = rootRef.current?.parentElement;
       if (!parent) return;
       const rect = parent.getBoundingClientRect();
+      // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+      // A real mousedown always reports its pressed button; a buttonless move
+      // after one means the mouseup was released outside this document.
+      const pressed = e.buttons !== 0;
+      // <<< AIM-FORK
       const move = (ev: MouseEvent) => {
+        // >>> AIM-FORK
         // A mouseup released outside this document (e.g. over the embedding
         // host when the viewer runs in an iframe) never reaches us — end the
         // drag on the first move without a pressed button instead of letting
         // the pane chase the cursor forever.
-        if (ev.buttons === 0) { up(); return; }
+        if (pressed && ev.buttons === 0) { up(); return; }
+        // <<< AIM-FORK
         // The content pane's right edge is fixed against the activity bar;
         // dragging its left edge sets the width. Clamp live to the same range
         // the store enforces so the pane doesn't rubber-band past the limits.
@@ -107,13 +116,13 @@ export function SidebarDock() {
             className="w-1.5 shrink-0 cursor-col-resize bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors"
             role="separator"
             aria-orientation="vertical"
-            aria-label="Resize sidebar"
+            aria-label={t('shellChrome.sidebarDock.resizeAriaLabel')}
           />
           <div
-            className="h-full min-w-0 overflow-hidden panel-container"
+            className="h-full min-w-0 overflow-hidden panel-container flex flex-col"
             style={{ width: contentPx ?? `${effectivePct}%` }}
           >
-            <SidebarPanelHost />
+            <div className="min-h-0 flex-1"><SidebarPanelHost /></div>
           </div>
         </>
       )}

@@ -109,11 +109,15 @@ describe('auditIDSDocument — IFC schema cross-checks', () => {
     expect(codes(r.issues)).toContain('E_IFC_ENTITY_UNKNOWN');
   });
 
+  // The entity's enum has no USERDEFINED, so only its listed values are valid.
+  // IfcWall would accept any value: a USERDEFINED-capable predefined type is
+  // matched against ObjectType (IDS-008b; corpus entity/pass-a_predefined_
+  // type_may_specify_a_user_defined_object_type).
   it('flags an invalid predefined type for a known entity', async () => {
-    const xml = wrap(`<specification name="Bogus pdt" ifcVersion="IFC4">
+    const xml = wrap(`<specification name="Bogus pdt" ifcVersion="IFC4X3_ADD2">
       <applicability>
         <entity>
-          <name><simpleValue>IFCWALL</simpleValue></name>
+          <name><simpleValue>IFCALIGNMENTCANTSEGMENT</simpleValue></name>
           <predefinedType><simpleValue>NOT_A_REAL_PDT</simpleValue></predefinedType>
         </entity>
       </applicability>
@@ -674,6 +678,28 @@ describe('auditIDSDocument — review feedback fixes', () => {
     </specification>`);
     const r = await auditIDSDocument(xml);
     expect(codes(r.issues)).toContain('E_CARDINALITY_INVALID');
+  });
+
+  it('reports only {required, prohibited} for an invalid <partOf> @cardinality', async () => {
+    // <partOf> is ids:simpleCardinality; the generic invalid-value message
+    // must not advertise "optional" as valid for this facet.
+    const xml = wrap(`<specification name="X" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <partOf cardinality="Invalid">
+          <entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity>
+        </partOf>
+      </requirements>
+    </specification>`);
+    const r = await auditIDSDocument(xml);
+    const issue = r.issues.find(
+      (i) => i.code === 'E_CARDINALITY_INVALID' && i.facetType === 'partOf'
+    );
+    expect(issue).toBeDefined();
+    expect(issue!.message).toContain('{required, prohibited}');
+    expect(issue!.message).not.toContain('optional');
   });
 
   it('audits every declared @ifcVersion, not just the first', async () => {

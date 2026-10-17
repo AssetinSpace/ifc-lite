@@ -14,12 +14,53 @@ replica.
 | `IFC_MEM_BUDGET_MB` | 70% of the tightest readable ceiling (cgroup, else physical RAM), else 0 | Total admitted upload bytes at once; `0` is an explicit opt-out that disables the byte gate |
 | `IFC_ADMISSION_QUEUE_DEPTH` | `2 * WORKER_THREADS` | Requests allowed to wait for a slot before immediate 503 |
 | `IFC_ADMISSION_QUEUE_TIMEOUT_SECS` | `5` | Longest a queued request waits before 503 |
+| `IFC_STREAM_IDLE_TIMEOUT_SECS` | `600` | Close a connection whose socket write makes no progress for this long; `0` disables |
 | `IFC_MEM_SHED_PCT` | `85` | RSS percentage of the budget above which new work is shed |
 | `IFC_METRICS_ENABLED` | off | Expose `GET /api/v1/metrics` (Prometheus text; behind the bearer token when one is set) |
 
 Each admitted parse reserves the full `MAX_FILE_SIZE_MB` against the byte
 budget (multipart rarely declares a length up front), so the budget divided by
-the max file size is the number of large parses that can run concurrently.
+the max file size is the number of large parses that can run concurrently. The
+reservation is held until the decode, hash and parse work has actually ended,
+even if the client disconnects or the request times out first. It is not
+shrunk to the upload's size once the file arrives: a parse's measured peak is
+20-33x its upload (53.7 MiB model: `parquet-stream` 22.5x, `parquet` 33x,
+`parse` 20x), so a smaller charge would admit more work than the box holds.
+Sizing it per route is deferred to L-server (#7676, SERVER-24). The streaming
+route's data-model fill runs under its stream's reservation rather than a
+second one.
+
+Cache reads are admitted as well (#7676). A route that hands back a stored
+model reserves the entry's stored size against the byte budget, without a
+parse slot when it only copies the entry out (data model, symbolic sidecar,
+cached geometry, the optimized `?sha256=` probe), and with one when it
+transforms it (the `GET /api/v1/cache/{key}` re-encode, the stream replay).
+Every response that holds a model in memory, live parse or cache hit, keeps
+its bytes reserved until the client has read the whole body, and gives its
+parse slot back as soon as the work is done: a slow reader costs budget, not
+a core. `GET /api/v1/cache/check/{hash}` and cache misses read no stored
+content and take nothing.
+
+Cache reads feed the same counters as parses: one refused for memory, a full
+queue or the RSS breaker adds to
+`ifc_server_admission_rejected_total{reason="overloaded"|"queue_full"|"rss_shed"}`
+and answers `503` with `Retry-After`, as `GET /api/v1/parse/data-model/{key}`,
+`.../symbolic/{key}`, `GET /api/v1/cache/geometry/{hash}`,
+`GET /api/v1/cache/{key}` and the `?sha256=` probes now can on a cache hit.
+Alert on those counters knowing that cache traffic is part of them, and that a
+burst of 503s can be clients downloading stored models, not uploading new
+ones. A hit on an upload route (`POST /api/v1/parse`, `/parse/parquet`,
+`/parse/parquet/optimized`, `/parse/parquet-stream`) is charged the stored
+entries' size, not the upload's, for as long as it holds them: a replay holds
+about three times the stored geometry while it builds, and the JSON route
+about three times the stored response. A reader that drains slowly keeps its
+bytes charged for as long as it takes (up to the write-idle timeout); there is
+no download-rate floor yet like the upload one below.
+
+An upload must keep arriving to keep its reservation: one that goes 30 s
+without a byte, or whose average rate falls below 8 KiB/s once it has run
+15 s, is refused with `408 REQUEST_TIMEOUT`, so a trickling client cannot hold
+a parse slot for the whole `REQUEST_TIMEOUT_SECS`.
 
 ## Sizing rule
 
@@ -53,7 +94,52 @@ your corpus. Concretely for a single-replica box:
 - `GET /api/v1/metrics` - admission gauges/counters + resident memory
   (`ifc_server_resident_bytes`, `ifc_server_admission_in_flight`,
   `ifc_server_admission_queued`, `ifc_server_admission_rejected_total{reason}`,
-  `ifc_server_mem_budget_bytes`), when `IFC_METRICS_ENABLED=1`.
+  `ifc_server_mem_budget_bytes`), plus cache size gauges
+  (`ifc_server_cache_entries`, `ifc_server_cache_bytes`), when
+  `IFC_METRICS_ENABLED=1`.
+
+## Cache
+
+The disk cache (`CACHE_DIR`) has no size limit and NEVER self-prunes.
+`CACHE_MAX_AGE_DAYS` is parsed into `Config` and read by nothing else -- no
+code path evicts on age, so an entry written today is still there next year
+unless something removes it. `DELETE /api/v1/cache/{cache_key}` is the only
+removal path the server offers (short of deleting `CACHE_DIR` on disk). It
+takes the `cache_key` a parse returned (`{sha256}-{opening_filter}`, plus
+`-q{quality}` for a non-default tessellation quality), the same key
+`GET /api/v1/cache/{cache_key}` takes, and removes every cache entry derived
+from the source file that key names (the
+request, `-json-v2`, `-parquet-vN`, `-parquet-metadata-vN` and `-symbolic-v1`
+entries, across every opening-filter/tessellation-quality combination) and
+reclaims any content blob none of them, or any unrelated entry, still
+references. It
+is idempotent: deleting a key nothing is cached under is a `200` with
+`{"key": "<cache_key>", "deleted": 0}`, not a `404`, so a caller can invoke it
+unconditionally (e.g. "the model behind this key was removed, drop whatever is
+cached for it")
+without checking existence first. Use it to bound cache size from an
+external job, or to invalidate the geometry for a model an application has
+deleted.
+
+Like every other route, `DELETE` is UNAUTHENTICATED when
+`IFC_SERVER_API_TOKEN` is unset -- anyone who can reach the port can empty
+the cache file by file. Set the token on any deployment whose port is not
+already private.
+
+The path segment must be a request `cache_key`; anything else is a `400` and
+never touches the index. That includes the bare 64-character sha256 this
+route took before #5750: pass the `cache_key` a parse returned instead. Each call
+walks the whole cache index (twice, the second pass under the cache's write
+lock), so one such walk runs at a time: a `DELETE` that arrives while another
+is in flight is shed with `503` and a `Retry-After` header rather than
+queued. The route is idempotent, so retrying is always safe.
+
+`DELETE` does not cancel or outrank an in-flight parse for the same hash: a
+cache fill that is already running (or queued behind the reclaim lock)
+re-inserts its entries after the `200` returns. If you are invalidating
+because the source bytes changed, note that different bytes hash to a
+different key anyway; if you are invalidating to reclaim space, re-issue the
+`DELETE` once the in-flight parse has finished.
 
 ## Behavior notes
 
@@ -62,6 +148,10 @@ your corpus. Concretely for a single-replica box:
   allocator was deliberately NOT swapped to jemalloc: the release matrix
   includes a musl target where that is a known build risk; the RSS source
   lives behind `admission::resident_bytes_now()` if that decision is revisited.
+- gzip and `.ifcZIP` uploads are decompressed on the blocking pool, as is the
+  SHA-256 of every upload, so neither stalls the async workers that also
+  serve `/health`, `/ready` and every open stream. The admission guard rides
+  those tasks, so a cancelled request keeps its slot until they end.
 - SSE disconnects cancel the parse at the next batch boundary
   (`StreamingOptions::cancel`), freeing the core and the admission slot early.
   Synchronous (non-streaming) parses run to completion; their admission slot

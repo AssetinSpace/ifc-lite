@@ -16,8 +16,10 @@
 //!   can recover or re-localise),
 //! - **welded / indexed** triangles straight from the kernel mesh (the GLB's
 //!   per-face duplication happens later, in the glTF exporter),
-//! - **occurrences only** (`geometry_class == 0`); type-product RepresentationMap
-//!   geometry is omitted, matching what occurrence-based tessellators emit.
+//! - **occurrences only**: type-product RepresentationMap geometry
+//!   (`geometry_class` 1 and 2) is omitted, matching what occurrence-based
+//!   tessellators emit. A material-layer wall's slices (class 3,
+//!   `GEOM_CLASS_LAYER_SLICE`) are that occurrence's own body and are kept.
 //!
 //! Keyed by IFC STEP/express id. Submeshes of one element (per-material splits)
 //! are merged into a single triangle soup per id. f64 throughout so building- and
@@ -27,6 +29,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::mesh_frame::{restoring_rotation, rotate_and_translate};
 use crate::MeshData;
 
 /// One IFC entity's merged geometry, in IFC Z-up absolute-world metres.
@@ -43,6 +46,19 @@ pub struct ExportedElement {
     pub faces: Vec<[u32; 3]>,
     /// RGBA in 0..1 (first submesh's colour when an element has several).
     pub color: [f32; 4],
+}
+
+/// Color-aware geometry. The existing `ExportedElement` remains unchanged for callers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ColoredExportedElement {
+    #[serde(flatten)]
+    pub geometry: ExportedElement,
+    /// Distinct RGBA values in first-submesh order; omitted when `color` suffices.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub palette: Vec<[f32; 4]>,
+    /// One palette index per surviving face; omitted with `palette` when `color` suffices.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub face_colors: Vec<u64>,
 }
 
 /// Top-level geometry-data document. Serializes to the `ifc-lite-geometry-data`
@@ -65,6 +81,18 @@ pub struct GeometryDataExport {
     pub elements: BTreeMap<u32, ExportedElement>,
 }
 
+/// Additive color-aware document. Uniform JSON stays compatible with version 1.
+#[derive(Debug, Clone, Serialize)]
+pub struct ColoredGeometryDataExport {
+    pub schema: &'static str,
+    pub version: u32,
+    pub up_axis: &'static str,
+    pub units: &'static str,
+    pub rtc_offset: [f64; 3],
+    pub element_count: usize,
+    pub elements: BTreeMap<u32, ColoredExportedElement>,
+}
+
 /// Build the geometry-data export from a processed model's meshes.
 ///
 /// `rtc_offset` is `ProcessingResult.metadata.coordinate_info.origin_shift`.
@@ -74,21 +102,74 @@ pub struct GeometryDataExport {
 /// pipeline inverse-rotates positions + origin into site-local axes, so to emit
 /// true IFC world coordinates we reapply the forward 3x3 rotation:
 /// `world = R * (position + origin) + rtc_offset`. Pass `None` for the
-/// `model_rtc` / `raw_ifc` spaces (R = identity), which is the common case.
+/// `model_rtc` / `raw_ifc` spaces (R = identity), which is the common case;
+/// [`crate::MeshFrame::site_placement`] of `ProcessingResult::frame` is
+/// exactly this argument.
 pub fn build_geometry_data_export(
     meshes: &[MeshData],
     rtc_offset: [f64; 3],
     site_rotation: Option<&[f64]>,
 ) -> GeometryDataExport {
-    let mut elements: BTreeMap<u32, ExportedElement> = BTreeMap::new();
-    let rot = match site_rotation {
-        Some(m) if m.len() >= 16 => Some(m),
-        _ => None,
-    };
+    let (elements, _) = build_elements::<false>(meshes, rtc_offset, site_rotation);
+    GeometryDataExport {
+        schema: "ifc-lite-geometry-data",
+        version: 1,
+        up_axis: "Z",
+        units: "m",
+        rtc_offset,
+        element_count: elements.len(),
+        elements,
+    }
+}
+
+/// Build geometry with optional palette indices, preserving face materials through welding.
+pub fn build_colored_geometry_data_export(
+    meshes: &[MeshData],
+    rtc_offset: [f64; 3],
+    site_rotation: Option<&[f64]>,
+) -> ColoredGeometryDataExport {
+    let (geometry, mut colors) = build_elements::<true>(meshes, rtc_offset, site_rotation);
+    let elements: BTreeMap<u32, ColoredExportedElement> = geometry
+        .into_iter()
+        .map(|(id, geometry)| {
+            let metadata = colors.remove(&id).unwrap_or_default();
+            (id, ColoredExportedElement {
+                geometry,
+                palette: metadata.palette,
+                face_colors: metadata.face_colors,
+            })
+        })
+        .collect();
+    ColoredGeometryDataExport {
+        schema: "ifc-lite-geometry-data",
+        version: 1,
+        up_axis: "Z",
+        units: "m",
+        rtc_offset,
+        element_count: elements.len(),
+        elements,
+    }
+}
+
+type ElementMap = BTreeMap<u32, ExportedElement>;
+type ColorMap = BTreeMap<u32, ColorMetadata>;
+
+fn build_elements<const COLORS: bool>(
+    meshes: &[MeshData],
+    rtc_offset: [f64; 3],
+    site_rotation: Option<&[f64]>,
+) -> (ElementMap, ColorMap) {
+    // Keep the legacy map's allocation and node size; material state lives only
+    // in the opt-in sidecar, allocated once an element becomes nonuniform.
+    let mut elements = ElementMap::new();
+    let mut colors = ColorMap::new();
+    // Decided once per call, not per vertex (#7684).
+    let rotation = restoring_rotation(site_rotation);
 
     for m in meshes {
-        // Occurrences only — skip type-product RepresentationMap geometry.
-        if m.geometry_class != 0 || m.indices.is_empty() {
+        // Occurrences only: skip type-product RepresentationMap geometry. Class 3
+        // is a layered wall's body, which has no class-0 mesh to fall back on.
+        if matches!(m.geometry_class, 1 | 2) || m.indices.is_empty() {
             continue;
         }
 
@@ -97,17 +178,13 @@ pub fn build_geometry_data_export(
             .positions
             .chunks_exact(3)
             .map(|p| {
-                // World point in (possibly site-local) axes: position + origin.
-                let (x, y, z) = (p[0] as f64 + o[0], p[1] as f64 + o[1], p[2] as f64 + o[2]);
-                match rot {
-                    // Reapply the site forward rotation (column-major R), then RTC.
-                    Some(r) => [
-                        r[0] * x + r[4] * y + r[8] * z + rtc_offset[0],
-                        r[1] * x + r[5] * y + r[9] * z + rtc_offset[1],
-                        r[2] * x + r[6] * y + r[10] * z + rtc_offset[2],
-                    ],
-                    None => [x + rtc_offset[0], y + rtc_offset[1], z + rtc_offset[2]],
-                }
+                // Baked point (`origin + position`, widened first), then the
+                // one frame-to-world restore (#7684): site rotation, then RTC.
+                let baked = [p[0] as f64 + o[0], p[1] as f64 + o[1], p[2] as f64 + o[2]];
+                rotation.map_or_else(
+                    || [baked[0] + rtc_offset[0], baked[1] + rtc_offset[1], baked[2] + rtc_offset[2]],
+                    |r| rotate_and_translate(r, baked, rtc_offset),
+                )
             })
             .collect();
 
@@ -121,6 +198,15 @@ pub fn build_geometry_data_export(
                 faces: Vec::new(),
                 color: m.color,
             });
+        if COLORS {
+            if let Some(metadata) = colors.get_mut(&m.express_id) {
+                metadata.append_color(m.color, m.indices.len() / 3);
+            } else if entry.color != m.color {
+                let mut metadata = ColorMetadata::new(entry.color, entry.faces.len());
+                metadata.append_color(m.color, m.indices.len() / 3);
+                colors.insert(m.express_id, metadata);
+            }
+        }
 
         // Merge this submesh: rebase its face indices onto the element's
         // accumulated vertex list.
@@ -133,35 +219,74 @@ pub fn build_geometry_data_export(
         );
     }
 
-    // Position-weld each element. The kernel mesh splits vertices per face (for
-    // flat-shading normals), so coincident corners aren't shared and the mesh
-    // reads as "open". Merging by position (1 um grid) yields a properly
-    // indexed solid so closed-mesh consumers (volume, watertightness) work.
-    for el in elements.values_mut() {
-        let (v, f) = weld_positions(&el.vertices, &el.faces, 1.0e-6);
-        el.vertices = v;
-        el.faces = f;
+    // Weld in place so the legacy path returns its original map directly.
+    for (id, element) in &mut elements {
+        let metadata = if COLORS { colors.get_mut(id) } else { None };
+        let face_colors = metadata
+            .as_ref()
+            .map_or(&[][..], |m| m.face_colors.as_slice());
+        let (vertices, faces, kept) = weld_positions::<COLORS>(
+            &element.vertices,
+            &element.faces,
+            face_colors,
+            1e-6,
+        );
+        element.vertices = vertices;
+        element.faces = faces;
+        if let Some(metadata) = metadata {
+            metadata.face_colors = kept;
+        }
+    }
+    if COLORS {
+        // Index 0 is the existing fallback. Preserve an index-1-only survivor:
+        // its appearance differs from the first submesh's fallback color.
+        colors.retain(|_, m| !m.face_colors.iter().all(|&index| index == 0));
+    }
+    (elements, colors)
+}
+
+/// Allocated only for elements whose submeshes have different colors.
+#[derive(Default)]
+struct ColorMetadata {
+    palette: Vec<[f32; 4]>,
+    face_colors: Vec<u64>,
+    indices: BTreeMap<[u32; 4], u64>,
+}
+
+impl ColorMetadata {
+    fn new(fallback: [f32; 4], prior_faces: usize) -> Self {
+        let mut indices = BTreeMap::new();
+        indices.insert(color_key(fallback), 0);
+        Self {
+            palette: vec![fallback],
+            face_colors: vec![0; prior_faces],
+            indices,
+        }
     }
 
-    let element_count = elements.len();
-    GeometryDataExport {
-        schema: "ifc-lite-geometry-data",
-        version: 1,
-        up_axis: "Z",
-        units: "m",
-        rtc_offset,
-        element_count,
-        elements,
+    fn append_color(&mut self, color: [f32; 4], face_count: usize) {
+        let next = self.palette.len() as u64;
+        let index = *self.indices.entry(color_key(color)).or_insert_with(|| {
+            self.palette.push(color);
+            next
+        });
+        self.face_colors.resize(self.face_colors.len() + face_count, index);
     }
+}
+
+fn color_key(color: [f32; 4]) -> [u32; 4] {
+    // Match IEEE equality for signed zero while retaining deterministic bit keys.
+    color.map(|value| if value == 0.0 { 0 } else { value.to_bits() })
 }
 
 /// Merge coincident vertices on a `1/eps` grid and remap faces, dropping any
 /// triangle that collapses to a degenerate after the merge.
-fn weld_positions(
+fn weld_positions<const COLORS: bool>(
     verts: &[[f64; 3]],
     faces: &[[u32; 3]],
+    colors: &[u64],
     eps: f64,
-) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u64>) {
     let inv = 1.0 / eps;
     let key = |v: &[f64; 3]| -> (i64, i64, i64) {
         (
@@ -182,7 +307,8 @@ fn weld_positions(
         remap.push(idx);
     }
     let mut out_faces: Vec<[u32; 3]> = Vec::with_capacity(faces.len());
-    for f in faces {
+    let mut kept = Vec::with_capacity(colors.len());
+    for (face_index, f) in faces.iter().enumerate() {
         let (a, b, c) = (
             remap[f[0] as usize],
             remap[f[1] as usize],
@@ -190,19 +316,67 @@ fn weld_positions(
         );
         if a != b && b != c && a != c {
             out_faces.push([a, b, c]);
+            if COLORS && !colors.is_empty() {
+                kept.push(colors[face_index]);
+            }
         }
     }
-    (out_verts, out_faces)
+    (out_verts, out_faces, kept)
+}
+
+/// `serde_json` writes NaN and the infinities as `null`, which a consumer
+/// cannot tell from an absent value (#7770, D11/D13). A document with one is
+/// refused as a whole, as the Python surface's `finite_json` does.
+fn ensure_finite_element(id: u32, e: &ExportedElement, extra: &[[f32; 4]]) -> Result<(), serde_json::Error> {
+    use serde::ser::Error;
+    for (i, v) in e.vertices.iter().enumerate() {
+        if v.iter().any(|c| !c.is_finite()) {
+            return Err(serde_json::Error::custom(format!("non-finite vertex {i} in element {id}")));
+        }
+    }
+    if e.color.iter().chain(extra.iter().flatten()).any(|c| !c.is_finite()) {
+        return Err(serde_json::Error::custom(format!("non-finite colour in element {id}")));
+    }
+    Ok(())
+}
+
+fn ensure_finite_offset(rtc_offset: &[f64; 3]) -> Result<(), serde_json::Error> {
+    use serde::ser::Error;
+    if rtc_offset.iter().any(|c| !c.is_finite()) {
+        return Err(serde_json::Error::custom("non-finite rtc_offset"));
+    }
+    Ok(())
 }
 
 impl GeometryDataExport {
-    /// Serialize to pretty JSON.
+    fn ensure_finite(&self) -> Result<(), serde_json::Error> {
+        ensure_finite_offset(&self.rtc_offset)?;
+        self.elements.iter().try_for_each(|(id, e)| ensure_finite_element(*id, e, &[]))
+    }
+
+    /// Serialize to pretty JSON. Refuses a non-finite coordinate rather than
+    /// writing `null` for it.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        self.ensure_finite()?;
         serde_json::to_string_pretty(self)
     }
 
-    /// Serialize to compact JSON.
+    /// Serialize to compact JSON. Refuses a non-finite coordinate rather than
+    /// writing `null` for it.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        self.ensure_finite()?;
+        serde_json::to_string(self)
+    }
+}
+
+impl ColoredGeometryDataExport {
+    /// Serialize color-aware elements as the version-1 JSON document with optional fields.
+    /// Refuses a non-finite coordinate or colour rather than writing `null`.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        ensure_finite_offset(&self.rtc_offset)?;
+        for (id, e) in &self.elements {
+            ensure_finite_element(*id, &e.geometry, &e.palette)?;
+        }
         serde_json::to_string(self)
     }
 }

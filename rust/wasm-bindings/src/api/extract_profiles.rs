@@ -94,7 +94,9 @@ impl From<ifc_lite_geometry::ExtractedProfile> for ProfileEntryJs {
             outer_points: p.outer_points,
             hole_counts: p.hole_counts,
             hole_points: p.hole_points,
-            transform: p.transform,
+            // The JS surface stays a Float32Array (D12): narrowed here, once,
+            // exactly where the extractor used to narrow it.
+            transform: p.transform.map(|v| v as f32),
             extrusion_dir: p.extrusion_dir,
             extrusion_depth: p.extrusion_depth,
             model_index: p.model_index,
@@ -110,6 +112,15 @@ impl From<ifc_lite_geometry::ExtractedProfile> for ProfileEntryJs {
 #[wasm_bindgen]
 pub struct ProfileCollection {
     entries: Vec<ProfileEntryJs>,
+    /// Express IDs of elements whose profile was DROPPED — a genuine
+    /// extraction failure or a mapped-item chain deeper than the extractor's
+    /// limit, never an element this extractor deliberately excludes. See
+    /// `ifc_lite_geometry::extract_profiles_with_diagnostics`: without this,
+    /// the only trace of a drop is a `diag_debug!` call gated behind Cargo
+    /// features the shipped wasm build never enables, so a caller building
+    /// e.g. a 2D construction drawing had no way to know an element was
+    /// silently missing from it.
+    skipped_express_ids: Vec<u32>,
 }
 
 #[wasm_bindgen]
@@ -133,6 +144,14 @@ impl ProfileCollection {
             extrusion_depth: e.extrusion_depth,
             model_index: e.model_index,
         })
+    }
+
+    /// Express IDs of elements that had an `IfcExtrudedAreaSolid` (direct or
+    /// mapped) but whose profile could not be extracted, so they are MISSING
+    /// from this collection. Empty on a clean model.
+    #[wasm_bindgen(getter, js_name = skippedExpressIds)]
+    pub fn skipped_express_ids(&self) -> js_sys::Uint32Array {
+        js_sys::Uint32Array::from(&self.skipped_express_ids[..])
     }
 }
 
@@ -164,9 +183,10 @@ impl IfcAPI {
     /// ```
     #[wasm_bindgen(js_name = extractProfiles)]
     pub fn extract_profiles(&self, content: String, model_index: u32) -> ProfileCollection {
-        let raw = ifc_lite_geometry::extract_profiles(&content, model_index);
+        let (raw, skipped) = ifc_lite_geometry::extract_profiles_with_diagnostics(&content, model_index);
         ProfileCollection {
             entries: raw.into_iter().map(ProfileEntryJs::from).collect(),
+            skipped_express_ids: skipped.into_iter().map(|s| s.express_id).collect(),
         }
     }
 }

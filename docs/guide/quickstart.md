@@ -1,18 +1,19 @@
 # Quick Start
 
-Get up and running with IFClite in under 5 minutes. Choose your path based on your use case.
-
-!!! tip "Beyond Single-Model Viewing"
-    IFClite also supports **multi-model federation** (loading and coordinating multiple IFC files), **BCF** (BIM Collaboration Format) for issue tracking, and **IDS** (Information Delivery Specification) for model validation. See the [Next Steps](#next-steps) section for links to these guides.
+Choose the developer task you need first. The SDK and CLI can query, edit and validate IFC data directly.
 
 ## Choose Your Approach
 
-| | Client-Side | Server + Client |
-|---|-------------|-----------------|
-| **Setup** | `npm install @ifc-lite/parser` | Start server + install client SDK |
-| **Processing** | Browser (WASM) | Server (native Rust) |
-| **Caching** | IndexedDB (local) | Shared across team |
-| **Best for** | Offline, privacy, simple apps | Teams, large files, production |
+| I need to… | Start here |
+|------------|------------|
+| Read properties in a Node script | [Headless SDK: first useful result](developer-workflows.md#first-useful-result) |
+| Run checks in a terminal or CI | [CLI toolkit](cli.md) |
+| Edit, export and verify an IFC file | [Complete developer recipes](developer-workflows.md#reference-model-and-runnable-recipes) |
+| Integrate meshes into my engine | [Geometry](geometry.md), [Three.js](../tutorials/threejs-integration.md) or [Babylon.js](../tutorials/babylonjs-integration.md) |
+| Expose model processing over HTTP | [Cancellable Node example](developer-workflows.md#a-cancellable-local-service) or [native Rust server](server.md) |
+| Start from a minimal parser project | `npx create-ifc-lite my-app --template basic` |
+
+The [developer workflows guide](developer-workflows.md) includes a verified real model, complete scripts, expected results, lifecycle and capability contracts. The browser and server integration paths below build on those packages.
 
 ## Option 1: Client-Side Parsing
 
@@ -25,7 +26,7 @@ Process IFC files entirely in the browser using WebAssembly.
     ```bash
     npx create-ifc-lite my-viewer --template react
     cd my-viewer
-    npm install
+    npm ci
     npm run dev
     ```
 
@@ -34,7 +35,7 @@ Process IFC files entirely in the browser using WebAssembly.
     ```bash
     npx create-ifc-lite my-viewer --template threejs
     cd my-viewer
-    npm install
+    npm ci
     npm run dev
     ```
 
@@ -43,9 +44,11 @@ Process IFC files entirely in the browser using WebAssembly.
     ```bash
     npx create-ifc-lite my-viewer --template babylonjs
     cd my-viewer
-    npm install
+    npm ci
     npm run dev
     ```
+
+The scaffolder writes `package-lock.json` after resolving the complete dependency set and checking peer requirements. Commit that lockfile and use `npm ci` to install the same versions.
 
 Open the URL Vite prints (`http://localhost:5173` by default) and drag an IFC file onto the viewer.
 
@@ -203,6 +206,7 @@ function setupCameraControls(canvas: HTMLCanvasElement, renderer: Renderer) {
 | `camera.orbit(dx, dy)` | Rotate around target (left-drag) |
 | `camera.pan(dx, dy)` | Pan the view (shift+drag or middle-click) |
 | `camera.zoom(delta, false, x, y, w, h)` | Zoom towards mouse position (scroll wheel) |
+| `camera.zoom(delta, false, x, y, w, h, false, point)` | Zoom in toward a picked surface point (e.g. `renderer.raycastScene(x, y)?.intersection.point`): approaches it and stops short instead of passing through |
 | `camera.fitToBounds(min, max)` | Fit camera to bounding box |
 | `camera.setPresetView('top')` | Set preset view: 'top', 'front', 'left', etc. |
 | `camera.frameBounds(min, max, 500)` | Animated zoom to fit (with duration in ms) |
@@ -306,17 +310,23 @@ if (entityRef) {
 }
 
 // Get spatial hierarchy
-import { IfcTypeEnum } from '@ifc-lite/data';
+import { IfcTypeEnum, type SpatialNode } from '@ifc-lite/data';
 
 const hierarchy = store.spatialHierarchy;
 console.log(`Project: ${hierarchy.project.name}`);
 
+// Storeys are NOT direct children of the project: the tree is
+// Project -> Site -> Building -> Storey, so walk it rather than reading
+// `project.children` directly.
+function* storeysOf(node: SpatialNode): Generator<SpatialNode> {
+  if (node.type === IfcTypeEnum.IfcBuildingStorey) yield node;
+  for (const child of node.children ?? []) yield* storeysOf(child);
+}
+
 // List storeys (SpatialNode.type is a numeric IfcTypeEnum, keyed by expressId)
-for (const storey of hierarchy.project.children) {
-  if (storey.type === IfcTypeEnum.IfcBuildingStorey) {
-    const elements = hierarchy.byStorey.get(storey.expressId) ?? [];
-    console.log(`${storey.name}: ${elements.length} elements`);
-  }
+for (const storey of storeysOf(hierarchy.project)) {
+  const elements = hierarchy.byStorey.get(storey.expressId) ?? [];
+  console.log(`${storey.name}: ${elements.length} elements`);
 }
 ```
 
@@ -441,6 +451,8 @@ canvas.addEventListener('click', async (e) => {
 
   const hit = await renderer.pick(x, y);
   if (hit) {
+    // `hit.geometryItemId` narrows this to the representation item the clicked
+    // surface came from, when the renderer has one. See the rendering guide.
     const expressId = hit.expressId;
     console.log(`Selected entity #${expressId}`);
     selectedIds = new Set([expressId]);
@@ -483,7 +495,7 @@ renderer.render({
 ```
 
 !!! tip "Basket Isolation in the Viewer App"
-    The viewer app provides an interactive **basket** for building isolation sets incrementally. Use `I` to set, `+` to add, `-` to remove entities. Cmd/Ctrl+Click to multi-select, then use basket shortcuts on the whole selection. See the [Rendering Guide](rendering.md#basket-isolation-viewer-app) for details.
+    The viewer app provides an interactive **basket** for building isolation sets incrementally. Use `I` to isolate, `=` or `+` to add, and `-` to remove entities. Cmd/Ctrl+Click to multi-select, then use basket shortcuts on the whole selection. See the [Rendering Guide](rendering.md#basket-isolation-viewer-app) for details.
 
 ## Data Flow Diagram
 
@@ -580,7 +592,7 @@ try {
 - [Rendering Guide](rendering.md) - WebGPU rendering features
 - [Query Guide](querying.md) - Query entities and properties
 - [Federation Guide](federation.md) - Multi-model loading and coordination
-- [BCF Guide](bcf.md) - BIM Collaboration Format for issue tracking
+- [BCF Guide](bcf.md) - BIM Collaboration Format for topic tracking
 - [IDS Guide](ids.md) - Information Delivery Specification for validation
 - [2D Drawing Guide](drawing-2d.md) - Generate 2D drawings from models
 - [Mutations Guide](mutations.md) - Programmatic model modifications

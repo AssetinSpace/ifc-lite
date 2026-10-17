@@ -1,0 +1,13 @@
+{
+  "apps/viewer/src/components/documents/DocumentPane.tsx": 2,
+  "apps/viewer/src/components/documents/DocumentsPanel.tsx": 19,
+  "apps/viewer/src/components/documents/PdfDocumentView.tsx": 2,
+  "apps/viewer/src/components/viewer/CalibrationPdfOverlay.tsx": 10,
+  "apps/viewer/src/components/viewer/CalibrationPdfSurface.tsx": 9,
+  "apps/viewer/src/components/viewer/DrawingPlanPane.tsx": 6,
+  "apps/viewer/src/components/viewer/DrawingUnderlayPanel.tsx": 75,
+  "apps/viewer/src/components/viewer/IdentifierLinkBoxes.tsx": 4,
+  "apps/viewer/src/components/viewer/IdentifierLinkSettings.tsx": 51,
+  "apps/viewer/src/components/viewer/ViewModeSwitcher.tsx": 3,
+  "apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx": 4
+}

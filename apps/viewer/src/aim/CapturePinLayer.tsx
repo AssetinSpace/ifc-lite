@@ -120,7 +120,8 @@ export function CapturePinLayer() {
     <div
       ref={containerRef}
       className="absolute inset-0 pointer-events-none overflow-hidden"
-      aria-label="Reality capture pins"
+      // No aria-label here: a name on a role-less div is prohibited (axe
+      // aria-prohibited-attr), and every pin is a button with its own title.
     >
       {projected.map((pin) => {
         if (!pin.screen) return null;

@@ -2,51 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Raster decoding for IFC surface textures (#961): STEP `BINARY` literals
-//! plus PNG/JPEG → RGBA8, with hostile-header dimension bounds. Split from the
+//! Raster decoding for IFC surface textures (#961): PNG/JPEG → RGBA8, with hostile-header dimension bounds. Split from the
 //! entity-resolution half (`texture`) so each stays within the module-size
 //! house rule; no behaviour differences.
 
-/// Decode a STEP binary literal as surfaced by the decoder (the parser strips
-/// the surrounding double quotes; the first hex character is the count of
-/// unused leading bits — `0` for the byte-aligned data every IFC texture
-/// fixture uses). Strips that leading character and hex-decodes the remainder
-/// pairwise. Returns the raw bytes (e.g. a complete PNG file for a blob, or one
-/// pixel's colour components for a pixel literal).
-pub fn decode_step_binary(s: &str) -> Vec<u8> {
-    let s = s.trim().trim_matches('"');
-    if s.len() < 3 {
-        return Vec::new();
-    }
-    let hex = s.as_bytes();
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    // Skip index 0 (the unused-bits indicator); decode the rest in pairs.
-    let mut i = 1;
-    while i + 1 < hex.len() {
-        match (hex_val(hex[i]), hex_val(hex[i + 1])) {
-            (Some(h), Some(l)) => out.push((h << 4) | l),
-            _ => break,
-        }
-        i += 2;
-    }
-    out
-}
-
-#[inline]
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
+use ifc_lite_core::step_encoding::hex_val;
 
 /// Upper bound on a decoded texture's width/height. 16384² RGBA ≈ 1 GiB — a
 /// hostile/garbage image header claiming larger dimensions is rejected BEFORE
 /// any pixel buffer is allocated, so a crafted file can't drive an OOM. Matches
 /// the `IfcPixelTexture` bound.
-pub(super) const MAX_TEX_DIM: u32 = 16384;
+pub const MAX_TEX_DIM: u32 = 16384;
 
 /// Decode a PNG byte buffer to RGBA8. Returns `(rgba, width, height)`.
 fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
@@ -150,3 +116,27 @@ pub(super) fn decode_raster_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     }
     None
 }
+
+/// Inspect supported raster headers without decoding pixel buffers. Hosts that
+/// aggregate many embedded images can budget their allocations before decoding.
+/// A successful header read does not certify the compressed pixel stream.
+///
+/// `step_binary` is a binary literal's raw hex, as
+/// `AttributeValue::as_binary_hex` returns it. Byte decoding of binaries has
+/// one home, `ifc_lite_core::decode_step_binary` (F4-1).
+pub fn embedded_raster_dimensions(step_binary: &str) -> Option<(u32, u32)> {
+    let hex = step_binary.trim().trim_matches('"').as_bytes();
+    if hex.first() != Some(&b'0') { return None; }
+    super::raster_header::dimensions(hex.len().saturating_sub(1) / 2, |i| {
+        Some((hex_val(*hex.get(1 + i * 2)?)? << 4) | hex_val(*hex.get(2 + i * 2)?)?)
+    })
+}
+
+#[cfg(test)]
+fn raster_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    super::raster_header::dimensions(bytes.len(), |i| bytes.get(i).copied())
+}
+
+#[cfg(test)]
+#[path = "raster_budget_tests.rs"]
+mod budget_tests;

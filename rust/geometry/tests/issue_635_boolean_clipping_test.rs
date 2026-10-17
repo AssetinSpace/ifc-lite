@@ -29,18 +29,11 @@
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
 use rustc_hash::FxHashMap;
-use std::fs;
-use std::path::PathBuf;
 
-fn fixture_path(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(relative)
-}
-
+/// Catalogued fixture or `None` (skip); a missing one panics under
+/// `IFC_LITE_REQUIRE_FIXTURES=1` (`ifc_lite_testkit`).
 fn load_fixture(relative: &str) -> Option<String> {
-    fs::read_to_string(fixture_path(relative)).ok()
+    ifc_lite_testkit::fixture_text(relative)
 }
 
 /// Build the void index the same way production does.
@@ -434,7 +427,7 @@ fn max_z_silhouette(mesh: &Mesh, bins: usize) -> Vec<f32> {
     max_per_bin
 }
 
-const FIXTURE: &str = "tests/models/ara3d/AC20-FZK-Haus.ifc";
+const FIXTURE: &str = "ara3d/AC20-FZK-Haus.ifc";
 
 // Wall #60012 = Wand-Ext-OG-1 (10m, gable wall, 2 chained PolygonalBoundedHalfSpace clips,
 // has round window opening #60579 via IfcRelVoidsElement #60582).

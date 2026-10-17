@@ -9,7 +9,7 @@ import { looksLikeProviderKey, maskKey, readClipboardKey } from './clipboard-det
 // ── looksLikeProviderKey ───────────────────────────────────────────────────
 
 test('looksLikeProviderKey accepts a realistic Anthropic console key', () => {
-  // 14-char prefix + 50 random body chars
+  // Synthetic legacy key with a realistic secret length.
   const key = 'sk-ant-api03-' + 'a'.repeat(60);
   assert.equal(looksLikeProviderKey('anthropic', key), true);
 });
@@ -21,7 +21,26 @@ test('looksLikeProviderKey rejects too-short Anthropic key', () => {
 
 test('looksLikeProviderKey rejects Anthropic key with wrong prefix', () => {
   assert.equal(looksLikeProviderKey('anthropic', 'sk-' + 'a'.repeat(80)), false);
-  assert.equal(looksLikeProviderKey('anthropic', 'sk-ant-api01-' + 'a'.repeat(80)), false);
+});
+
+test('Anthropic recognition does not pin the key version or legacy secret length', () => {
+  // #7017: identity-linked keys could not be saved because only api03
+  // was recognized. Synthetic suffixes exercise the documented sk-ant- family;
+  // they do not claim to enumerate the formats Anthropic issues.
+  for (const suffix of ['api01-', 'api04-', 'future-format-']) {
+    const key = `sk-ant-${suffix}${'a'.repeat(30)}`;
+    assert.equal(looksLikeProviderKey('anthropic', key), true);
+    assert.equal(looksLikeProviderKey('openai', key), false);
+  }
+});
+
+test('provider recognition rejects embedded whitespace and paste artifacts', () => {
+  for (const provider of ['anthropic', 'openai'] as const) {
+    const prefix = provider === 'anthropic' ? 'sk-ant-' : 'sk-proj-';
+    for (const artifact of [' ', '\n', '\u200b']) {
+      assert.equal(looksLikeProviderKey(provider, `${prefix}${'a'.repeat(30)}${artifact}tail`), false);
+    }
+  }
 });
 
 test('looksLikeProviderKey accepts a legacy OpenAI key', () => {
@@ -64,6 +83,10 @@ test('maskKey preserves OpenAI project prefix', () => {
   assert.equal(masked.endsWith('WXYZ'), true);
 });
 
+test('maskKey hides unknown Anthropic suffixes including secret-body dashes', () => {
+  assert.equal(maskKey(`sk-ant-future-${'a'.repeat(30)}-WXYZ`), 'sk-ant-••••WXYZ');
+});
+
 test('maskKey preserves bare sk- prefix for legacy keys', () => {
   const key = 'sk-' + 'a'.repeat(45) + 'WXYZ';
   const masked = maskKey(key);
@@ -74,6 +97,25 @@ test('maskKey preserves bare sk- prefix for legacy keys', () => {
 test('maskKey falls back to bullets for absurdly short input', () => {
   assert.equal(maskKey('short'), '••••');
   assert.equal(maskKey(''), '••••');
+});
+
+test('maskKey does not leak secret characters when the secret body contains a dash', () => {
+  // The key alphabet is [A-Za-z0-9_-] (see PROVIDER_PATTERNS), so a real
+  // secret can legitimately contain a `-` anywhere after the provider
+  // prefix. `maskKey` must mask everything past the KNOWN prefix regardless
+  // of where any later dash falls — a secret-body dash is not the prefix
+  // boundary.
+  const legacyKey = 'sk-ab-cdEFGH12IJKLMNOP34QRST5678';
+  const legacyMasked = maskKey(legacyKey);
+  assert.equal(legacyMasked.startsWith('sk-••••'), true, `expected only "sk-" unmasked, got: ${legacyMasked}`);
+  assert.equal(legacyMasked.endsWith('5678'), true);
+  assert.equal(legacyMasked.includes('ab-cd'), false, `secret body leaked into: ${legacyMasked}`);
+
+  const projKey = 'sk-proj-ab-cdEFGH12IJKLMNOP34QRST';
+  const projMasked = maskKey(projKey);
+  assert.equal(projMasked.startsWith('sk-proj-••••'), true, `expected only "sk-proj-" unmasked, got: ${projMasked}`);
+  assert.equal(projMasked.endsWith('QRST'), true);
+  assert.equal(projMasked.includes('ab-cd'), false, `secret body leaked into: ${projMasked}`);
 });
 
 // ── readClipboardKey ──────────────────────────────────────────────────────

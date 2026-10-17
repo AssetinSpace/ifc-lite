@@ -1,0 +1,15 @@
+{
+  "apps/viewer/src/aim/AimCard.tsx": 8,
+  "apps/viewer/src/aim/AimInspectorTabs.tsx": 2,
+  "apps/viewer/src/components/documents/DocumentPane.tsx": 1,
+  "apps/viewer/src/components/documents/DocumentsPanel.tsx": 5,
+  "apps/viewer/src/components/documents/PdfDocumentView.tsx": 3,
+  "apps/viewer/src/components/viewer/CalibrationPdfOverlay.tsx": 2,
+  "apps/viewer/src/components/viewer/CalibrationPdfSurface.tsx": 4,
+  "apps/viewer/src/components/viewer/DrawingPlanPane.tsx": 4,
+  "apps/viewer/src/components/viewer/DrawingUnderlayPanel.tsx": 35,
+  "apps/viewer/src/components/viewer/IdentifierLinkBoxes.tsx": 1,
+  "apps/viewer/src/components/viewer/IdentifierLinkSettings.tsx": 26,
+  "apps/viewer/src/components/viewer/ViewModeSwitcher.tsx": 2,
+  "apps/viewer/src/components/viewer/hierarchy/HierarchyNode.tsx": 1
+}

@@ -32,6 +32,22 @@ describe('sidebarSlice (#1208)', () => {
     assert.strictEqual(s.getState().sidebarMode, 'expanded');
   });
 
+  it('keeps customize mode when staying expanded, and drops it when collapsing', () => {
+    // github.com/LTplus-AG/ifc-lite/issues/2765: forcing `sidebarCustomizing`
+    // unconditionally false in `setSidebarMode` left 19 tests green. The
+    // conditional exists because collapsing strands the customize popover with
+    // no UI, while re-selecting expanded must not throw the user out of a
+    // customize session they are in the middle of.
+    const s = make();
+    s.getState().setSidebarCustomizing(true);
+
+    s.getState().setSidebarMode('expanded');
+    assert.strictEqual(s.getState().sidebarCustomizing, true, 'staying expanded keeps the session');
+
+    s.getState().setSidebarMode('collapsed');
+    assert.strictEqual(s.getState().sidebarCustomizing, false, 'collapsing strands the popover, so it exits');
+  });
+
   it('migrates a persisted/captured "hidden" mode to collapsed (rail never hides)', () => {
     const s = make();
     s.getState().applySidebarLayout({ mode: 'hidden' });
@@ -77,7 +93,7 @@ describe('sidebarSlice (#1208)', () => {
     const s = make();
     s.getState().setSidebarMode('collapsed');
     s.getState().setSidebarWidthPct(33);
-    s.getState().setPanelShownInSidebar('ids', false);
+    s.getState().setPanelShownInSidebar('validation', false);
     s.getState().reorderSidebarPanel('extensions', 0);
     const snap = s.getState().serializeSidebarLayout();
 
@@ -85,7 +101,7 @@ describe('sidebarSlice (#1208)', () => {
     s2.getState().applySidebarLayout(snap);
     assert.strictEqual(s2.getState().sidebarMode, 'collapsed');
     assert.strictEqual(Math.round(s2.getState().sidebarWidthPct), 33);
-    assert.ok(s2.getState().sidebarHiddenIds.includes('ids'));
+    assert.ok(s2.getState().sidebarHiddenIds.includes('validation'));
     assert.strictEqual(s2.getState().sidebarOrder[0], 'extensions');
   });
 
@@ -94,15 +110,15 @@ describe('sidebarSlice (#1208)', () => {
     s.getState().applySidebarLayout({
       mode: 'nope',
       widthPct: 'x',
-      order: ['bcf', 'not-a-panel', 'bcf'],
+      order: ['bcf', 'not-a-panel', 'bcf', 'compare'],
       hiddenIds: ['properties', 'lens'],
     });
     assert.ok(['expanded', 'collapsed'].includes(s.getState().sidebarMode));
     assert.ok(Number.isFinite(s.getState().sidebarWidthPct));
-    // order: Hierarchy is migrated to the top (#1267), then the persisted bcf,
-    // no dupes / unknowns, every registry panel present.
+    // Hierarchy remains at the top (#1267), and captured panels retain their
+    // relative order while new tools join their task group (#6927).
     assert.strictEqual(s.getState().sidebarOrder[0], 'hierarchy');
-    assert.strictEqual(s.getState().sidebarOrder[1], 'bcf');
+    assert.ok(s.getState().sidebarOrder.indexOf('bcf') < s.getState().sidebarOrder.indexOf('compare'));
     assert.strictEqual(new Set(s.getState().sidebarOrder).size, WORKSPACE_PANELS.length);
     // Information is never hidden; a valid id is.
     assert.ok(!s.getState().sidebarHiddenIds.includes('properties'));
@@ -146,19 +162,51 @@ describe('sidebarSlice ordering (#1267)', () => {
     assert.strictEqual(s.getState().sidebarOrder[1], 'properties');
     assert.strictEqual(new Set(s.getState().sidebarOrder).size, WORKSPACE_PANELS.length);
   });
+
+  it('migrates a pre-#5138 "ids" order/hidden entry to "validation" (registry rename)', () => {
+    const s = make();
+    // A layout persisted before the IDS panel was renamed/generalised to
+    // Data validation (#5138): the retired id must migrate, not vanish.
+    s.getState().applySidebarLayout({ order: ['ids', 'bcf'], hiddenIds: ['ids'] });
+    assert.ok(s.getState().sidebarOrder.includes('validation'));
+    assert.ok(!s.getState().sidebarOrder.includes('ids' as never));
+    assert.deepStrictEqual(s.getState().sidebarHiddenIds, ['validation']);
+    assert.strictEqual(new Set(s.getState().sidebarOrder).size, WORKSPACE_PANELS.length);
+  });
+});
+
+describe('sidebarSlice task group migration (#5873)', () => {
+  it('groups an unchanged saved rail order and preserves a customized order', () => {
+    const previousDefault = [
+      'hierarchy',
+      ...WORKSPACE_PANELS.map((panel) => panel.id).filter((id) => id !== 'hierarchy'),
+    ] as SidebarSlice['sidebarOrder'];
+    const original = make();
+    original.getState().applySidebarLayout({ order: previousDefault });
+    const migrated = original.getState().sidebarOrder;
+    assert.strictEqual(migrated[0], 'hierarchy');
+    assert.notDeepStrictEqual(migrated, previousDefault);
+    assert.strictEqual(new Set(migrated).size, WORKSPACE_PANELS.length);
+
+    const customized = [...previousDefault];
+    customized.splice(customized.indexOf('extensions'), 1);
+    customized.unshift('extensions');
+    original.getState().applySidebarLayout({ order: customized });
+    assert.deepStrictEqual(original.getState().sidebarOrder, customized);
+  });
 });
 
 describe('sidebarSlice docked split (#1266)', () => {
   it('sets a side panel as the lower split half', () => {
     const s = make();
-    s.getState().setSidebarActivePanel('ids');
+    s.getState().setSidebarActivePanel('validation');
     s.getState().setSidebarSecondaryPanel('compare');
     assert.strictEqual(s.getState().sidebarSecondaryPanel, 'compare');
   });
 
   it('rejects non-side panels as the split half (bottom / left)', () => {
     const s = make();
-    s.getState().setSidebarActivePanel('ids');
+    s.getState().setSidebarActivePanel('validation');
     s.getState().setSidebarSecondaryPanel('script'); // bottom strip
     assert.strictEqual(s.getState().sidebarSecondaryPanel, null);
     s.getState().setSidebarSecondaryPanel('hierarchy'); // left slot
@@ -167,14 +215,14 @@ describe('sidebarSlice docked split (#1266)', () => {
 
   it('refuses to split a panel against itself', () => {
     const s = make();
-    s.getState().setSidebarActivePanel('ids');
-    s.getState().setSidebarSecondaryPanel('ids');
+    s.getState().setSidebarActivePanel('validation');
+    s.getState().setSidebarSecondaryPanel('validation');
     assert.strictEqual(s.getState().sidebarSecondaryPanel, null);
   });
 
   it('collapses the split when the secondary is promoted to primary', () => {
     const s = make();
-    s.getState().setSidebarActivePanel('ids');
+    s.getState().setSidebarActivePanel('validation');
     s.getState().setSidebarSecondaryPanel('compare');
     assert.strictEqual(s.getState().sidebarSecondaryPanel, 'compare');
     s.getState().setSidebarActivePanel('compare');
@@ -196,7 +244,7 @@ describe('sidebarSlice docked split (#1266)', () => {
 
   it('resetSidebarLayout drops the split back to a single panel', () => {
     const s = make();
-    s.getState().setSidebarActivePanel('ids');
+    s.getState().setSidebarActivePanel('validation');
     s.getState().setSidebarSecondaryPanel('compare');
     s.getState().setSidebarSplitRatio(0.7);
     s.getState().resetSidebarLayout();

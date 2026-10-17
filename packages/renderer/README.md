@@ -28,6 +28,56 @@ renderer.requestRender();
 
 `loadGeometry()` accepts a `GeometryResult` from `@ifc-lite/geometry` or a raw `MeshData[]`. The renderer keeps geometry in GPU buffers; subsequent `requestRender()` calls coalesce into a single frame.
 
+Camera zoom refuses a step that would move the eye or target outside the renderer's supported source-coordinate envelope (±1,000,000,000 metres per axis). The previous pose, cursor anchor and orbit pivot remain intact, so reversing the gesture works. If another control has already moved outside the envelope, zoom may recover incrementally: each accepted step must strictly reduce the largest absolute eye/target coordinate until the pose is supported again. This applies to ordinary, cursor-anchored, fast, surface and inertial zoom. Orthographic zoom keeps its existing scale behavior while its cursor translation observes the same coordinate boundary.
+
+## Inspect GPU pass timing
+
+Timestamp queries are opt-in. Enable them before rendering, then read resolved
+samples after frames have submitted:
+
+```typescript
+renderer.setGpuFrameTiming(true);
+renderer.render();
+const timing = renderer.getGpuFrameTiming();
+console.log(timing.mode, timing.frames);
+```
+
+`gpu-queries` samples report each render pass in milliseconds. `unsupported`
+means the actual device lacks timestamp queries; no CPU or queue-completion
+value is substituted. Readback is asynchronous, so the first snapshot can be
+empty. Frames arriving during a pending map are skipped, and the bounded sample
+history reports overwritten frames. Errors and resource epochs identify invalid
+or interrupted captures. Device loss clears old samples before observers run;
+recovery preserves the opt-in setting and starts a new epoch. Disable with
+`renderer.setGpuFrameTiming(false)` to release the timing resources.
+
+## Recover from GPU device loss
+
+```typescript
+renderer.onDeviceLost(async () => {
+  const result = await renderer.recoverDevice();
+  if (result.ok === false) {
+    console.error('Renderer recovery failed:', result.reason);
+  } else if (result.omissions.length > 0) {
+    console.warn('Recovered with transient layers cleared:', result.omissions);
+  }
+});
+```
+
+`recoverDevice()` requests a replacement adapter/device and rebuilds the GPU
+scene in place, preserving the `Renderer`, camera, IFC geometry, model
+placements, visibility, selection and colour overrides. Concurrent calls share
+one attempt. It returns a typed failure instead of presenting an incomplete
+scene when CPU geometry has been released, a finalizer or authoring transaction
+is active, cold geometry cannot be restored, or public `addMesh()` content has
+no CPU source. Retained streaming fragments are rebuilt from their CPU owners;
+the pending queue resumes from its existing cursor only after recovery commits.
+Frame and stream-end consumers cannot access the staged replacement device.
+Clearing or replacing the source during an awaited recovery refuses that attempt
+without consuming the new load's queue. Append-only pending arrivals are retained.
+Point clouds, reference images and transient overlay layers are reported in
+`omissions` when they must be reloaded by the host.
+
 ## Pick an entity
 
 ```typescript
@@ -43,7 +93,7 @@ canvas.addEventListener('click', async (e) => {
 });
 ```
 
-For exact world-space hits with surface normals, use `raycastScene(x, y)` — slower but returns the precise intersection point + normal.
+For exact world-space hits with surface normals, use `raycastScene(x, y)` — slower but returns the precise intersection point, normal and, where provenance is unambiguous, the federation model, representation item and canonical evaluated-surface triangle.
 
 ## Section planes
 
@@ -88,6 +138,10 @@ renderer.requestRender();
 ```typescript
 import { federationRegistry } from '@ifc-lite/renderer';
 
+// The highest expressId in each model decides the offset spacing
+const maxArchExpressId = 500_000;
+const maxStructExpressId = 250_000;
+
 // Register each model with a unique ID offset
 federationRegistry.registerModel('arch', maxArchExpressId);
 federationRegistry.registerModel('struct', maxStructExpressId);
@@ -104,3 +158,13 @@ See the [Rendering Guide](https://ifclite.dev/docs/guide/rendering/) and [API Re
 ## License
 
 [MPL-2.0](../../LICENSE)
+
+Registered raster references are available through `renderer.getReferenceImages()`; see the [rendering guide](../../docs/guide/rendering.md#registered-raster-references) for identity, coordinates, resource ownership and picking.
+
+### Exact surface tools and clipping
+
+`renderer.hasActiveClipping()` reports whether the last rendered frame applied
+section, terrain or box clipping. It reads the retained render snapshot, so
+mutating a previous options object does not change the answer.
+`raycastScene()` applies that same clip state while walking triangles, so a
+clipped front face cannot hide a visible face behind it.

@@ -5,7 +5,8 @@
 /**
  * Direct browser-to-provider streaming for BYOK (Bring Your Own Key) models.
  *
- * Anthropic: Uses the official @anthropic-ai/sdk with `dangerouslyAllowBrowser`.
+ * Anthropic: Uses the official @anthropic-ai/sdk with `dangerouslyAllowBrowser`,
+ *            constructed in ./anthropic-client.ts.
  * OpenAI:    Uses fetch against the OpenAI chat completions API (same SSE format
  *            the proxy already returns, so SSE parsing is shared).
  *
@@ -13,10 +14,16 @@
  * They never pass through our server.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { outputTokenLimit, ANTHROPIC_OUTPUT_TOKEN_CEILING, OPENAI_OUTPUT_TOKEN_CEILING } from '../../../../../shared/ai/output-budget.js';
+import {
+  anthropicErrorMessage,
+  createAnthropicClient,
+  type AnthropicCredentials,
+} from './anthropic-client.js';
 import { readSseStream, type StreamMessage, type StreamOptions } from './stream-client.js';
-import { getModelById } from './models.js';
+import { getModelById, sendsSamplingParams } from './models.js';
 import { buildCacheableSystem, logCacheHit } from './prompt-cache.js';
+import { anthropicUsage, chatCompletionsUsage, responsesUsage } from '@ifc-lite/ai';
 
 const STREAM_REQUEST_TIMEOUT_MS = 45_000;
 
@@ -63,28 +70,33 @@ function toAnthropicMessages(
 }
 
 export async function streamAnthropicChat(
-  apiKey: string,
+  credentials: AnthropicCredentials,
   options: Omit<StreamOptions, 'proxyUrl' | 'authToken' | 'onUsageInfo'>,
 ): Promise<void> {
   const { model, messages, system, signal, onChunk, onComplete, onError, onFinishReason } = options;
 
-  const client = new Anthropic({
-    apiKey,
-    dangerouslyAllowBrowser: true,
-  });
-
-  // Opus 4.7+ returns 400 if `temperature` (or `top_p`/`top_k`) is present.
-  // We gate on the per-model `acceptsSamplingParams` flag in models.ts so
-  // future Claude models that adopt the same policy only need a flag bump,
-  // and Opus 4.6 / Sonnet 4.6 / Haiku 4.5 keep their tuned temperature.
-  const modelDef = getModelById(model);
-  const sendSamplingParams = modelDef?.acceptsSamplingParams !== false;
+  // Send a tuned temperature only where the model is flagged for it. Naming
+  // the models here instead just grows a second registry nothing keeps honest.
+  const sendSamplingParams = sendsSamplingParams(model);
 
   let fullText = '';
   try {
+    // Inside the try: constructing the client rejects a workspace id that
+    // cannot go in a header, and that belongs on `onError` like every other
+    // failure rather than escaping as an unhandled throw.
+    const maxOutputTokens = outputTokenLimit(options.maxOutputTokens, ANTHROPIC_OUTPUT_TOKEN_CEILING);
+    if (signal?.aborted) return;
+    const client = createAnthropicClient(credentials);
+    options.onOutputFormat?.(options.outputSchema ? 'json-schema' : 'text');
     const stream = client.messages.stream({
       model,
-      max_tokens: 8192,
+      // Opus 5.5 (the default BYOK model) runs adaptive thinking when `thinking`
+      // is omitted. Thinking spends this ceiling, and
+      // `display` defaults to omitted, so too low a value truncates the visible
+      // answer with nothing to show for the tokens. Keep that default unless
+      // the caller explicitly chooses a smaller budget.
+      max_tokens: maxOutputTokens,
+      ...(options.outputSchema ? { output_config: { format: { type: 'json_schema' as const, schema: { ...options.outputSchema.schema } } } } : {}),
       ...(sendSamplingParams ? { temperature: 0.3 } : {}),
       // Wrap the system prompt in an ephemeral cache block when it's
       // long enough to be worth caching (Anthropic's minimum is ~1024
@@ -93,7 +105,7 @@ export async function streamAnthropicChat(
       // turns fall under it and pass through as plain string.
       system: buildCacheableSystem(system),
       messages: toAnthropicMessages(messages),
-    });
+    }, { maxRetries: 0 }); // A retry is another budgeted request, owned by the caller.
 
     // Wire up abort signal
     if (signal) {
@@ -114,6 +126,9 @@ export async function streamAnthropicChat(
     // Surface cache hit/miss numbers in dev tools so we can see
     // whether the authoring contract is paying off.
     logCacheHit(finalMessage.usage as { cache_creation_input_tokens?: number; cache_read_input_tokens?: number });
+    // The SDK accumulates message_start.usage and message_delta.usage into this.
+    const tokenUsage = anthropicUsage(finalMessage.usage);
+    if (tokenUsage) options.onTokenUsage?.(tokenUsage);
 
     const stopReason = finalMessage.stop_reason;
     onFinishReason?.(stopReason === 'end_turn' ? 'stop' : stopReason);
@@ -121,16 +136,7 @@ export async function streamAnthropicChat(
   } catch (err) {
     if (signal?.aborted) return;
 
-    if (err instanceof Anthropic.APIError) {
-      const msg = err.status === 401
-        ? 'Invalid Anthropic API key. Check your key in Settings.'
-        : err.status === 429
-          ? 'Anthropic rate limit reached. Please wait and try again.'
-          : `Anthropic error (${err.status}): ${err.message}`;
-      onError(new Error(msg));
-    } else {
-      onError(err instanceof Error ? err : new Error(String(err)));
-    }
+    onError(new Error(anthropicErrorMessage(err, credentials.workspaceId)));
   }
 }
 
@@ -145,6 +151,13 @@ export async function streamOpenAiChat(
   apiKey: string,
   options: Omit<StreamOptions, 'proxyUrl' | 'authToken' | 'onUsageInfo'>,
 ): Promise<void> {
+  try {
+    options = { ...options, maxOutputTokens: outputTokenLimit(options.maxOutputTokens, OPENAI_OUTPUT_TOKEN_CEILING) };
+  } catch (error) {
+    options.onError(error instanceof Error ? error : new Error(String(error)));
+    return;
+  }
+  if (options.signal?.aborted) return;
   const modelDef = getModelById(options.model);
   if (modelDef?.openaiApi === 'responses') {
     return streamOpenAiResponses(apiKey, options);
@@ -152,7 +165,7 @@ export async function streamOpenAiChat(
   return streamOpenAiChatCompletions(apiKey, options);
 }
 
-/** Standard Chat Completions API (GPT-5.4, GPT-5.4 Mini, etc.) */
+/** Standard Chat Completions API; the Responses variant is handled above. */
 async function streamOpenAiChatCompletions(
   apiKey: string,
   options: Omit<StreamOptions, 'proxyUrl' | 'authToken' | 'onUsageInfo'>,
@@ -163,11 +176,10 @@ async function streamOpenAiChatCompletions(
     ? [{ role: 'system', content: system }, ...messages]
     : [...messages];
 
-  // GPT-5 reasoning models (gpt-5.5, gpt-5.5-pro) only accept the default
-  // temperature; sending any other value returns 400. Mirror the Anthropic
-  // path: when the model is flagged `acceptsSamplingParams: false`, omit.
-  const modelDef = getModelById(model);
-  const sendSamplingParams = modelDef?.acceptsSamplingParams !== false;
+  // Mirror the Anthropic path.
+  const sendSamplingParams = sendsSamplingParams(model);
+
+  options.onOutputFormat?.(options.outputSchema ? 'json-schema' : 'text');
 
   const { response, cleanup } = await openAiFetch(
     'https://api.openai.com/v1/chat/completions',
@@ -176,11 +188,15 @@ async function streamOpenAiChatCompletions(
       messages: allMessages.map((m) => ({ role: m.role, content: m.content })),
       stream: true,
       ...(sendSamplingParams ? { temperature: 0.3 } : {}),
-      max_completion_tokens: 8192,
+      max_completion_tokens: options.maxOutputTokens,
+      ...(options.outputSchema ? { response_format: { type: 'json_schema', json_schema: { ...options.outputSchema, strict: true } } } : {}),
+      // Without this OpenAI streams no usage at all; with it the last chunk carries it.
+      stream_options: { include_usage: true },
     },
     apiKey,
     signal,
     onError,
+    options.useParentDeadline,
   );
   if (!response) return;
 
@@ -193,6 +209,8 @@ async function streamOpenAiChatCompletions(
     const parsed = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>;
     };
+    const tokenUsage = chatCompletionsUsage(parsed);
+    if (tokenUsage) options.onTokenUsage?.(tokenUsage);
     const content = parsed.choices?.[0]?.delta?.content;
     if (content) { fullText += content; onChunk(content); }
     const fr = parsed.choices?.[0]?.finish_reason;
@@ -219,17 +237,21 @@ async function streamOpenAiResponses(
     input.push({ role: m.role, content: m.content });
   }
 
+  options.onOutputFormat?.(options.outputSchema ? 'json-schema' : 'text');
+
   const { response, cleanup } = await openAiFetch(
     'https://api.openai.com/v1/responses',
     {
       model,
       input,
       stream: true,
-      max_output_tokens: 8192,
+      max_output_tokens: options.maxOutputTokens,
+      ...(options.outputSchema ? { text: { format: { type: 'json_schema', ...options.outputSchema, strict: true } } } : {}),
     },
     apiKey,
     signal,
     onError,
+    options.useParentDeadline,
   );
   if (!response) return;
 
@@ -242,6 +264,10 @@ async function streamOpenAiResponses(
   // the ChatPanel "Continue" UX can resume a truncated Codex reply. Other
   // explicit reasons (e.g. `content_filter`) pass through unchanged.
   let finishReason: string | null = 'stop';
+  const reportResponsesUsage = (event: unknown) => {
+    const tokenUsage = responsesUsage(event);
+    if (tokenUsage) options.onTokenUsage?.(tokenUsage);
+  };
 
   const ok = await readSseStream(response.body, signal, (data) => {
     const event = JSON.parse(data) as {
@@ -256,9 +282,11 @@ async function streamOpenAiResponses(
       fullText += event.delta;
       onChunk(event.delta);
     } else if (event.type === 'response.incomplete') {
+      reportResponsesUsage(event);
       const reason = event.response?.incomplete_details?.reason;
       finishReason = reason == null || reason === 'max_output_tokens' ? 'length' : reason;
     } else if (event.type === 'response.completed') {
+      reportResponsesUsage(event);
       finishReason = 'stop';
     }
   }, onError);
@@ -275,9 +303,10 @@ async function openAiFetch(
   apiKey: string,
   signal: AbortSignal | undefined,
   onError: (err: Error) => void,
+  useParentDeadline = false,
 ): Promise<{ response: Response | null; cleanup: () => void }> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(
+  const timeoutId = useParentDeadline ? undefined : setTimeout(
     () => controller.abort(new Error('Chat request timed out. Please try again.')),
     STREAM_REQUEST_TIMEOUT_MS,
   );
@@ -320,16 +349,41 @@ async function openAiFetch(
   if (!response.ok) {
     cleanup();
     let detail = `OpenAI error (${response.status})`;
+    let error: { code?: string; message?: string } | undefined;
     try {
-      const errBody = (await response.json()) as { error?: { message?: string } };
-      if (response.status === 401) {
-        detail = 'Invalid OpenAI API key. Check your key in the chat panel.';
-      } else if (response.status === 429) {
-        detail = 'OpenAI rate limit reached. Please wait and try again.';
-      } else if (errBody.error?.message) {
-        detail = `OpenAI: ${errBody.error.message}`;
+      const errBody = (await response.json()) as { error?: { code?: string; message?: string } };
+      error = errBody.error;
+    } catch (parseError) {
+      console.warn('Could not parse OpenAI error response:', parseError);
+    }
+    if (response.status === 401) {
+      detail = 'Invalid OpenAI API key. Check your key in the chat panel.';
+    } else if (response.status === 429) {
+      switch (error?.code) {
+        case 'credit_balance_exhausted':
+          detail = 'OpenAI API credits are exhausted. Check your organization billing.';
+          break;
+        case 'organization_spend_limit_exceeded':
+          detail = 'OpenAI organization spend limit reached. Check organization limits.';
+          break;
+        case 'project_spend_limit_exceeded':
+          detail = 'OpenAI project spend limit reached. Check project limits.';
+          break;
+        case 'organization_usage_limit_exceeded':
+          detail = 'OpenAI organization usage limit reached. Check organization limits.';
+          break;
+        case 'rate_limit_exceeded':
+        case 'slow_down':
+          detail = 'OpenAI rate limit reached. Please wait and try again.';
+          break;
+        default:
+          detail = error?.message
+            ? `OpenAI (429): ${error.message}`
+            : 'OpenAI rejected the request (429). Check API rate limits, billing, and project limits.';
       }
-    } catch { /* ignore parse failure */ }
+    } else if (error?.message) {
+      detail = `OpenAI: ${error.message}`;
+    }
     onError(new Error(detail));
     return { response: null, cleanup: () => {} };
   }

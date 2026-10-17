@@ -12,12 +12,14 @@
  * (non-embedded) mode renders nothing — zero upstream impact.
  */
 
+import { lazy, Suspense } from 'react';
 import { create } from 'zustand';
 import { Database, FileBox } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useViewerStore } from '@/store';
 import { useAimPanelStore } from './aimPanelStore';
-import { AimCard } from './AimCard';
+// Lazy: the card only renders under the AIM tab inside the AIM host.
+const AimCard = lazy(() => import('./AimCard').then((m) => ({ default: m.AimCard })));
 
 type InspectorTab = 'aim' | 'ifc';
 
@@ -77,7 +79,7 @@ export function AimInspectorTabs() {
       </Tabs>
       {tab === 'aim' && (
         <div className={isMobile ? '' : 'flex-1 min-h-0 overflow-y-auto'}>
-          <AimCard />
+          <Suspense fallback={null}><AimCard /></Suspense>
         </div>
       )}
     </>

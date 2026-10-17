@@ -9,7 +9,7 @@ re-runnable differential against a pinned reference engine.
 ## Layout
 
 - `canonical.py` - every stat both sides report (bbox, tri/vertex counts,
-  signed volume, watertightness), computed from plain vertex/face arrays so
+signed volume, watertightness), computed from plain vertex/face arrays so
   the comparison measures geometry, never stat-computation differences.
   Known-answer unit tests in `test_harness.py` (stdlib unittest), including
   an `EndToEndFaultInjection` suite that perturbs an in-memory copy of a
@@ -39,6 +39,23 @@ advisory). Triangle/vertex counts never gate: the engines legitimately
 triangulate identical solids at different densities (duplex wall #5448 is
 92 vs 308 triangles with identical bbox and volumes agreeing to 0.001%).
 
+Signed volume uses one local bounds centre and compensated summation to avoid
+world-origin cancellation at survey coordinates (#6533). A physical volume is
+reported only for a closed mesh whose shared edges are traversed in opposite
+directions. The `closed` flag retains its undirected edge-pairing meaning;
+inconsistent winding yields `volume: null` and a `volume-unverifiable` advisory.
+Global winding reversal preserves absolute volume. Open meshes still have no
+volume evidence, and the bbox and 1% usable-volume gates are unchanged.
+
+The [survey-volume evidence](evidence/survey-volume-6533.json) records the actual
+Revit `rvt01.ifc` host #10191 replay using pinned IfcOpenShell 0.8.5, fixture and
+geometry hashes, four quick-lane fixture checks, and independent negative
+controls. The existing unittest entry point runs all new known-answer tests.
+The two swept-disk references were regenerated with that engine: only their
+volume eligibility and engine provenance changed. Their inconsistently wound
+end caps are not a physical-volume oracle; no arbitrary recentered volume was
+accepted. The full downloaded reference corpus was not regenerated here.
+
 ## Running locally
 
 ```bash
@@ -51,6 +68,29 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.lock
 .venv/bin/python dump_ifclite.py <model.ifc> --out-dir /tmp/lite
 .venv/bin/python compare.py --reference reference/<model>.reference.json \
     --ifclite /tmp/lite/<model>.ifclite.json --allowlist allowlist.json
+```
+
+To replay #6533 after fetching `tests/models/various/rvt01.ifc` with `pnpm fixtures`,
+run from this directory with the pinned engine installed:
+
+```python
+import hashlib
+from pathlib import Path
+import ifcopenshell, ifcopenshell.geom
+import canonical
+
+path = Path("../../tests/models/various/rvt01.ifc")
+assert hashlib.sha256(path.read_bytes()).hexdigest() == "a83e9aacb43c7f82955ee3ba650ec66dc24af552924ec058e1b0c49a76180ee6"
+model = ifcopenshell.open(str(path))
+host = model.by_id(10191)
+for disable_openings in (False, True):
+    settings = ifcopenshell.geom.settings()
+    settings.set(settings.USE_WORLD_COORDS, True)
+    settings.set(settings.WELD_VERTICES, True)
+    settings.set(settings.DISABLE_OPENING_SUBTRACTIONS, disable_openings)
+    shape = ifcopenshell.geom.create_shape(settings, host)
+    vertices, faces = list(shape.geometry.verts), list(shape.geometry.faces)
+    print(disable_openings, canonical.element_record(host.id(), host.is_a(), vertices, faces))
 ```
 
 Regenerating the committed reference (pin bump or intentional acceptance):
@@ -70,3 +110,38 @@ Both lanes live in the `IfcOpenShell parity` workflow
 - Nightly (`full` job): installs the pinned engine, runs the
   full committed corpus (fetched fixtures included), regenerates reference
   dumps to detect reference-staleness, and uploads the diff reports.
+
+## Rejecting invalid Boolean references (#7723)
+
+Fresh geometry exports run in a private worker that parses each model once.
+The worker owns IfcOpenShell's process-global detailed JSON logger and retains
+native stdout/stderr per conversion. It copies each shape's children while
+the owning shape is alive. A terminal Boolean retry failure or explicit
+invalid-operand fallback refuses the reference, even when the engine returns
+a nonempty mesh. A transient failed retry or a valid disjoint Boolean no-op
+alone does not refuse it. Other engine errors and incomplete JSON diagnostics
+remain unresolved. No geometry settings or comparison tolerances change.
+
+Use a fresh output directory. Each model gets a `.reference-diagnostics/`
+sidecar directory containing raw logs, copied arrays and a hash-bound receipt.
+The companion `.reference-validation.json` binds the canonical file and the
+completed diagnostic receipt without changing canonical geometry-stat bytes.
+A conversion has a 120-second deadline and a 32 MiB diagnostic bound; the
+parent retires and reaps only its own worker on failure. `dump_reference.py`
+returns **2** and does not publish that model's canonical reference after an
+invalid or unresolved conversion. Ordinary shape-conversion exceptions retain
+the existing explicit skip records. The uncached reporter surface CLI uses
+the same check and writes `passed: false`, `planes: []` and an explicit
+reference status before returning 2. Cached historical references are not
+retroactively certified by this check.
+
+Arrays returned by a session are provisional: publish them only after its
+context exits successfully. After the worker exits, the final admission
+barrier checks every complete conversion, initialization and stderr log;
+late native output cannot escape validation. Sidecar call hashes describe
+these final retained bytes, with initial observed hashes kept separately.
+
+The absence of terminal engine diagnostics is necessary, not sufficient, for
+a trustworthy reference. The tool does not prove IFC intent or Boolean success
+from mesh counts, reference/base equality, or silence. The captured failure
+and positive control are documented in [evidence/7723](evidence/7723/README.md).

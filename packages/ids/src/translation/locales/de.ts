@@ -45,6 +45,8 @@ export const de = {
     IfcRelFillsElement: 'ausfüllend',
     'IfcRelVoidsElement IfcRelFillsElement': 'über eine Öffnung verbunden mit',
   },
+  /** A partOf without a relation: any partOf relation, followed recursively (#7401). */
+  anyRelation: 'Teil von',
 
   // ============================================================================
   // Constraint Descriptions
@@ -52,6 +54,7 @@ export const de = {
   constraints: {
     simpleValue: '"{value}"',
     pattern: 'entsprechend Muster "{pattern}"',
+    conjunction: '{first} und {second}',
     enumeration: {
       single: '"{value}"',
       multiple: 'eines von [{values}]',
@@ -173,6 +176,7 @@ export const de = {
     propertyValueMismatch: 'Eigenschaft "{pset}.{property}" ist "{actual}", erwartet {expected}',
     propertyPatternMismatch: 'Eigenschaft "{pset}.{property}" Wert "{actual}" entspricht nicht {expected}',
     propertyDatatypeMismatch: 'Eigenschaft "{pset}.{property}" Datentyp ist "{actual}", erwartet {expected}',
+    propertyDatatypeUnknown: 'Eigenschaft "{pset}.{property}" hat keinen bekannten Datentyp und kann daher nicht gegen {expected} geprüft werden',
     propertyOutOfBounds: 'Eigenschaft "{pset}.{property}" Wert {actual} liegt außerhalb des Bereichs {expected}',
     propertyProhibited: 'Verbotene Eigenschaft "{pset}.{property}" existiert mit Wert "{actual}"',
 
@@ -183,9 +187,12 @@ export const de = {
     classificationValueMismatch: 'Klassifizierungscode "{actual}" entspricht nicht dem erwarteten {expected}',
     classificationValueMissingAvailable: 'Klassifizierungscode {expected} nicht gefunden. Verfügbar: {available}',
     classificationProhibited: 'Verbotene Klassifizierung "{actual}" existiert im System "{system}"',
+    classificationUnresolved: 'Entität ist klassifiziert, aber die Klassifizierungsdetails können aus dieser Datenquelle nicht gelesen werden',
+    classificationPresenceUnresolved: 'Ob diese Entität klassifiziert ist, kann aus dieser Datenquelle nicht bestimmt werden',
 
     // Material failures
     materialMissing: 'Kein Material zugewiesen',
+    materialUnresolved: 'Entität hat ein Material, aber dessen Details können aus dieser Datenquelle nicht gelesen werden',
     materialValueMismatch: 'Material "{actual}" entspricht nicht dem erwarteten {expected}',
     materialValueMissingAvailable: 'Material {expected} nicht gefunden. Verfügbar: {available}',
     materialProhibited: 'Verbotenes Material "{actual}" ist zugewiesen',

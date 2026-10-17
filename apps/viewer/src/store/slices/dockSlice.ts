@@ -16,7 +16,7 @@
  */
 
 import type { StateCreator } from 'zustand';
-import type { WorkspacePanelId } from '@/lib/panels/registry';
+import { migratePanelId, type WorkspacePanelId } from '@/lib/panels/registry';
 
 /** Where a floating panel is anchored. `free` uses {@link FloatingPanelState.x/y}. */
 export type SnapZone = 'free' | 'left' | 'right' | 'bottom';
@@ -44,14 +44,19 @@ function defaultRect(index: number): { x: number; y: number; w: number; h: numbe
   return { x: 80 + offset, y: 96 + offset, w: 360, h: 460 };
 }
 
+/** Floating entries for a panel this build does not know (a newer build's or
+ *  an extension's), retained on saves by this preservation-aware build (#6927). */
+let preservedFloating: Array<Omit<FloatingPanelState, 'id'> & { id: string }> = [];
+
 function loadPersisted(): FloatingPanelState[] {
+  preservedFloating = [];
   if (typeof window === 'undefined') return [];
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
+    const valid = parsed.filter(
       (p): p is FloatingPanelState =>
         !!p && typeof p === 'object'
         && typeof p.id === 'string'
@@ -59,6 +64,17 @@ function loadPersisted(): FloatingPanelState[] {
         && Number.isFinite(p.x) && Number.isFinite(p.y)
         && Number.isFinite(p.w) && Number.isFinite(p.h),
     );
+    // A retired panel id (e.g. pre-#5138 'ids') migrates to its replacement
+    // rather than floating a panel the registry no longer knows how to render.
+    // An id that is neither current nor a known legacy alias is not shown but
+    // stays in storage (#6927).
+    const out: FloatingPanelState[] = [];
+    for (const p of valid) {
+      const id = migratePanelId(p.id);
+      if (id === undefined) preservedFloating.push(p);
+      else if (!out.some((q) => q.id === id)) out.push(id === p.id ? p : { ...p, id });
+    }
+    return out;
   } catch (error) {
     console.warn('[dock] ignoring malformed persisted panel layout:', error);
     return [];
@@ -80,7 +96,7 @@ function persist(panels: FloatingPanelState[]): void {
   cancelPendingPersist();
   if (typeof window === 'undefined') return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(panels));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify([...panels, ...preservedFloating]));
   } catch (error) {
     // Quota / private mode — the layout just won't persist this session.
     console.warn('[dock] failed to persist panel layout:', error);
@@ -116,6 +132,13 @@ export interface DockSlice {
   bringFloatingPanelToFront: (id: WorkspacePanelId) => void;
   /** Drop every floating panel back to the docked layout. */
   resetDockLayout: () => void;
+  /**
+   * Bumped by the one "Reset layout" (`store/layoutReset.ts`). Layout that is
+   * held in components rather than the store (the bottom strip's height, the
+   * hierarchy pane's width) resets itself when this changes.
+   */
+  layoutResetEpoch: number;
+  bumpLayoutResetEpoch: () => void;
 }
 
 export const createDockSlice: StateCreator<DockSlice, [], [], DockSlice> = (set, get) => ({
@@ -167,4 +190,7 @@ export const createDockSlice: StateCreator<DockSlice, [], [], DockSlice> = (set,
     persist([]);
     set({ floatingPanels: [] });
   },
+
+  layoutResetEpoch: 0,
+  bumpLayoutResetEpoch: () => set({ layoutResetEpoch: get().layoutResetEpoch + 1 }),
 });

@@ -31,11 +31,12 @@ import {
 } from '@ifc-lite/drawing-underlay';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
-import { useCameraTickSubscription } from '@/hooks/useCameraTickSubscription';
+import { useCameraTickSubscription } from '@/aim/useCameraTickSubscription';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 import { IdentifierLinkLayer } from './IdentifierLinkLayer';
+import { capturePointer } from '@/lib/pointer-capture';
 
 /** Base raster (zoom 1) and the ceiling for zoomed re-rasters. */
 const PANE_RASTER_PX = 2000;
@@ -160,7 +161,7 @@ export function DrawingPlanPane() {
           setPageAspect(raster.width / raster.height);
           host.replaceChildren(canvas);
         } finally {
-          void doc.destroy();
+          void doc.loadingTask.destroy();
         }
       } catch (err) {
         console.error('drawing plan pane: rasterization failed', err);
@@ -297,7 +298,7 @@ export function DrawingPlanPane() {
         panX: pan.x,
         panY: pan.y,
       };
-      e.currentTarget.setPointerCapture(e.pointerId);
+      capturePointer(e.currentTarget, e.pointerId);
     },
     [drawing, pan, walkMode],
   );

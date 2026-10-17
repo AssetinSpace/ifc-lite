@@ -4,7 +4,7 @@
 
 /**
  * BCF tour: select a problem, raise a topic with an auto-attached snapshot,
- * capture a second viewpoint, and export the .bcfzip. Topics and viewpoints
+ * capture a second viewpoint, and export the .bcf. Topics and viewpoints
  * are the user's data - deliberately NO cleanup anywhere in this tour.
  * Target: about 3 minutes.
  */
@@ -15,8 +15,8 @@ import type { TourDefinition } from '../types';
 
 export const BCF_TOUR: TourDefinition = {
   id: 'bcf',
-  title: 'Raise issues with BCF',
-  description: 'Flag a problem, capture viewpoints, and export a .bcfzip your whole team can open.',
+  title: 'Raise topics with BCF',
+  description: 'Flag a problem, capture viewpoints, and export a .bcf your whole team can open.',
   minutes: 3,
   version: 1,
   panel: 'bcf',
@@ -27,15 +27,15 @@ export const BCF_TOUR: TourDefinition = {
       kind: 'action',
       anchor: activityAnchor('bcf'),
       placement: 'left',
-      title: 'Open BCF issues',
-      body: 'BCF is the open format for sharing issues between BIM tools. Open the BCF panel from the sidebar rail, or press Alt+3.',
+      title: 'Open BCF topics',
+      body: 'BCF is the open format for sharing topics between BIM tools. Open the BCF panel from the sidebar rail, or press Alt+3.',
       gate: { predicate: (s) => s.bcfPanelVisible },
     },
     {
       id: 'frame-problem',
       kind: 'canvas',
       title: 'Frame the problem',
-      body: 'Click an element to select it and orbit so the issue is in view. The viewpoint you capture next records this selection with the camera.',
+      body: 'Click an element to select it and orbit so the topic is in view. The viewpoint you capture next records this selection with the camera.',
       // A stale selection must not auto-advance the step (same guard as the
       // welcome tour's select step).
       prepare: (store) => {
@@ -50,7 +50,7 @@ export const BCF_TOUR: TourDefinition = {
       anchor: TOUR_ANCHORS.bcfNewTopic,
       panel: 'bcf',
       placement: 'left',
-      title: 'Create an issue',
+      title: 'Create a topic',
       body: 'Click +, give the topic a short title, and click Create Topic. A snapshot of your current view is attached automatically.',
       arm: (state, ctx) => {
         ctx.baseline.topics = state.bcfProject ? state.bcfProject.topics.size : 0;
@@ -94,9 +94,9 @@ export const BCF_TOUR: TourDefinition = {
       panel: 'bcf',
       placement: 'left',
       title: 'Export BCF',
-      body: 'Click the download icon in the header. The .bcfzip opens in Revit, Navisworks, Solibri, and other BCF tools; a returned one imports via the button next to it.',
+      body: 'Click the download icon in the header. The .bcf opens in Revit, Navisworks, Solibri, and other BCF tools; a returned one imports via the button next to it.',
       // The export funnels through downloadBlob -> the shared download choke
-      // point, which emits the file-downloaded event with the extension.
+      // point, which emits the file-downloaded event with the BCF archive kind.
       gate: { event: EVENT_FILE_DOWNLOADED, eventKind: 'bcfzip', hintAfterMs: 30_000 },
     },
   ],

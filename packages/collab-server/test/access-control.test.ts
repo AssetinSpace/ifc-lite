@@ -169,6 +169,26 @@ describe('mint rate limiting (per client IP)', () => {
       ),
     ).toBeNull();
   });
+
+  it('refuses an admin bearer for room A minting a link for already-claimed room B', async () => {
+    const ac = create({ secret: SECRET, dir: freshDir(), mintRateCapacity: 100 });
+    const authorize = authorizeOf(ac);
+    // Claim room A (mints its admin bearer) and room B independently.
+    expect(
+      await authorize({ roomId: 'm/room-a', role: 'editor' }, { bearerClaims: null, clientIp: '1.1.1.10' }),
+    ).toBe('admin');
+    expect(
+      await authorize({ roomId: 'm/room-b', role: 'editor' }, { bearerClaims: null, clientIp: '1.1.1.11' }),
+    ).toBe('admin');
+    // Room A's admin bearer must not be able to mint a link for room B — the
+    // admin bypass is scoped to the bearer's OWN room, not "any admin token".
+    expect(
+      await authorize(
+        { roomId: 'm/room-b', role: 'admin' },
+        { bearerClaims: adminClaims('m/room-a'), clientIp: '1.1.1.12' },
+      ),
+    ).toBeNull();
+  });
 });
 
 describe('claimedRooms cap', () => {
@@ -278,25 +298,29 @@ describe('state persistence (debounced, atomic, flushable)', () => {
     expect(fs.existsSync(path.join(dir, 'access-control.json'))).toBe(false);
   });
 
-  it('flush() rejects when the state cannot be written (unwritable dir)', async () => {
+  it('flush() rejects when the state cannot be written (temp path blocked, any user)', async () => {
     const dir = freshDir();
     const ac = create({ secret: SECRET, dir, persistDebounceMs: 1 });
     const authorize = authorizeOf(ac);
     expect(
       await authorize({ roomId: 'm/doomed', role: 'editor' }, { bearerClaims: null, clientIp: '6.6.6.6' }),
     ).toBe('admin');
-    fs.chmodSync(dir, 0o500); // read + traverse, no write
+    // A directory where the temp file goes makes the write fail for any user.
+    // A read-only chmod would not: root (a container, or a root-run CI
+    // runner) ignores mode bits, so the flush would succeed there.
+    const tmp = path.join(dir, 'access-control.json.tmp');
+    fs.mkdirSync(tmp);
     try {
       await expect(ac.flush()).rejects.toThrow(/could not be persisted/);
-      // Nothing landed and no torn temp file exists.
+      // Nothing landed.
       expect(fs.existsSync(path.join(dir, 'access-control.json'))).toBe(false);
-      // Once the volume is writable again a later flush succeeds and the
+      // Once the path is writable again a later flush succeeds and the
       // pending claim finally lands (state stayed dirty, not dropped).
-      fs.chmodSync(dir, 0o700);
+      fs.rmdirSync(tmp);
       await ac.flush();
       expect(readState(dir).claimedRooms).toContain('m/doomed');
     } finally {
-      fs.chmodSync(dir, 0o700);
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 });
@@ -385,11 +409,14 @@ describe('revocation retention', () => {
       ),
     ).toBeNull();
     // Re-persisting upgrades to the jti -> exp shape with a fallback horizon.
-    await ac.serverOptions.revokeEndpoint!.recordRevocation('new-jti', 'm/old', adminClaims('m/old').exp);
+    // Capture claims once: two independent adminClaims() calls each recompute
+    // Date.now() and can straddle a wall-clock second boundary (#2094).
+    const claims = adminClaims('m/old');
+    await ac.serverOptions.revokeEndpoint!.recordRevocation('new-jti', 'm/old', claims.exp);
     await ac.flush();
     const state = readState(dir);
     expect(typeof state.revoked!['legacy-jti']).toBe('number');
-    expect(state.revoked!['new-jti']).toBe(adminClaims('m/old').exp);
+    expect(state.revoked!['new-jti']).toBe(claims.exp);
   });
 
   it('prunes revocations once their tokens have expired on their own', async () => {

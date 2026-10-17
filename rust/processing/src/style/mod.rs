@@ -30,6 +30,8 @@
 
 use ifc_lite_core::IfcType;
 
+pub(crate) mod fill;
+mod finish_join;
 mod indexed_colour;
 mod material;
 mod surface;
@@ -39,14 +41,18 @@ mod surface;
 // path can restore the per-triangle palette split it lost in the #874 mesh-pipeline
 // unification (issue #858) — keeping one shared splitter rather than a wasm copy.
 pub use indexed_colour::{
-    resolve_indexed_colour_map_full, split_mesh_by_indexed_colour, FullIndexedColourMap,
+    indexed_colour_split_guard_ids, resolve_indexed_colour_map_full, split_mesh_by_indexed_colour,
+    FullIndexedColourMap,
 };
 pub use material::{
-    build_element_material_colors, build_material_style_index, flatten_material_color_index,
-    pick_material_style_for_submesh, pick_opaque_first, resolve_material_ids,
+    build_element_material_colors, build_material_style_index, element_material_fallback_color,
+    flatten_material_color_index, pick_material_style_for_submesh, pick_opaque_first,
+    resolve_material_ids,
     resolve_submesh_color,
 };
-pub use surface::extract_surface_style_colors;
+pub use surface::{extract_surface_style_colors, extract_surface_style_specular, SpecularMaterial};
+// #5984: the finish of an already produced mesh, from the style its colour came from.
+pub use finish_join::{MeshFinishJoin, ModelFinishes};
 
 /// Alpha at or above which a color is treated as opaque.
 ///
@@ -127,8 +133,9 @@ impl Rgba {
     /// Quantize to 8-bit RGBA for the browser SAB transport.
     ///
     /// Components are clamped to `0.0..=1.0` then rounded to nearest 1/255.
-    /// This is the *only* sanctioned quantization point (plan §8.3); the
-    /// backend never calls it.
+    /// This is the *only* sanctioned 8-bit quantization point (plan §8.3). The
+    /// geometry backend never calls it; byte-oriented writers (the server's
+    /// Parquet material key) call it rather than re-implementing the clamp.
     pub fn to_rgba8(self) -> [u8; 4] {
         let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
         [q(self.0[0]), q(self.0[1]), q(self.0[2]), q(self.0[3])]
@@ -220,6 +227,24 @@ pub fn default_color_for_type(ifc_type: IfcType) -> Rgba {
         // Default — neutral gray
         _ => Rgba::new(0.8, 0.8, 0.8, 1.0),
     }
+}
+
+/// The colour a class ALWAYS renders with, overriding any authored styling, or
+/// `None` for the ordinary style precedence.
+///
+/// Only `IfcOpeningElement` (and its subtypes such as `IfcOpeningStandardCase`)
+/// is fixed. An opening is a virtual subtraction volume, not a surface anyone
+/// sees in the built object, so an authored style on it says nothing about
+/// appearance: Revit, for one, writes its neutral grey onto opening geometry
+/// through `IfcIndexedColourMap` / `IfcStyledItem`. Honouring that drew the
+/// opening as an opaque solid plugging the very hole it cuts, next to other
+/// openings in the translucent overlay, and an opaque shape then also qualified
+/// for GPU instancing (#5409). One overlay colour for every opening is the
+/// display contract.
+pub fn fixed_display_color_for_type(ifc_type: &IfcType) -> Option<Rgba> {
+    ifc_type
+        .is_subtype_of(IfcType::IfcOpeningElement)
+        .then(|| default_color_for_type(IfcType::IfcOpeningElement))
 }
 
 #[cfg(test)]

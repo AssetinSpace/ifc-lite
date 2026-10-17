@@ -31,14 +31,13 @@ import {
   updateBoundsFromPositions,
   calculateMeshBounds,
   MAX_VALID_COORD,
-  createCoordinateInfo,
   getServerStreamIntervalMs,
 } from '../utils/localParsingUtils.js';
 
 // Server data model conversion
 import { convertServerDataModel, type ServerParseResult } from '../utils/serverDataModel.js';
 import { convertServerMesh } from '../utils/serverMesh.js';
-import { buildSpatialIndexGuarded } from '../utils/loadingUtils.js';
+import { serverOriginShift } from '../utils/serverOriginShift.js';
 
 /** Server parse result type - union of streaming and non-streaming responses */
 type ServerParseResultType = ParquetParseResponse | ParquetStreamResult | ParseResponse;
@@ -116,7 +115,13 @@ export function useIfcServer() {
   const loadFromServer = useCallback(async (
     file: File,
     buffer: ArrayBuffer,
-    /** Optional staleness check — returns true if this load has been superseded. */
+    /**
+     * Optional staleness check — returns true if this load has been
+     * superseded. Same contract as `loadFromCache`'s (useIfcCache.ts:194):
+     * re-checked before every write into the active model slot, including
+     * inside the streaming batch callback below — a stale batch (or a stale
+     * post-stream/post-parse result) writes nothing.
+     */
     isStale?: () => boolean,
   ): Promise<boolean> => {
     const { setProgress, setIfcDataStore, setGeometryResult } = useViewerStore.getState();
@@ -136,6 +141,12 @@ export function useIfcServer() {
 
       // Check if Parquet is supported (requires parquet-wasm)
       const parquetSupported = await client.isParquetSupported();
+
+      // A newer load (or model removal) may have superseded this one while
+      // the capability check above was in flight — same reasoning as every
+      // other post-await re-check in this function: an `await` is a window
+      // for `isStale` to flip, not just the streaming/parse calls below.
+      if (isStale?.()) return false;
 
       let allMeshes: MeshData[];
       let result: ServerParseResultType;
@@ -167,6 +178,14 @@ export function useIfcServer() {
 
         // Use streaming endpoint with batch callback
         const streamResult = await client.parseParquetStream(file, (batch: ParquetBatch) => {
+          // Re-check on every batch: `onBatch` fires once per batch of ONE
+          // long-running awaited stream, so a newer load can own the active
+          // slot by the time any batch after the first arrives. Same
+          // contract, same reason, as useIfcCache.ts's per-chunk guard in its
+          // streaming loop — without it a superseded load's later batches
+          // keep painting into the model the user just opened.
+          if (isStale?.()) return;
+
           batchCount++;
 
           // Convert batch meshes to viewer format (snake_case to camelCase, number[] to TypedArray)
@@ -222,6 +241,13 @@ export function useIfcServer() {
           }
         });
 
+        // Re-check after the stream's single big await resolves: supersession
+        // can land at any point during it, including after the LAST batch's
+        // onBatch call returns. Without this the "final geometry set with
+        // complete bounds" write below still lands in the active slot for a
+        // load nobody owns any more.
+        if (isStale?.()) return false;
+
         cacheKey = streamResult.cache_key;
         streamMetadata = streamResult.metadata;
         streamStats = streamResult.stats;
@@ -237,9 +263,8 @@ export function useIfcServer() {
         // Final geometry set with complete bounds
         // Server already applies RTC shift to mesh positions, so bounds are shifted
         // Reconstruct originalBounds by adding originShift back to shifted bounds
-        const originShift = streamMetadata?.coordinate_info?.origin_shift
-          ? { x: streamMetadata.coordinate_info.origin_shift[0], y: streamMetadata.coordinate_info.origin_shift[1], z: streamMetadata.coordinate_info.origin_shift[2] }
-          : { x: 0, y: 0, z: 0 };
+        // (Y-up like the meshes: the server leaves the shift in IFC Z-up.)
+        const originShift = serverOriginShift(streamMetadata?.coordinate_info?.origin_shift);
         const finalCoordinateInfo = {
           originShift,
           // Original bounds = shifted bounds + originShift (reconstruct world coordinates)
@@ -272,6 +297,10 @@ export function useIfcServer() {
         // NON-STREAMING PATH - for smaller files, use batch request (with cache check)
         // Use Parquet endpoint - much smaller payload (~15x compression)
         const parquetResult = await client.parseParquet(file);
+        // Re-check right after this await, before the first write below —
+        // same reason as the streaming re-check above: a non-streaming parse
+        // is still one awaited network round trip a newer load can outrun.
+        if (isStale?.()) return false;
         result = parquetResult;
 
         setProgress({ phase: 'Converting meshes', percent: 70 });
@@ -281,6 +310,7 @@ export function useIfcServer() {
       } else {
         // Fallback to JSON endpoint
         result = await client.parse(file);
+        if (isStale?.()) return false;
 
         setProgress({ phase: 'Converting meshes', percent: 70 });
 
@@ -304,9 +334,8 @@ export function useIfcServer() {
         // - shiftedBounds = bounds (already shifted by server)
         // - originalBounds = bounds + originShift (reconstruct original world coordinates)
         const serverCoordInfo = result.metadata.coordinate_info;
-        const originShift = serverCoordInfo?.origin_shift
-          ? { x: serverCoordInfo.origin_shift[0], y: serverCoordInfo.origin_shift[1], z: serverCoordInfo.origin_shift[2] }
-          : { x: 0, y: 0, z: 0 };
+        // (Y-up like the meshes: the server leaves the shift in IFC Z-up.)
+        const originShift = serverOriginShift(serverCoordInfo?.origin_shift);
 
         // When server already shifted meshes, shiftedBounds IS the calculated bounds
         // (don't use createCoordinateInfo which would subtract originShift again)
@@ -381,7 +410,6 @@ export function useIfcServer() {
           if (isStale?.()) return;
           setIfcDataStore(dataStore);
 
-          buildSpatialIndexGuarded(allMeshes, dataStore, setIfcDataStore);
         } catch (err) {
           if (!isStale?.()) {
             console.warn('[useIfc] Server data model fetch/decode failed; geometry shown without properties:', err);

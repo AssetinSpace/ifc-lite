@@ -2,33 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Websocket sync server entry point.
- */
+/** Websocket sync server entry point. */
 
 import * as http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { WebSocketServer, type WebSocket } from 'ws';
-import { RoomManager, type PeerConnection } from './room-manager.js';
-import { FilePersistence, MemoryPersistence, type Persistence } from './persistence.js';
-import { allowAnonymousEditor, canWrite, type AuthenticateFn, type Principal } from './auth.js';
+import { WebSocketServer } from 'ws';
+import { RoomManager, type VerifyMessageFn } from './room-manager.js';
+import { handleConnection } from './connection.js';
+import { startExpirySweep } from './principal-expiry.js';
+import { MemoryPersistence, type Persistence } from './persistence.js';
+import { allowAnonymousEditor, type AuthenticateFn, type Principal } from './auth.js';
 import { type AuditSink } from './audit-log.js';
 import { type RateLimitOptions } from './rate-limit.js';
-import { type VerifyMessageFn } from './room-manager.js';
-import {
-  handleBlobRequest,
-  InMemoryBlobStorage,
-  type BlobAuthorizeFn,
-  type ServerBlobStorage,
-} from './blob-route.js';
-import {
-  handleTokenMintRequest,
-  handleRevokeRequest,
-  handleKickRequest,
-  type TokenEndpointOptions,
-  type RevokeEndpointOptions,
-  type KickEndpointOptions,
-} from './room-token.js';
+import { handleBlobRequest, type BlobAuthorizeFn } from './blob-route.js';
+import { InMemoryBlobStorage, type ServerBlobStorage } from './blob-storage.js';
+import { handleTokenMintRequest, type TokenEndpointOptions } from './room-token.js';
+import { handleKickRequest, handleReleaseRequest, handleRevokeRequest } from './room-admin-routes.js';
+import type { KickEndpointOptions, ReleaseEndpointOptions, RevokeEndpointOptions } from './room-admin-routes.js';
 import { MemoryLayerRegistry, type LayerRegistryStore } from './layer-registry.js';
 import type { RegistryWebhook } from './registry-webhooks.js';
 import {
@@ -36,6 +26,8 @@ import {
   type RegistryAuthorizeFn,
 } from './layer-registry-route.js';
 import { defaultMetrics, MetricsRegistry } from './metrics.js';
+import { parseRequestUrl } from './request-target.js';
+import { makeBlobAuthorizer, makeRegistryAuthorizer } from './http-authorizers.js';
 
 /**
  * Cross-origin policy for the HTTP routes (`/blobs`, `/collab/*`, `/healthz`,
@@ -100,6 +92,12 @@ function applyCors(
 
 export interface StartCollabServerOptions {
   port?: number;
+  /**
+   * Application-level keepalive period in ms (default 15s). Exposed so tests
+   * can observe the keepalive without waiting on the real cadence; production
+   * callers should leave it alone. See `Room.sendKeepalive`.
+   */
+  keepaliveIntervalMs?: number;
   host?: string;
   persistence?: Persistence;
   authenticate?: AuthenticateFn;
@@ -175,6 +173,8 @@ export interface StartCollabServerOptions {
    * only the verifying `secret` is supplied here. Omit to disable (404).
    */
   kickEndpoint?: Pick<KickEndpointOptions, 'secret' | 'isRevoked'>;
+  /** Enable `POST /collab/release` (hand back an unused fresh-room claim). Omit to disable (404). */
+  releaseEndpoint?: ReleaseEndpointOptions;
   /**
    * Cross-origin access for the HTTP routes. Default: enabled with origin
    * reflection (permissive). Pass an allow-list to restrict, or `false` to
@@ -204,7 +204,59 @@ export interface CollabServerHandle {
   stop(): Promise<void>;
 }
 
-const PING_INTERVAL_MS = 30_000;
+/**
+ * Application-level keepalive period. Must stay comfortably under
+ * y-websocket's hardcoded 30s `messageReconnectTimeout`; 15s matches the
+ * awareness renewal cadence the client's watchdog was written around.
+ * See `Room.sendKeepalive`.
+ */
+const KEEPALIVE_INTERVAL_MS = 15_000;
+
+/**
+ * The watchdog this keepalive exists to feed. y-websocket closes a connection
+ * after this long with no inbound message, and it is a module-level const there
+ * with no per-provider override, so we cannot widen it.
+ */
+const CLIENT_RECONNECT_TIMEOUT_MS = 30_000;
+
+/**
+ * Largest keepalive period that can actually keep a connection alive.
+ *
+ * Merely being under {@link CLIENT_RECONNECT_TIMEOUT_MS} is not enough. A
+ * period of 29_999ms against a 30_000ms watchdog leaves 1ms for timer
+ * scheduling, serialisation and network transit, so the frame routinely lands
+ * after the deadline and the client disconnects anyway. The margin below has
+ * to cover a slow hop and an event loop that is busy, or the keepalive is
+ * configured and still useless.
+ */
+const MAX_KEEPALIVE_INTERVAL_MS = 25_000;
+
+/**
+ * Validate a configured keepalive period, rejecting values that would silently
+ * defeat it in EITHER direction.
+ *
+ * Too small is the classic footgun: `setInterval` coerces 0, negative and
+ * non-finite delays to about 1ms, so a typo turns the keepalive into a flood.
+ * Too large is the subtler one and is specific to this feature: a period that
+ * does not clear the client's watchdog with margin leaves the server looking
+ * correctly configured while the disconnect loop it exists to prevent comes
+ * back. Both fail loudly instead.
+ */
+function resolveKeepaliveMs(configured: number | undefined): number {
+  if (configured === undefined) return KEEPALIVE_INTERVAL_MS;
+  if (
+    !Number.isFinite(configured) ||
+    configured <= 0 ||
+    configured > MAX_KEEPALIVE_INTERVAL_MS
+  ) {
+    throw new Error(
+      `[collab-server] keepaliveIntervalMs must be a finite number in (0, ${MAX_KEEPALIVE_INTERVAL_MS}]; ` +
+        `got ${configured}. The client closes after ${CLIENT_RECONNECT_TIMEOUT_MS}ms of silence, ` +
+        'so the period must clear that with margin for transit and scheduling.',
+    );
+  }
+  return configured;
+}
 
 export async function startCollabServer(
   opts: StartCollabServerOptions = {},
@@ -220,6 +272,7 @@ export async function startCollabServer(
     idleUnloadMs: opts.idleUnloadMs,
     verifyMessage: opts.verifyMessage,
   });
+  const expirySweep = startExpirySweep(roomManager); // #3441; see principal-expiry.ts
 
   const blobStorage = opts.blobStorage ?? new InMemoryBlobStorage();
   // Default the blob authorizer to one that reuses the WS `authenticate`
@@ -240,6 +293,10 @@ export async function startCollabServer(
     : opts.authorizeRegistry === null
       ? undefined
       : opts.authorizeRegistry ?? makeRegistryAuthorizer(authenticate);
+  // Validate at STARTUP, not per connection: a throw inside the connection
+  // handler is swallowed by its own .catch, so a misconfigured server would
+  // come up healthy and only misbehave once someone connected.
+  const keepaliveIntervalMs = resolveKeepaliveMs(opts.keepaliveIntervalMs);
   const metricsToken = opts.metricsToken ?? process.env.COLLAB_METRICS_TOKEN;
   const metrics = opts.metrics ?? defaultMetrics;
   const peersGauge = metrics.gauge(
@@ -260,7 +317,8 @@ export async function startCollabServer(
     opts.server ??
     http.createServer(async (req, res) => {
       try {
-        const reqUrl = new URL(req.url ?? '/', 'http://localhost');
+        const reqUrl = parseRequestUrl(req.url);
+        if (!reqUrl) { res.writeHead(400).end(); return; } // unparseable target: this client's error
         const pathname = reqUrl.pathname;
         applyCors(req, res, opts.cors);
         // Preflight: answer OPTIONS before any route so cross-origin PUT/HEAD/
@@ -294,10 +352,10 @@ export async function startCollabServer(
             res.end(JSON.stringify({ error: 'unauthorized' }));
             return;
           }
-          // Refresh derived gauges before rendering so the snapshot
-          // reflects live state, not state-at-last-event.
           const stats = await roomManager.stats();
           roomsGauge.set(stats.length);
+          // Reset first — keyed by peer-chosen roomId, an unloaded room would otherwise report a stale peer count forever.
+          peersGauge.reset();
           for (const s of stats) peersGauge.set(s.peerCount, { room: s.roomId });
           res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
           res.end(metrics.render());
@@ -331,6 +389,9 @@ export async function startCollabServer(
             },
           });
           if (handled) return;
+        }
+        if (opts.releaseEndpoint && pathname === '/collab/release') {
+          if (await handleReleaseRequest(req, res, opts.releaseEndpoint)) return;
         }
         // Blob route: PUT / GET / HEAD / DELETE on /blobs/<hash>, GET /blobs.
         if (pathname.startsWith('/blobs')) {
@@ -390,7 +451,12 @@ export async function startCollabServer(
       // surfacing as a process-level unhandledRejection. Catch the error,
       // log it, and close the socket with a non-1000 code so the client
       // sees a deterministic shutdown.
-      handleConnection(ws, req, { roomManager, authenticate }).catch((err) => {
+      handleConnection(ws, req, {
+        roomManager,
+        authenticate,
+        keepaliveIntervalMs,
+        reject: (reason) => rejectsCounter.inc(1, { reason }),
+      }).catch((err) => {
         // eslint-disable-next-line no-console
         console.error('[collab-server] connection setup failed:', err);
         try {
@@ -427,138 +493,13 @@ export async function startCollabServer(
     wss,
     roomManager,
     async stop() {
+      expirySweep.stop();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       if (!opts.server) {
         await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       }
       await roomManager.unloadAll();
     },
-  };
-}
-
-interface ConnectionContext {
-  roomManager: RoomManager;
-  authenticate: AuthenticateFn;
-}
-
-async function handleConnection(ws: WebSocket, req: http.IncomingMessage, ctx: ConnectionContext) {
-  ws.binaryType = 'arraybuffer';
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  // y-websocket convention: room id is the path (e.g. ws://host/project/model)
-  const roomId = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
-  const token = url.searchParams.get('token') ?? undefined;
-  if (!roomId) {
-    ws.close(4400, 'missing-room');
-    return;
-  }
-
-  let principal: Principal | null;
-  try {
-    principal = await ctx.authenticate(token, roomId);
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('[collab-server] auth threw:', err);
-    ws.close(4500, 'auth-error');
-    return;
-  }
-
-  if (!principal) {
-    ws.close(4401, 'unauthorized');
-    return;
-  }
-
-  const room = await ctx.roomManager.getOrCreate(roomId);
-  const conn: PeerConnection = {
-    ws,
-    principal,
-    awarenessClients: new Set<number>(),
-  };
-  room.addConnection(conn);
-
-  let alive = true;
-  const ping = setInterval(() => {
-    if (!alive) {
-      try { ws.terminate(); } catch { /* socket already gone */ }
-      clearInterval(ping);
-      return;
-    }
-    alive = false;
-    try { ws.ping(); } catch { /* socket already gone */ }
-  }, PING_INTERVAL_MS);
-  ws.on('pong', () => { alive = true; });
-
-  ws.on('message', (data: ArrayBuffer | Buffer) => {
-    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data);
-    room.handleMessage(conn, bytes);
-  });
-
-  const cleanup = () => {
-    clearInterval(ping);
-    room.removeConnection(conn);
-  };
-  ws.on('close', cleanup);
-  ws.on('error', (err) => {
-    // eslint-disable-next-line no-console
-    console.error('[collab-server] ws error:', err);
-    cleanup();
-  });
-}
-
-/**
- * Pseudo-room scope handed to `authenticate` for blob requests. Blobs are
- * content-addressed and not room-scoped, but reusing the WS `authenticate`
- * hook keeps the credential scheme identical. Custom authenticators that
- * key off roomId see this sentinel and can grant/deny blob access
- * explicitly.
- */
-const BLOB_AUTH_ROOM = '__blobs__';
-
-/**
- * Derive a blob authorizer from the websocket `authenticate` hook so the
- * blob route shares the same token scheme. A null principal (bad/missing
- * token) is rejected; PUT/DELETE additionally require write capability,
- * GET/HEAD/list accept any authenticated principal.
- */
-/** Room key the registry authorizer authenticates against. */
-const REGISTRY_AUTH_ROOM = '__layer_registry__';
-
-/**
- * Derive a registry authorizer from the websocket `authenticate` hook —
- * same scheme as blobs: reads accept any authenticated principal, writes
- * (POST/PUT) require write capability. The principal flows through so the
- * merge endpoint records it as the acting resolver.
- */
-function makeRegistryAuthorizer(authenticate: AuthenticateFn): RegistryAuthorizeFn {
-  return async (token, method) => {
-    let principal: Principal | null;
-    try {
-      principal = await authenticate(token, REGISTRY_AUTH_ROOM);
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[collab-server] registry auth threw:', err);
-      return null;
-    }
-    if (!principal) return null;
-    if ((method === 'POST' || method === 'PUT' || method === 'DELETE') && !canWrite(principal)) {
-      return null;
-    }
-    return principal;
-  };
-}
-
-function makeBlobAuthorizer(authenticate: AuthenticateFn): BlobAuthorizeFn {
-  return async (token, method, _hash) => {
-    let principal: Principal | null;
-    try {
-      principal = await authenticate(token, BLOB_AUTH_ROOM);
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[collab-server] blob auth threw:', err);
-      return false;
-    }
-    if (!principal) return false;
-    if (method === 'PUT' || method === 'DELETE') return canWrite(principal);
-    return true;
   };
 }
 

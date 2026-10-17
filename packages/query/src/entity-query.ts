@@ -119,8 +119,19 @@ export class EntityQuery {
   }
   
   async first(): Promise<QueryResultEntity | null> {
-    const results = this.limit(1).execute();
-    return results[0] ?? null;
+    // Narrow to one row for this call only. `this.limit(1)` mutates the query
+    // itself, so the cap outlived the call and every later
+    // execute()/ids()/first() on the same object returned at most one row --
+    // including one the caller had set a different limit on. Restore whatever
+    // was there before rather than clearing it, so an explicit limit survives.
+    const previousLimit = this.limitCount;
+    this.limitCount = 1;
+    try {
+      const results = this.execute();
+      return results[0] ?? null;
+    } finally {
+      this.limitCount = previousLimit;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -132,12 +143,14 @@ export class EntityQuery {
     if (this.typeFilter) {
       const ids: number[] = [];
       for (const typeEnum of this.typeFilter) {
+        // @raw-entity-enumeration-ok EntityQuery takes only a parsed store, with no mutation view; fluent bulk queries describe that source snapshot
         ids.push(...this.store.entities.getByType(typeEnum));
       }
       return ids;
     }
     // Return all entity IDs
     const allIds: number[] = [];
+    // @raw-entity-enumeration-ok the unfiltered fluent query enumerates the supplied parsed EntityTable, not a live SDK backend
     for (let i = 0; i < this.store.entities.count; i++) {
       allIds.push(this.store.entities.expressId[i]);
     }

@@ -7,44 +7,96 @@
 //! This is the Rust source of truth; CLI / SDK / wasm become thin callers (mirroring how
 //! geometry already flows through `ifc-lite-wasm`).
 
+#[cfg(test)]
+#[macro_use]
+mod test_support;
+
 mod adjacency;
 mod collada;
+mod collada_document;
+mod collada_fmt;
+mod color_space;
 mod constructions;
 mod csv;
+/// The single CSV cell escaper for this crate — RFC 4180 quoting plus the
+/// CWE-1236 formula-injection guard, pinned to the TypeScript half by
+/// `tests/csv_cell_parity.rs`.
+pub mod csv_cell;
+mod dfjson;
 mod error;
+mod file_schema;
 mod frame;
+#[cfg(test)]
+mod frame_fixtures;
+mod generated;
 mod geom;
 mod gltf;
 mod hbjson;
+mod ident;
 mod ifc5;
 mod json;
 mod jsonld;
 mod kmz;
+mod landxml_terrain;
 mod merged;
+mod mesh_input;
 mod model;
+mod quantity_analysis;
+mod quantity_analysis_derived;
 mod obj;
+mod relationships;
+mod rebar_attributes;
+mod rebar_schedule;
 mod openings;
 #[cfg(feature = "parquet-bos")]
 mod parquet_bos;
 mod rooms;
+pub mod rooted_type;
 mod schema_convert;
+mod schema_detect;
+mod schema_ifc2x3_slots;
+mod schema_enum;
+mod schema_ifc4_slots;
+mod schema_owner_history;
+mod schema_plan;
+mod schema_renames;
+mod schema_style_flatten;
+mod schema_unrepresented;
 mod shades;
+pub mod source_header;
 mod step;
+mod step_api;
+mod step_cow;
+mod step_header;
+mod step_ids;
+mod step_index;
+mod step_json;
+mod step_log;
+mod step_record_frame;
+mod step_slot;
+mod step_text;
+mod step_map_transform;
+pub use step_map_transform::{plan_map_conversion_normalization, MapConversionEntityPatch, MapConversionNormalizationPlan};
+mod usd;
+mod xml_text;
 
-pub use collada::export_collada_from_meshes;
+/// The STEP string-literal escaper; `escape`'s docs say why it is public.
+pub use step_text::escape as escape_step_string;
+
+pub use collada::try_export_collada_from_meshes;
 pub use csv::{export_csv, CsvMode, CsvOptions};
+pub use dfjson::DfjsonStats;
 pub use error::ExportError;
 pub use gltf::{
-    export_glb, export_glb_from_meshes, export_glb_streaming_bounded,
-    export_glb_streaming_bounded_with_index, export_glb_with_stats,
-    export_glb_with_stats_with_index, export_gltf_streaming, export_gltf_streaming_with_index,
-    project_glb_size, project_glb_size_with_index, try_export_glb, try_export_glb_streaming_bounded,
-    try_export_glb_streaming_bounded_with_index, try_export_glb_with_stats, GlbSizeProjection,
+    export_gltf_streaming, export_gltf_streaming_with_index,
+    project_glb_size, project_glb_size_with_index, try_export_glb, try_export_glb_from_meshes,
+    try_export_glb_streaming_bounded, try_export_glb_streaming_bounded_with_index,
+    try_export_glb_with_stats, try_export_glb_with_stats_with_index, GlbSizeProjection,
     GltfBuffer, GltfOptions, GltfStats,
 };
 pub use hbjson::Model;
 // Re-exported so a caller can `build_entity_index` once and share it across the
-// geometry (`export_glb_with_stats_with_index`) and attribute
+// geometry (`try_export_glb_with_stats_with_index`) and attribute
 // (`stream_export_model_with_index`) passes.
 //
 // `entity_count` is the cheap `O(scan)`, `O(1)`-memory entity tally (issue
@@ -52,40 +104,84 @@ pub use hbjson::Model;
 // count WITHOUT forcing the full index (`build_entity_index(..).len()` would
 // allocate ~20 B/entity — undoing the bounded-memory work).
 pub use ifc_lite_core::{build_entity_index, entity_count, EntityIndex};
+// The attribute model, re-exported so a consumer of the row callback can name
+// the types it is handed, and `IfcType` so it can tell what it was handed.
+pub use ifc_lite_core::{AttributeValue, DecodedEntity, IfcType};
+// Re-exported alongside the model so a consumer of `EntityRow` attribute values
+// can interpret them: those values are in the file's own units, unlike the
+// geometry exporters' output, which is normalised to metres.
+pub use ifc_lite_processing::prepass::UnitScales;
+// Named so a caller can pick a `GltfOptions::tessellation_quality`.
+pub use ifc_lite_processing::TessellationQuality;
 pub use ifc5::{export_ifc5, Ifc5Options};
+// Spatial and type relationships, which `EntityRow` cannot carry because IFC
+// models them as separate entities that are not products.
+pub use relationships::{relationships, Relationships};
+mod rebar_preflight;
+mod rebar_fabrication;
+pub use rebar_fabrication::{RebarFabricationCheck, RebarFabricationCheckStatus,
+    RebarFabricationPolicy, RebarFabricationPolicyError, RebarFabricationReport,
+    RebarScheduleFabricationError};
+pub use rebar_preflight::{RebarPreflightComparison, RebarPreflightError, RebarPreflightLimits,
+    RebarPreflightReport, RebarSchedulePreflightError};
+pub use rebar_schedule::{build_rebar_schedule, build_rebar_schedule_with_preflight,
+    build_rebar_schedule_with_fabrication_precheck, AuthoredRebarAttribute, AuthoredRebarValue,
+    RebarSchedule, RebarScheduleRow, RebarSource, RebarSweep};
 pub use json::{export_json, JsonOptions};
-pub use jsonld::{export_jsonld, JsonLdOptions};
+pub use landxml_terrain::{
+    try_export_landxml_terrain, LandXmlLinearUnit, LandXmlTerrainExport, LandXmlTerrainOptions,
+    LandXmlTerrainRefusal, LandXmlTerrainSurface,
+};
+pub use jsonld::{export_jsonld, export_jsonld_with_filter, JsonLdOptions};
 pub use kmz::{
-    export_kmz, export_kmz_collada_from_meshes, ifc_angle_to_kml_heading, AltitudeMode, KmzOptions,
+    ifc_angle_to_kml_heading, try_export_kmz_collada_from_meshes, AltitudeMode, KmzOptions,
 };
-pub use merged::{export_merged, export_merged_with_stats, MergedOptions, MergedStats};
+pub use merged::{
+    deterministic_global_id, export_merged, export_merged_models, export_merged_with_stats,
+    leading_rooted_global_id, ContainerMergeStrategy, MergedModel, MergedOptions, MergedStats,
+    StoreyMergeStrategy, UnitReconciliation,
+};
 pub use model::{
-    build_export_model, stream_export_model, stream_export_model_with_index, EntityRow,
-    ExportModel, PropValue, PropertySet, QuantitySet, QuantityValue,
+    build_export_model, build_export_model_with_options, stream_export_model,
+    stream_export_model_with_index, stream_export_model_with_options, EntityRow, ExportModel,
+    ModelOptions, Placement, PropValue, PropertySet, QuantitySet, QuantityValue, ValueKind,
 };
+pub use quantity_analysis_derived::{analyze_quantities, DerivedQuantity,
+    ProductQuantityAnalysis, QuantityAnalysis, QuantitySourceOccurrence};
+pub use quantity_analysis::{analyze_authored_quantities, AuthoredQuantity,
+    AuthoredQuantityAnalysis, ProductQuantities, QuantityConflict, QuantityUnit};
 pub use obj::{export_obj, export_obj_with_stats, ObjOptions, ObjStats};
 #[cfg(feature = "parquet-bos")]
 pub use parquet_bos::{export_bos, ParquetBosOptions};
 pub use step::{
-    export_step, export_step_json, export_step_with_stats, AttrMutation, PropMutation, StepOptions,
-    StepStats,
+    export_step, export_step_to_writer, export_step_with_stats, AttrMutation, CopyOnWriteMutation,
+    PropMutation, StepOptions, StepStats,
 };
+pub use step_json::export_step_json;
+pub use step_log::{
+    export_merged_models_with_logs, export_step_with_log, export_step_with_log_to_writer, GeorefMutations, LogExportStats, LogMutation,
+    LogNewEntity, MutationKind, MutationLog, StepCounters,
+};
+pub use usd::{export_usd, UsdOptions};
 
 use ifc_lite_geometry::extract_profiles;
 
-/// Honeybee identifiers may not contain spaces or most special characters; map anything
-/// other than alphanumerics / `_` / `-` to `_`.
-fn sanitize_identifier(s: &str) -> String {
-    let out: String = s
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
-    if out.is_empty() { "model".to_string() } else { out }
+/// The Model `identifier` for `name` (the Ladybug grammar, see [`ident`]); the
+/// unrestricted `display_name` keeps `name` itself.
+fn model_identifier(name: &str) -> String {
+    ident::ladybug_identifier(name, "model")
+}
+
+/// What a Model's `display_name` carries: the caller's own name, or the identifier
+/// when there is none.
+fn model_display_name(name: &str, identifier: &str) -> String {
+    if name.is_empty() { identifier.to_string() } else { name.to_string() }
 }
 
 /// Options for HBJSON export.
 pub struct HbjsonOptions {
-    /// Model identifier / display name.
+    /// Model display name. The identifier is derived from it (ASCII
+    /// `[.A-Za-z0-9_-]`, at most 100 characters; see `ident`).
     pub name: String,
     /// Geometry tolerance in metres (Honeybee default 0.01).
     pub tolerance: f64,
@@ -98,10 +194,13 @@ impl Default for HbjsonOptions {
 }
 
 /// Coverage stats for an HBJSON export.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HbjsonStats {
-    /// `IfcSpace` profiles seen in the model.
+    /// `IfcSpace` profiles seen in the model: one per extruded item, so a space
+    /// modelled as two items counts twice. `spaces == rooms + skipped`.
     pub spaces: usize,
-    /// Rooms emitted (watertight prisms).
+    /// Rooms emitted (watertight prisms), one per space piece.
     pub rooms: usize,
     /// Spaces skipped as degenerate (malformed footprint / holes / non-extrusion — P5).
     pub skipped: usize,
@@ -159,127 +258,50 @@ pub fn export_hbjson_with_stats(content: &[u8], opts: &HbjsonOptions) -> (String
     let n_constructions = cons.energy.as_ref().map_or(0, |e| e.constructions.len());
     let stats = HbjsonStats { spaces, rooms: rooms.len(), skipped, apertures, doors, shades, constructions: n_constructions, interior_adjacencies };
 
-    let model = Model::new(&sanitize_identifier(&opts.name), rooms, shade_meshes, cons.energy, opts.tolerance);
+    let identifier = model_identifier(&opts.name);
+    let mut model = Model::new(&identifier, rooms, shade_meshes, cons.energy, opts.tolerance);
+    model.display_name = model_display_name(&opts.name, &identifier);
     let json = serde_json::to_string(&model).expect("HBJSON model serializes");
     (json, stats)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
+/// Options for DFJSON (Dragonfly) export.
+pub struct DfjsonOptions {
+    /// Model display name. The identifier is derived from it (ASCII
+    /// `[.A-Za-z0-9_-]`, at most 100 characters; see `ident`).
+    pub name: String,
+    /// Geometry tolerance in metres (Ladybug Tools default 0.01).
+    pub tolerance: f64,
+}
 
-    /// Skip-if-absent fixture loader (matches the geometry crate convention — test
-    /// models are staged, not git-tracked, so a fresh checkout returns `None`).
-    fn fixture(rel: &str) -> Option<Vec<u8>> {
-        let path = format!("{}/../../tests/models/{}", env!("CARGO_MANIFEST_DIR"), rel);
-        std::fs::read(path).ok()
-    }
-
-    #[test]
-    fn entity_count_reexport_matches_index() {
-        // The re-exported cheap tally must equal the full index's entity count
-        // (both walk the same scanner) — so a downstream can gate on the count
-        // without paying for the index. Well-formed fixtures have unique ids, so
-        // the index map length equals the scanned entity count.
-        let Some(bytes) = fixture("ara3d/duplex.ifc") else {
-            eprintln!(
-                "skipping entity_count_reexport_matches_index: fixture absent — run `pnpm fixtures`"
-            );
-            return;
-        };
-        let counted = entity_count(&bytes);
-        let indexed = build_entity_index(&bytes).len();
-        assert!(counted > 0, "expected entities");
-        assert_eq!(counted, indexed, "cheap count must match the index length");
-    }
-
-    #[test]
-    fn duplex_exports_valid_room_model() {
-        let Some(bytes) = fixture("ara3d/duplex.ifc") else {
-            return;
-        };
-        let (json, stats) = export_hbjson_with_stats(&bytes, &HbjsonOptions::default());
-        // P2: windows and doors are placed on exterior walls.
-        assert!(stats.apertures > 0, "expected windows, got {}", stats.apertures);
-        assert!(stats.doors > 0, "expected doors, got {}", stats.doors);
-        // P5: shared interior walls are paired as Surface adjacencies.
-        assert!(stats.interior_adjacencies > 0, "expected interior adjacencies, got {}", stats.interior_adjacencies);
-        // P4: material layer sets become opaque constructions assigned to faces.
-        assert!(stats.constructions > 0, "expected constructions, got {}", stats.constructions);
-        let v: Value = serde_json::from_str(&json).expect("valid JSON");
-
-        // Energy + adjacency surface through the schema (materials, constructions, Surface BCs).
-        let energy = &v["properties"]["energy"];
-        assert_eq!(energy["type"], "ModelEnergyProperties");
-        assert!(!energy["materials"].as_array().unwrap().is_empty());
-        assert!(!energy["constructions"].as_array().unwrap().is_empty());
-        let surface_faces = v["rooms"].as_array().unwrap().iter()
-            .flat_map(|r| r["faces"].as_array().unwrap())
-            .filter(|f| f["boundary_condition"]["type"] == "Surface")
-            .count();
-        assert!(surface_faces > 0, "expected Surface (interior) faces");
-        // Every interior face references an adjacent [face, room].
-        for r in v["rooms"].as_array().unwrap() {
-            for f in r["faces"].as_array().unwrap() {
-                if f["boundary_condition"]["type"] == "Surface" {
-                    assert_eq!(f["boundary_condition"]["boundary_condition_objects"].as_array().unwrap().len(), 2);
-                }
-            }
-        }
-
-        assert_eq!(v["type"], "Model");
-        assert_eq!(v["units"], "Meters");
-        assert_eq!(v["tolerance"], 0.01);
-
-        let rooms = v["rooms"].as_array().expect("rooms array");
-        assert!(rooms.len() >= 15, "expected >=15 IfcSpace rooms, got {}", rooms.len());
-
-        // Every room must have exactly one Floor + one RoofCeiling + >=3 Walls.
-        for room in rooms {
-            let faces = room["faces"].as_array().unwrap();
-            let mut floor = 0;
-            let mut roof = 0;
-            let mut wall = 0;
-            for f in faces {
-                match f["face_type"].as_str().unwrap() {
-                    "Floor" => floor += 1,
-                    "RoofCeiling" => roof += 1,
-                    "Wall" => wall += 1,
-                    other => panic!("unexpected face_type {other}"),
-                }
-                // boundary must be a non-degenerate polygon
-                assert!(f["geometry"]["boundary"].as_array().unwrap().len() >= 3);
-            }
-            assert_eq!(floor, 1, "room {} floors", room["identifier"]);
-            assert_eq!(roof, 1, "room {} roofs", room["identifier"]);
-            assert!(wall >= 3, "room {} walls={}", room["identifier"], wall);
-        }
-    }
-
-    #[test]
-    fn revit_georeferenced_model_does_not_collapse() {
-        // rvt01 carries national-grid coordinates (~2.78e6); the origin-rebase must keep
-        // room footprints sane (no f32 collapse).
-        let Some(bytes) = fixture("various/rvt01.ifc") else {
-            return;
-        };
-        let (json, stats) = export_hbjson_with_stats(&bytes, &HbjsonOptions::default());
-        // P2/P3: windows, doors and railing shades are all present on this Revit model.
-        assert!(stats.apertures > 0 && stats.doors > 0, "openings: {} win / {} door", stats.apertures, stats.doors);
-        assert!(stats.shades > 0, "expected railing shades, got {}", stats.shades);
-        let v: Value = serde_json::from_str(&json).unwrap();
-        let rooms = v["rooms"].as_array().unwrap();
-        assert!(rooms.len() >= 30, "expected >=30 rooms, got {}", rooms.len());
-        // No coordinate should exceed ~1km from the rebased origin.
-        for room in rooms {
-            for f in room["faces"].as_array().unwrap() {
-                for p in f["geometry"]["boundary"].as_array().unwrap() {
-                    for c in p.as_array().unwrap() {
-                        assert!(c.as_f64().unwrap().abs() < 1000.0, "coordinate not rebased: {c}");
-                    }
-                }
-            }
-        }
+impl Default for DfjsonOptions {
+    fn default() -> Self {
+        Self { name: "ifc_lite_model".to_string(), tolerance: 0.01 }
     }
 }
+
+/// Export the `IfcSpace` volumes in `content` (raw IFC/STEP bytes) as a Dragonfly DFJSON
+/// string. Each space becomes an extruded `Room2D` (floor polygon + heights) grouped into
+/// stories — the simpler Ladybug target for mostly-vertical-wall models.
+pub fn export_dfjson(content: &[u8], opts: &DfjsonOptions) -> String {
+    export_dfjson_with_stats(content, opts).0
+}
+
+/// Like [`export_dfjson`] but also returns coverage stats.
+pub fn export_dfjson_with_stats(content: &[u8], opts: &DfjsonOptions) -> (String, DfjsonStats) {
+    let profiles = extract_profiles(content, 0);
+    // Read the file's own IfcBuilding / IfcBuildingStorey containment so stories are the
+    // model's storeys rather than an elevation guess at them (#1911). An empty index
+    // (no spatial structure declared) falls back to the elevation heuristic inside
+    // `build_model`.
+    let spatial = dfjson::spatial_index(content);
+    let identifier = model_identifier(&opts.name);
+    let (mut model, stats) = dfjson::build_model(&identifier, &profiles, opts.tolerance, Some(&spatial));
+    model.display_name = model_display_name(&opts.name, &identifier);
+    let json = serde_json::to_string(&model).expect("DFJSON model serializes");
+    (json, stats)
+}
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

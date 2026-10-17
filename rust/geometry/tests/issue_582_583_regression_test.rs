@@ -22,23 +22,7 @@ use ifc_lite_geometry::{GeometryRouter, VoidIndex};
 use rustc_hash::FxHashMap;
 
 fn read_fixture(rel: &str) -> Option<String> {
-    let path = format!("../../tests/models/{}", rel);
-    match std::fs::read_to_string(&path) {
-        Ok(s) if s.starts_with("version https://git-lfs.github.com/spec/") => {
-            eprintln!(
-                "skipping: fixture {path} is a Git LFS pointer; run `pnpm fixtures` from the repo root"
-            );
-            None
-        }
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "skipping: fixture {path} not present; run `pnpm fixtures` to download (manifest at tests/models/manifest.json)"
-            );
-            None
-        }
-        Err(e) => panic!("failed to read fixture {path}: {e}"),
-    }
+    ifc_lite_testkit::fixture_text(rel)
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -189,6 +173,13 @@ fn issue_583_institute_var2_walls_and_doors_present() {
     );
 }
 
+// Default build only: with `csg_manifold_gate` on, the accept gate refuses two
+// boolean results on this fixture as non-manifold and #3854 routes each refusal
+// into `csg_failures_total`. That is the gate reporting, not a #583 regression;
+// the census in issue_3440_manifold_gate_census.rs is what pins the gated count.
+// #3925 also guards the raw-union-first roof path: walls #227944/#229966
+// need a clean repaired subtraction even when the default gate accepts a tear.
+#[cfg(not(feature = "csg_manifold_gate"))]
 #[test]
 fn issue_583_institute_var2_no_csg_failures() {
     let Some(content) = read_fixture("ara3d/C20-Institute-Var-2.ifc") else {
