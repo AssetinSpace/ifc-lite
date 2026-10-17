@@ -39,6 +39,8 @@ import {
 import { useAimPanelStore } from './aimPanelStore.js';
 import { useCapturePinsStore } from './capturePinsStore.js';
 import { useAimDecorationsStore } from './aimDecorationsStore.js';
+import { isViewMessage } from './view-protocol.js';
+import { useAimViewCommands } from './useAimViewCommands.js';
 
 export function AimBridge() {
   const bim = useBim();
@@ -51,6 +53,8 @@ export function AimBridge() {
   // ako ENTITY_SELECTED (echo by z jeho vlastného príkazu spravilo "user
   // pick" a prirodzená host implementácia by sa zacyklila FOCUS→SELECTED).
   const programmaticSelectionRef = useRef<Set<string> | null>(null);
+  // Pohľad (AIM D-083): rez, kamera, režim 3D|2D|Split - vlastný protokol.
+  const viewCommands = useAimViewCommands(bim);
 
   useEffect(() => {
     // No parent frame (e.g. a standalone viewer tab) — nothing to bridge.
@@ -80,6 +84,10 @@ export function AimBridge() {
       // posielať bridge príkazy, ani keby trafili origin.
       if (e.source !== window.parent) return;
       if (parentOriginRef.current && e.origin !== parentOriginRef.current) return;
+      if (isViewMessage(e.data)) {
+        viewCommands.current(e.data);
+        return;
+      }
       if (!isInboundMessage(e.data)) return;
 
       switch (e.data.type) {
