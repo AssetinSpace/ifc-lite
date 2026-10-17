@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
 import { isViewMessage } from './view-protocol.js';
-import { VIEWER_AXIS, cameraStep, storeyCutPercent } from './viewCommands.js';
+import { VIEWER_AXIS, cameraStep, pickStorey, storeyCutPercent } from './viewCommands.js';
 
 const S = 'aim-bridge';
 const G = '27hbQtAoP6qvoEYhPARoI7';
@@ -59,5 +59,12 @@ describe('viewCommands (AIM D-083)', () => {
     assert.deepEqual(cameraStep('iso'), { kind: 'home' });
     assert.deepEqual(cameraStep('fit_all'), { kind: 'fit' });
     assert.deepEqual(cameraStep('front'), { kind: 'preset', view: 'front' });
+  });
+
+  it('neznáme podlažie sa nevykoná, chýbajúce nechá výber na viewri', () => {
+    const storeys = [{ guid: 'A' }, { guid: 'B' }];
+    assert.deepEqual(pickStorey(storeys, 'B'), { guid: 'B' });
+    assert.equal(pickStorey(storeys, undefined), undefined);
+    assert.equal(pickStorey(storeys, 'X'), null);
   });
 });

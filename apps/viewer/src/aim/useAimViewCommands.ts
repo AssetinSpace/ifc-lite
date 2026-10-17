@@ -20,7 +20,7 @@ import { useViewMode } from '@/hooks/useViewMode';
 import type { BimContext } from '@ifc-lite/sdk';
 import { resolveGuids } from './bridge-protocol.js';
 import type { ViewInboundMessage } from './view-protocol.js';
-import { VIEWER_AXIS, cameraStep, storeyCutPercent } from './viewCommands.js';
+import { VIEWER_AXIS, cameraStep, pickStorey, storeyCutPercent } from './viewCommands.js';
 
 export function useAimViewCommands(bim: BimContext) {
   const { setMode, storeys } = useViewMode();
@@ -33,7 +33,7 @@ export function useAimViewCommands(bim: BimContext) {
           return;
         }
         if (msg.storeyGuid) {
-          const storey = storeys.find((s) => s.guid === msg.storeyGuid);
+          const storey = pickStorey(storeys, msg.storeyGuid);
           if (!storey) {
             console.warn('[aim-bridge] SET_SECTION: neznáme podlažie', msg.storeyGuid);
             return;
@@ -69,8 +69,11 @@ export function useAimViewCommands(bim: BimContext) {
         return;
       }
       case 'SET_VIEW_MODE': {
-        const storey = msg.storeyGuid ? storeys.find((s) => s.guid === msg.storeyGuid) : undefined;
-        if (msg.storeyGuid && !storey) console.warn('[aim-bridge] SET_VIEW_MODE: neznáme podlažie', msg.storeyGuid);
+        const storey = pickStorey(storeys, msg.storeyGuid);
+        if (storey === null) {
+          console.warn('[aim-bridge] SET_VIEW_MODE: neznáme podlažie', msg.storeyGuid);
+          return;
+        }
         setMode(msg.mode, storey);
         return;
       }

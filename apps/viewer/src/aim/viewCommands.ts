@@ -41,3 +41,13 @@ export function cameraStep(preset: CameraPreset): CameraStep {
   if (preset === 'fit_all') return { kind: 'fit' };
   return { kind: 'preset', view: preset };
 }
+
+/**
+ * Podlažie z bridge správy: bez GUID = `undefined` (useViewMode si vyberie
+ * aktívne/posledné), známy GUID = podlažie, neznámy GUID = `null` - správa sa
+ * nevykoná, aby viewer potichu neprepol na iné podlažie, než host žiadal.
+ */
+export function pickStorey<T extends { guid: string }>(storeys: readonly T[], guid?: string): T | undefined | null {
+  if (!guid) return undefined;
+  return storeys.find((s) => s.guid === guid) ?? null;
+}
