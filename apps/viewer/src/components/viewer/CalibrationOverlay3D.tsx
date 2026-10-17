@@ -16,7 +16,7 @@
 import { useEffect, useRef } from 'react';
 import { useViewerStore } from '@/store';
 import { getGlobalRenderer } from '@/hooks/useBCF';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 
 const MARKER_COLOR = '#10b981'; // emerald-500, matches the pane marker
 const LABELS = ['A', 'B'] as const;

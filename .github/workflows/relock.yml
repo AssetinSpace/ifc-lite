@@ -36,6 +36,7 @@ concurrency:
 jobs:
   relock:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Same PAT as the sync workflow: the branch may carry upstream changes
       # under .github/workflows/, which GITHUB_TOKEN is not allowed to push.

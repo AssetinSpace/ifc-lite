@@ -15,7 +15,7 @@
 
 import { useCallback, useMemo } from 'react';
 import { useViewerStore } from '@/store';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { useIfc } from './useIfc';
 import {
   collectStoreys,

@@ -15,7 +15,8 @@
   "scripts": {
     "build": "pnpm exec tsc",
     "dev": "pnpm exec tsc --watch",
-    "test": "vitest run --passWithNoTests"
+    "typecheck": "node ../../scripts/typecheck-tests.mjs",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.71",

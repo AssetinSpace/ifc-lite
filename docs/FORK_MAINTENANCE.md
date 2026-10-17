@@ -283,6 +283,23 @@ so those guards were dropped in that sync. What stays fork-only:
 > Every hit must either carry a repository-conditional `runs-on`, or sit in a job whose `if:`
 > already restricts it to upstream (that is how `docker.yml` is handled).
 
+## Upstream ratchets that carry fork rows
+
+Upstream gates new code with per-file ratchets. The fork-owned UI (D-072 underlays, D-075
+documents, D-076 identifier links) predates several of them, so the 2026-10 sync recorded the
+fork's current counts as baseline rows instead of rewriting that UI in the same PR:
+
+| Gate | File | Fork rows |
+|---|---|---|
+| `check-i18n-literals` | `scripts/i18n-literals-baseline.json` | hardcoded English in the underlay / documents / identifier-link panels |
+| `check-icon-button-adoption` | `BASELINE` in the script (`AIM-FORK` block) | `<Button size="icon">` in the same panels |
+| `check-module-size` | `scripts/module-size-allowlist.txt` | fork files over 400 lines, and upstream files the wiring grew |
+| `check-agents-md-size` | `scripts/agents-md-budget.txt` | the fork section in `AGENTS.md` and `packages/collab-server/AGENTS.md` |
+
+They ratchet **down**: moving a panel's copy into `catalogues/aim-fork.en.ts`, switching to
+`IconButton`, or splitting a file lowers its row (`--update`). Never raise a row for new fork
+code without saying why in the PR.
+
 ## Conventions (don't drift)
 
 - **New custom code → `apps/viewer/src/aim/`**, not scattered into upstream files.

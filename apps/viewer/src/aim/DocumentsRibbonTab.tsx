@@ -31,7 +31,7 @@ import { VIEW_MODES, StoreyPicker } from '@/components/viewer/ViewModeSwitcher';
 import {
   RibbonGroup,
   RibbonGroupDivider,
-  RibbonLargeButton,
+  RibbonContentLargeButton,
 } from '@/components/viewer/ribbon/primitives';
 
 /** Ribbon icons for the view modes, keyed by the shared `VIEW_MODES` ids. */
@@ -55,16 +55,20 @@ export function DocumentsRibbonTab() {
   return (
     <>
       <RibbonGroup label="Library">
-        <RibbonLargeButton
+        <RibbonContentLargeButton
           icon={Files}
-          label="Documents"
+          contentLabel="Documents"
+          contentSource="panel-browser"
+          contentId="documents"
           tooltip="Project documents (PDFs & images) — open as tabs"
           active={documentsPanelVisible}
           onClick={() => useViewerStore.getState().toggleWorkspacePanel('documents')}
         />
-        <RibbonLargeButton
+        <RibbonContentLargeButton
           icon={MapIcon}
-          label="Underlays"
+          contentLabel="Underlays"
+          contentSource="panel-browser"
+          contentId="drawing-underlay"
           tooltip="Drawing underlays — georeferenced PDF plans"
           active={underlayPanelVisible}
           onClick={() => useViewerStore.getState().toggleWorkspacePanel('drawing-underlay')}
@@ -77,10 +81,12 @@ export function DocumentsRibbonTab() {
           shape: identical modes, identical gating, identical storey picker. */}
       <RibbonGroup label="View mode">
         {VIEW_MODES.map((m) => (
-          <RibbonLargeButton
+          <RibbonContentLargeButton
             key={m.id}
             icon={MODE_ICONS[m.id]}
-            label={m.label}
+            contentLabel={m.label}
+            contentSource="extension"
+            contentId={`aim-view-mode:${m.id}`}
             tooltip={disabledReason ?? m.title}
             active={mode === m.id}
             disabled={disabledReason !== null}

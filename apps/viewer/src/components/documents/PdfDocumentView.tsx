@@ -90,7 +90,7 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
         if (stale) {
           // Unmounted while downloading — the cleanup below saw doc === null,
           // so this instance must release the proxy itself.
-          void opened.destroy();
+          void opened.loadingTask.destroy();
           return;
         }
         doc = opened;
@@ -107,7 +107,7 @@ export function PdfDocumentView({ docId, url }: PdfDocumentViewProps) {
     })();
     return () => {
       stale = true;
-      void doc?.destroy();
+      void doc?.loadingTask.destroy();
       setPdf(null);
       // This document's rasters are useless without its proxy; children have
       // already detached their canvases (child cleanups run first), so every

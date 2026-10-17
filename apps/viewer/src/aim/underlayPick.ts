@@ -19,6 +19,7 @@ function resolveStoreyFloorY(): number {
   if (!modelId) return 0;
   const ds = state.models.get(modelId)?.ifcDataStore;
   if (!ds) return 0;
+  // @raw-entity-enumeration-ok storeys are spatial structure from the source file; the calibration floor plane only needs the first storey's elevation
   const ids = ds.entityIndex.byType.get('IFCBUILDINGSTOREY');
   const storeyId = ids && ids.length > 0 ? ids[0] : null;
   if (storeyId === null) return 0;

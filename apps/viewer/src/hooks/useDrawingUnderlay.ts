@@ -30,7 +30,7 @@ import {
   type DrawingPlacement,
 } from '@ifc-lite/drawing-underlay';
 import { useViewerStore } from '@/store';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 
 export const UNDERLAY_OVERLAY_ID = 'drawing-underlay';
@@ -226,7 +226,7 @@ export function useDrawingUnderlay({ rendererRef, isInitialized }: UseDrawingUnd
             appliedPlacementsRef.current.set(drawing.id, posKey);
             renderer.requestRender();
           } finally {
-            void doc.destroy();
+            void doc.loadingTask.destroy();
           }
         } catch (err) {
           console.error(`drawing-underlay: failed to rasterize "${drawing.name}"`, err);

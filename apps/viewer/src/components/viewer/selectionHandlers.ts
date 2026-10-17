@@ -15,7 +15,7 @@ import { useViewerStore } from '@/store';
 import { fromGlobalIdFromModels } from '@/store/globalId';
 // >>> AIM-FORK: drawing-underlay calibration pick (D-072)
 import { worldToIfcMetres } from '@ifc-lite/drawing-underlay';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { raycastStoreyFloor } from '@/aim/underlayPick';
 // <<< AIM-FORK
 import { toast } from '@/components/ui/toast';

@@ -114,6 +114,7 @@ class TagReader {
   constructor(private store: IfcDataStore) {}
 
   read(expressId: number): string {
+    // @raw-entity-enumeration-ok identifier tags are read from the parsed source entity (D-076 link index), not the live mutation overlay
     const ref = this.store.entityIndex.byId.get(expressId);
     if (!ref) return '';
     let tagIndex = this.tagIndexByType.get(ref.type);

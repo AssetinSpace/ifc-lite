@@ -45,6 +45,16 @@ const BASELINE = {
   'viewer/ribbon/RibbonToolbar.tsx': 2,
   'viewer/tools/MeasureToolbar.tsx': 2,
   'viewer/tools/SectionToolbar.tsx': 1,
+  // >>> AIM-FORK: fork-owned panels predating this gate (D-072 / D-075 / D-076);
+  // ratchets down as they move to IconButton — see docs/FORK_MAINTENANCE.md.
+  'documents/DocumentsPanel.tsx': 6,
+  'documents/PdfDocumentView.tsx': 2,
+  'viewer/CalibrationPdfOverlay.tsx': 2,
+  'viewer/CalibrationPdfSurface.tsx': 3,
+  'viewer/DrawingPlanPane.tsx': 1,
+  'viewer/DrawingUnderlayPanel.tsx': 9,
+  'viewer/IdentifierLinkSettings.tsx': 3,
+  // <<< AIM-FORK
 };
 
 function fail(message) {

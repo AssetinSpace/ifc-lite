@@ -65,7 +65,7 @@ export function IdentifierLinkLayer({ drawing, zoom }: IdentifierLinkLayerProps)
           if (stale) return;
           setItems(fetched);
         } finally {
-          void doc.destroy();
+          void doc.loadingTask.destroy();
         }
       } catch (err) {
         if (stale) return;

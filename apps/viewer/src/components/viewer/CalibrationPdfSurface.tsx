@@ -157,7 +157,7 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
           setPreview({ canvas, pixelsPerPoint: raster.pixelsPerPoint, pageSizePts: raster.pageSizePts });
           setCalibrationPageSize(raster.pageSizePts);
         } finally {
-          void doc.destroy();
+          void doc.loadingTask.destroy();
         }
       } catch (err) {
         console.error('calibration surface: rasterization failed', err);

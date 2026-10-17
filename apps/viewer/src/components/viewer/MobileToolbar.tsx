@@ -280,32 +280,6 @@ export function MobileToolbar() {
 
           <DropdownMenuSeparator />
 
-          {/* Drawing underlays (D-072): opens as a mobile bottom sheet. */}
-          <DropdownMenuCheckboxItem
-            checked={underlayPanelVisible}
-            onCheckedChange={(checked) => {
-              setUnderlayPanelVisible(checked === true);
-              setRightPanelCollapsed(checked !== true);
-            }}
-          >
-            <MapIcon className="h-4 w-4 mr-2" />
-            Drawing Underlays
-          </DropdownMenuCheckboxItem>
-
-          {/* Documents (D-075): opens as a mobile bottom sheet. */}
-          <DropdownMenuCheckboxItem
-            checked={documentsPanelVisible}
-            onCheckedChange={(checked) => {
-              setDocumentsPanelVisible(checked === true);
-              setRightPanelCollapsed(checked !== true);
-            }}
-          >
-            <Files className="h-4 w-4 mr-2" />
-            Documents
-          </DropdownMenuCheckboxItem>
-
-          <DropdownMenuSeparator />
-
           {/* Camera */}
           {menuItem('view:projection')}
 

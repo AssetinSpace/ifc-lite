@@ -31,9 +31,9 @@ import {
 } from '@ifc-lite/drawing-underlay';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
-import { useCameraTickSubscription } from '@/hooks/useCameraTickSubscription';
+import { useCameraTickSubscription } from '@/aim/useCameraTickSubscription';
 import { useFloorplanView } from '@/hooks/useFloorplanView';
-import { totalYupOffset } from '@/lib/geo/ifc-origin';
+import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 import { IdentifierLinkLayer } from './IdentifierLinkLayer';
 
@@ -160,7 +160,7 @@ export function DrawingPlanPane() {
           setPageAspect(raster.width / raster.height);
           host.replaceChildren(canvas);
         } finally {
-          void doc.destroy();
+          void doc.loadingTask.destroy();
         }
       } catch (err) {
         console.error('drawing plan pane: rasterization failed', err);
