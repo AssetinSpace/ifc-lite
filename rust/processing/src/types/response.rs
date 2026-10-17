@@ -6,6 +6,7 @@
 
 use super::mesh::MeshData;
 use crate::georeferencing::Georeferencing;
+use crate::mesh_frame::MeshCoordinateSpace;
 use crate::symbolic::SymbolicData;
 use serde::{Deserialize, Serialize};
 
@@ -16,13 +17,11 @@ pub struct ParseResponse {
     pub cache_key: String,
     /// All meshes extracted from the IFC file.
     pub meshes: Vec<MeshData>,
-    /// Declares the coordinate space used by serialized mesh vertices:
-    /// * `site_local` — vertices are relative to the IfcSite placement
-    ///   translation (small floats in a meaningful, relatable frame).
-    /// * `model_rtc`  — a model-level detected RTC anchor was subtracted.
-    /// * `raw_ifc`    — no RTC anchor was applied; vertices are in raw IFC space.
+    /// Declares the coordinate space used by serialized mesh vertices (see
+    /// [`MeshCoordinateSpace`] for the three tiers and their wire spelling).
+    /// `None` only on responses written before the tag existed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mesh_coordinate_space: Option<String>,
+    pub mesh_coordinate_space: Option<MeshCoordinateSpace>,
     /// IfcSite ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
     /// Used by clients to relocate geometry between global and site-local coordinate systems.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +58,13 @@ pub struct ModelMetadata {
     /// `extractLengthUnitScale` (issue #900).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_unit_scale: Option<f64>,
+    /// The model's length-unit factor is unusable (zero, negative or
+    /// non-finite), so no geometry was meshed (#7678, D3). Holds the express
+    /// id of the offending `IfcSIUnit` / `IfcConversionBasedUnit` record.
+    /// `length_unit_scale` is then `None`, not an invented `1.0`. `None` for a
+    /// usable unit. Mirrors the wasm wire's `unitRefused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_unit_refused: Option<u32>,
     /// Georeferencing (`IfcMapConversion` + `IfcProjectedCRS`). `None` when the
     /// model carries no map-conversion data. Mirrors the browser parser's
     /// `extractGeoreferencing` (issue #900).
@@ -104,6 +110,46 @@ pub struct QuickMetadataBootstrap {
     pub entity_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spatial_tree: Option<QuickMetadataSpatialNode>,
+    /// Child edges the tree walk skipped, in the order it met them (#4662).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned_aggregate_edges: Vec<QuickMetadataPrunedEdge>,
+}
+
+/// A spatial child edge left out of [`QuickMetadataBootstrap::spatial_tree`].
+/// Each node is placed where the depth-first walk from the root first reaches
+/// it; every later `IfcRelAggregates` edge to it is recorded here, as is every
+/// child edge the walk would follow out of a node at the depth limit. A spatial
+/// element an `IfcRelContainedInSpatialStructure` promotes to a child is not an
+/// aggregate edge: skipping it because the node is already placed, or because
+/// the node is settled (see [`QuickMetadataPrunedEdgeKind::DepthLimit`]), is not
+/// recorded (#4689).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickMetadataPrunedEdge {
+    /// Express id of the node whose child list names the edge.
+    pub parent_express_id: u32,
+    /// Express id of the child the edge names.
+    pub child_express_id: u32,
+    pub kind: QuickMetadataPrunedEdgeKind,
+}
+
+/// Why a [`QuickMetadataPrunedEdge`] was left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum QuickMetadataPrunedEdgeKind {
+    /// The parent that placed the child names it again.
+    SiblingRepeat,
+    /// A different parent names a child already placed elsewhere.
+    SecondParent,
+    /// A node names itself or one of its own ancestors.
+    BackEdge,
+    /// The parent sits at the tree's depth limit, so its subtree is cut there
+    /// (#4689). The child still appears if the walk reaches it by another
+    /// edge it follows. A containment of a settled node is not followed, even
+    /// when the limit cuts the path that settles it: settled means aggregated
+    /// and reached from the root through aggregates and containments of nodes
+    /// no aggregate names.
+    DepthLimit,
 }
 
 /// Processing statistics.
@@ -141,6 +187,20 @@ pub struct ProcessingStats {
     /// the backstop engaged for this model.
     #[serde(default)]
     pub degenerate_triangles_dropped: u64,
+    /// Elements whose geometry read a record refused by input admission: it
+    /// holds a REAL the double range cannot represent (`1.E400`), so that
+    /// geometry failed closed instead of carrying an infinity (#7678, D3).
+    /// Counted on the native pass. Omitted from the wire when zero, so a
+    /// clean file's response is byte-identical to before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_input_elements: u64,
+    /// Records the native pass's pre-pass decoders refused for the same
+    /// reason (#7678, D3). They read styles and colours (a refused style
+    /// falls back to the default colour, counted only here), unit factors,
+    /// voids and the geometry records RTC detection samples. Omitted when
+    /// zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_prepass_records: u64,
     /// CartesianPoints served from the per-worker point cache while meshing
     /// faceted breps (`EntityDecoder::get_polyloop_coords_cached`). Non-zero
     /// means the cross-element cache hoist memoized a shared point list rather
@@ -162,4 +222,8 @@ pub struct ProcessingStats {
     /// `None` when nothing diagnostic-worthy happened (no openings, no failures).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry_diagnostics: Option<ifc_lite_geometry::GeometryDiagnostics>,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }

@@ -19,23 +19,15 @@
 //! pipeline several times under a watchdog. A re-introduced deadlock parks the
 //! worker forever, so the timeout fails the test instead of hanging CI.
 
+use ifc_lite_geometry::test_support::recv_or_diagnose;
 use std::sync::mpsc;
 use std::time::Duration;
 
-const FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/models/ara3d/schependomlaan.ifc"
-);
+const FIXTURE: &str = "ara3d/schependomlaan.ifc";
 
 #[test]
 fn multithreaded_faceted_brep_pipeline_does_not_deadlock() {
-    let Ok(content) = std::fs::read(FIXTURE) else {
-        eprintln!(
-            "skipping: fixture {FIXTURE} not present — run `pnpm fixtures` \
-             (sha256 in tests/models/manifest.json)"
-        );
-        return;
-    };
+    let content = ifc_lite_testkit::fixture_bytes_or_skip!(FIXTURE);
 
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -56,14 +48,21 @@ fn multithreaded_faceted_brep_pipeline_does_not_deadlock() {
     // A clean run is a few seconds even in a debug build; 180s is a generous
     // ceiling. A deadlocked worker never sends, so recv_timeout fires and fails
     // the test rather than hanging the suite.
-    match rx.recv_timeout(Duration::from_secs(180)) {
-        Ok(()) => {
-            let _ = worker.join();
-        }
-        Err(_) => panic!(
-            "process_geometry deadlocked on a faceted-brep-heavy model — the \
-             nested-par_iter worker-point-cache re-entrancy regression is back \
-             (#1572; fix is `try_lock` in processor/mod.rs)"
-        ),
-    }
+    //
+    // The two Err variants are distinguished by `recv_or_diagnose`:
+    // `recv_timeout` returns Err for Disconnected as well as Timeout, so a
+    // PANIC in the worker would otherwise be reported as a deadlock and send
+    // the reader to #1572's `try_lock` fix for a bug that is not the one they
+    // have (#2945). That split is pinned in both directions by the meta-tests
+    // in `ifc_lite_geometry::test_support`.
+    recv_or_diagnose(
+        &rx,
+        Duration::from_secs(180),
+        "process_geometry deadlocked on a faceted-brep-heavy model — the \
+         nested-par_iter worker-point-cache re-entrancy regression is back \
+         (#1572; fix is `try_lock` in processor/mod.rs)",
+        "process_geometry's worker PANICKED rather than deadlocking, so #1572 \
+         is not implicated; its panic is printed above",
+    );
+    let _ = worker.join();
 }

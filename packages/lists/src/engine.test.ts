@@ -3,7 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, it, expect } from 'vitest';
-import { IfcTypeEnum } from '@ifc-lite/data';
+import { IfcTypeEnum, PropertyValueType, type PropertySet } from '@ifc-lite/data';
+import { Rule } from '@ifc-lite/rules';
 import { executeList, listResultToCSV, summariseListRows, groupPathKey, toScheduleRows } from './engine.js';
 import { discoverColumns } from './discovery.js';
 import { LIST_PRESETS } from './presets.js';
@@ -25,22 +26,22 @@ function createMockProvider(): ListDataProvider {
     [IfcTypeEnum.IfcSlab, [3]],
   ]);
 
-  const propertySets = new Map<number, Array<{ name: string; properties: Array<{ name: string; value: unknown; dataType?: string }> }>>([
+  const propertySets = new Map<number, PropertySet[]>([
     [1, [
-      { name: 'Pset_WallCommon', properties: [
-        { name: 'IsExternal', value: ['IFCBOOLEAN', '.T.'] },
-        { name: 'FireRating', value: 'REI 90' },
-        { name: 'LoadBearing', value: ['IFCBOOLEAN', '.T.'] },
+      { name: 'Pset_WallCommon', globalId: 'pset-1', properties: [
+        { name: 'IsExternal', type: PropertyValueType.Boolean, value: ['IFCBOOLEAN', '.T.'] },
+        { name: 'FireRating', type: PropertyValueType.Label, value: 'REI 90' },
+        { name: 'LoadBearing', type: PropertyValueType.Boolean, value: ['IFCBOOLEAN', '.T.'] },
         // A measure property carrying its raw IFC dataType — used to prove
         // executeList surfaces it onto the result column (#1573).
-        { name: 'ThermalTransmittance', value: 0.24, dataType: 'IFCTHERMALTRANSMITTANCEMEASURE' },
+        { name: 'ThermalTransmittance', type: PropertyValueType.Real, value: 0.24, dataType: 'IFCTHERMALTRANSMITTANCEMEASURE' },
       ]},
     ]],
     [2, [
-      { name: 'Pset_WallCommon', properties: [
-        { name: 'IsExternal', value: ['IFCBOOLEAN', '.F.'] },
-        { name: 'FireRating', value: 'EI 30' },
-        { name: 'LoadBearing', value: ['IFCBOOLEAN', '.F.'] },
+      { name: 'Pset_WallCommon', globalId: 'pset-2', properties: [
+        { name: 'IsExternal', type: PropertyValueType.Boolean, value: ['IFCBOOLEAN', '.F.'] },
+        { name: 'FireRating', type: PropertyValueType.Label, value: 'EI 30' },
+        { name: 'LoadBearing', type: PropertyValueType.Boolean, value: ['IFCBOOLEAN', '.F.'] },
       ]},
     ]],
     [3, []],
@@ -147,6 +148,14 @@ function createMockProvider(): ListDataProvider {
 // ============================================================================
 
 describe('executeList', () => {
+  it('rejects unevaluated Rules groups instead of silently widening a list (#5894)', () => {
+    const definition: ListDefinition = {
+      ...LIST_PRESETS[0],
+      groups: [{ combinator: 'AND', rules: [Rule.property('Pset_WallCommon', 'FireRating', 'eq', 'REI 90')] }],
+    };
+    expect(() => executeList(definition, createMockProvider())).toThrow(/Rules groups.*evaluated/);
+  });
+
   it('returns rows for matching entity types', () => {
     const provider = createMockProvider();
     const def: ListDefinition = {
@@ -155,7 +164,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'class', source: 'attribute', propertyName: 'Class' },
@@ -178,7 +187,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'predef', source: 'attribute', propertyName: 'PredefinedType' },
@@ -201,7 +210,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'ext', source: 'property', psetName: 'Pset_WallCommon', propertyName: 'IsExternal' },
@@ -226,7 +235,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'len', source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length' },
@@ -251,7 +260,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'area', source: 'quantity', psetName: 'Qto_SlabBaseQuantities', propertyName: 'GrossArea' },
       ],
@@ -271,7 +280,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'u', source: 'property', psetName: 'Pset_WallCommon', propertyName: 'ThermalTransmittance' },
       ],
@@ -289,7 +298,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'missing', source: 'quantity', psetName: 'Qto_SlabBaseQuantities', propertyName: 'GrossArea' },
       ],
@@ -307,7 +316,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'mat', source: 'material', propertyName: 'Material' },
@@ -334,7 +343,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'model', source: 'model', propertyName: 'Model' },
@@ -363,7 +372,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'container', source: 'spatial', propertyName: 'Container' },
@@ -386,7 +395,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'sp', source: 'spatial', propertyName: '' }],
     }, provider);
     expect(result.rows[0].values[0]).toBe('Level 0');
@@ -400,6 +409,15 @@ describe('executeList', () => {
     { source: 'attribute', propertyName: 'Class', operator: 'equals', value: 'IfcWall', expected: ['Wall-01', 'Wall-02'] },
     // Only Wall-02 has an insulation layer (multi-valued, any-match).
     { source: 'material', propertyName: 'Material', operator: 'contains', value: 'insulation', expected: ['Wall-02'] },
+    // Multi-valued equals: Wall-02's material list is ['Brick', 'Rigid
+    // Insulation'] — equals must match on ANY candidate ('some'), not
+    // require ALL of them to equal the target ('every' would drop it).
+    { source: 'material', propertyName: 'Material', operator: 'equals', value: 'Brick', expected: ['Wall-02'] },
+    // Multi-valued notEquals: must exclude an entity when ANY candidate
+    // equals the target ('every' semantics) — 'some' would wrongly keep
+    // Wall-02 because its OTHER material ('Rigid Insulation') still
+    // differs from 'Brick'.
+    { source: 'material', propertyName: 'Material', operator: 'notEquals', value: 'Brick', expected: ['Slab-01', 'Wall-01'] },
     // Classification matches by code or by name.
     { source: 'classification', propertyName: 'Classification', operator: 'contains', value: 'Pr_20', expected: ['Wall-01'] },
     { source: 'classification', propertyName: 'Classification', operator: 'contains', value: 'slab', expected: ['Slab-01'] },
@@ -422,7 +440,65 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [{ source, propertyName, operator, value }],
+      groups: [], legacyConditions: [{ source, propertyName, operator, value }],
+      columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
+    };
+
+    const result = executeList(def, provider);
+    expect(result.rows.map((r) => r.values[0]).sort()).toEqual([...expected]);
+  });
+
+  // Bug: `equals`/`notEquals` were case-SENSITIVE while their sibling
+  // `contains` (line ~318) is case-insensitive. An IFC boolean property
+  // decodes and displays as "True"/"False" (resolvePropertyValue), so a user
+  // filtering on the natural lowercase "true"/"false" got no match — and
+  // `notEquals` silently INCLUDED rows that differed only by letter case.
+  // IsExternal: Wall-01=['IFCBOOLEAN','.T.'] -> "True", Wall-02=['IFCBOOLEAN','.F.'] -> "False",
+  // Slab-01 has no Pset_WallCommon at all (null -> excluded from every operator).
+  it.each([
+    // equals must match across case for boolean-like values.
+    { operator: 'equals', value: 'true', expected: ['Wall-01'] },
+    { operator: 'equals', value: 'TRUE', expected: ['Wall-01'] },
+    // Bounding control: a genuinely DIFFERENT boolean value must still NOT
+    // match — proves the fix didn't loosen equals into "match everything".
+    { operator: 'equals', value: 'false', expected: ['Wall-02'] },
+    // notEquals must NOT report "not equal" purely on letter case (Wall-01
+    // is "True", condition is 'true' -> they ARE equal -> excluded).
+    { operator: 'notEquals', value: 'true', expected: ['Wall-02'] },
+  ] as const)('boolean property $operator "$value" is case-insensitive', ({ operator, value, expected }) => {
+    const provider = createMockProvider();
+    const def: ListDefinition = {
+      id: 'cond-bool-case',
+      name: 'Test',
+      createdAt: 0,
+      updatedAt: 0,
+      entityTypes: [],
+      groups: [], legacyConditions: [{ source: 'property', psetName: 'Pset_WallCommon', propertyName: 'IsExternal', operator, value }],
+      columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
+    };
+
+    const result = executeList(def, provider);
+    expect(result.rows.map((r) => r.values[0]).sort()).toEqual([...expected]);
+  });
+
+  // Bounding control: GlobalId is a base64-ish IFC GUID where case IS
+  // significant (two distinct GUIDs can differ only by case). `equals` must
+  // stay case-sensitive here even after the boolean fix above, or a list
+  // could match the WRONG entity. Mock GlobalIds are lowercase hex
+  // ('0abc' for Wall-01) so an uppercase condition must NOT match.
+  it.each([
+    { operator: 'equals', value: '0abc', expected: ['Wall-01'] },
+    { operator: 'equals', value: '0ABC', expected: [] },
+    { operator: 'notEquals', value: '0ABC', expected: ['Slab-01', 'Wall-01', 'Wall-02'] },
+  ] as const)('GlobalId $operator "$value" stays case-sensitive', ({ operator, value, expected }) => {
+    const provider = createMockProvider();
+    const def: ListDefinition = {
+      id: 'cond-globalid-case',
+      name: 'Test',
+      createdAt: 0,
+      updatedAt: 0,
+      entityTypes: [],
+      groups: [], legacyConditions: [{ source: 'attribute', propertyName: 'GlobalId', operator, value }],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
     };
 
@@ -440,6 +516,12 @@ describe('executeList', () => {
     { source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length', operator: 'lt', value: 4, expected: ['Wall-02'] },
     { source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length', operator: 'gte', value: 5.0, expected: ['Wall-01'] },
     { source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length', operator: 'lte', value: 3.5, expected: ['Wall-02'] },
+    // Boundary pin for gt/lt (strict): value exactly equal to a wall's own
+    // Length must NOT match — `>`/`<` mutated to `>=`/`<=` would wrongly
+    // include it. gte/lte at the same values (above) already cover the
+    // inclusive side, so this isolates strictness specifically.
+    { source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length', operator: 'gt', value: 5.0, expected: [] },
+    { source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length', operator: 'lt', value: 3.5, expected: [] },
     // FireRating: Wall-01='REI 90', Wall-02='EI 30', Slab-01 has no
     // Pset_WallCommon at all (null actualValue is excluded, not a match).
     { source: 'property', psetName: 'Pset_WallCommon', propertyName: 'FireRating', operator: 'notEquals', value: 'EI 30', expected: ['Wall-01'] },
@@ -454,7 +536,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [{ source, psetName, propertyName, operator, value }],
+      groups: [], legacyConditions: [{ source, psetName, propertyName, operator, value }],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
     };
 
@@ -473,7 +555,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'vol', source: 'quantity', psetName: '/Qto_.*BaseQuantities/', propertyName: 'NetVolume' },
@@ -495,7 +577,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'ext', source: 'property', psetName: 'Pset_WallCommon', propertyName: 'IsExternal' },
@@ -516,7 +598,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
       ],
@@ -535,7 +617,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
       expressIdsByModel: { default: [1, 3, 999] },
     }, provider);
@@ -548,7 +630,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [{ source: 'attribute', propertyName: 'Class', operator: 'equals', value: 'IfcWall' }],
+      groups: [], legacyConditions: [{ source: 'attribute', propertyName: 'Class', operator: 'equals', value: 'IfcWall' }],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
       expressIdsByModel: { default: [1, 2, 3] },
     }, provider);
@@ -563,7 +645,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
       // Same local id 1 means different elements in model a vs b — picking by
       // modelId keeps them apart.
@@ -581,7 +663,7 @@ describe('executeList', () => {
     delete (provider as { getAllEntityIds?: unknown }).getAllEntityIds;
     const result = executeList({
       id: 'noall', name: 'T', createdAt: 0, updatedAt: 0, entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
     }, provider);
     expect(result.totalCount).toBe(0);
@@ -595,7 +677,7 @@ describe('executeList', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
       ],
@@ -605,6 +687,33 @@ describe('executeList', () => {
     const result = executeList(def, provider);
     expect(result.rows[0].values[0]).toBe('Wall-02');
     expect(result.rows[1].values[0]).toBe('Wall-01');
+  });
+
+  // Mutation: compareCellValues() special-cases null so it always sorts
+  // first regardless of direction (`a === null` -> -1). Swapping the two
+  // returned constants (null sorting last instead) left the whole suite
+  // green, because the only existing sortBy tests compare two non-null
+  // values. Wall-02 has no PredefinedType (resolves to null); pin that it
+  // sorts ahead of Wall-01's 'SOLIDWALL' under an ascending sort.
+  it('sorts null values first, ahead of non-null values', () => {
+    const provider = createMockProvider();
+    const def: ListDefinition = {
+      id: 'test-null-sort',
+      name: 'Test',
+      createdAt: 0,
+      updatedAt: 0,
+      entityTypes: [IfcTypeEnum.IfcWall],
+      groups: [], legacyConditions: [],
+      columns: [
+        { id: 'name', source: 'attribute', propertyName: 'Name' },
+        { id: 'predef', source: 'attribute', propertyName: 'PredefinedType' },
+      ],
+      sortBy: { columnId: 'predef', direction: 'asc' },
+    };
+
+    const result = executeList(def, provider);
+    expect(result.rows[0].values[0]).toBe('Wall-02'); // null PredefinedType
+    expect(result.rows[1].values[0]).toBe('Wall-01'); // 'SOLIDWALL'
   });
 });
 
@@ -617,7 +726,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'class', source: 'attribute', propertyName: 'Class' },
         { id: 'len', source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length' },
@@ -648,7 +757,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'fire', source: 'property', psetName: 'Pset_WallCommon', propertyName: 'NonExistent' },
       ],
@@ -667,7 +776,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'class', source: 'attribute', propertyName: 'Class' },
         { id: 'name', source: 'attribute', propertyName: 'Name' },
@@ -706,7 +815,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'class', source: 'attribute', propertyName: 'Class' },
         { id: 'name', source: 'attribute', propertyName: 'Name' },
@@ -727,7 +836,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'a', source: 'attribute', propertyName: 'Name' },
         { id: 'b', source: 'attribute', propertyName: 'Tag' },
@@ -755,7 +864,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'a', source: 'attribute', propertyName: 'Class' },
         { id: 'b', source: 'attribute', propertyName: 'Name' },
@@ -784,7 +893,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'a', source: 'attribute', propertyName: 'Class' },
         { id: 'b', source: 'attribute', propertyName: 'Name' },
@@ -807,7 +916,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'a', source: 'attribute', propertyName: 'Name' },
         { id: 'n', source: 'quantity', propertyName: 'Length' },
@@ -826,7 +935,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'a', source: 'attribute', propertyName: 'Name' }],
       grouping: { columnId: 'gone', columnIds: ['gone'], sumColumnIds: [] },
     };
@@ -845,7 +954,7 @@ describe('grouping & summary', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [{ id: 'name', source: 'attribute', propertyName: 'Name' }],
     };
     const result = executeList(def, provider);
@@ -867,7 +976,7 @@ describe('toScheduleRows', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'class', source: 'attribute', propertyName: 'Class' },
         { id: 'len', source: 'quantity', psetName: 'Qto_WallBaseQuantities', propertyName: 'Length' },
@@ -890,7 +999,7 @@ describe('toScheduleRows', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall, IfcTypeEnum.IfcSlab],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'class', source: 'attribute', propertyName: 'Class' },
         { id: 'name', source: 'attribute', propertyName: 'Name' },
@@ -930,6 +1039,22 @@ describe('toScheduleRows', () => {
     const rows = toScheduleRows([{ key: 'k', label: 'Solo', count: 4, sums: {}, level: 0 }], 1);
     expect(rows).toEqual([{ key: 'k', path: ['Solo'], count: 4, sums: {} }]);
   });
+
+  it('a hand-built group with `level` omitted derives it from `path.length - 1`, not `path.length`', () => {
+    // `level` is optional on the public ListGroup type; `summariseListRows`
+    // always fills it, but a caller assembling groups by hand (the
+    // documented "hand-built multi-level set" case) may only supply `path`.
+    // For a 3-level tuple ['A','B','C'], the leaf level is 2 (path.length -
+    // 1), matching `levelCount=3`'s `leafLevel = levelCount - 1 = 2`. Using
+    // `path.length` (3) instead would never equal `leafLevel`, so every
+    // hand-built leaf group would be filtered out and the schedule would
+    // come back empty.
+    const rows = toScheduleRows(
+      [{ key: groupPathKey(['A', 'B', 'C']), label: 'C', count: 2, sums: {}, path: ['A', 'B', 'C'] }],
+      3,
+    );
+    expect(rows).toEqual([{ key: groupPathKey(['A', 'B', 'C']), path: ['A', 'B', 'C'], count: 2, sums: {} }]);
+  });
 });
 
 describe('listResultToCSV', () => {
@@ -941,7 +1066,7 @@ describe('listResultToCSV', () => {
       createdAt: 0,
       updatedAt: 0,
       entityTypes: [IfcTypeEnum.IfcWall],
-      conditions: [],
+      groups: [], legacyConditions: [],
       columns: [
         { id: 'name', source: 'attribute', propertyName: 'Name' },
         { id: 'fire', source: 'property', psetName: 'Pset_WallCommon', propertyName: 'FireRating', label: 'Fire Rating' },
@@ -950,7 +1075,7 @@ describe('listResultToCSV', () => {
 
     const result = executeList(def, provider);
     const csv = listResultToCSV(result);
-    const lines = csv.split('\n');
+    const lines = csv.split('\r\n');
 
     expect(lines[0]).toBe('Name,Fire Rating');
     expect(lines.length).toBe(3); // header + 2 rows
@@ -1016,7 +1141,7 @@ describe('listResultToCSV', () => {
       executionTime: 0,
     });
 
-    const dataLine = csv.split('\n')[1];
+    const dataLine = csv.split('\r\n')[1];
     expect(dataLine).toBe(escaped);
   });
 });
@@ -1037,6 +1162,23 @@ describe('discoverColumns', () => {
     expect(result.quantities.get('Qto_WallBaseQuantities')).toContain('Length');
   });
 
+  it('returns property/quantity names sorted alphabetically, not in discovery order', () => {
+    // Discovery-order for Pset_WallCommon (entity 1's properties, in
+    // fixture order) is IsExternal, FireRating, LoadBearing,
+    // ThermalTransmittance — alphabetically it's FireRating, IsExternal,
+    // LoadBearing, ThermalTransmittance. An order-blind `toContain`
+    // assertion can't tell these apart; `toEqual` pins the exact order.
+    const provider = createMockProvider();
+    const result = discoverColumns(provider, [IfcTypeEnum.IfcWall]);
+
+    expect(result.properties.get('Pset_WallCommon')).toEqual([
+      'FireRating',
+      'IsExternal',
+      'LoadBearing',
+      'ThermalTransmittance',
+    ]);
+  });
+
   it('aggregates discovery across multiple providers and multiple types', () => {
     const p1 = createMockProvider();
     const p2 = createMockProvider();
@@ -1045,6 +1187,27 @@ describe('discoverColumns', () => {
     expect(result.properties.has('Pset_WallCommon')).toBe(true);
     expect(result.quantities.has('Qto_WallBaseQuantities')).toBe(true);
     expect(result.quantities.has('Qto_SlabBaseQuantities')).toBe(true);
+  });
+
+  // Mutation: discovery.ts sorts property/quantity names before returning
+  // them ("for stable UI"), but every prior assertion here used toContain(),
+  // which is order-insensitive. Dropping the .sort() call in discoverColumns
+  // left the whole suite green. Pin the exact alphabetical order using
+  // fixture data whose insertion order differs from sorted order (entity 1's
+  // Pset_WallCommon is inserted IsExternal/FireRating/LoadBearing/..., and
+  // its Qto_WallBaseQuantities is inserted Length/Height/Width/NetVolume).
+  it('sorts property and quantity names alphabetically, independent of insertion order', () => {
+    const provider = createMockProvider();
+    const result = discoverColumns(provider, [IfcTypeEnum.IfcWall]);
+
+    expect(result.properties.get('Pset_WallCommon')).toEqual([
+      'FireRating',
+      'IsExternal',
+      'LoadBearing',
+      'ThermalTransmittance',
+    ]);
+
+    expect(result.quantities.get('Qto_WallBaseQuantities')).toEqual(['Height', 'Length', 'NetVolume', 'Width']);
   });
 });
 

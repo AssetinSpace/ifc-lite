@@ -35,12 +35,19 @@ fn build_void_index(content: &str) -> FxHashMap<u32, Vec<u32>> {
     void_index
 }
 
+/// Load a fixture, distinguishing a genuinely absent file from a broken
+/// read. `NotFound` is the fresh-clone case (`pnpm fixtures` not run yet):
+/// skip unless `IFC_LITE_REQUIRE_FIXTURES=1`, in which case panic naming
+/// the path, matching every other skip-on-missing test in this crate. Any
+/// other `io::Error` (permission denied, corrupt read, ...) means the
+/// environment is broken rather than merely missing an optional download,
+/// so it panics unconditionally.
+fn read_fixture(path: &str) -> Option<String> {
+    ifc_lite_testkit::fixture_text(path)
+}
+
 fn process(path: &str, host_id: u32) -> Option<Mesh> {
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: fixture {path} not present");
-        return None;
-    }
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_fixture(path)?;
     let entity_index = build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
@@ -120,8 +127,8 @@ fn bbox(m: &Mesh) -> ([f64; 3], [f64; 3]) {
     (mn, mx)
 }
 
-const ADVANCED: &str = "../../tests/models/ara3d/advanced_model.ifc";
-const ROOF_1007: &str = "../../tests/models/issues/1007_roof_brep_opening_winding.ifc";
+const ADVANCED: &str = "ara3d/advanced_model.ifc";
+const ROOF_1007: &str = "issues/1007_roof_brep_opening_winding.ifc";
 
 #[test]
 fn box_opening_wall_555082_volume_and_watertight() {

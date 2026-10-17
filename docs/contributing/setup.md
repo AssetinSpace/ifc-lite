@@ -8,8 +8,8 @@ Guide to setting up a development environment for IFClite.
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Node.js | 22.x | JavaScript runtime (`engines` in `package.json`) |
-| pnpm | 10.x (8.0+ minimum) | Package manager (pinned via `packageManager: pnpm@10.8.1`) |
+| Node.js | 22.13+ or 24.x | JavaScript runtime (`engines` in `package.json`) |
+| pnpm | 10.x (`engines` requires 10.0+) | Package manager (pinned via `packageManager: pnpm@10.8.1`) |
 | Rust | pinned nightly | WASM compilation; `rust-toolchain.toml` pins the nightly channel and the `wasm32-unknown-unknown` target, and rustup installs both automatically on first use in the repo |
 | wasm-pack | 0.12+ | WASM toolchain (only needed to rebuild WASM; see `pnpm build:wasm:fetch` below) |
 
@@ -69,7 +69,17 @@ Guide to setting up a development environment for IFClite.
     ```
 
 If you do not want a Rust toolchain at all, `pnpm build:wasm:fetch` downloads
-the prebuilt `@ifc-lite/wasm` bundle from npm instead of compiling it.
+the prebuilt `@ifc-lite/wasm` runtime from npm instead of compiling it.
+
+The published runtime is the last release, so it can be older than your
+checkout. The fetch compares it with the committed type declarations
+(`packages/wasm/pkg/ifc-lite.d.ts`) and, if those declare a top-level export
+the runtime does not provide, lists the missing names, installs nothing and
+exits 1. In that case a source build (`pnpm build:wasm`) is the only way to
+get a matching runtime until the next release. A runtime that is already
+installed gets the same check and is never deleted; `pnpm build:wasm:fetch
+--force` re-fetches over it, replacing it only if the published one passes.
+The committed `ifc-lite.d.ts` is never overwritten.
 
 ## Clone and Build
 
@@ -240,18 +250,25 @@ Install recommended extensions:
     "rust-lang.rust-analyzer",
     "tamasfe.even-better-toml",
     "bradlc.vscode-tailwindcss",
-    "esbenp.prettier-vscode",
-    "dbaeumer.vscode-eslint"
+    "oxc.oxc-vscode"
   ]
 }
 ```
 
 ### Settings
 
+!!! note "No Prettier, no ESLint, and no format-on-save"
+
+    This repo has no `.prettierrc` and no ESLint config, and neither is a
+    devDependency. Linting is [oxlint](https://oxc.rs/) via `pnpm lint`, whose
+    ERROR tier is the CI gate. Turning on format-on-save with a formatter the
+    repo does not configure reformats files against nobody's settings and
+    buries the real diff — the same reason `cargo fmt` is never run repo-wide
+    here (see AGENTS.md).
+
+
 ```json
 {
-  "editor.formatOnSave": true,
-  "editor.defaultFormatter": "esbenp.prettier-vscode",
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer"
   },
@@ -323,6 +340,34 @@ pnpm install
 # Rebuild type declarations
 pnpm -r build
 ```
+
+### A gate judges my branch against a stale `main`
+
+Several scripts compare your branch with `main` when you give them no base:
+`scripts/check-module-size.mjs`, `scripts/check-source-text-assertions.mjs`,
+`scripts/check-raw-entity-enumeration.mjs`, the base-freshness sweep
+(`scripts/lib/base-freshness-io.mjs`) and `scripts/perf/ab.sh`. They find
+`main` through the remote whose URL is `LTplus-AG/ifc-lite`, not through the
+remote's name, so a clone made from a fork needs no flags as long as the
+canonical repository is one of its remotes and has been fetched:
+
+```bash
+git remote add upstream https://github.com/LTplus-AG/ifc-lite.git
+git fetch upstream main
+```
+
+What each situation resolves to (`scripts/lib/canonical-remote.mjs`):
+
+| Situation | Base used |
+|---|---|
+| `origin` is `LTplus-AG/ifc-lite` (a direct clone, every CI checkout of it) | `origin/main` |
+| `origin` is a fork and another remote is `LTplus-AG/ifc-lite` | `<that remote>/main` |
+| You pass a base (`--base <ref>`) | exactly that ref; the remotes are not consulted |
+| No remote is `LTplus-AG/ifc-lite` (a fork's own CI, a mirror) | `origin/main` |
+| The canonical remote exists but its `main` was never fetched | each script's own behaviour for a missing base, naming the ref to fetch: `check-module-size` and `check-source-text-assertions` fall back to a local `main` and warn; `check-raw-entity-enumeration` fails; `ab.sh` falls back to `HEAD~1`; the base-freshness sweep falls back to `HEAD` and refuses unless that is the `main` GitHub reports |
+
+`scripts/perf/ab.sh <fixture> --print-base` prints the base it would build,
+without building anything.
 
 ### Push fails with "You need Push access to upload Git LFS objects"
 

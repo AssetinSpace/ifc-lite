@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Scalar abstraction for the mesher (B4.4, M3 kernel-adjoint spike).
+//! Scalar abstraction for the mesher and its adjoint validation.
 //!
 //! The extrusion mesher used to be written directly against `f64`. It is now
 //! written against [`GeomScalar`], with `f64` as the production instantiation.
@@ -13,7 +13,7 @@
 //! copies of the pre-refactor functions.
 //!
 //! The point of the abstraction is that a second instantiation (a forward-mode
-//! dual number, see `b44_battery`) can run the *same* mesher and carry
+//! dual number, see `scalar_adjoint_battery`) can run the *same* mesher and carry
 //! derivatives of every emitted vertex coordinate with respect to design
 //! parameters. Nothing in the production build pays for it: there is exactly
 //! one non-test instantiation, and monomorphisation erases the trait.
@@ -23,7 +23,7 @@
 //! staircase function of the inputs and therefore not differentiable; the dual
 //! sink stores the scalar unrounded. That quantisation is the *only* difference
 //! between the two instantiations, and it is measured rather than assumed (see
-//! `scripts/moonshot/b44-kernel-adjoint/DESIGN.md`).
+//! `scalar_adjoint_tests.rs`).
 
 use nalgebra::{Matrix4, Point3, Vector3};
 use std::fmt::Debug;
@@ -180,15 +180,7 @@ impl MeshSink<f64> for crate::mesh::Mesh {
     }
     #[inline]
     fn transform_normals(&mut self, transform: &Matrix4<f64>) {
-        // Verbatim from the pre-refactor `apply_transform` normal loop.
-        let normal_matrix = transform.try_inverse().unwrap_or(*transform).transpose();
-        self.normals.chunks_exact_mut(3).for_each(|chunk| {
-            let normal = Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-            let transformed = (normal_matrix * normal.to_homogeneous()).xyz().normalize();
-            chunk[0] = transformed.x as f32;
-            chunk[1] = transformed.y as f32;
-            chunk[2] = transformed.z as f32;
-        });
+        crate::math::normals::transform_normals_in_place(&mut self.normals, transform);
     }
 }
 

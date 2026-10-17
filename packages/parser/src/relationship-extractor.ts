@@ -10,6 +10,10 @@
  */
 
 import type { IfcEntity, Relationship } from './types.js';
+import { createLogger } from '@ifc-lite/data';
+import { propertyDefinitionRefsOfValue } from './property-definition-refs.js';
+
+const relationshipLog = createLogger('RelationshipExtractor');
 
 export class RelationshipExtractor {
   private entities: Map<number, IfcEntity>;
@@ -32,10 +36,7 @@ export class RelationshipExtractor {
         typeCounts.set(typeUpper, (typeCounts.get(typeUpper) || 0) + 1);
       }
 
-      const rel = this.extractRelationship(entity);
-      if (rel) {
-        relationships.push(rel);
-      }
+      relationships.push(...this.extractRelationship(entity));
 
       processed++;
       // Yield to event loop every 2000 entities to prevent blocking
@@ -44,8 +45,8 @@ export class RelationshipExtractor {
       }
     }
 
-    console.log('[RelationshipExtractor] Relationship type counts:', Object.fromEntries(typeCounts));
-    console.log('[RelationshipExtractor] Successfully extracted:', relationships.length);
+    relationshipLog.debug('Relationship type counts:', Object.fromEntries(typeCounts));
+    relationshipLog.debug('Successfully extracted:', relationships.length);
 
     return relationships;
   }
@@ -63,22 +64,20 @@ export class RelationshipExtractor {
         typeCounts.set(typeUpper, (typeCounts.get(typeUpper) || 0) + 1);
       }
 
-      const rel = this.extractRelationship(entity);
-      if (rel) {
-        relationships.push(rel);
-      }
+      relationships.push(...this.extractRelationship(entity));
     }
 
-    console.log('[RelationshipExtractor] Relationship type counts:', Object.fromEntries(typeCounts));
-    console.log('[RelationshipExtractor] Successfully extracted:', relationships.length);
+    relationshipLog.debug('Relationship type counts:', Object.fromEntries(typeCounts));
+    relationshipLog.debug('Successfully extracted:', relationships.length);
 
     return relationships;
   }
 
   /**
-   * Extract relationship from entity
+   * Extract the relationships an entity declares: one, or one per distinct
+   * property definition when `RelatingPropertyDefinition` is a set (#7681).
    */
-  private extractRelationship(entity: IfcEntity): Relationship | null {
+  private extractRelationship(entity: IfcEntity): Relationship[] {
     // IFC entity types may be uppercase or mixed case
     const entityTypeUpper = entity.type.toUpperCase();
     
@@ -93,7 +92,7 @@ export class RelationshipExtractor {
     ];
 
     if (!relTypes.includes(entityTypeUpper)) {
-      return null;
+      return [];
     }
 
     try {
@@ -101,7 +100,20 @@ export class RelationshipExtractor {
       // IfcRelDefinesByProperties: RelatedObjects (4), RelatingPropertyDefinition (5)
       // IfcRelAggregates: RelatingObject (4), RelatedObjects (5)
       // IfcRelContainedInSpatialStructure: RelatedElements (4), RelatingStructure (5)
-      
+      // IfcRelAssociatesMaterial: RelatedObjects (4, inherited from IfcRelAssociates),
+      //   RelatingMaterial (5, own attribute) — the list/single-ref slots are
+      //   swapped relative to IfcRelAggregates. Schema (IFC4_ADD2_TC1.exp):
+      //     ENTITY IfcRelAssociates SUBTYPE OF (IfcRelationship);
+      //       RelatedObjects : SET [1:?] OF IfcDefinitionSelect;
+      //     ENTITY IfcRelAssociatesMaterial SUBTYPE OF (IfcRelAssociates);
+      //       RelatingMaterial : IfcMaterialSelect;
+      //   The "standard" RelatingObject-then-RelatedObjects branch below only
+      //   holds for the IfcRelAggregates shape; applying it here read the
+      //   RelatedObjects list as the (single) relatingObject and the single
+      //   RelatingMaterial reference as the relatedObjects list, so every
+      //   `typeof relatingObject !== 'number'` / `!Array.isArray(relatedObjects)`
+      //   guard below failed and the association was silently dropped (#3253).
+
       let relatingObject: any;
       let relatedObjects: any;
 
@@ -113,24 +125,33 @@ export class RelationshipExtractor {
         // RelatedElements at 4, RelatingStructure at 5
         relatedObjects = this.getAttributeValue(entity, 4);
         relatingObject = this.getAttributeValue(entity, 5);
+      } else if (entityTypeUpper === 'IFCRELASSOCIATESMATERIAL') {
+        // RelatedObjects at 4, RelatingMaterial at 5
+        relatedObjects = this.getAttributeValue(entity, 4);
+        relatingObject = this.getAttributeValue(entity, 5);
       } else {
         // Standard: RelatingObject at 4, RelatedObjects at 5
         relatingObject = this.getAttributeValue(entity, 4);
         relatedObjects = this.getAttributeValue(entity, 5);
       }
 
-      if (relatingObject === null || typeof relatingObject !== 'number' || !Array.isArray(relatedObjects)) {
-        return null;
-      }
+      if (!Array.isArray(relatedObjects)) return [];
+      const related = relatedObjects.filter((id): id is number => typeof id === 'number');
 
-      return {
+      // RelatingPropertyDefinition is a single reference, a bare set or an
+      // IFCPROPERTYSETDEFINITIONSET; every other slot is one reference.
+      const relating = entityTypeUpper === 'IFCRELDEFINESBYPROPERTIES'
+        ? [...new Set(propertyDefinitionRefsOfValue(relatingObject))]
+        : typeof relatingObject === 'number' ? [relatingObject] : [];
+
+      return relating.map((relatingId) => ({
         type: entity.type,
-        relatingObject: relatingObject,
-        relatedObjects: relatedObjects.filter((id): id is number => typeof id === 'number'),
-      };
+        relatingObject: relatingId,
+        relatedObjects: related,
+      }));
     } catch (error) {
       console.warn(`Failed to extract relationship #${entity.expressId}:`, error);
-      return null;
+      return [];
     }
   }
 

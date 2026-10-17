@@ -9,10 +9,15 @@
  * External tools (ifc-scripts, ifc-flow) depend on these types.
  */
 
+import type { StructuralBackendMethods } from './structural-types.js';
+// Re-exported below via `export *`; imported by name because `BimBackend` uses it here.
+import type { ScheduleBackendMethods } from './schedule-types.js';
+import type { CostBackendMethods } from './cost-types.js';
+import type { SpacesBackendMethods, StyleBackendMethods } from './backend-extension-types.js';
+import type { StoreAuthoringBackendMethods } from './store-authoring-types.js';
 import type {
-  GenerateSpacesAllOptions,
-  GenerateSpacesAllResult,
-  StoreyInfo,
+  BeamInStoreParams, ColumnInStoreParams, MemberInStoreParams,
+  ProfiledBeamInStoreParams, ProfiledColumnInStoreParams, ProfiledMemberInStoreParams,
 } from '@ifc-lite/create';
 
 // ============================================================================
@@ -28,16 +33,32 @@ export interface EntityRef {
 /** Serialized entity ref for transport (e.g., "arch:42") */
 export type EntityRefString = string;
 
+/** NOTE: `apps/viewer/src/store/types.ts` carries a second implementation of
+ *  `entityRefToString`/`stringToEntityRef` with a SENTINEL contract
+ *  (`{ modelId: '', expressId: -1 }`) and a FIRST-colon split. Deliberate,
+ *  not drift: the viewer decodes untrusted DOM/state strings on hot paths
+ *  and must not throw, whereas this is a published API where failing at the
+ *  corruption site is correct. Keep the two in step on *bugs*, not on
+ *  contract. */
 export function entityRefToString(ref: EntityRef): EntityRefString {
   return `${ref.modelId}:${ref.expressId}`;
 }
 
 export function stringToEntityRef(s: EntityRefString): EntityRef {
-  const idx = s.indexOf(':');
+  // Split on the LAST colon: expressId is always purely numeric, so it
+  // never contains a colon itself, while modelId may (e.g. "proj:arch:5").
+  // Splitting on the first colon would misparse such modelIds.
+  const idx = s.lastIndexOf(':');
   if (idx < 1) {
     throw new Error(`Invalid EntityRefString: "${s}" — expected "modelId:expressId"`);
   }
-  const expressId = Number(s.slice(idx + 1));
+  const idPart = s.slice(idx + 1);
+  // Reject empty/non-numeric expressId explicitly — Number('') is 0, which
+  // would otherwise silently decode a truncated ref like "arch:" to expressId 0.
+  if (!/^\d+$/.test(idPart)) {
+    throw new Error(`Invalid expressId in EntityRefString: "${s}"`);
+  }
+  const expressId = Number(idPart);
   if (!Number.isFinite(expressId) || expressId < 0) {
     throw new Error(`Invalid expressId in EntityRefString: "${s}"`);
   }
@@ -118,6 +139,7 @@ export interface ClassificationData {
   location?: string;
   description?: string;
   path?: string[];
+  unresolved?: boolean; // classified, attributes unreadable — other fields `undefined` (#3948)
 }
 
 export interface MaterialLayerData {
@@ -169,18 +191,47 @@ export interface DocumentData {
   confidentiality?: string;
 }
 
+/**
+ * The related **objects** of an entity's structural relationships — never the
+ * `IfcRel*` entities themselves:
+ *
+ * - `voids` — the `IfcOpeningElement`s that void this element
+ *   (`IfcRelVoidsElement`, host → opening).
+ * - `fills` — the `IfcOpeningElement` this element fills
+ *   (`IfcRelFillsElement`, filler → opening).
+ * - `groups` — the `IfcZone` / `IfcGroup` / `IfcSystem` it is assigned to.
+ * - `connections` — the elements it is joined to.
+ *
+ * The field names are deliberately not EXPRESS names, and #2422 resolved to
+ * keep them. IFC's own names for these traversals (`HasOpenings`, `FillsVoids`,
+ * `HasAssignments`, `ConnectedTo` / `ConnectedFrom`) are INVERSE attributes
+ * holding the `IfcRel*` entity, which is not what these arrays contain — so
+ * "use the exact EXPRESS name" has no name to offer here. Renaming `voids` to
+ * `openings` is not a fix either: `voids` **and** `fills` both hold
+ * `IfcOpeningElement`s, and only the voids/fills pair — buildingSMART's own
+ * vocabulary for the two directions — tells them apart. Pinned by
+ * `packages/parser/test/relationship-field-semantics-2422.test.ts`.
+ */
 export interface EntityRelationshipsData {
   voids: Array<{ id: number; name?: string; type: string }>;
   fills: Array<{ id: number; name?: string; type: string }>;
-  groups: Array<{ id: number; name?: string }>;
+  groups: Array<{ id: number; name?: string; type?: string }>;
   connections: Array<{ id: number; name?: string; type: string }>;
+  /** Every graph edge touching the entity, preserving its exact IfcRel* class.
+   * Optional for third-party backends compiled against the pre-#4205 shape. */
+  relations?: Array<{
+    relationshipId: number;
+    relationshipType: string;
+    direction: 'forward' | 'inverse';
+    entity: { id: number; name?: string; type: string };
+  }>;
 }
 
 // ============================================================================
 // Query Types
 // ============================================================================
 
-export type ComparisonOp = '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'exists';
+export type ComparisonOp = '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'exists' | 'matches'; // kept in step with FilterComparisonOp in @ifc-lite/query/filter-predicate.ts
 
 export interface QueryFilter {
   psetName: string;
@@ -210,12 +261,7 @@ export interface CameraState {
   up?: [number, number, number];
 }
 
-export interface SectionPlane {
-  axis: 'x' | 'y' | 'z';
-  position: number;
-  enabled: boolean;
-  flipped: boolean;
-}
+import type { SectionPlane } from './section-plane.js';
 
 // ============================================================================
 // Spatial Types
@@ -239,8 +285,8 @@ export interface SpatialFrustum {
 // Lens Types (re-export core types for SDK consumers)
 // ============================================================================
 
-import type { Lens, LensRule, LensCriteria, RGBAColor } from '@ifc-lite/lens';
-export type { Lens, LensRule, LensCriteria, RGBAColor };
+import type { Lens, LensRule, RGBAColor } from '@ifc-lite/lens';
+export type { Lens, LensRule, RGBAColor };
 
 // ============================================================================
 // Mutation Types
@@ -313,9 +359,8 @@ export interface ModelBackendMethods {
 export interface QueryBackendMethods {
   entities(descriptor: QueryDescriptor): EntityData[];
   /**
-   * Entities matching the host's active advanced filter, or `null` when no
-   * filter is active (so callers can distinguish "no filter" from "filter with
-   * zero matches"). Host-specific; transport/headless backends may return null.
+   * Entities matching the host's active advanced filter, or `null` when no filter is
+   * active (distinguishes "no filter" from "filter with zero matches"). Host-specific.
    */
   entitiesMatchingActiveFilter(): EntityData[] | null;
   entityData(ref: EntityRef): EntityData | null;
@@ -341,20 +386,36 @@ export interface VisibilityBackendMethods {
   isolate(refs: EntityRef[]): void;
   reset(): void;
 }
-
 export interface ViewerBackendMethods {
   colorize(refs: EntityRef[], color: RGBAColor): void;
   colorizeAll(batches: Array<{ refs: EntityRef[]; color: RGBAColor }>): void;
+  /** Omitted refs reset all overrides; an explicit empty list is a no-op. */
   resetColors(refs?: EntityRef[]): void;
   flyTo(refs: EntityRef[]): void;
   setSection(section: SectionPlane | null): void;
   getSection(): SectionPlane | null;
+  /** Several cutting planes; optional, `bim.viewer` falls back to `setSection` / `getSection`. */
+  setSections?(sections: SectionPlane[]): void;
+  getSections?(): SectionPlane[];
+  addSection?(section: SectionPlane): string | null;
+  removeSection?(id: string): boolean;
   setCamera(state: Partial<CameraState>): void;
   getCamera(): CameraState;
+  /**
+   * Translation from the frame `getCamera()`/`setCamera()` work in to the
+   * IFC world coordinates of the loaded model(s), `[x, y, z]` in IFC Z-up
+   * metres. A viewer shifts large-coordinate (georeferenced) models towards
+   * the origin before drawing them, so its camera is not in world
+   * coordinates; `bim.bcf.createViewpoint()` adds this offset and
+   * `bim.bcf.extractViewpointState()` subtracts it, so BCF viewpoints are in
+   * world coordinates as the BCF standard requires (#4879). Optional: a
+   * backend without a shifted frame omits it, which means no offset.
+   */
+  getRenderFrameOffset?(): [number, number, number];
 }
 
 export interface MutateBackendMethods {
-  setProperty(ref: EntityRef, psetName: string, propName: string, value: string | number | boolean): void;
+  setProperty(ref: EntityRef, psetName: string, propName: string, value: string | number | boolean, dataType?: string): void;
   setAttribute(ref: EntityRef, attrName: string, value: string): void;
   deleteProperty(ref: EntityRef, psetName: string, propName: string): void;
   batchBegin(label: string): void;
@@ -372,44 +433,44 @@ export interface MutateBackendMethods {
  * the underlying store buffer is never mutated; changes materialise on
  * the next `bim.export.ifc()`.
  */
-export interface AddColumnInStoreParams {
-  Position: [number, number, number];
-  Width: number;
-  Depth: number;
-  Height: number;
+/**
+ * The `IfcRoot` + `IfcElement` header every in-store element builder takes:
+ * naming, and the optional explicit `GlobalId` a re-runnable author (a flow
+ * graph) derives from a stable key so a re-run updates the element instead
+ * of duplicating it. A malformed GlobalId is refused by the builder.
+ */
+export interface AddElementCommonParams {
   Name?: string;
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  GlobalId?: string;
 }
 
-export interface AddWallInStoreParams {
+/** Rectangular column parameters retain their public interface and inherit
+ * the canonical geometry fields, including storey-local RefDirection. */
+export interface AddColumnInStoreParams extends AddElementCommonParams,
+  Pick<ColumnInStoreParams, 'Position' | 'Width' | 'Depth' | 'Height' | 'RefDirection'> {}
+
+export interface AddWallInStoreParams extends AddElementCommonParams {
   Start: [number, number, number];
   End: [number, number, number];
   Thickness: number;
   Height: number;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
 export type AddSlabInStoreParams = AddSlabRectangleParams | AddSlabPolygonParams;
 
-export interface AddSlabRectangleParams {
+export interface AddSlabRectangleParams extends AddElementCommonParams {
   Position: [number, number, number];
   Width: number;
   Depth: number;
   Thickness: number;
   /** `'rectangle'` (or omit) selects the IfcRectangleProfileDef path. */
   Profile?: 'rectangle';
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddSlabPolygonParams {
+export interface AddSlabPolygonParams extends AddElementCommonParams {
   /** `'polygon'` selects the IfcArbitraryClosedProfileDef path. */
   Profile: 'polygon';
   /** Closed outline as 2D storey-local points (≥3). Auto-closed at emit time. */
@@ -417,142 +478,88 @@ export interface AddSlabPolygonParams {
   /** Local placement origin (metres). Defaults to `[0, 0, 0]`. */
   Position?: [number, number, number];
   Thickness: number;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddBeamInStoreParams {
-  Start: [number, number, number];
-  End: [number, number, number];
-  Width: number;
-  Height: number;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
-}
+export interface AddBeamInStoreParams extends AddElementCommonParams,
+  Pick<BeamInStoreParams, 'Start' | 'End' | 'Width' | 'Height'> {}
 
-export interface AddDoorInStoreParams {
+export interface AddDoorInStoreParams extends AddElementCommonParams {
   Position: [number, number, number];
   Width: number;
   Height: number;
   FrameThickness?: number;
   PredefinedType?: 'DOOR' | 'GATE' | 'TRAPDOOR' | 'USERDEFINED' | 'NOTDEFINED';
   OperationType?: string;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddWindowInStoreParams {
+export interface AddWindowInStoreParams extends AddElementCommonParams {
   Position: [number, number, number];
   Width: number;
   Height: number;
   FrameThickness?: number;
   PredefinedType?: 'WINDOW' | 'SKYLIGHT' | 'LIGHTDOME' | 'USERDEFINED' | 'NOTDEFINED';
   PartitioningType?: string;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
 export type AddSpaceInStoreParams = AddSpaceRectangleParams | AddSpacePolygonParams;
 
-export interface AddSpaceRectangleParams {
+export interface AddSpaceRectangleParams extends Omit<AddElementCommonParams, 'Tag'> {
   Position: [number, number, number];
   Width: number;
   Depth: number;
   Height: number;
   Profile?: 'rectangle';
-  Name?: string;
   LongName?: string;
-  Description?: string;
-  ObjectType?: string;
 }
 
-export interface AddSpacePolygonParams {
+export interface AddSpacePolygonParams extends Omit<AddElementCommonParams, 'Tag'> {
   Profile: 'polygon';
   OuterCurve: Array<[number, number]>;
   Position?: [number, number, number];
   Height: number;
-  Name?: string;
   LongName?: string;
-  Description?: string;
-  ObjectType?: string;
 }
 
 export type AddRoofInStoreParams = AddRoofRectangleParams | AddRoofPolygonParams;
 
-export interface AddRoofRectangleParams {
+export interface AddRoofRectangleParams extends AddElementCommonParams {
   Position: [number, number, number];
   Width: number;
   Depth: number;
   Thickness: number;
   Profile?: 'rectangle';
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddRoofPolygonParams {
+export interface AddRoofPolygonParams extends AddElementCommonParams {
   Profile: 'polygon';
   OuterCurve: Array<[number, number]>;
   Position?: [number, number, number];
   Thickness: number;
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
 export type AddPlateInStoreParams = AddPlateRectangleParams | AddPlatePolygonParams;
 
-export interface AddPlateRectangleParams {
+export interface AddPlateRectangleParams extends AddElementCommonParams {
   Position: [number, number, number];
   Width: number;
   Depth: number;
   Thickness: number;
   Profile?: 'rectangle';
   PredefinedType?: 'CURTAIN_PANEL' | 'SHEET' | 'USERDEFINED' | 'NOTDEFINED';
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddPlatePolygonParams {
+export interface AddPlatePolygonParams extends AddElementCommonParams {
   Profile: 'polygon';
   OuterCurve: Array<[number, number]>;
   Position?: [number, number, number];
   Thickness: number;
   PredefinedType?: 'CURTAIN_PANEL' | 'SHEET' | 'USERDEFINED' | 'NOTDEFINED';
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
 }
 
-export interface AddMemberInStoreParams {
-  Start: [number, number, number];
-  End: [number, number, number];
-  Width: number;
-  Height: number;
-  PredefinedType?:
-    | 'BRACE' | 'CHORD' | 'COLLAR' | 'MEMBER' | 'MULLION' | 'PLATE'
-    | 'POST' | 'PURLIN' | 'RAFTER' | 'STRINGER' | 'STRUT' | 'STUD'
-    | 'USERDEFINED' | 'NOTDEFINED';
-  Name?: string;
-  Description?: string;
-  ObjectType?: string;
-  Tag?: string;
-}
+export interface AddMemberInStoreParams extends AddElementCommonParams,
+  Pick<MemberInStoreParams, 'Start' | 'End' | 'Width' | 'Height' | 'PredefinedType'> {}
 
-export interface StoreBackendMethods {
+export interface StoreBackendMethods extends StoreAuthoringBackendMethods {
   addEntity(modelId: string, def: { type: string; attributes: unknown[] }): EntityRef;
   removeEntity(ref: EntityRef): boolean;
   setPositionalAttribute(ref: EntityRef, index: number, value: unknown): void;
@@ -564,16 +571,16 @@ export interface StoreBackendMethods {
    * into the overlay so the element appears alongside the existing
    * model on export.
    */
-  addColumn(modelId: string, storeyExpressId: number, params: AddColumnInStoreParams): EntityRef;
+  addColumn(modelId: string, storeyExpressId: number, params: AddColumnInStoreParams | ProfiledColumnInStoreParams): EntityRef;
   addWall(modelId: string, storeyExpressId: number, params: AddWallInStoreParams): EntityRef;
   addSlab(modelId: string, storeyExpressId: number, params: AddSlabInStoreParams): EntityRef;
-  addBeam(modelId: string, storeyExpressId: number, params: AddBeamInStoreParams): EntityRef;
+  addBeam(modelId: string, storeyExpressId: number, params: AddBeamInStoreParams | ProfiledBeamInStoreParams): EntityRef;
   addDoor(modelId: string, storeyExpressId: number, params: AddDoorInStoreParams): EntityRef;
   addWindow(modelId: string, storeyExpressId: number, params: AddWindowInStoreParams): EntityRef;
   addSpace(modelId: string, storeyExpressId: number, params: AddSpaceInStoreParams): EntityRef;
   addRoof(modelId: string, storeyExpressId: number, params: AddRoofInStoreParams): EntityRef;
   addPlate(modelId: string, storeyExpressId: number, params: AddPlateInStoreParams): EntityRef;
-  addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams): EntityRef;
+  addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams | ProfiledMemberInStoreParams): EntityRef;
 }
 
 export interface SpatialBackendMethods {
@@ -585,7 +592,7 @@ export interface SpatialBackendMethods {
 export interface ExportBackendMethods {
   csv(refs: unknown, options: unknown): string;
   json(refs: unknown, columns: unknown): Record<string, unknown>[];
-  ifc(refs: unknown, options: unknown): string | Uint8Array;
+  ifc(refs: EntityRef[] | undefined, options: unknown): string | Uint8Array; // `undefined` = no isolation filter (whole model); `[]` never arrives (#4738)
   download(content: string | Uint8Array, filename: string, mimeType: string): void;
   /**
    * Export the model's `IfcSpace` volumes as a Honeybee HBJSON energy/daylight model.
@@ -593,6 +600,11 @@ export interface ExportBackendMethods {
    * wasm engine); the data-only SDK never meshes, so it delegates here.
    */
   hbjson?(name?: string): Promise<string>;
+  /**
+   * Export the model's `IfcSpace` volumes as a Dragonfly DFJSON energy model (extruded
+   * `Room2D` plates). Optional — present only on geometry-capable backends.
+   */
+  dfjson?(name?: string): Promise<string>;
 }
 
 export interface LensBackendMethods {
@@ -617,98 +629,23 @@ export interface FilesBackendMethods {
 // layer stays serializable across the sandbox/transport boundary without
 // pulling the parser into consumer bundles.
 // ============================================================================
+export * from './schedule-types.js';
 
-export type ScheduleSequenceType =
-  | 'START_START' | 'START_FINISH' | 'FINISH_START' | 'FINISH_FINISH'
-  | 'USERDEFINED' | 'NOTDEFINED';
+// ============================================================================
+// Structural analysis — IfcStructuralAnalysisModel, IfcStructuralMember /
+// IfcStructuralConnection / IfcStructuralActivity subtypes, load groups and
+// result groups.
+//
+// Shapes mirror `@ifc-lite/parser`'s `StructuralExtraction` struct, for the
+// same reason as the schedule types above: the SDK layer stays serializable
+// across the sandbox/transport boundary without pulling the parser into
+// consumer bundles.
+// ============================================================================
 
-export type ScheduleTaskDurationType =
-  | 'WORKTIME' | 'ELAPSEDTIME' | 'NOTDEFINED';
-
-export interface ScheduleTaskTimeData {
-  scheduleStart?: string;
-  scheduleFinish?: string;
-  scheduleDuration?: string;
-  actualStart?: string;
-  actualFinish?: string;
-  actualDuration?: string;
-  earlyStart?: string;
-  earlyFinish?: string;
-  lateStart?: string;
-  lateFinish?: string;
-  freeFloat?: string;
-  totalFloat?: string;
-  remainingTime?: string;
-  statusTime?: string;
-  durationType?: ScheduleTaskDurationType;
-  isCritical?: boolean;
-  completion?: number;
-}
-
-export interface ScheduleTaskData {
-  expressId: number;
-  globalId: string;
-  name: string;
-  description?: string;
-  objectType?: string;
-  identification?: string;
-  longDescription?: string;
-  status?: string;
-  workMethod?: string;
-  isMilestone: boolean;
-  priority?: number;
-  predefinedType?: string;
-  taskTime?: ScheduleTaskTimeData;
-  parentGlobalId?: string;
-  childGlobalIds: string[];
-  productExpressIds: number[];
-  productGlobalIds: string[];
-  controllingScheduleGlobalIds: string[];
-}
-
-export interface ScheduleSequenceData {
-  globalId: string;
-  relatingTaskGlobalId: string;
-  relatedTaskGlobalId: string;
-  sequenceType: ScheduleSequenceType;
-  userDefinedSequenceType?: string;
-  timeLagSeconds?: number;
-  timeLagDuration?: string;
-}
-
-export interface WorkScheduleData {
-  expressId: number;
-  globalId: string;
-  kind: 'WorkSchedule' | 'WorkPlan';
-  name: string;
-  description?: string;
-  identification?: string;
-  creationDate?: string;
-  purpose?: string;
-  duration?: string;
-  startTime?: string;
-  finishTime?: string;
-  predefinedType?: string;
-  taskGlobalIds: string[];
-}
-
-export interface ScheduleExtractionData {
-  workSchedules: WorkScheduleData[];
-  tasks: ScheduleTaskData[];
-  sequences: ScheduleSequenceData[];
-  hasSchedule: boolean;
-}
-
-export interface ScheduleBackendMethods {
-  /** Extract the full schedule graph from the active or specified model. */
-  data(modelId?: string): ScheduleExtractionData;
-  /** Convenience — just the task list. */
-  tasks(modelId?: string): ScheduleTaskData[];
-  /** Convenience — just the work schedules / work plans. */
-  workSchedules(modelId?: string): WorkScheduleData[];
-  /** Convenience — just the task dependency edges. */
-  sequences(modelId?: string): ScheduleSequenceData[];
-}
+/** Why one `Values` slot of a load configuration carries no nested load. */
+export * from './structural-types.js';
+export * from './cost-types.js';
+export * from './backend-extension-types.js';
 
 // ============================================================================
 // Backend Interface (implemented by local store or remote proxy)
@@ -723,21 +660,6 @@ export interface ScheduleBackendMethods {
  * BimHost (wire protocol) uses dispatchToBackend() to route string-based
  * SdkRequests to the typed namespace methods.
  */
-/**
- * Derive IfcSpace from a model's walls/slabs/roofs. Optional on the backend:
- * local backends with direct store access implement it; remote backends (whose
- * store lives server-side) leave it undefined.
- */
-export interface SpacesBackendMethods {
-  /** Every IfcBuildingStorey (id, name, elevation), low → high. */
-  listStoreys(): StoreyInfo[];
-  /**
-   * Derive IfcSpace across the selected storeys, writing them to the backend's
-   * mutation overlay. Persist with `bim.export.toStep()`.
-   */
-  generate(options?: GenerateSpacesAllOptions): GenerateSpacesAllResult;
-}
-
 export interface BimBackend {
   readonly model: ModelBackendMethods;
   readonly query: QueryBackendMethods;
@@ -751,8 +673,14 @@ export interface BimBackend {
   readonly lens: LensBackendMethods;
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
+  /** IFC 5D cost reads, when the backend retains loaded source bytes. */
+  readonly cost?: CostBackendMethods;
+  /** Structural analysis reads, when supported by the backend. */
+  readonly structural?: StructuralBackendMethods;
   /** Space derivation — present only on local backends with store access. */
   readonly spaces?: SpacesBackendMethods;
+  /** Persistent colouring — present only on local backends with store access. */
+  readonly style?: StyleBackendMethods;
 
   /** Subscribe to viewer events */
   subscribe(event: BimEventType, handler: (data: unknown) => void): () => void;

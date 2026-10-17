@@ -20,6 +20,24 @@ async function makeZip(entries: Record<string, string>): Promise<ArrayBuffer> {
   return zip.generateAsync({ type: 'arraybuffer' });
 }
 
+async function makeDeflatedZip(entries: Record<string, string>): Promise<ArrayBuffer> {
+  const zip = new JSZip();
+  for (const [name, content] of Object.entries(entries)) zip.file(name, content);
+  return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+}
+
+function forgeCentralUncompressedSize(buffer: ArrayBuffer, size: number): ArrayBuffer {
+  const bytes = new Uint8Array(buffer.slice(0));
+  const view = new DataView(bytes.buffer);
+  for (let offset = 0; offset <= bytes.byteLength - 28; offset++) {
+    if (view.getUint32(offset, true) === 0x02014b50) {
+      view.setUint32(offset + 24, size, true);
+      return bytes.buffer;
+    }
+  }
+  throw new Error('test ZIP has no central-directory entry');
+}
+
 function toArrayBuffer(text: string): ArrayBuffer {
   const bytes = new TextEncoder().encode(text);
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
@@ -78,11 +96,78 @@ describe('unwrapIfcZip', () => {
     await expect(unwrapIfcZip(zip)).rejects.toThrow(/expected exactly one/);
   });
 
+  // macOS Finder adds an AppleDouble sidecar per entry when compressing, and it
+  // keeps the original extension - so `__MACOSX/._model.ifc` counted as a second
+  // model and EVERY Mac-made archive was rejected as ambiguous (#2812, reported
+  // from production).
+  it('ignores the __MACOSX AppleDouble sidecar macOS adds when zipping', async () => {
+    const zip = await makeZip({
+      'model.ifc': STEP_HEADER,
+      '__MACOSX/._model.ifc': 'AppleDouble resource fork bytes',
+    });
+    const result = await unwrapIfcZip(zip);
+    expect(new TextDecoder().decode(result)).toBe(STEP_HEADER);
+  });
+
+  it('ignores a bare ._ sidecar left beside its original by a rezip', async () => {
+    // Several unzip/rezip round trips drop the __MACOSX/ directory but keep the
+    // `._` file next to the original, so the prefix alone is not enough.
+    const zip = await makeZip({
+      'model.ifc': STEP_HEADER,
+      '._model.ifc': 'AppleDouble resource fork bytes',
+    });
+    const result = await unwrapIfcZip(zip);
+    expect(new TextDecoder().decode(result)).toBe(STEP_HEADER);
+  });
+
+  it('ignores a sidecar in a nested folder', async () => {
+    const zip = await makeZip({
+      'project/model.ifc': STEP_HEADER,
+      'project/__MACOSX/._model.ifc': 'AppleDouble resource fork bytes',
+    });
+    const result = await unwrapIfcZip(zip);
+    expect(new TextDecoder().decode(result)).toBe(STEP_HEADER);
+  });
+
+  it('finds a genuine model inside a folder that happens to be named __MACOSX', async () => {
+    // The sidecar test is the BASENAME, not the directory. Matching the folder
+    // name would drop a real model for anyone whose archive contains a folder
+    // called that - a silent data loss traded for a redundant check, since
+    // every real sidecar is already `._`-prefixed.
+    const zip = await makeZip({ '__MACOSX/model.ifc': STEP_HEADER });
+    const result = await unwrapIfcZip(zip);
+    expect(new TextDecoder().decode(result)).toBe(STEP_HEADER);
+  });
+
+  it('still rejects two GENUINE models, so the sidecar filter did not weaken the guard', async () => {
+    // The ambiguity error exists for a reason; skipping sidecars must not skip
+    // a real second model that happens to sit in a folder.
+    const zip = await makeZip({
+      'a.ifc': STEP_HEADER,
+      'nested/b.ifc': STEP_HEADER,
+    });
+    await expect(unwrapIfcZip(zip)).rejects.toThrow(/expected exactly one/);
+  });
+
+  it('still reports NO model when the archive holds only a sidecar', async () => {
+    // A sidecar is not a model, so this must be the "nothing to parse" error
+    // rather than silently unwrapping resource-fork bytes as a model.
+    const zip = await makeZip({ '__MACOSX/._model.ifc': 'AppleDouble bytes' });
+    await expect(unwrapIfcZip(zip)).rejects.toThrow(/no \.ifc\/\.ifcxml entry/);
+  });
+
   it('rejects a model entry whose declared uncompressed size exceeds the limit (zip-bomb guard)', async () => {
     const zip = await makeZip({ 'model.ifc': STEP_HEADER });
     // STEP_HEADER is ~60 bytes; a 10-byte limit forces the guard to fire
     // without needing a real multi-gigabyte fixture.
     await expect(unwrapIfcZipWithLimit(zip, 10)).rejects.toThrow(/refusing to decompress/);
+  });
+
+  it('aborts inflation when forged metadata understates the actual model size', async () => {
+    const expanded = `${STEP_HEADER}\n${' '.repeat(1024 * 1024)}`;
+    const zip = await makeDeflatedZip({ 'model.ifc': expanded });
+    const forged = forgeCentralUncompressedSize(zip, 16);
+    await expect(unwrapIfcZipWithLimit(forged, 4096)).rejects.toThrow(/extracted entry.*exceeds/);
   });
 
   it('allows a model entry within the size limit', async () => {
@@ -167,6 +252,11 @@ describe('unwrapIfcZipWithResources (#1781)', () => {
     await expect(unwrapIfcZipWithResources(zip)).rejects.toThrow(/2 model files/);
   });
 
+  it('checks a caller model ceiling before decompressing the model entry', async () => {
+    const zip = await makeZip({ 'model.ifc': STEP_HEADER.repeat(8), 'wood.png': 'image' });
+    await expect(unwrapIfcZipWithResources(zip, 32)).rejects.toThrow(/over the .* limit/);
+  });
+
   it('first entry wins on a basename collision', async () => {
     const zip = await makeZip({
       'model.ifc': STEP_HEADER,
@@ -187,4 +277,29 @@ describe('unwrapIfcZipWithResources aggregate budgets (#1781)', () => {
     const { resources } = await unwrapIfcZipWithResources(zip);
     expect(resources.size).toBe(256);
   });
+});
+
+// #4243: basename resolution is compatibility, not archive identity.
+it('preserves exact IFC/image archive paths and colliding resources without byte copies', async () => {
+  const zip = await makeZip({
+    'nested/Model.IFC': STEP_HEADER,
+    'nested/a/Wood.PNG': 'first',
+    'nested/b/wood.png': 'second',
+  });
+  const result = await unwrapIfcZipWithResources(zip);
+  expect(result.modelPath).toBe('nested/Model.IFC');
+  expect([...result.originalResources.keys()]).toEqual(['nested/a/Wood.PNG', 'nested/b/wood.png']);
+  expect(result.resources.get('wood.png')).toBe(result.originalResources.get('nested/a/Wood.PNG'));
+  expect(new TextDecoder().decode(result.originalResources.get('nested/b/wood.png'))).toBe('second');
+});
+
+it('reports extraction omissions at the entry cap without reporting complete archives as partial (#4243)', async () => {
+  const entries: Record<string, string> = { 'model.ifc': STEP_HEADER };
+  for (let i = 0; i < 256; i++) entries[`image${i}.png`] = 'x';
+  expect((await unwrapIfcZipWithResources(await makeZip(entries))).resourcesIncomplete).toBe(false);
+  entries['omitted.png'] = 'x';
+  const partial = await unwrapIfcZipWithResources(await makeZip(entries));
+  expect(partial.originalResources.size).toBe(256);
+  expect(partial.resourcesIncomplete).toBe(true);
+  expect((await unwrapIfcZipWithResources(toArrayBuffer(STEP_HEADER))).resourcesIncomplete).toBe(false);
 });

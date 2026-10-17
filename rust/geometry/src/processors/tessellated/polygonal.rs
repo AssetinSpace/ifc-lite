@@ -16,24 +16,12 @@ impl PolygonalFaceSetProcessor {
         Self
     }
 
+    /// One face loop as 1-based corners for `triangulate_polygon`, under the
+    /// shared index rule and `PnIndex` remap; an invalid corner is `0`, which
+    /// drops the whole face rather than a vertex of it (#7689).
     #[inline]
     fn parse_index_loop(indices: &[AttributeValue], pn_index: Option<&[u32]>) -> Vec<u32> {
-        indices
-            .iter()
-            .filter_map(|value| {
-                let idx = value.as_int()?;
-                if idx <= 0 {
-                    return None;
-                }
-                let idx = idx as usize;
-
-                if let Some(remap) = pn_index {
-                    remap.get(idx - 1).copied().filter(|mapped| *mapped > 0)
-                } else {
-                    Some(idx as u32)
-                }
-            })
-            .collect()
+        indices.iter().map(|value| super::indices::polygon_corner(value, pn_index)).collect()
     }
 
     #[inline]
@@ -62,15 +50,14 @@ impl PolygonalFaceSetProcessor {
 
         result
     }
-}
 
-impl GeometryProcessor for PolygonalFaceSetProcessor {
-    fn process(
-        &self,
+    /// Mesh the face set; `rtc_file_units` rebases before f32 narrowing
+    /// (see `read_point_list`), so triangulation and orientation also run on
+    /// the rebased, collapse-free positions.
+    fn process_rebased(
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
-        _schema: &IfcSchema,
-        _quality: TessellationQuality,
+        rtc_file_units: Option<(f64, f64, f64)>,
     ) -> Result<Mesh> {
         // IfcPolygonalFaceSet attributes:
         // 0: Coordinates (IfcCartesianPointList3D)
@@ -78,31 +65,14 @@ impl GeometryProcessor for PolygonalFaceSetProcessor {
         // 2: Faces (LIST of IfcIndexedPolygonalFace)
         // 3: PnIndex (optional - point index remapping)
 
-        // Get coordinate entity reference
-        let coords_attr = entity
+        let coord_entity_id = entity
             .get(0)
-            .ok_or_else(|| Error::geometry("PolygonalFaceSet missing Coordinates".to_string()))?;
-
-        let coord_entity_id = coords_attr.as_entity_ref().ok_or_else(|| {
-            Error::geometry("Expected entity reference for Coordinates".to_string())
-        })?;
-
-        // Parse coordinates - try fast path first
-        use ifc_lite_core::extract_coordinate_list_from_entity;
-
-        let positions = if let Some(raw_bytes) = decoder.get_raw_bytes(coord_entity_id) {
-            extract_coordinate_list_from_entity(raw_bytes).unwrap_or_default()
-        } else {
-            // Fallback path
-            let coords_entity = decoder.decode_by_id(coord_entity_id)?;
-            let coord_list_attr = coords_entity.get(0).ok_or_else(|| {
-                Error::geometry("CartesianPointList3D missing CoordList".to_string())
+            .ok_or_else(|| Error::geometry("PolygonalFaceSet missing Coordinates".to_string()))?
+            .as_entity_ref()
+            .ok_or_else(|| {
+                Error::geometry("Expected entity reference for Coordinates".to_string())
             })?;
-            let coord_list = coord_list_attr
-                .as_list()
-                .ok_or_else(|| Error::geometry("Expected coordinate list".to_string()))?;
-            AttributeValue::parse_coordinate_list_3d(coord_list)
-        };
+        let positions = super::read_point_list(decoder, coord_entity_id, rtc_file_units)?;
 
         if positions.is_empty() {
             return Ok(Mesh::new());
@@ -117,15 +87,9 @@ impl GeometryProcessor for PolygonalFaceSetProcessor {
             .as_list()
             .ok_or_else(|| Error::geometry("Expected faces list".to_string()))?;
 
-        // Optional point remapping list for IfcPolygonalFaceSet.
-        // CoordIndex values refer to this list when present.
-        let pn_index = entity.get(3).and_then(|attr| attr.as_list()).map(|list| {
-            list.iter()
-                .filter_map(|value| value.as_int())
-                .filter(|v| *v > 0)
-                .map(|v| v as u32)
-                .collect::<Vec<u32>>()
-        });
+        // Optional point remapping list (attribute 3): CoordIndex values
+        // index it when present.
+        let pn_index = super::indices::read_pn_index(entity, 3);
 
         // Pre-allocate indices - estimate 2 triangles per face average
         let mut indices = Vec::with_capacity(face_refs.len() * 6);
@@ -158,21 +122,42 @@ impl GeometryProcessor for PolygonalFaceSetProcessor {
             let inner_indices = Self::parse_face_inner_indices(&face_entity, pn_index.as_deref());
 
             // Triangulate the polygon face (including holes when present).
-            Self::triangulate_polygon(&face_indices, &inner_indices, &positions, &mut indices);
+            Self::triangulate_polygon(&face_entity.ifc_type, &face_indices, &inner_indices, &positions, &mut indices);
         }
 
         // Closed shells from some exporters may be consistently inward.
-        // Flip globally to outward winding when needed.
-        let is_closed = entity
-            .get(1)
-            .and_then(|a| a.as_enum())
-            .map(|v| v == "T")
-            .unwrap_or(false);
-        if is_closed {
+        // Flip globally to outward winding when needed, under the one
+        // `Closed` policy shared with the triangulated processor.
+        if super::orients_outward(entity.get(1)) {
             Self::orient_closed_shell_outward(&positions, &mut indices);
         }
 
-        Ok(Self::build_flat_shaded_mesh(&positions, &indices))
+        let mut mesh = Self::build_flat_shaded_mesh(&positions, &indices);
+        mesh.rtc_applied = rtc_file_units.is_some();
+        Ok(mesh)
+    }
+}
+
+impl GeometryProcessor for PolygonalFaceSetProcessor {
+    fn process(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        _quality: TessellationQuality,
+    ) -> Result<Mesh> {
+        Self::process_rebased(entity, decoder, None)
+    }
+
+    fn process_in_rtc_frame(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        _quality: TessellationQuality,
+        rtc_file_units: (f64, f64, f64),
+    ) -> Option<Result<Mesh>> {
+        Some(Self::process_rebased(entity, decoder, Some(rtc_file_units)))
     }
 
     fn supported_types(&self) -> Vec<IfcType> {

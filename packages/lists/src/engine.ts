@@ -3,15 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * List execution engine - resolves source sets and extracts column values
- *
+ * List execution engine - resolves source sets and extracts column values.
  * PERF: Uses ListDataProvider.getEntitiesByType() for O(typeRange) entity lookups,
  * and property/quantity accessors for O(1) lookups per entity.
  */
 
 import type { PropertySet, Property, QuantitySet, Quantity } from '@ifc-lite/data';
-import { parsePropertyValue } from '@ifc-lite/encoding';
+import { isWhollyNumeric, parsePropertyValue } from '@ifc-lite/encoding';
+import { resolveSourceSet } from './source-set.js';
 import { compileNameMatcher } from './name-pattern.js';
+import { getWorldCoordinateValue, extractGeometryColumnValue } from './geometry-column.js';
+import { withAggregateInheritance } from './condition-inherit.js';
+import { getAttributeValue } from './entity-attributes.js';
 import type {
   ListDataProvider,
   ListDefinition,
@@ -34,11 +37,13 @@ export function executeList(
   definition: ListDefinition,
   provider: ListDataProvider,
   modelId = 'default',
+  capturedExpressIds?: ReadonlySet<number>,
 ): ListResult {
+  if (definition.groups.some((group) => group.rules.length > 0))
+    throw new Error('executeList requires Rules groups to be evaluated before provider-only execution');
   const startTime = performance.now();
 
-  // Step 1: Resolve source set (which entities match)
-  const matchedIds = resolveSourceSet(definition, provider, modelId);
+  const matchedIds = resolveSourceSet(definition, provider, modelId, matchesAllConditions, capturedExpressIds);
 
   // Step 2: Extract column values for matched entities. `columnMeta` collects,
   // per quantity/property column, the QuantityType / measure dataType of the
@@ -94,7 +99,6 @@ interface ColumnMeta {
 // ============================================================================
 // Grouping & Aggregation
 // ============================================================================
-
 
 /**
  * Effective ordered group-by column ids for a grouping config — `columnIds`
@@ -232,48 +236,6 @@ export function toScheduleRows(groups: ListGroup[] | undefined, levelCount: numb
     .map((g) => ({ key: g.key, path: g.path ?? [g.label], count: g.count, sums: g.sums }));
 }
 
-// ============================================================================
-// Source Set Resolution
-// ============================================================================
-
-function resolveSourceSet(
-  definition: ListDefinition,
-  provider: ListDataProvider,
-  modelId: string,
-): number[] {
-  const { entityTypes, conditions, expressIdsByModel } = definition;
-
-  let entityIds: number[];
-  if (expressIdsByModel) {
-    // Explicit snapshot scope (e.g. from a filter result) — target exactly
-    // the ids captured FOR THIS model. Keyed by model so a federated list
-    // never picks up a foreign model's element that happens to share a
-    // local express ID. Still intersect with this model for safety.
-    const snapshot = expressIdsByModel[modelId] ?? [];
-    entityIds = snapshot.filter((id) => provider.getEntityTypeName(id) !== '');
-  } else if (entityTypes.length === 0) {
-    // No class constraint — target every element in the model. Requires
-    // the provider to enumerate all ids; older providers without it
-    // resolve to an empty set rather than throwing.
-    entityIds = provider.getAllEntityIds?.() ?? [];
-  } else {
-    // Collect entity IDs by type - gather arrays first, then flatten once
-    const chunks: number[][] = [];
-    for (const type of entityTypes) {
-      const ids = provider.getEntitiesByType(type);
-      if (ids.length > 0) chunks.push(ids);
-    }
-    entityIds = chunks.length === 1 ? chunks[0] : chunks.flat();
-  }
-
-  // Apply conditions as filters
-  if (conditions.length === 0) {
-    return entityIds;
-  }
-
-  return entityIds.filter(id => matchesAllConditions(id, conditions, provider));
-}
-
 function matchesAllConditions(
   entityId: number,
   conditions: PropertyCondition[],
@@ -287,7 +249,7 @@ function matchesAllConditions(
   return true;
 }
 
-function matchesCondition(
+export function matchesCondition(
   entityId: number,
   condition: PropertyCondition,
   provider: ListDataProvider,
@@ -311,9 +273,9 @@ function matchesCondition(
 
   switch (condition.operator) {
     case 'equals':
-      return String(actualValue) === String(condition.value);
+      return equalsIgnoringBooleanCase(actualValue, condition.value);
     case 'notEquals':
-      return String(actualValue) !== String(condition.value);
+      return !equalsIgnoringBooleanCase(actualValue, condition.value);
     case 'contains':
       return String(actualValue).toLowerCase().includes(String(condition.value).toLowerCase());
     case 'gt':
@@ -329,6 +291,37 @@ function matchesCondition(
   }
 }
 
+/** `true` for a JS boolean, or a string that stringifies an IFC boolean/
+ *  logical ("true" / "false" / "unknown", any case) — the only cases the
+ *  compared values can genuinely differ by CASE ALONE while meaning the same
+ *  thing (IfcBoolean displays as "True"/"False" via resolvePropertyValue,
+ *  IfcLogical adds "Unknown"; a raw JS boolean like `zone`'s Straddles flag
+ *  stringifies lowercase). Deliberately narrow: an arbitrary string field
+ *  (Name, GlobalId, classification code, …) is NOT boolean-like, so it falls
+ *  through to the exact, case-sensitive comparison below — a GlobalId that
+ *  differs only by case IS a different entity and must not match. */
+function isBooleanLike(value: CellValue): boolean {
+  if (typeof value === 'boolean') return true;
+  if (typeof value !== 'string') return false;
+  const lower = value.toLowerCase();
+  return lower === 'true' || lower === 'false' || lower === 'unknown';
+}
+
+/**
+ * `equals` comparison used by both `equals` and `notEquals` (case #: sibling
+ * asymmetry — `contains` was already case-insensitive, `equals`/`notEquals`
+ * were not, so `IsExternal = True` never matched a stored "true"). Only
+ * boolean-like values (see {@link isBooleanLike}) compare case-insensitively;
+ * everything else — including GlobalId, where two distinct GUIDs can differ
+ * only by case — keeps the original exact-match semantics.
+ */
+function equalsIgnoringBooleanCase(actualValue: CellValue, conditionValue: string | number | boolean): boolean {
+  if (isBooleanLike(actualValue) && isBooleanLike(conditionValue)) {
+    return String(actualValue).toLowerCase() === String(conditionValue).toLowerCase();
+  }
+  return String(actualValue) === String(conditionValue);
+}
+
 function getConditionValue(
   entityId: number,
   condition: PropertyCondition,
@@ -337,16 +330,16 @@ function getConditionValue(
   switch (condition.source) {
     case 'attribute':
       return getAttributeValue(entityId, condition.propertyName, provider);
-    case 'property':
-      return getPropertyValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
-    case 'quantity':
-      return getQuantityValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
-    case 'spatial':
-      return getSpatialValue(entityId, condition.propertyName, provider);
-    case 'model':
-      return provider.getModelName?.() || null;
+    case 'property': case 'quantity':
+      return withAggregateInheritance(entityId, condition, provider, (id) => condition.source === 'property'
+        ? getPropertyValue(id, condition.psetName ?? '', condition.propertyName, provider)
+        : getQuantityValue(id, condition.psetName ?? '', condition.propertyName, provider));
+    case 'spatial': return getSpatialValue(entityId, condition.propertyName, provider);
+    case 'model': return provider.getModelName?.() || null;
     case 'zone':
       return getZoneValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
+    case 'geometry':
+      return getWorldCoordinateValue(entityId, condition.propertyName, provider);
     default:
       return null;
   }
@@ -367,13 +360,52 @@ function getZoneValue(
   mode: string,
   provider: ListDataProvider,
 ): CellValue {
+  const normalized = mode.toLowerCase();
+  // The two volume modes (#2508) resolve against the apportionment cache, not
+  // the classification, and are `null` until the user asks for one — so adding
+  // the column never triggers a model-wide clip.
+  if (normalized === ZONE_MODE_VOLUME || normalized === ZONE_MODE_BREAKDOWN) {
+    const split = provider.getZoneVolumeShares?.(entityId, zoneSetId);
+    if (!split) return null;
+    if (normalized === ZONE_MODE_VOLUME) return split.homeValue;
+    if (split.shares.length === 0) return null;
+    return split.shares.map((s) => `${s.zoneName}: ${s.value}`).join(', ');
+  }
   const assignment = provider.getZoneAssignment?.(entityId, zoneSetId);
   if (!assignment) return null;
-  if (mode.toLowerCase() === 'straddles') return assignment.straddles;
+  if (normalized === 'straddles') return assignment.straddles;
   if (assignment.straddles && assignment.touchedZoneNames.length > 0) {
     return uniqueJoin(assignment.touchedZoneNames);
   }
   return assignment.zoneName;
+}
+
+/**
+ * `zone` column/condition modes that carry a VOLUME rather than a name.
+ *
+ * The basis is IN THE MODE NAME, not in a tooltip: a list cell is one number
+ * and a zone volume derived from a net wall is not comparable to one derived
+ * from a gross wall (the convention #2199 settled and #2508 adopts). These
+ * report the `mesh` basis — the as-built geometry, after opening cuts — which
+ * is the only basis whose split is measured rather than inferred. The declared
+ * net / gross breakdowns live in the properties panel, where there is room to
+ * show all of them side by side.
+ *
+ * Lower-cased here so the engine, the unit tagging below and the picker cannot
+ * drift on capitalisation.
+ */
+export const ZONE_MODE_VOLUME = 'volume (mesh)';
+export const ZONE_MODE_BREAKDOWN = 'volume breakdown (mesh)';
+
+/** `QuantityType.Volume` — spelled out rather than importing `@ifc-lite/data`
+ *  into the engine for one number. */
+const VOLUME_QUANTITY_TYPE = 2;
+
+/** True when a `zone` column's mode makes its cells volumes, so the shared
+ *  per-column unit resolver converts and labels them like any other declared
+ *  volume (issue #1573's single-target normalization). */
+export function isZoneVolumeMode(mode: string | undefined): boolean {
+  return (mode ?? '').toLowerCase() === ZONE_MODE_VOLUME;
 }
 
 /**
@@ -524,14 +556,16 @@ function extractColumnValues(
         values[i] = codes.length > 0 ? uniqueJoin(codes) : null;
         break;
       }
-      case 'spatial':
-        values[i] = getSpatialValue(entityId, col.propertyName, provider);
-        break;
-      case 'model':
-        values[i] = provider.getModelName?.() || null;
-        break;
+      case 'spatial': values[i] = getSpatialValue(entityId, col.propertyName, provider); break;
+      case 'model': values[i] = provider.getModelName?.() || null; break;
       case 'zone':
         values[i] = getZoneValue(entityId, col.psetName ?? '', col.propertyName, provider);
+        if (isZoneVolumeMode(col.propertyName) && columnMeta[i].quantityType === undefined) {
+          columnMeta[i].quantityType = VOLUME_QUANTITY_TYPE;
+        }
+        break;
+      case 'geometry':
+        values[i] = extractGeometryColumnValue(entityId, col.propertyName, provider, columnMeta[i]);
         break;
       default:
         values[i] = null;
@@ -549,30 +583,6 @@ function uniqueJoin(values: string[]): string {
 // ============================================================================
 // Value Accessors
 // ============================================================================
-
-function getAttributeValue(entityId: number, attrName: string, provider: ListDataProvider): CellValue {
-  switch (attrName) {
-    case 'Name':
-      return provider.getEntityName(entityId) || null;
-    case 'GlobalId':
-      return provider.getEntityGlobalId(entityId) || null;
-    case 'Class':
-      return provider.getEntityTypeName(entityId) || null;
-    case 'Type':
-      // The element's IfcTypeProduct name (issue #1754).
-      return provider.getEntityDefiningTypeName?.(entityId) || null;
-    case 'Description':
-      return provider.getEntityDescription(entityId) || null;
-    case 'ObjectType':
-      return provider.getEntityObjectType(entityId) || null;
-    case 'PredefinedType':
-      return provider.getEntityPredefinedType?.(entityId) || null;
-    case 'Tag':
-      return provider.getEntityTag(entityId) || null;
-    default:
-      return null;
-  }
-}
 
 function getPropertyValue(
   entityId: number,
@@ -617,9 +627,12 @@ function findPropertyEntry(psets: PropertySet[], psetName: string, propName: str
 }
 
 /**
- * Resolve a raw IFC property value to a clean display value.
- * Handles typed arrays [IFCTYPE, value], boolean enums (.T./.F./.U.),
- * IFC string encodings, etc.
+ * Resolve a stored IFC property value to a clean display value.
+ * Handles typed arrays [IFCTYPE, value], boolean enums (.T./.F./.U.), etc.
+ *
+ * NOT STEP decoding: the value arrives already decoded from the parse boundary,
+ * and `parsePropertyValue` deliberately does not decode a second time (that
+ * collapses `\\` twice — see its own note).
  */
 function resolvePropertyValue(value: unknown): CellValue {
   if (value === null || value === undefined) return null;
@@ -696,7 +709,21 @@ export function listResultToCSV(result: ListResult, delimiter = ','): string {
     // is a plain (optionally signed, decimal/exponent) number carries no formula
     // payload, so it is left untouched; anything else with a trigger prefix
     // (including `-cmd` or `-1+cmd`) is still quoted.
-    if (/^[=+\-@\t\r]/.test(str) && !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(str)) {
+    //
+    // The trigger is looked for PAST any leading invisible characters, and the
+    // invisibles are kept rather than stripped. A BOM, zero-width space,
+    // left-to-right mark, no-break space or U+2028/U+2029 in front of `=` does
+    // not stop Excel/Sheets reading the cell as a formula, but it does stop an
+    // anchored `/^[=+\-@\t\r]/` matching, so `\uFEFF=HYPERLINK(...)` used to
+    // sail through this copy of the guard unguarded (#1944 was fixed in
+    // `packages/sdk/src/namespaces/export.ts` but not here). IFC text
+    // properties are attacker-controllable and can carry any of them.
+    //
+    // `\p{Cf}` and `\p{Z}`, not `\s`: `\s` would swallow a leading TAB, and TAB
+    // is itself a trigger, so "\t=cmd" would stop being guarded. `\p{Z}` rather
+    // than `\p{Zs}` because the separator category also covers `Zl`/`Zp`, so
+    // U+2028/U+2029 would otherwise remain viable hiding prefixes.
+    if (/^[\p{Cf}\p{Z}]*[=+\-@\t\r]/u.test(str) && !isWhollyNumeric(str)) {
       str = `'${str}`;
     }
     if (str.includes(delimiter) || str.includes('"') || str.includes('\n') || str.includes('\r')) {
@@ -712,5 +739,11 @@ export function listResultToCSV(result: ListResult, delimiter = ','): string {
     lines.push(row.values.map(csvEscape).join(delimiter));
   }
 
-  return lines.join('\n');
+  // CRLF, not LF: RFC 4180 s2.1 -- "each record is located on a separate line,
+  // delimited by a line break (CRLF)" -- and the ABNF admits no other record
+  // separator (`file = [header CRLF] record *(CRLF record) [CRLF]`). The
+  // viewer's own Lists CSV writer (`apps/viewer/src/lib/lists/export/csv.ts`)
+  // already emits CRLF; this copy emitted LF, so the two disagreed on the same
+  // export. No trailing terminator is written, which s2.2 explicitly permits.
+  return lines.join('\r\n');
 }

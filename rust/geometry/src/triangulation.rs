@@ -13,6 +13,7 @@
 
 #[cfg(feature = "triangulation-alt")]
 pub(crate) mod alt_oracle;
+mod hole_overlap;
 mod ring_geom;
 use ring_geom::{point_in_ring, ring_bbox};
 
@@ -161,6 +162,15 @@ pub(crate) fn safe_earcut(
         // earcutr's bridge walk.
     }
 
+    // Duplicate holes collapse to one; overlapping or nested holes, or a set
+    // too costly to check, refuse the cap (D3). earcutr is superlinear on
+    // these and its output for them is not the authored face (#7787).
+    {
+        let ring_slices: Vec<&[f64]> = rings.iter().map(|(c, _)| c.as_slice()).collect();
+        let hole_vertices = real_holes.iter().map(|&h| ring_slices[h].len() / 2).sum();
+        hole_overlap::settle_holes(&ring_slices, &mut real_holes, hole_overlap::hole_work_budget(hole_vertices))?;
+    }
+
     let mut out: Vec<usize> = Vec::new();
 
     // Outer ring + its real holes in one earcut call.
@@ -221,6 +231,73 @@ fn is_convex(points: &[Point2<f64>]) -> bool {
     true
 }
 
+/// Split a quad across the diagonal that lies INSIDE the ring.
+///
+/// This arm used to hard-code the 0-2 diagonal with no test at all, while the
+/// very next arm tested convexity. A fan is only valid from a vertex that SEES
+/// the whole ring, so on a CONCAVE quad the 0-2 split can cross outside the
+/// polygon: for the dart `[(0,0), (2,2), (4,0), (2,10)]` (reflex at vertex 1) the
+/// ring's signed area is +16.0 while `tri(0,1,2)` is -4.0 and `tri(0,2,3)` is
+/// +20.0, so the first triangle is wound BACKWARDS and lies entirely outside the
+/// polygon while the second covers that outside region twice. Every extruded
+/// profile cap reaches this (`extrusion.rs` via `triangulate_polygon_with_holes`),
+/// as do the faceted-brep, advanced-face and sectioned processors.
+///
+/// `orient(a, b, c)` is twice the signed area of that triangle. `c1` is the
+/// convexity of vertex 1, `c3` that of vertex 3, and `c1 + c3` is twice the
+/// ring's own signed area. A simple quad has at most ONE reflex vertex and the
+/// only interior diagonal is the one incident to it, so: the two agreeing in sign
+/// means neither 1 nor 3 is reflex and 0-2 is interior; disagreeing means one of
+/// them is, and 1-3 is. Either way both emitted triangles carry the ring's
+/// winding. A degenerate (collinear) vertex scores 0, which agrees with anything
+/// and keeps the old 0-2 split.
+///
+/// Kept as an orientation test rather than deleted in favour of the `is_convex`
+/// arm below, and not for speed: the delete measured 4 ns per call, under the
+/// cost of the `vec!` this call already pays. The reason that binds is winding.
+/// A concave quad that fell through would reach `safe_earcut`, and earcutr
+/// re-winds EVERY output counter-clockwise regardless of input, so a
+/// clockwise concave quad would come back flipped. This arm splits it across
+/// the interior diagonal in the ring's own winding, which
+/// `concave_quad_split_is_correct_for_a_clockwise_ring` pins; deleting the
+/// arm fails that test with both triangles at +16. Convex quads keep
+/// byte-identical output either way.
+#[inline]
+fn quad_indices(p: &[Point2<f64>]) -> Vec<usize> {
+    let orient = |a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>| {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    };
+    let c1 = orient(&p[0], &p[1], &p[2]);
+    let c3 = orient(&p[2], &p[3], &p[0]);
+    quad_pattern(c1 * c3 >= 0.0).iter().map(|&i| i as usize).collect()
+}
+
+/// The two quad splits: `0-2` when vertices 1 and 3 agree in convexity,
+/// otherwise `1-3`. One home for both the 2D and the 3D test.
+#[inline]
+fn quad_pattern(zero_two: bool) -> [u32; 6] {
+    if zero_two {
+        [0, 1, 2, 0, 2, 3]
+    } else {
+        [1, 2, 3, 1, 3, 0]
+    }
+}
+
+/// [`quad_indices`] for a planar quad in 3D, without projecting it (#7686,
+/// GEOM-3 / PROC-S10).
+///
+/// The 2D test compares the orientation of triangles `(0,1,2)` and `(2,3,0)`;
+/// for a planar quad both cross products are parallel to the face normal, so
+/// their dot product has the sign of that product. Convex quads keep the
+/// `0-2` split byte for byte; a reflex vertex 1 or 3 takes the interior `1-3`
+/// diagonal, and both triangles carry the ring's own winding.
+#[inline]
+pub fn quad_split_3d(p: &[Point3<f64>]) -> [u32; 6] {
+    let c1 = (p[1] - p[0]).cross(&(p[2] - p[1]));
+    let c3 = (p[3] - p[2]).cross(&(p[0] - p[3]));
+    quad_pattern(c1.dot(&c3) >= 0.0)
+}
+
 /// Simple fan triangulation for convex polygons
 #[inline]
 fn fan_triangulate(n: usize) -> Vec<usize> {
@@ -250,9 +327,9 @@ pub fn triangulate_polygon(points: &[Point2<f64>]) -> Result<Vec<usize>> {
         return Ok(vec![0, 1, 2]);
     }
 
-    // FAST PATH: Quad - simple fan
+    // FAST PATH: Quad - fan across the diagonal that lies INSIDE the ring.
     if n == 4 {
-        return Ok(vec![0, 1, 2, 0, 2, 3]);
+        return Ok(quad_indices(points));
     }
 
     // FAST PATH: Convex polygon - use fan triangulation
@@ -365,6 +442,108 @@ pub fn triangulate_polygon_with_holes_refined(
     Ok((all, idx))
 }
 
+/// Triangulate one planar 3D face, the single home for every planar-face
+/// consumer (faceted breps, surface models, planar `IfcAdvancedFace`).
+///
+/// Returns indices into `outer ++ holes` (the vertex order the callers emit).
+/// The ring is projected on its Newell plane, holes onto the SAME basis, and
+/// triangulated once, so the triangles wind with the outer ring.
+///
+/// Fails closed with holes (#7686 PROC-S5): when the holed triangulation
+/// fails, a fan of the outer ring would silently close the authored openings,
+/// so the face is an `Err` the caller refuses and counts. Without holes the
+/// historical fan of the outer ring remains the fallback.
+pub fn triangulate_planar_face(
+    outer: &[Point3<f64>],
+    holes: &[Vec<Point3<f64>>],
+) -> Result<Vec<u32>> {
+    if outer.len() < 3 {
+        return Err(Error::TriangulationError(
+            "Need at least 3 points in a planar face".to_string(),
+        ));
+    }
+    let normal = calculate_polygon_normal(outer);
+    let (outer_2d, u_axis, v_axis, origin) = project_to_2d(outer, &normal);
+    let holes_2d: Vec<Vec<Point2<f64>>> = holes
+        .iter()
+        .map(|hole| project_to_2d_with_basis(hole, &u_axis, &v_axis, &origin))
+        .collect();
+    // Hole-free rings of five or more corners keep the
+    // exact dominant-axis projection every polygonal face used before the planar home: it never
+    // perturbs exactly collinear or axis-aligned corners, so the triangulation
+    // (and the booleans downstream of it) does not shift with Newell-basis
+    // rounding, and a convex ring with a collinear corner is never fanned
+    // through a degenerate zero-area triangle (which opens the edges its
+    // neighbour shares through that corner).
+    // Ear-clipping on either projection can still cut a zero-area ear at a
+    // collinear corner; the Newell result is kept where it has strictly fewer
+    // of them (duplex IfcSpace surface models tore on the axis ears).
+    let held = if holes_2d.is_empty() && outer.len() >= 5 {
+        match axis_earcut(outer, &normal) {
+            Ok(axis) if zero_area_triangles(outer, &axis) > 0 => match triangulate_polygon(&outer_2d) {
+                Ok(newell) if zero_area_triangles(outer, &newell) < zero_area_triangles(outer, &axis) => Ok(newell),
+                _ => Ok(axis),
+            },
+            held => held,
+        }
+    } else {
+        triangulate_polygon_with_holes(&outer_2d, &holes_2d)
+    };
+    match held {
+        Ok(idx) => Ok(idx.into_iter().map(|i| i as u32).collect()),
+        Err(_) if holes.is_empty() => {
+            let mut idx = Vec::with_capacity((outer.len() - 2) * 3);
+            for i in 1..outer.len() as u32 - 1 {
+                idx.extend_from_slice(&[0, i, i + 1]);
+            }
+            Ok(idx)
+        }
+        Err(error) => Err(Error::TriangulationError(format!(
+            "planar face triangulation with holes failed: {error}"
+        ))),
+    }
+}
+
+/// Triangles of `idx` over the planar `ring` whose area is zero relative to
+/// the ring's own (`1e-9`): the ears a collinear corner yields.
+fn zero_area_triangles(ring: &[Point3<f64>], idx: &[usize]) -> usize {
+    let n = ring.len();
+    let twice_area = (0..n)
+        .fold(Vector3::zeros(), |acc, i| acc + ring[i].coords.cross(&ring[(i + 1) % n].coords))
+        .norm();
+    idx.chunks_exact(3)
+        .filter(|t| (ring[t[1]] - ring[t[0]]).cross(&(ring[t[2]] - ring[t[0]])).norm() <= 1e-9 * twice_area)
+        .count()
+}
+
+/// Earcut a hole-free planar ring on the plane its dominant normal axis drops,
+/// winding the triangles with the ring (earcut itself re-winds counter-clockwise
+/// in the projected frame, which mirrors for a ring that runs clockwise there).
+fn axis_earcut(ring: &[Point3<f64>], normal: &Vector3<f64>) -> Result<Vec<usize>> {
+    let (a, b) = if normal.z.abs() >= normal.x.abs() && normal.z.abs() >= normal.y.abs() {
+        (0, 1)
+    } else if normal.y.abs() >= normal.x.abs() {
+        (0, 2)
+    } else {
+        (1, 2)
+    };
+    let flat: Vec<f64> = ring.iter().flat_map(|p| [p[a], p[b]]).collect();
+    let n = ring.len();
+    let area2: f64 = (0..n)
+        .map(|i| {
+            let (p, q) = (&ring[i], &ring[(i + 1) % n]);
+            p[a] * q[b] - q[a] * p[b]
+        })
+        .sum();
+    let mut idx = safe_earcut(&flat, &[], 2).map_err(Error::TriangulationError)?;
+    if area2 < 0.0 {
+        for tri in idx.chunks_exact_mut(3) {
+            tri.swap(1, 2);
+        }
+    }
+    Ok(idx)
+}
+
 /// Project 3D points onto a 2D plane defined by a normal
 /// Returns 2D points and the coordinate system (u_axis, v_axis, origin)
 #[inline]
@@ -431,8 +610,13 @@ pub fn project_to_2d_with_basis(
         .collect()
 }
 
-/// Calculate the normal of a polygon from its vertices
-/// Optimized for triangles and quads using simple cross product
+/// Calculate the normal of a polygon from its vertices.
+///
+/// A triangle's cross product is its normal, and so is a convex quad's. A quad
+/// reflex at vertex 1 or 3 (the dart `[(0,0), (2,2), (4,0), (2,10)]`) gets
+/// Newell's method like every larger ring: the cross product of its first two
+/// edges points AGAINST the ring there (-Z for a CCW dart, #7686 GEOM-3) and
+/// mirrored the projection and the winding built on it.
 #[inline]
 pub fn calculate_polygon_normal(points: &[Point3<f64>]) -> Vector3<f64> {
     let n = points.len();
@@ -447,20 +631,26 @@ pub fn calculate_polygon_normal(points: &[Point3<f64>]) -> Vector3<f64> {
         let v2 = points[2] - points[0];
         let normal = v1.cross(&v2);
         let len = normal.norm();
-        if len > 1e-10 {
+        // `quad_split_3d`'s test: turns at 1 and 3 disagreeing means a reflex
+        // vertex there and `normal` may be reversed; Newell below.
+        let reflex = n == 4
+            && normal.dot(&(points[3] - points[2]).cross(&(points[0] - points[3]))) < 0.0;
+        if len > 1e-10 && !reflex {
             return normal / len;
         }
-        // Fallback for degenerate triangles
-        if n == 4 {
-            // Try different edges for quad
-            let v3 = points[3] - points[0];
-            let normal = v2.cross(&v3);
-            let len = normal.norm();
-            if len > 1e-10 {
-                return normal / len;
+        if !reflex {
+            // Fallback for degenerate triangles
+            if n == 4 {
+                // Try different edges for quad
+                let v3 = points[3] - points[0];
+                let normal = v2.cross(&v3);
+                let len = normal.norm();
+                if len > 1e-10 {
+                    return normal / len;
+                }
             }
+            return Vector3::new(0.0, 0.0, 1.0);
         }
-        return Vector3::new(0.0, 0.0, 1.0);
     }
 
     // Use Newell's method for robust normal calculation on complex polygons
@@ -484,286 +674,5 @@ pub fn calculate_polygon_normal(points: &[Point3<f64>]) -> Vector3<f64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_triangulate_square() {
-        let points = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(1.0, 0.0),
-            Point2::new(1.0, 1.0),
-            Point2::new(0.0, 1.0),
-        ];
-
-        let indices = triangulate_polygon(&points).unwrap();
-
-        // Square should be split into 2 triangles = 6 indices
-        assert_eq!(indices.len(), 6);
-    }
-
-    #[test]
-    fn test_triangulate_triangle() {
-        let points = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(1.0, 0.0),
-            Point2::new(0.5, 1.0),
-        ];
-
-        let indices = triangulate_polygon(&points).unwrap();
-
-        // Triangle should have 3 indices
-        assert_eq!(indices.len(), 3);
-    }
-
-    #[test]
-    fn test_triangulate_insufficient_points() {
-        let points = vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)];
-
-        let result = triangulate_polygon(&points);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_triangulate_square_with_hole() {
-        // Outer square: 0-10
-        let outer = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(10.0, 0.0),
-            Point2::new(10.0, 10.0),
-            Point2::new(0.0, 10.0),
-        ];
-
-        // Inner square (hole): 3-7
-        let hole = vec![
-            Point2::new(3.0, 3.0),
-            Point2::new(7.0, 3.0),
-            Point2::new(7.0, 7.0),
-            Point2::new(3.0, 7.0),
-        ];
-
-        let indices = triangulate_polygon_with_holes(&outer, &[hole]).unwrap();
-
-        // With a hole, we should get more triangles than without
-        // The result should have indices for triangles around the hole
-        assert!(indices.len() > 6); // More than the 2 triangles for a simple square
-        assert_eq!(indices.len() % 3, 0); // Must be a multiple of 3 (triangles)
-    }
-
-    #[test]
-    fn test_triangulate_with_multiple_holes() {
-        // Outer square: 0-20
-        let outer = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(20.0, 0.0),
-            Point2::new(20.0, 20.0),
-            Point2::new(0.0, 20.0),
-        ];
-
-        // Two holes
-        let hole1 = vec![
-            Point2::new(2.0, 2.0),
-            Point2::new(5.0, 2.0),
-            Point2::new(5.0, 5.0),
-            Point2::new(2.0, 5.0),
-        ];
-
-        let hole2 = vec![
-            Point2::new(10.0, 10.0),
-            Point2::new(15.0, 10.0),
-            Point2::new(15.0, 15.0),
-            Point2::new(10.0, 15.0),
-        ];
-
-        let indices = triangulate_polygon_with_holes(&outer, &[hole1, hole2]).unwrap();
-
-        assert!(indices.len() > 6);
-        assert_eq!(indices.len() % 3, 0);
-    }
-
-    /// `triangulate_polygon_with_holes_refined`, normal path: the returned
-    /// vertex list starts with exactly the input vertices (`outer ++ holes`;
-    /// Steiner points only after them), every index is in range, and — with
-    /// boundary splits off — every hole-ring constraint edge survives as an
-    /// edge of the output triangulation (the hole stays a hole).
-    #[test]
-    fn test_refined_vertex_layout_and_hole_constraints() {
-        let outer = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(10.0, 0.0),
-            Point2::new(10.0, 10.0),
-            Point2::new(0.0, 10.0),
-        ];
-        let hole = vec![
-            Point2::new(3.0, 3.0),
-            Point2::new(7.0, 3.0),
-            Point2::new(7.0, 7.0),
-            Point2::new(3.0, 7.0),
-        ];
-        let (pts, idx) =
-            triangulate_polygon_with_holes_refined(&outer, std::slice::from_ref(&hole)).unwrap();
-
-        let n_input = outer.len() + hole.len();
-        assert!(pts.len() >= n_input, "input vertices must all be present");
-        for (i, p) in outer.iter().chain(hole.iter()).enumerate() {
-            assert_eq!(
-                (pts[i].x, pts[i].y),
-                (p.x, p.y),
-                "vertex {i} must be the input vertex (outer ++ holes order)"
-            );
-        }
-        assert!(!idx.is_empty());
-        assert_eq!(idx.len() % 3, 0);
-        assert!(idx.iter().all(|&i| i < pts.len()), "index out of range");
-
-        let mut edges = std::collections::BTreeSet::new();
-        for t in idx.chunks_exact(3) {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                edges.insert(if a < b { (a, b) } else { (b, a) });
-            }
-        }
-        for k in 0..hole.len() {
-            let a = outer.len() + k;
-            let b = outer.len() + (k + 1) % hole.len();
-            let key = if a < b { (a, b) } else { (b, a) };
-            assert!(
-                edges.contains(&key),
-                "hole-ring constraint edge {key:?} missing from the triangulation"
-            );
-        }
-    }
-
-    /// `triangulate_polygon_with_holes_refined`, degenerate path: a fully
-    /// collinear outer ring is declined by the CDT (its closing constraint
-    /// passes through the intermediate vertices and cannot be recovered), so the
-    /// function must bail to the earcut/fan fallback and still return `Ok` with
-    /// the `outer ++ holes` vertex set and in-range indices. This fallback is
-    /// independent of the (removed) Ruppert boundary-split path — it fires on
-    /// the CDT-decline branch before any refinement — so it still needs its own
-    /// regression coverage under the no-arg signature.
-    #[test]
-    fn test_refined_collinear_outer_falls_back() {
-        let outer = vec![
-            Point2::new(0.0, 0.0),
-            Point2::new(1.0, 0.0),
-            Point2::new(2.0, 0.0),
-            Point2::new(3.0, 0.0),
-        ];
-        let (pts, idx) = triangulate_polygon_with_holes_refined(&outer, &[])
-            .expect("degenerate input must fall back, not error");
-        assert_eq!(pts.len(), outer.len(), "fallback must return the input vertex set");
-        for (i, p) in outer.iter().enumerate() {
-            assert_eq!((pts[i].x, pts[i].y), (p.x, p.y));
-        }
-        assert_eq!(idx.len() % 3, 0);
-        assert!(idx.iter().all(|&i| i < pts.len()));
-    }
-
-    #[test]
-    fn test_calculate_polygon_normal() {
-        // XY plane polygon - normal should be Z
-        let points = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(1.0, 1.0, 0.0),
-            Point3::new(0.0, 1.0, 0.0),
-        ];
-
-        let normal = calculate_polygon_normal(&points);
-        assert!((normal.z.abs() - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_project_to_2d() {
-        // Points on the XY plane
-        let points = vec![
-            Point3::new(0.0, 0.0, 5.0),
-            Point3::new(1.0, 0.0, 5.0),
-            Point3::new(1.0, 1.0, 5.0),
-            Point3::new(0.0, 1.0, 5.0),
-        ];
-
-        let normal = Vector3::new(0.0, 0.0, 1.0);
-        let (projected, _, _, _) = project_to_2d(&points, &normal);
-
-        assert_eq!(projected.len(), 4);
-        // After projection, all Z values are ignored, and we get 2D coords
-    }
-
-    /// The production input that wedged earcutr 0.5 forever (Revit→Bonsai
-    /// IFC4X3 door): an `IfcArbitraryProfileDefWithVoids` whose two "voids"
-    /// are rectangles entirely OUTSIDE the outer boundary (sibling door
-    /// panels). Bridging an outside ring into the outer loop creates a
-    /// self-intersecting polygon on which `filter_points` never terminates —
-    /// one wedged rayon worker natively, a dead WASM worker (geometry-stream
-    /// stall) in the browser. `safe_earcut` must terminate AND render all
-    /// three rectangles as separate polygons.
-    #[test]
-    fn safe_earcut_terminates_on_outside_voids_and_renders_them() {
-        // Captured verbatim from the wedged element (#5222).
-        let data = vec![
-            0.0, -0.0, 0.0, 83.0, -2325.0, 83.0, -2325.0, -0.0, // outer
-            -2620.0, 83.0, -2620.0, -0.0, -2375.0, -0.0, -2375.0, 83.0, // "void" 1 (outside)
-            -2326.0, 83.0, -2374.0, 83.0, -2374.0, -0.0, -2326.0, -0.0, // "void" 2 (outside)
-        ];
-        let holes = vec![4, 8];
-
-        let indices = safe_earcut(&data, &holes, 2).expect("must triangulate");
-
-        // Three disjoint rectangles → 2 triangles each.
-        assert_eq!(indices.len(), 18, "3 rects × 2 tris × 3 idx");
-        // Each triangle must stay within a single ring's vertex range.
-        for tri in indices.chunks_exact(3) {
-            let ring = |v: usize| {
-                if v < 4 {
-                    0
-                } else if v < 8 {
-                    1
-                } else {
-                    2
-                }
-            };
-            assert_eq!(ring(tri[0]), ring(tri[1]));
-            assert_eq!(ring(tri[1]), ring(tri[2]));
-        }
-    }
-
-    /// A genuine contained hole must still subtract (the classification must
-    /// not break valid profiles).
-    #[test]
-    fn safe_earcut_keeps_contained_holes() {
-        // 10×10 outer, 2×2 hole in the middle.
-        let data = vec![
-            0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, // outer
-            4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 6.0, 4.0, // hole (CW)
-        ];
-        let indices = safe_earcut(&data, &[4], 2).expect("must triangulate");
-        // A square with a square hole triangulates to 8 triangles.
-        assert_eq!(indices.len() / 3, 8);
-        // Hole vertices must participate (the hole was not dropped).
-        assert!(indices.iter().any(|&i| i >= 4));
-    }
-
-    /// Closing wrap-around duplicates (P0 … P0) and consecutive duplicate
-    /// vertices must be tolerated, with indices remapped to the caller's
-    /// original vertex order.
-    #[test]
-    fn safe_earcut_drops_duplicate_vertices_and_remaps() {
-        let data = vec![
-            0.0, 0.0, 10.0, 0.0, 10.0, 0.0, // consecutive duplicate of v1
-            10.0, 10.0, 0.0, 10.0, 0.0, 0.0, // closing duplicate of v0
-        ];
-        let indices = safe_earcut(&data, &[], 2).expect("must triangulate");
-        assert_eq!(indices.len() / 3, 2, "a quad → 2 triangles");
-        // Remapped indices reference the caller's original positions; the
-        // dropped duplicates (2 and 5) must never appear.
-        assert!(indices.iter().all(|&i| i != 2 && i != 5 && i < 6));
-    }
-
-    /// Non-finite coordinates are rejected, not hung on.
-    #[test]
-    fn safe_earcut_rejects_non_finite() {
-        let data = vec![0.0, 0.0, 10.0, f64::NAN, 10.0, 10.0];
-        assert!(safe_earcut(&data, &[], 2).is_err());
-    }
-}
+#[path = "triangulation_tests.rs"]
+mod tests;

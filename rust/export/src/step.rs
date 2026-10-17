@@ -8,297 +8,119 @@
 //! **mutation application** (MutablePropertyView edits bridged from TS) are the P2/P3
 //! follow-ons; the structure here is the seam they plug into.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use ifc_lite_core::EntityScanner;
-use serde::Deserialize;
+pub use crate::step_api::{
+    AttrMutation, CopyOnWriteMutation, PropMutation, StepOptions, StepStats,
+};
 
-/// A single root-attribute edit: replace the top-level attribute at `index` of entity
-/// `express_id` with `value` (already STEP-serialized, e.g. `'New Name'` or `$`).
-/// This is the wasm-bridge form of a `MutablePropertyView` UPDATE_ATTRIBUTE mutation.
-pub struct AttrMutation {
-    pub express_id: u32,
-    pub index: usize,
-    pub value: String,
-}
-
-/// A property create/update: attach (or overwrite) `prop_name` in `pset_name` on
-/// `express_id` with `value` — the STEP-serialized nominal value, e.g. `IFCLABEL('2HR')`
-/// or `IFCREAL(42.)`. The wasm-bridge form of a `MutablePropertyView` CREATE/UPDATE_PROPERTY.
-/// Synthesizes fresh `IfcPropertySingleValue` / `IfcPropertySet` / `IfcRelDefinesByProperties`
-/// entities appended to DATA (new psets; merge-into-existing is a follow-on).
-pub struct PropMutation {
-    pub express_id: u32,
-    pub pset_name: String,
-    pub prop_name: String,
-    pub value: String,
-}
-
-/// Options for STEP export.
-pub struct StepOptions {
-    /// FILE_SCHEMA label to write (e.g. `IFC4`). `None` ⇒ preserve the source schema.
-    /// When `Some` and the target differs, entity types/attributes are converted (P2).
-    pub schema: Option<String>,
-    /// Express ids to include. `None` ⇒ the whole model. When set, the forward
-    /// reference closure is added so every emitted `#ref` resolves.
-    pub included: Option<Vec<u32>>,
-    /// Root-attribute edits to apply during serialization (P3 mutation bridge).
-    pub attribute_mutations: Vec<AttrMutation>,
-    /// Property create/update edits — synthesized as new pset entities appended to DATA.
-    pub property_mutations: Vec<PropMutation>,
-    pub description: String,
-    pub author: String,
-    pub organization: String,
-    pub application: String,
-}
-
-impl Default for StepOptions {
-    fn default() -> Self {
-        Self {
-            schema: None,
-            included: None,
-            attribute_mutations: Vec::new(),
-            property_mutations: Vec::new(),
-            description: "ViewDefinition [CoordinationView]".to_string(),
-            author: "".to_string(),
-            organization: "".to_string(),
-            application: "ifc-lite".to_string(),
-        }
-    }
-}
-
-/// Coverage stats for a STEP export.
-pub struct StepStats {
-    /// Entities in the source model.
-    pub total: usize,
-    /// Entities written (after filtering + reference closure).
-    pub written: usize,
-}
-
-/// Escape a STEP string literal body (double single-quotes; drop control chars).
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("''"),
-            '\n' | '\r' | '\t' => out.push(' '),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Detect the source `FILE_SCHEMA` label (e.g. `IFC2X3`); defaults to `IFC4`.
-fn detect_schema(content: &[u8]) -> String {
-    // Only look in the header region (before DATA;).
-    let head_len = content.len().min(4096);
-    let head = String::from_utf8_lossy(&content[..head_len]);
-    if let Some(idx) = head.find("FILE_SCHEMA") {
-        let rest = &head[idx..];
-        if let Some(q1) = rest.find('\'') {
-            if let Some(q2) = rest[q1 + 1..].find('\'') {
-                let label = &rest[q1 + 1..q1 + 1 + q2];
-                if !label.is_empty() {
-                    return label.to_string();
-                }
-            }
-        }
-    }
-    "IFC4".to_string()
-}
-
-/// Collect outgoing `#<digits>` references in a STEP entity line, skipping the
-/// contents of single-quoted strings (where a `#` is literal text).
-fn refs_in_line(line: &[u8], out: &mut Vec<u32>) {
-    let mut i = 0;
-    let mut in_quote = false;
-    while i < line.len() {
-        let b = line[i];
-        if b == b'\'' {
-            // STEP escapes a quote as '' — toggling twice is a no-op, which is fine.
-            in_quote = !in_quote;
-            i += 1;
-            continue;
-        }
-        if !in_quote && b == b'#' {
-            let mut j = i + 1;
-            let mut n: u32 = 0;
-            let mut any = false;
-            while j < line.len() && line[j].is_ascii_digit() {
-                n = n.wrapping_mul(10).wrapping_add((line[j] - b'0') as u32);
-                j += 1;
-                any = true;
-            }
-            if any {
-                out.push(n);
-                i = j;
-                continue;
-            }
-        }
-        i += 1;
-    }
-}
-
-/// Split a STEP attribute list into its top-level arguments (parens/strings aware).
-fn split_top_level_args(attrs: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut current = String::new();
-    let bytes = attrs.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' && !in_string {
-            in_string = true;
-            current.push(ch);
-        } else if ch == '\'' && in_string {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                current.push_str("''");
-                i += 2;
-                continue;
-            }
-            in_string = false;
-            current.push(ch);
-        } else if in_string {
-            current.push(ch);
-        } else if ch == '(' {
-            depth += 1;
-            current.push(ch);
-        } else if ch == ')' {
-            depth -= 1;
-            current.push(ch);
-        } else if ch == ',' && depth == 0 {
-            out.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-        i += 1;
-    }
-    out.push(current);
-    out
-}
-
-/// Apply root-attribute edits to a `#id=TYPE(attrs);` line. Returns the line unchanged
-/// when it cannot be parsed.
-fn apply_attr_mutations(line: &str, muts: &[(usize, String)]) -> String {
-    let trimmed = line.trim_end();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
-    let eq = match body.find('=') {
-        Some(e) => e,
-        None => return line.to_string(),
-    };
-    let after = &body[eq + 1..];
-    let popen = match after.find('(') {
-        Some(p) => p,
-        None => return line.to_string(),
-    };
-    let aclose = match after.rfind(')') {
-        Some(c) if c > popen => c,
-        _ => return line.to_string(),
-    };
-    let prefix = &body[..=eq];
-    let type_name = &after[..popen];
-    let mut args = split_top_level_args(&after[popen + 1..aclose]);
-    for (idx, val) in muts {
-        if *idx < args.len() {
-            args[*idx] = val.clone();
-        }
-    }
-    format!("{prefix}{type_name}({});", args.join(","))
-}
-
-// ── Mutation JSON bridge (the wasm-facing contract) ─────────────────────────
-
-#[derive(Deserialize)]
-struct AttrMutJson {
-    #[serde(rename = "expressId")]
-    express_id: u32,
-    index: usize,
-    value: String,
-}
-
-#[derive(Deserialize)]
-struct PropMutJson {
-    #[serde(rename = "expressId")]
-    express_id: u32,
-    #[serde(rename = "psetName")]
-    pset_name: String,
-    #[serde(rename = "propName")]
-    prop_name: String,
-    value: String,
-}
-
-#[derive(Deserialize, Default)]
-struct MutationsJson {
-    #[serde(default, rename = "attributeUpdates")]
-    attribute_updates: Vec<AttrMutJson>,
-    #[serde(default, rename = "propertyMutations")]
-    property_mutations: Vec<PropMutJson>,
-}
-
-/// Export STEP from raw bytes + a JSON mutation payload (the wasm bridge form of a
-/// `MutablePropertyView` diff). `mutations_json` shape:
-/// `{ "attributeUpdates": [{expressId,index,value}], "propertyMutations":
-/// [{expressId,psetName,propName,value}] }` where `value` is already STEP-serialized
-/// (`'Name'`, `IFCLABEL('x')`, `IFCREAL(1.)`). Empty/invalid JSON ⇒ no mutations.
-pub fn export_step_json(
-    content: &[u8],
-    schema: Option<String>,
-    included: Option<Vec<u32>>,
-    mutations_json: &str,
-) -> String {
-    let muts: MutationsJson = if mutations_json.trim().is_empty() {
-        MutationsJson::default()
-    } else {
-        serde_json::from_str(mutations_json).unwrap_or_default()
-    };
-    let opts = StepOptions {
-        schema,
-        included,
-        attribute_mutations: muts
-            .attribute_updates
-            .into_iter()
-            .map(|a| AttrMutation { express_id: a.express_id, index: a.index, value: a.value })
-            .collect(),
-        property_mutations: muts
-            .property_mutations
-            .into_iter()
-            .map(|p| PropMutation {
-                express_id: p.express_id,
-                pset_name: p.pset_name,
-                prop_name: p.prop_name,
-                value: p.value,
-            })
-            .collect(),
-        ..StepOptions::default()
-    };
-    export_step(content, &opts)
-}
+use crate::schema_detect::detect_schema;
+use crate::step_text::{
+    apply_attr_mutations_counted, escape, merge_edits, refs_in_line_counted, renumber,
+};
 
 /// Export the parsed model in `content` as a STEP/IFC string.
-pub fn export_step(content: &[u8], opts: &StepOptions) -> String {
-    export_step_with_stats(content, opts).0
+///
+/// Errs when a source entity's (possibly renamed) type has no representation
+/// at all in an explicit `opts.schema` target and is not an `IfcRoot`
+/// subtype either — see [`crate::schema_unrepresented`] (#5116).
+pub fn export_step(content: &[u8], opts: &StepOptions) -> std::io::Result<String> {
+    export_step_with_stats(content, opts).map(|(s, _)| s)
 }
 
 /// Like [`export_step`] but also returns coverage stats.
+pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> std::io::Result<(String, StepStats)> {
+    // Presized for a full re-export, where the output is within a small factor
+    // of the source. Not for a subset: 200 MB filtered to a few records would
+    // reserve 200 MB, and on wasm that linear memory never comes back.
+    let mut buf = match opts.included {
+        None => Vec::with_capacity(content.len()),
+        Some(_) => Vec::new(),
+    };
+    // `emit`, not `export_step_to_writer`: a `Vec` needs no buffering, and
+    // wrapping one memcpys the whole output through a 1 MiB window for nothing.
+    // A Vec's `Write` impl cannot fail for I/O reasons, so an `Err` here is
+    // always a schema-conversion failure (`emit` also propagates those through
+    // this same `io::Result`, see `schema_unrepresented::UnrepresentedEntityError`'s
+    // `From` impl) — genuinely fallible now, unlike the `.expect` this replaced.
+    let stats = emit(content, opts, &mut buf)?;
+    // Every byte came from the source by way of `from_utf8_lossy`, or from a
+    // `format!`, so this validates rather than converts.
+    let out = String::from_utf8(buf).expect("the writer emits UTF-8");
+    Ok((out, stats))
+}
+
+/// [`export_step_with_stats`], writing as it goes instead of returning the file.
+/// The two cannot drift: that one is this one writing into a `Vec`.
+///
+/// The gigabyte of `String` that doubled its way there is gone. What replaces
+/// it is not free: the entity index measures ~84 bytes a record, so 370 MB on
+/// 4.4 M records and ~1.1 GB on 16.8 M, before a byte is written. On a very
+/// large model it outweighs the output it stopped holding, and it is not
+/// removable -- source order and the reference closure both need it.
+///
+/// `out` is buffered here, so a bare `File` is fine. A record costs two `write`
+/// calls, which unbuffered is two syscalls: measured 15.0 s against 4.3 s on
+/// 4.4 M records. A caller who already buffers pays one memcpy through 1 MiB.
 // The grouped-property-mutation Vec type is explicit by design; aliasing it
 // would hide the (entity, pset) -> [(key, value)] grouping structure.
 #[allow(clippy::type_complexity)]
-pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> (String, StepStats) {
-    // 1. Index every entity line (preserve source order).
-    let mut order: Vec<u32> = Vec::new();
-    let mut line_of: HashMap<u32, (usize, usize)> = HashMap::new();
-    let mut max_id = 0u32;
-    let mut scanner = EntityScanner::new(content);
-    while let Some((id, _type, start, end)) = scanner.next_entity() {
-        max_id = max_id.max(id);
-        if line_of.insert(id, (start, end)).is_none() {
-            order.push(id);
+pub fn export_step_to_writer<W: std::io::Write>(
+    content: &[u8],
+    opts: &StepOptions,
+    w: &mut W,
+) -> std::io::Result<StepStats> {
+    use std::io::Write as _;
+    let mut buffered = std::io::BufWriter::with_capacity(1 << 20, w);
+    let stats = emit(content, opts, &mut buffered)?;
+    // Flushed here for the error, not for the bytes: `BufWriter::drop` does
+    // flush, it just has nowhere to report a failure and swallows it.
+    buffered.flush()?;
+    Ok(stats)
+}
+
+/// Write one record this exporter SYNTHESIZES (a property set, its properties,
+/// the relationship that attaches it), through the IFC2X3 required-slot fills
+/// when the output is IFC2X3.
+///
+/// These records never reach `convert_step_line` — they are built here, after
+/// the emit loop — so before #4714 they went out with `$` in `OwnerHistory`,
+/// which IFC2X3 requires, even when the file had an owner history to point
+/// them at. Source records are filled inside the converter; these are filled
+/// here, through the same object, so both land in the same counters.
+fn write_synthesized<W: std::io::Write>(
+    out: &mut W,
+    line: String,
+    targets_ifc2x3: bool,
+    slot_fill: &mut crate::schema_ifc2x3_slots::Ifc2x3SlotFill,
+) -> std::io::Result<()> {
+    let line = if targets_ifc2x3 { slot_fill.apply(line) } else { line };
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")
+}
+
+#[allow(clippy::type_complexity)]
+fn emit<W: std::io::Write>(
+    content: &[u8],
+    opts: &StepOptions,
+    out: &mut W,
+) -> std::io::Result<StepStats> {
+    // 1. Index every entity line (preserve source order). A repeated id keeps
+    // its last record, as core does, and the rest are counted (#7682,
+    // EXPORT-STEP-11).
+    let mut owner_histories: Vec<(u32, usize)> = Vec::new();
+    let index = crate::step_index::RecordIndex::build(content, |id, type_name, start| {
+        if type_name.eq_ignore_ascii_case("IFCOWNERHISTORY") {
+            owner_histories.push((id, start));
         }
-    }
+    });
+    let owner_histories: Vec<u32> =
+        owner_histories.into_iter().filter(|&(id, start)| index.is_kept(id, start)).map(|(id, _)| id).collect();
+    let (order, line_of, max_id) = (&index.order, &index.spans, index.max_id);
 
     // 2. Resolve the included set + forward reference closure.
+    let mut refused_refs = 0usize;
+    let mut attribute_edits_refused = 0usize;
     let included: HashSet<u32> = match &opts.included {
         None => order.iter().copied().collect(),
         Some(roots) => {
@@ -311,7 +133,7 @@ pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> (String, St
                 }
                 if let Some(&(s, e)) = line_of.get(&id) {
                     refs.clear();
-                    refs_in_line(&content[s..e], &mut refs);
+                    refs_in_line_counted(&content[s..e], &mut refs, &mut refused_refs);
                     for &r in &refs {
                         if !keep.contains(&r) {
                             stack.push(r);
@@ -323,289 +145,204 @@ pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> (String, St
         }
     };
 
+    // Read the source HEADER once, here, so the writer can carry its
+    // provenance forward instead of blanking it (see `step_header`).
+    let source_header = crate::source_header::parse_source_header(content);
     let source_schema = detect_schema(content);
     let schema = opts.schema.clone().unwrap_or_else(|| source_schema.clone());
     // Only convert entity types/attributes when an explicit target differs from source.
     let converting = opts.schema.is_some()
         && crate::schema_convert::needs_conversion(&source_schema, &schema);
+    let mut flatten = crate::schema_style_flatten::StyleFlatten::for_export(content, &source_schema, &schema); // D57
+    // The slots IFC2X3 requires a value in: `OwnerHistory` from the first owner
+    // history this export writes (#4686), the rest from the generated
+    // required-slot table (#4714).
+    let mut slot_fill = crate::schema_ifc2x3_slots::Ifc2x3SlotFill::new(
+        owner_histories.into_iter().find(|id| included.contains(id)),
+    );
+    // IFC4-required `$` slots (#5307) and enum members the target lacks (#5365).
+    let mut checks = crate::schema_enum::ConversionChecks::new();
+    // The synthesized property sets below are filled whenever the OUTPUT is
+    // IFC2X3, not only when a conversion runs: an IFC2X3 source needs no
+    // conversion, and the records this exporter writes for it still have to be
+    // valid IFC2X3.
+    let targets_ifc2x3 = crate::schema_convert::targets_ifc2x3(&schema);
 
-    // Root-attribute edits, grouped by entity id.
-    let mut muts_by_id: HashMap<u32, Vec<(usize, String)>> = HashMap::new();
+    // Root-attribute edits, resolved per (entity, attribute) as they are read.
+    // A list plus a last-wins rule made "the value at this index" a derived
+    // fact that every reader re-derived its own way, and two of them got it
+    // wrong. Keyed by index there is nothing left to derive.
+    // A value that is not one STEP value is refused here, before it can shift
+    // a slot or close the record early (#7682, EXPORT-STEP-26).
+    let mut muts_by_id: HashMap<u32, BTreeMap<usize, String>> = HashMap::new();
     for m in &opts.attribute_mutations {
-        muts_by_id.entry(m.express_id).or_default().push((m.index, m.value.clone()));
+        if !crate::step_slot::is_step_value(&m.value) {
+            attribute_edits_refused += 1;
+            continue;
+        }
+        muts_by_id.entry(m.express_id).or_default().insert(m.index, m.value.clone());
     }
 
+    // Copy-on-write, resolved before the emit loop so the copies and the
+    // repointed referrers both go through it. Its own module: the pass has four
+    // rules now and every one of them is a file that came out wrong without it.
+    // One allocator for the copies and the property sets after them
+    // (#7682, EXPORT-STEP-9).
+    let mut ids = crate::step_ids::IdAllocator::after(max_id);
+    let resolved = crate::step_cow::resolve(&opts.copy_on_write, content, line_of, &included, &muts_by_id, &mut ids);
+    let copies_refused = resolved.refused;
+    let copies = resolved.copies; flatten.note_edits(content, &copies, &muts_by_id);
+    let repointed = resolved.repointed;
+
     // 3. Emit header + filtered entities (source order) + footer.
-    let mut out = String::new();
-    out.push_str("ISO-10303-21;\nHEADER;\n");
-    out.push_str(&format!("FILE_DESCRIPTION(('{}'),'2;1');\n", escape(&opts.description)));
-    out.push_str(&format!(
-        "FILE_NAME('','',('{}'),('{}'),'{}','ifc-lite-export','');\n",
-        escape(&opts.author),
-        escape(&opts.organization),
-        escape(&opts.application),
-    ));
-    out.push_str(&format!("FILE_SCHEMA(('{}'));\n", escape(&schema)));
-    out.push_str("ENDSEC;\nDATA;\n");
+    // The FILE_SCHEMA token, by the TypeScript twin's rule: keep the source's
+    // exact identifier unless this export converts, else declare the target
+    // family's file identifier (IFC4X3 is written as IFC4X3_ADD2, #5351).
+    let header_schema = crate::file_schema::declared_token(source_header.as_ref(), converting, &schema);
+    crate::step_header::write_header(out, opts, source_header.as_ref(), header_schema)?;
 
     let mut written = 0usize;
-    for id in &order {
-        if included.contains(id) {
+    for id in order {
+        if included.contains(id) && !flatten.drops(*id) {
             if let Some(&(s, e)) = line_of.get(id) {
                 let raw = String::from_utf8_lossy(&content[s..e]);
                 // Apply root-attribute edits first (original-schema positions), then convert.
-                let edited = match muts_by_id.get(id) {
-                    Some(muts) => apply_attr_mutations(&raw, muts),
+                let edited = match merge_edits(muts_by_id.get(id), repointed.get(id)) {
+                    Some(edits) => {
+                        apply_attr_mutations_counted(&raw, &edits, &mut attribute_edits_refused)
+                    }
                     None => raw.into_owned(),
                 };
+                let Some(edited) = flatten.line(&source_schema, edited) else { continue };
                 if converting {
-                    out.push_str(&crate::schema_convert::convert_step_line(
+                    let converted = crate::schema_convert::convert_step_line(
                         &edited,
                         &source_schema,
                         &schema,
                         *id,
-                    ));
+                        &mut slot_fill,
+                        Some(&mut checks),
+                    )?;
+                    out.write_all(converted.as_bytes())?;
                 } else {
-                    out.push_str(&edited);
+                    out.write_all(edited.as_bytes())?;
                 }
-                out.push('\n');
+                out.write_all(b"\n")?;
                 written += 1;
             }
         }
     }
 
-    // 4. Synthesize new property sets from property mutations (fresh ids past max_id).
-    if !opts.property_mutations.is_empty() {
-        // Group props by (entity, pset) preserving first-seen order.
-        let mut groups: Vec<((u32, String), Vec<(&str, &str)>)> = Vec::new();
-        let mut index_of: HashMap<(u32, String), usize> = HashMap::new();
-        for m in &opts.property_mutations {
-            // Only attach to entities actually present in the export.
-            if !included.contains(&m.express_id) {
-                continue;
+    // The copies, emitted rather than appended: counted in `written` and put
+    // through `convert_step_line` like every other record.
+    for (copy_id, source_id, edits) in copies.iter().filter(|c| !flatten.drops(c.0)) {
+        if let Some(&(s0, e0)) = line_of.get(source_id) {
+            let raw = String::from_utf8_lossy(&content[s0..e0]);
+            // The caller's edits to the record belong to the copy too: the
+            // copy is this element's version of that record, not a snapshot
+            // taken before the caller touched it. Repointings do not, which is
+            // why they are resolved into their own map.
+            let mut muts = muts_by_id.get(source_id).cloned().unwrap_or_default();
+            muts.extend(edits.iter().map(|(i, v)| (*i, v.clone())));
+            let edited = apply_attr_mutations_counted(&raw, &muts, &mut attribute_edits_refused);
+            let Some(renumbered) = flatten.line(&source_schema, renumber(&edited, *copy_id)) else { continue };
+            if converting {
+                let converted = crate::schema_convert::convert_step_line(
+                    &renumbered,
+                    &source_schema,
+                    &schema,
+                    *copy_id,
+                    &mut slot_fill,
+                    Some(&mut checks),
+                )?;
+                out.write_all(converted.as_bytes())?;
+            } else {
+                out.write_all(renumbered.as_bytes())?;
             }
-            let key = (m.express_id, m.pset_name.clone());
-            let idx = *index_of.entry(key.clone()).or_insert_with(|| {
-                groups.push((key.clone(), Vec::new()));
-                groups.len() - 1
-            });
-            groups[idx].1.push((m.prop_name.as_str(), m.value.as_str()));
-        }
-
-        let mut next = max_id + 1;
-        for ((express_id, pset_name), props) in &groups {
-            let mut prop_refs: Vec<u32> = Vec::with_capacity(props.len());
-            for (pname, value) in props {
-                out.push_str(&format!(
-                    "#{next}=IFCPROPERTYSINGLEVALUE('{}',$,{},$);\n",
-                    escape(pname),
-                    value
-                ));
-                prop_refs.push(next);
-                next += 1;
-                written += 1;
-            }
-            let psid = next;
-            next += 1;
-            let refs_str = prop_refs.iter().map(|r| format!("#{r}")).collect::<Vec<_>>().join(",");
-            out.push_str(&format!(
-                "#{psid}=IFCPROPERTYSET('{}',$,'{}',$,({}));\n",
-                crate::schema_convert::placeholder_guid(psid),
-                escape(pset_name),
-                refs_str
-            ));
-            written += 1;
-            let rid = next;
-            next += 1;
-            out.push_str(&format!(
-                "#{rid}=IFCRELDEFINESBYPROPERTIES('{}',$,$,$,(#{express_id}),#{psid});\n",
-                crate::schema_convert::placeholder_guid(rid),
-            ));
+            out.write_all(b"\n")?;
             written += 1;
         }
     }
 
-    out.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+    // 4. Synthesize new property sets from property mutations (fresh ids past
+    // max_id). Every mutation that does not reach the file is counted
+    // (#7682, EXPORT-STEP-10).
+    let mut property_mutations_refused = 0usize;
+    // Group props by (entity, pset) preserving first-seen order.
+    let mut groups: Vec<((u32, String), Vec<(&str, &str)>)> = Vec::new();
+    let mut index_of: HashMap<(u32, String), usize> = HashMap::new();
+    for m in &opts.property_mutations {
+        // Only attach to entities actually present in the export, and only a
+        // value that is one STEP value (EXPORT-STEP-26).
+        if !included.contains(&m.express_id) || !crate::step_slot::is_step_value(&m.value) {
+            property_mutations_refused += 1;
+            continue;
+        }
+        let key = (m.express_id, m.pset_name.clone());
+        let idx = *index_of.entry(key.clone()).or_insert_with(|| {
+            groups.push((key.clone(), Vec::new()));
+            groups.len() - 1
+        });
+        groups[idx].1.push((m.prop_name.as_str(), m.value.as_str()));
+    }
+    for ((express_id, pset_name), props) in &groups {
+        // One property set costs one id per property plus one for the set
+        // and one for the relationship, reserved together: a group that does
+        // not fit in the id space left is refused whole, so nothing
+        // half-written reaches the file and no id is handed out twice.
+        let needed = u32::try_from(props.len()).ok().and_then(|n| n.checked_add(2));
+        let Some(mut next) = needed.and_then(|n| ids.reserve(n)) else {
+            property_mutations_refused += props.len();
+            continue;
+        };
+        let mut prop_refs: Vec<u32> = Vec::with_capacity(props.len());
+        for (pname, value) in props {
+            let line = format!("#{next}=IFCPROPERTYSINGLEVALUE('{}',$,{},$);", escape(pname), value);
+            write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
+            prop_refs.push(next);
+            next += 1;
+            written += 1;
+        }
+        let (psid, rid) = (next, next + 1);
+        let refs_str = prop_refs.iter().map(|r| format!("#{r}")).collect::<Vec<_>>().join(",");
+        let line = format!(
+            "#{psid}=IFCPROPERTYSET('{}',$,'{}',$,({}));",
+            crate::schema_convert::placeholder_guid(psid),
+            escape(pset_name),
+            refs_str
+        );
+        write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
+        let line = format!(
+            "#{rid}=IFCRELDEFINESBYPROPERTIES('{}',$,$,$,(#{express_id}),#{psid});",
+            crate::schema_convert::placeholder_guid(rid),
+        );
+        write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
+        written += 2;
+    }
 
-    (out, StepStats { total: order.len(), written })
+    out.write_all(b"ENDSEC;\nEND-ISO-10303-21;\n")?;
+
+    Ok(StepStats {
+        total: order.len(),
+        written,
+        copies_refused,
+        refused_refs,
+        attribute_edits_refused,
+        owner_history_unfilled: slot_fill.owner_history_unfilled(),
+        required_slots_unfilled: slot_fill.required_slots_unfilled(),
+        ifc4_required_slots_unfilled: checks.ifc4_slots.required_slots_unfilled(),
+        enum_values_lost: checks.enums.lost(),
+        enum_values_refused: checks.enums.refused(),
+        attribute_values_dropped: checks.attribute_values_dropped,
+        property_mutations_refused,
+        duplicate_records_dropped: index.duplicates.len(),
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "step_tests.rs"]
+mod tests;
 
-    fn fixture(rel: &str) -> Vec<u8> {
-        let path = format!("{}/../../tests/models/{}", env!("CARGO_MANIFEST_DIR"), rel);
-        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
-    }
-
-    /// Count `#id=` entity lines in a STEP DATA section + grab the FILE_SCHEMA label.
-    fn parse_back(step: &str) -> (usize, HashSet<u32>, String) {
-        let bytes = step.as_bytes();
-        let mut ids = HashSet::new();
-        let mut scanner = EntityScanner::new(bytes);
-        while let Some((id, _t, _s, _e)) = scanner.next_entity() {
-            ids.insert(id);
-        }
-        let schema = detect_schema(bytes);
-        (ids.len(), ids, schema)
-    }
-
-    #[test]
-    fn full_roundtrip_preserves_all_entities() {
-        let src = fixture("ara3d/duplex.ifc");
-        let (step, stats) = export_step_with_stats(&src, &StepOptions::default());
-
-        // Source entity count == written count == re-parsed count.
-        let (reparsed, _ids, schema) = parse_back(&step);
-        assert_eq!(stats.written, stats.total, "wrote every entity");
-        assert_eq!(reparsed, stats.total, "re-parse recovers every entity");
-        assert!(step.starts_with("ISO-10303-21;"));
-        assert!(step.trim_end().ends_with("END-ISO-10303-21;"));
-        assert_eq!(schema, "IFC2X3", "preserved source schema label");
-    }
-
-    #[test]
-    fn subset_export_is_reference_closed() {
-        let src = fixture("ara3d/duplex.ifc");
-        // Pick a real wall id from the model.
-        let mut scanner = EntityScanner::new(&src[..]);
-        let mut wall_id = None;
-        while let Some((id, t, _s, _e)) = scanner.next_entity() {
-            if t.eq_ignore_ascii_case("IFCWALLSTANDARDCASE") || t.eq_ignore_ascii_case("IFCWALL") {
-                wall_id = Some(id);
-                break;
-            }
-        }
-        let wall_id = wall_id.expect("a wall in duplex");
-
-        let (step, stats) = export_step_with_stats(
-            &src,
-            &StepOptions { included: Some(vec![wall_id]), ..StepOptions::default() },
-        );
-        let (_n, ids, _schema) = parse_back(&step);
-
-        assert!(ids.contains(&wall_id), "the requested wall is present");
-        assert!(stats.written < stats.total, "subset is smaller than the whole model");
-
-        // Reference-closed: every #ref emitted must itself be present (no dangling refs).
-        for line in step.lines().filter(|l| l.starts_with('#')) {
-            let mut refs = Vec::new();
-            refs_in_line(line.as_bytes(), &mut refs);
-            for r in refs {
-                assert!(ids.contains(&r), "dangling reference #{r} in subset export");
-            }
-        }
-    }
-
-    #[test]
-    fn attribute_mutation_renames_entity() {
-        let src = fixture("ara3d/duplex.ifc");
-        // Find a wall to rename (attribute index 2 = Name on IfcRoot products).
-        let mut scanner = EntityScanner::new(&src[..]);
-        let mut wall_id = None;
-        while let Some((id, t, _s, _e)) = scanner.next_entity() {
-            if t.eq_ignore_ascii_case("IFCWALLSTANDARDCASE") {
-                wall_id = Some(id);
-                break;
-            }
-        }
-        let wall_id = wall_id.expect("a wall");
-
-        let step = export_step(
-            &src,
-            &StepOptions {
-                attribute_mutations: vec![AttrMutation {
-                    express_id: wall_id,
-                    index: 2,
-                    value: "'RENAMED_BY_TEST'".to_string(),
-                }],
-                ..StepOptions::default()
-            },
-        );
-        // The mutated wall line carries the new name; the model still re-parses fully.
-        let line = step
-            .lines()
-            .find(|l| l.starts_with(&format!("#{wall_id}=")))
-            .expect("wall line present");
-        assert!(line.contains("'RENAMED_BY_TEST'"), "name replaced: {line}");
-        let (reparsed, _ids, _schema) = parse_back(&step);
-        let mut sc = EntityScanner::new(&src[..]);
-        let mut total = 0usize;
-        while sc.next_entity().is_some() {
-            total += 1;
-        }
-        assert_eq!(reparsed, total, "no entities dropped by the edit");
-    }
-
-    #[test]
-    fn property_synthesis_attaches_new_pset() {
-        let src = fixture("ara3d/duplex.ifc");
-        let mut scanner = EntityScanner::new(&src[..]);
-        let mut wall = None;
-        while let Some((id, t, _s, _e)) = scanner.next_entity() {
-            if t.eq_ignore_ascii_case("IFCWALLSTANDARDCASE") {
-                wall = Some(id);
-                break;
-            }
-        }
-        let wall = wall.expect("a wall");
-
-        let (step, stats) = export_step_with_stats(
-            &src,
-            &StepOptions {
-                property_mutations: vec![PropMutation {
-                    express_id: wall,
-                    pset_name: "Pset_Test".to_string(),
-                    prop_name: "MyProp".to_string(),
-                    value: "IFCLABEL('hello')".to_string(),
-                }],
-                ..StepOptions::default()
-            },
-        );
-
-        // The three synthesized entities are present.
-        assert!(
-            step.contains("=IFCPROPERTYSINGLEVALUE('MyProp',$,IFCLABEL('hello'),$);"),
-            "single value synthesized"
-        );
-        assert!(step.contains("'Pset_Test'"), "pset name present");
-        // The synthesized rel ($-owner/name/desc) relates the wall to the new pset —
-        // distinct from duplex's original rels which carry a real OwnerHistory ref.
-        let synth_rel = format!(",$,$,$,(#{wall}),#");
-        assert!(
-            step.lines().any(|l| l.contains("=IFCRELDEFINESBYPROPERTIES(") && l.contains(&synth_rel)),
-            "synthesized rel targeting the wall not found"
-        );
-
-        // Re-parses, and the synthesized entities are counted (written = original + 3).
-        let (reparsed, _ids, _schema) = parse_back(&step);
-        assert_eq!(reparsed, stats.written, "every written entity re-parses");
-        assert_eq!(stats.written, stats.total + 3, "added 1 prop + 1 pset + 1 rel");
-    }
-
-    #[test]
-    fn split_top_level_args_respects_nesting() {
-        let args = "'a',$,(#1,#2,#3),IFCBOOLEAN(.T.),#9";
-        let parts = split_top_level_args(args);
-        assert_eq!(parts.len(), 5);
-        assert_eq!(parts[2], "(#1,#2,#3)");
-        assert_eq!(parts[3], "IFCBOOLEAN(.T.)");
-    }
-
-    #[test]
-    fn schema_conversion_to_ifc4_keeps_model_parseable() {
-        let src = fixture("ara3d/duplex.ifc");
-        let (step, stats) = export_step_with_stats(
-            &src,
-            &StepOptions { schema: Some("IFC4".to_string()), ..StepOptions::default() },
-        );
-        assert!(step.contains("FILE_SCHEMA(('IFC4'))"));
-        // Conversion preserves every express id (renames type, never drops entities).
-        let (reparsed, _ids, schema) = parse_back(&step);
-        assert_eq!(reparsed, stats.total, "no entities lost in conversion");
-        assert_eq!(schema, "IFC4");
-        // The converted file must still re-parse as a coherent entity set.
-        assert!(step.lines().filter(|l| l.starts_with('#')).count() == stats.written);
-    }
-}
+#[cfg(test)]
+#[path = "step_roundtrip_tests.rs"]
+mod roundtrip_tests;

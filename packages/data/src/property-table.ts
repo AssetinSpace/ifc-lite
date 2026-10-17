@@ -10,6 +10,7 @@
 import type { StringTable } from './string-table.js';
 import { PropertyValueType } from './types.js';
 import type { StringTable as StringTableType } from './string-table.js';
+import { groupPropertySetsByInstance } from './group-property-sets.js';
 
 export interface PropertySet {
   name: string;
@@ -21,15 +22,15 @@ export interface Property {
   name: string;
   type: PropertyValueType;
   value: PropertyValue;
-  /** Candidate values for multi-valued properties (enumerated / bounded /
-   *  list / table) — IDS facet checks pass when ANY candidate matches
-   *  (issue #1766). Absent for single values. */
-  values?: string[];
+  /** Candidate values of a multi-valued (enumerated / bounded / list / table) property — IDS facet checks pass when ANY matches (#1766). Absent for single values. */ values?: string[];
+  /** Symbol of the property's own explicit `Unit`; an unresolvable unit reference is `#<id>` (#4833). Absent when the value is in the project's unit assignment. */
   unit?: string;
-  /** Raw IFC measure value type of this property (e.g. "IFCVOLUMETRICFLOWRATEMEASURE"),
-   *  used to resolve the file's declared display unit (issue #1573). Absent for
-   *  properties whose value type carries no measure semantics (labels, enums, ...). */
+  /** Scale of the explicit `unit` to its SI base (`mm` → `1e-3`), only when it resolved; `unit` without it means "a unit we could not read": neither convertible nor project-unit. */ unitSiScale?: number;
+  /** Additive SI offset of `unit` (°F: `si = value * unitSiScale + unitSiOffset`), only when it has one. */ unitSiOffset?: number;
+  /** Raw IFC measure value type (e.g. "IFCVOLUMETRICFLOWRATEMEASURE") that resolves the file's declared display unit (#1573). Absent when the value type has no measure semantics. */
   dataType?: string;
+  /** `IfcPropertyTableValue`: columns differ in type by design, so no single `dataType` (#5224). */ dataTypeMixed?: true;
+  /** Subtype of a non-single value; rules read a list/enumerated/table `values` member by member (#5475). */ structure?: 'enumerated' | 'bounded' | 'list' | 'table' | 'reference' | 'complex';
 }
 
 export type PropertyValue = string | number | boolean | null | PropertyValue[];
@@ -218,22 +219,15 @@ export function propertyTableFromColumns(columns: PropertyTableColumns, strings:
 
     getForEntity: (id) => {
       const rowIndices = entityIndex.get(id) || [];
-      const psets = new Map<string, PropertySet>();
-      for (const idx of rowIndices) {
-        const psetNameStr = strings.get(psetName[idx]);
-        const psetGlobalIdStr = strings.get(psetGlobalId[idx]);
-        if (!psets.has(psetNameStr)) {
-          psets.set(psetNameStr, { name: psetNameStr, globalId: psetGlobalIdStr, properties: [] });
-        }
-        const pset = psets.get(psetNameStr)!;
-        const propNameStr = strings.get(propName[idx]);
-        pset.properties.push({
-          name: propNameStr,
-          type: propType[idx],
-          value: getPropertyValue(table, idx, strings),
-        });
-      }
-      return Array.from(psets.values());
+      return groupPropertySetsByInstance(
+        rowIndices,
+        psetName,
+        psetGlobalId,
+        propName,
+        propType,
+        strings,
+        (idx) => getPropertyValue(table, idx, strings),
+      );
     },
 
     getPropertyValue: (id, pset, prop) => {
@@ -307,6 +301,27 @@ function addToIndex(index: Map<number, number[]>, key: number, value: number): v
   list.push(value);
 }
 
+/**
+ * List-value parse failures are per-property on a hot read path, so the
+ * warning is latched: a corrupt table would otherwise emit one line per row.
+ */
+let listParseWarningShown = false;
+
+/** @internal test seam — reset the once-per-process list-parse warning latch. */
+export function __resetListParseWarningLatch(): void {
+  listParseWarningShown = false;
+}
+
+function warnListParseFailureOnce(listStr: string, err: unknown): void {
+  if (listParseWarningShown) return;
+  listParseWarningShown = true;
+  console.warn(
+    `[data] property list value is not valid JSON; reporting an empty list ` +
+      `(further occurrences suppressed). value=${JSON.stringify(listStr.slice(0, 120))}`,
+    err,
+  );
+}
+
 function getPropertyValue(table: PropertyTable, idx: number, strings: StringTableType): PropertyValue {
   const type = table.propType[idx];
   
@@ -329,10 +344,19 @@ function getPropertyValue(table: PropertyTable, idx: number, strings: StringTabl
       return boolVal === 255 ? null : boolVal === 1;
     }
     case PropertyValueType.List: {
-      const listStr = strings.get(table.valueString[idx]);
+      // Same NULL handling as the string branch above: `valueString` is a
+      // Uint32Array, so the -1 sentinel wraps to 4294967295 and `strings.get`
+      // answers '' for it. Without this guard a NULL list property came back
+      // as `[]` — an empty list is a value, and the silent catch below made
+      // that indistinguishable from a real one.
+      const si = table.valueString[idx];
+      if (!(si >= 0 && si < strings.count)) return null;
+      const listStr = strings.get(si);
+      if (listStr === '') return null;
       try {
         return JSON.parse(listStr);
-      } catch {
+      } catch (err) {
+        warnListParseFailureOnce(listStr, err);
         return [];
       }
     }

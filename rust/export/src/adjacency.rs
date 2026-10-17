@@ -21,11 +21,7 @@ const MAX_LATERAL: f64 = 0.15;
 /// rarely produce perfectly congruent faces), so only near-congruent walls are paired.
 const MAX_AREA_DIFF: f64 = 0.01;
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] { [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
-fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
-    let d = sub(a, b);
-    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-}
+use ifc_lite_geometry::math::v3::{dist, sub};
 
 struct AdjFace {
     ri: usize,
@@ -115,4 +111,67 @@ pub fn solve_adjacency(rooms: &mut [Room]) -> usize {
         rooms[ri_b].faces[fi_b].set_surface_bc(fid_a, rid_a);
     }
     pairs.len() * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hbjson::{Face, Face3D};
+
+    /// Two square wall faces, 0.5m apart, coplanar-facing (anti-parallel normals,
+    /// matching area, zero lateral offset) — the geometry `solve_adjacency` is
+    /// built to pair. Room/face identifiers are distinct on purpose so a swap
+    /// between "which room" and "which face" is observable in the output.
+    fn facing_rooms() -> Vec<Room> {
+        // Room A's wall: outward normal +x (winding gives Newell normal (1,0,0)).
+        let face_a = Face3D::new(vec![
+            [2.0, 0.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [2.0, 2.0, 2.0],
+            [2.0, 0.0, 2.0],
+        ]);
+        // Room B's wall: outward normal -x, offset 0.5m, same footprint extents.
+        let face_b = Face3D::new(vec![
+            [2.5, 0.0, 0.0],
+            [2.5, 0.0, 2.0],
+            [2.5, 2.0, 2.0],
+            [2.5, 2.0, 0.0],
+        ]);
+        let room_a = Room::new(
+            "RoomA".to_string(),
+            vec![Face::new("FaceA".to_string(), face_a, "Wall", "Outdoors")],
+        );
+        let room_b = Room::new(
+            "RoomB".to_string(),
+            vec![Face::new("FaceB".to_string(), face_b, "Wall", "Outdoors")],
+        );
+        vec![room_a, room_b]
+    }
+
+    /// Mutation killed: swapping `vec![adjacent_face, adjacent_room]` to
+    /// `vec![adjacent_room, adjacent_face]` inside `BoundaryCondition::surface`
+    /// (hbjson.rs) survived the full suite — every existing assertion only checks
+    /// `boundary_condition_objects.len() == 2`, never which slot holds the face id
+    /// vs. the room id, and never that room A's face points at room B (not itself).
+    /// This test pins both the slot order and the cross-room identity.
+    #[test]
+    fn solve_adjacency_pairs_faces_with_correct_face_then_room_order() {
+        let mut rooms = facing_rooms();
+        let created = solve_adjacency(&mut rooms);
+        assert_eq!(created, 2, "expected exactly one matched pair (2 interior faces)");
+
+        let bc_a = &rooms[0].faces[0].boundary_condition;
+        let bc_b = &rooms[1].faces[0].boundary_condition;
+        assert_eq!(bc_a.ty, "Surface");
+        assert_eq!(bc_b.ty, "Surface");
+
+        // Room A's face must reference [FaceB, RoomB] — face id first, room id second —
+        // and NOT its own room.
+        let objs_a = bc_a.boundary_condition_objects.as_ref().expect("room A objects");
+        assert_eq!(objs_a.as_slice(), ["FaceB".to_string(), "RoomB".to_string()].as_slice());
+
+        // Room B's face must reference [FaceA, RoomA], the mirror image.
+        let objs_b = bc_b.boundary_condition_objects.as_ref().expect("room B objects");
+        assert_eq!(objs_b.as_slice(), ["FaceA".to_string(), "RoomA".to_string()].as_slice());
+    }
 }

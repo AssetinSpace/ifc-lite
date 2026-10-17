@@ -4,13 +4,13 @@
 
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getPackageVersion } from '../utils/config-fixers.js';
+import { getPinnedPackageVersion } from '../utils/config-fixers.js';
 
 /**
  * Scaffold a Docker-based IFC processing server with TypeScript client examples.
  */
 export function createServerTemplate(targetDir: string, projectName: string) {
-  const serverClientVersion = getPackageVersion('@ifc-lite/server-client');
+  const serverClientVersion = getPinnedPackageVersion('@ifc-lite/server-client');
 
   // docker-compose.yml - Production configuration
   writeFileSync(join(targetDir, 'docker-compose.yml'), `# IFC-Lite Server - Production Configuration
@@ -18,7 +18,7 @@ export function createServerTemplate(targetDir: string, projectName: string) {
 
 services:
   ifc-server:
-    image: ghcr.io/LTplus-AG/ifc-lite-server:latest
+    image: ghcr.io/ltplus-ag/ifc-lite-server:latest
     container_name: ${projectName}-server
     ports:
       - "\${PORT:-3001}:8080"
@@ -51,7 +51,7 @@ volumes:
 
 services:
   ifc-server:
-    image: ghcr.io/LTplus-AG/ifc-lite-server:latest
+    image: ghcr.io/ltplus-ag/ifc-lite-server:latest
     container_name: ${projectName}-server-dev
     ports:
       - "\${PORT:-3001}:8080"
@@ -176,6 +176,7 @@ cache
   writeFileSync(join(targetDir, 'package.json'), JSON.stringify({
     name: projectName,
     version: '0.1.0',
+    private: true,
     type: 'module',
     description: 'IFC processing server with TypeScript client',
     scripts: {
@@ -197,7 +198,7 @@ cache
       '@types/node': '^20.0.0',
     },
     optionalDependencies: {
-      'parquet-wasm': '^0.6.0',
+      'parquet-wasm': '^0.7.2',
       'apache-arrow': '^17.0.0',
     },
   }, null, 2));
@@ -498,7 +499,7 @@ IFC processing server using [IFC-Lite](https://github.com/LTplus-AG/ifc-lite).
 docker compose up -d
 
 # 2. Install client dependencies
-npm install
+npm ci
 
 # 3. Run the example (replace with your IFC file)
 npm run example ./your-model.ifc
@@ -600,8 +601,8 @@ The Docker image works on any container platform:
 
 \`\`\`bash
 # Pull and run
-docker pull ghcr.io/LTplus-AG/ifc-lite-server:latest
-docker run -p 8080:8080 -v ifc-cache:/app/cache ghcr.io/LTplus-AG/ifc-lite-server
+docker pull ghcr.io/ltplus-ag/ifc-lite-server:latest
+docker run -p 8080:8080 -v ifc-cache:/app/cache ghcr.io/ltplus-ag/ifc-lite-server
 \`\`\`
 
 ### Environment Variables
@@ -619,7 +620,7 @@ RUST_LOG=info
 ## Learn More
 
 - [IFC-Lite Documentation](https://ifclite.dev/docs/)
-- [Server API Reference](https://ifclite.dev/docs/api/server/)
+- [Server Guide](https://ifclite.dev/docs/guide/server/)
 - [GitHub Repository](https://github.com/LTplus-AG/ifc-lite)
 `);
 

@@ -1,0 +1,28 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "ifc-lite-landxml"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded pull-parser ingestion for LandXML terrain sources"
+keywords = ["landxml", "terrain", "tin", "xml", "aec"]
+categories = ["parser-implementations", "data-structures"]
+
+[dependencies]
+quick-xml = "0.42"
+serde.workspace = true
+serde_json.workspace = true
+ifc-lite-geometry.workspace = true
+geometry-predicates.workspace = true
+
+[dev-dependencies]
+# Test-only (publish = false). Path-only: cargo strips it when packaging.
+ifc-lite-testkit = { path = "../testkit" }
+
+[lints]
+workspace = true

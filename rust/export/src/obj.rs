@@ -2,35 +2,44 @@
 //! Wavefront **OBJ** exporter — triangulated render geometry as a single `.obj` text.
 //!
 //! Source = `ifc_lite_processing::process_geometry` (the same per-element `MeshData`
-//! the viewer renders, produced by the one unified Rust pipeline). Per-mesh `origin`
-//! is folded into world positions so building / georef-scale placements export without
-//! f32 collapse. Vertices and normals are emitted once per mesh with a running global
+//! the viewer renders, produced by the one unified Rust pipeline). Every vertex goes
+//! back to IFC world through the frame the pipeline baked in (`MeshFrame::to_world`:
+//! per-mesh `origin`, site rotation and RTC offset, all f64, #7684), so building /
+//! georef-scale placements export without f32 collapse and land where the GLB puts
+//! them. Vertices and normals are emitted once per mesh with a running global
 //! index; each element becomes an OBJ `o`/`g` group (`IfcWall_1234`) so downstream DCC
 //! tools keep per-element traceability.
 //!
-//! Instanced type-library meshes (`geometry_class == 2`) are skipped — their geometry is
+//! Instanced type-library meshes (`GEOM_CLASS_INSTANCED_TYPE`) are skipped — their geometry is
 //! already drawn by the real occurrences, so emitting them would duplicate shapes at the
 //! type origin (the Model/Types orphan-gate footgun).
 
 use std::fmt::Write as _;
 
-use ifc_lite_processing::{process_geometry, MeshData};
+use ifc_lite_processing::{process_geometry, MeshData, MeshFrame};
 
-use crate::frame::{yup_f32, yup_f64};
+use crate::error::ExportError;
+use ifc_lite_geometry::math::frame::zup_to_yup;
 
 /// Options for OBJ export.
 pub struct ObjOptions {
     /// Emit per-vertex normals (`vn` + `f a//na`). Most DCC tools expect them.
     pub include_normals: bool,
-    /// Restrict to these express ids (isolation). Empty ⇒ all visible elements.
-    pub isolated: Vec<u32>,
+    /// Restrict to these express ids (isolation allowlist). `None` ⇒ no filter,
+    /// every mesh is a candidate; `Some(empty)` ⇒ the filter is ACTIVE and
+    /// matched nothing, so every mesh is excluded. Do not collapse the two —
+    /// an active isolation that matches zero elements must export nothing, not
+    /// silently fall back to the whole model (matches the null-vs-empty
+    /// convention used by `GltfOptions::isolated` and by
+    /// `packages/export/src/reference-collector.ts` on the TS side).
+    pub isolated: Option<Vec<u32>>,
     /// Exclude these express ids (hidden in the viewer).
     pub hidden: Vec<u32>,
 }
 
 impl Default for ObjOptions {
     fn default() -> Self {
-        Self { include_normals: true, isolated: Vec::new(), hidden: Vec::new() }
+        Self { include_normals: true, isolated: None, hidden: Vec::new() }
     }
 }
 
@@ -45,37 +54,62 @@ pub struct ObjStats {
 }
 
 /// True when `mesh` should be written given the isolation/hidden filters.
-fn mesh_visible(mesh: &MeshData, isolated: &[u32], hidden: &[u32]) -> bool {
-    // Instanced type-library shapes duplicate real occurrence geometry — never export.
-    if mesh.geometry_class == 2 {
-        return false;
-    }
+fn mesh_visible(mesh: &MeshData, isolated: &Option<Vec<u32>>, hidden: &[u32]) -> bool {
     if hidden.contains(&mesh.express_id) {
         return false;
     }
-    if !isolated.is_empty() && !isolated.contains(&mesh.express_id) {
-        return false;
+    // `Some(ids)` = isolation is ACTIVE — an empty allowlist must exclude every
+    // mesh here, not read the same as "no filter" (`None`). See `ObjOptions::isolated`.
+    if let Some(ids) = isolated {
+        if !ids.contains(&mesh.express_id) {
+            return false;
+        }
     }
-    !mesh.indices.is_empty() && mesh.positions.len() >= 9
+    // OBJ's `v`/`vn` tokens have no lexical form for a non-finite number, and
+    // this exporter folds `mesh.origin` into every position, so the shared
+    // from-bytes gate (instanced type-library shapes out, whole triangles, all
+    // finite) is exactly what it needs.
+    crate::mesh_input::is_exportable(mesh)
 }
 
 /// Export the render geometry in `content` (raw IFC/STEP bytes) as a Wavefront OBJ string.
-pub fn export_obj(content: &[u8], opts: &ObjOptions) -> String {
-    export_obj_with_stats(content, opts).0
+///
+/// Fail-closed like the GLB exporters: when no mesh survives the filters and
+/// the emittable-mesh gate, this is [`ExportError::NoRenderGeometry`] rather
+/// than a header-only file reported as success (#7695, EXPORT-GEOM-15).
+pub fn export_obj(content: &[u8], opts: &ObjOptions) -> Result<String, ExportError> {
+    export_obj_with_stats(content, opts).map(|(obj, _)| obj)
 }
 
 /// Like [`export_obj`] but also returns coverage stats.
-pub fn export_obj_with_stats(content: &[u8], opts: &ObjOptions) -> (String, ObjStats) {
+pub fn export_obj_with_stats(content: &[u8], opts: &ObjOptions) -> Result<(String, ObjStats), ExportError> {
     let result = process_geometry(content);
+    let (obj, stats) = write_obj_in(&result.meshes, result.frame, opts);
+    crate::error::require_render_geometry(stats.meshes)?;
+    Ok((obj, stats))
+}
 
+/// [`write_obj_in`] for meshes already in IFC world (nothing to restore).
+#[cfg(test)]
+fn write_obj(meshes: &[MeshData], opts: &ObjOptions) -> (String, ObjStats) {
+    write_obj_in(meshes, MeshFrame::RawIfc, opts)
+}
+
+/// The OBJ text for already-meshed geometry baked in `frame`.
+fn write_obj_in(meshes: &[MeshData], frame: MeshFrame, opts: &ObjOptions) -> (String, ObjStats) {
     let mut out = String::new();
     let _ = writeln!(out, "# ifc-lite OBJ export");
     let _ = writeln!(out, "# units: metres (renderer Y-up frame, origin-folded world coords)");
 
     let mut vert_base: usize = 0; // 0-based count of vertices written so far
+    // `vn` lines written so far: a mesh without normals writes none, so this is
+    // not `vert_base`.
+    let mut norm_base: usize = 0;
     let mut stats = ObjStats { meshes: 0, vertices: 0, triangles: 0 };
 
-    for mesh in &result.meshes {
+    // The frame's rotation check is made once per export, not per vertex.
+    let (to_world, direction) = (frame.world_mapper(), frame.direction_mapper());
+    for mesh in meshes {
         if !mesh_visible(mesh, &opts.isolated, &opts.hidden) {
             continue;
         }
@@ -86,46 +120,48 @@ pub fn export_obj_with_stats(content: &[u8], opts: &ObjOptions) -> (String, ObjS
         let _ = writeln!(out, "o {group}");
         let _ = writeln!(out, "g {group}");
 
-        // Vertices — fold the per-mesh f64 origin so georef-scale placements survive,
-        // then convert the producer-native IFC Z-up world point to WebGL Y-up
-        // (`(x,y,z) -> (x,z,-y)`) so OBJ matches the header's declared frame and the
-        // GLB exporter (`process_geometry` itself is Z-up; the swap is normally done
-        // at the wasm FFI, which this path never crosses).
+        // Vertices — fold the per-mesh f64 origin, then restore the frame the
+        // pipeline baked in (site rotation + RTC, f64) so a georeferenced model
+        // lands at its world coordinates, then convert the producer-native IFC
+        // Z-up world point to WebGL Y-up (`(x,y,z) -> (x,z,-y)`) so OBJ matches
+        // the header's declared frame and the GLB exporter (`process_geometry`
+        // itself is Z-up; the swap is normally done at the wasm FFI, which this
+        // path never crosses).
         let [ox, oy, oz] = mesh.origin;
         for i in 0..nverts {
             let wx = mesh.positions[i * 3] as f64 + ox;
             let wy = mesh.positions[i * 3 + 1] as f64 + oy;
             let wz = mesh.positions[i * 3 + 2] as f64 + oz;
-            let [x, y, z] = yup_f64([wx, wy, wz]);
+            let [x, y, z] = zup_to_yup(to_world([wx, wy, wz]));
             let _ = writeln!(out, "v {x:.6} {y:.6} {z:.6}");
         }
         if has_normals {
+            // Directions take the frame's rotation, no translation.
             for i in 0..nverts {
-                let [nx, ny, nz] = yup_f32([
-                    mesh.normals[i * 3],
-                    mesh.normals[i * 3 + 1],
-                    mesh.normals[i * 3 + 2],
-                ]);
+                let n = [0, 1, 2].map(|k| mesh.normals[i * 3 + k] as f64);
+                let [nx, ny, nz] = zup_to_yup(direction(n));
                 let _ = writeln!(out, "vn {nx:.6} {ny:.6} {nz:.6}");
             }
         }
 
         // Faces — OBJ indices are 1-based and global; offset by vert_base. Winding is
-        // reversed (2nd/3rd vertex swapped) to compensate the Z-up→Y-up handedness
-        // convention, matching the GLB exporter / `MeshDataJs::new`.
+        // preserved: (x,y,z) -> (x,z,-y) has determinant +1, so this frame
+        // rotation does not change handedness.
         for tri in mesh.indices.chunks_exact(3) {
-            let a = vert_base + tri[0] as usize + 1;
-            let b = vert_base + tri[1] as usize + 1;
-            let c = vert_base + tri[2] as usize + 1;
+            let [a, b, c] = [0, 1, 2].map(|k| vert_base + tri[k] as usize + 1);
             if has_normals {
-                let _ = writeln!(out, "f {a}//{a} {c}//{c} {b}//{b}");
+                let [na, nb, nc] = [0, 1, 2].map(|k| norm_base + tri[k] as usize + 1);
+                let _ = writeln!(out, "f {a}//{na} {b}//{nb} {c}//{nc}");
             } else {
-                let _ = writeln!(out, "f {a} {c} {b}");
+                let _ = writeln!(out, "f {a} {b} {c}");
             }
             stats.triangles += 1;
         }
 
         vert_base += nverts;
+        if has_normals {
+            norm_base += nverts;
+        }
         stats.vertices += nverts;
         stats.meshes += 1;
     }
@@ -134,53 +170,5 @@ pub fn export_obj_with_stats(content: &[u8], opts: &ObjOptions) -> (String, ObjS
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture(rel: &str) -> Vec<u8> {
-        let path = format!("{}/../../tests/models/{}", env!("CARGO_MANIFEST_DIR"), rel);
-        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
-    }
-
-    #[test]
-    fn duplex_exports_well_formed_obj() {
-        let (obj, stats) =
-            export_obj_with_stats(&fixture("ara3d/duplex.ifc"), &ObjOptions::default());
-        assert!(stats.meshes > 0, "expected meshes");
-        assert!(stats.vertices > 0, "expected vertices");
-        assert!(stats.triangles > 0, "expected triangles");
-        assert!(obj.contains("\nv "), "has vertices");
-        assert!(obj.contains("\nf "), "has faces");
-        assert!(obj.contains("\no Ifc"), "has element object groups");
-
-        // Every face index must reference a written vertex (1..=vertices).
-        let max_idx = stats.vertices;
-        for line in obj.lines().filter(|l| l.starts_with("f ")) {
-            for tok in line[2..].split_whitespace() {
-                let v: usize = tok.split("//").next().unwrap().parse().unwrap();
-                assert!(v >= 1 && v <= max_idx, "face index {v} out of range 1..={max_idx}");
-            }
-        }
-    }
-
-    #[test]
-    fn isolation_filter_limits_output() {
-        let all = export_obj_with_stats(&fixture("ara3d/duplex.ifc"), &ObjOptions::default()).1;
-        // Find one express id that was emitted by re-reading meshes through the pipeline.
-        let result = process_geometry(&fixture("ara3d/duplex.ifc")[..]);
-        let some_id = result
-            .meshes
-            .iter()
-            .find(|m| super::mesh_visible(m, &[], &[]))
-            .map(|m| m.express_id)
-            .expect("at least one visible mesh");
-
-        let isolated = export_obj_with_stats(
-            &fixture("ara3d/duplex.ifc"),
-            &ObjOptions { isolated: vec![some_id], ..ObjOptions::default() },
-        )
-        .1;
-        assert!(isolated.meshes >= 1);
-        assert!(isolated.meshes <= all.meshes);
-    }
-}
+#[path = "obj_tests.rs"]
+mod tests;

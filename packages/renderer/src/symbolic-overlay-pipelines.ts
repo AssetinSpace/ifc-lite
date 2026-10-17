@@ -9,35 +9,36 @@
  * viewProj)` entry point that the caller invokes from inside an existing
  * RGBA-blended render pass.
  *
- * Triangulation: simple ear-clipping for polygon-with-optional-holes,
- * inlined below to avoid adding a dependency. Good enough for typical IFC
- * fill regions (rooms, hatched zones) which are usually convex or near-convex.
- * Pathological concave shapes with many holes may show tessellation glitches —
- * an `earcut` upgrade is straightforward when it matters.
+ * Triangulation lives in `fill-triangulate.ts` and is shared with the section
+ * cut caps: rings are nested by the even-odd rule, holes are bridged in, and
+ * the result is ear-clipped.
  */
 
-import { SymbolicTextAtlas } from './symbolic-text-atlas.js';
+import { uploadFillPartition } from './symbolic-fill-upload.js';
+import { haloGlyphQuad, SymbolicTextAtlas } from './symbolic-text-atlas.js';
 import {
   SYMBOLIC_FILL_WGSL,
   SYMBOLIC_TEXT_WGSL,
 } from './shaders/symbolic-overlay.wgsl.js';
 import { PIPELINE_CONSTANTS } from './constants.js';
+import { tryPackRteDrawableDelta, type WorldPoint } from './relative-to-eye.js';
+import type { InstanceRun } from './instanced-rte.js';
+import { packTextRteDeltas, TEXT_RTE_DELTA_FLOATS, TEXT_RTE_DELTA_STRIDE_BYTES } from './symbolic-text-rte.js';
+import { parseBoxAlignment, triangulateFillTo } from './symbolic-overlay-geometry.js';
+export { parseBoxAlignment } from './symbolic-overlay-geometry.js';
 
 const FILL_VERTEX_STRIDE_BYTES = (3 + 4) * 4; // pos.xyz + color.rgba, 4 bytes each
-const TEXT_INSTANCE_STRIDE_BYTES = (3 + 3 + 3 + 4 + 4 + 3 + 1 + 1 + 4 + 1) * 4;
-// origin.xyz + rightAxis.xyz + upAxis.xyz + uvBounds.xyzw + color.rgba
-// + anchor.xyz + capHeight (shared per text label, used by the shader to
-//   compute a single screen-space scale for every glyph in the row)
-// + billboard (1 = use camera-aligned axes, 0 = authored — IfcGridAxis only)
-// + glyphOffsetSize.xyzw (baseline-relative 2D atlas-pixel offset + size
-//   in world units; only consulted on the billboard branch)
-// + targetPxOverride (per-instance screen-pixel target cap height; 0 falls
-//   back to the uniform default — grid bubble glyphs use a larger value
-//   than tag text so the bubble stays proportional at all zoom levels).
-
-// Uniform: viewProj (64 B) + viewportAndTarget (16 B) + cameraRight (16 B)
-// + cameraUp (16 B) = 112 B.
-const TEXT_UNIFORM_BYTES = 112;
+const TEXT_INSTANCE_FLOATS = 3 + 3 + 3 + 4 + 4 + 3 + 1 + 1 + 4 + 1;
+const TEXT_INSTANCE_STRIDE_BYTES = TEXT_INSTANCE_FLOATS * 4;
+// Static glyph fields: origin, axes, UV/color, label anchor, cap height,
+// billboard, glyph offset/size and target override (108 B/glyph). A separate
+// dynamic RTE delta stream updates only 32 B/glyph per camera frame; low.w marks anchor-local legacy origins.
+// Uniform: global viewProj (64 B) + RTE viewProj (64 B) + viewport/target
+// (16 B) + camera basis (32 B) + f64 camera split (32 B) = 208 B. Keeping
+// both projections is deliberate: a mixed legacy/anchored upload must keep
+// legacy world-f32 labels on the original matrix while anchored labels use the
+// eye-relative matrix selected by their instance record.
+const TEXT_UNIFORM_BYTES = 208;
 // Default target glyph cap height in physical pixels. Roughly matches a
 // 13–14px body font at 1× DPR — readable at any zoom without dominating
 // the model. Authored IFC text height is ignored in screen space, but the
@@ -53,14 +54,24 @@ export interface SymbolicFillInput {
   /** Vertex indices marking the start of each hole. Empty = no holes. */
   holesOffsets: Uint32Array;
   worldY: number;
+  /** Opt-in f64 anchor. points/worldY are local to it; legacy inputs omit it. */
+  origin?: [number, number, number];
   /** Straight-alpha RGBA in [0..1]. The shader premultiplies. */
   color: [number, number, number, number];
+  /** Does this fill DEFINE the model's extent? Default true; see `uploadFills` (#3359). */
+  definesExtent?: boolean;
 }
 
 // ─── Text input ─────────────────────────────────────────────────────────────
 
 export interface SymbolicTextInput {
   worldPos: [number, number, number];
+  /**
+   * Opt-in canonical f64 label anchor. When supplied, `worldPos` is a small
+   * local offset from this origin; legacy callers omit it and retain their
+   * world-f32 projection path without a fabricated precision claim.
+   */
+  origin?: [number, number, number];
   /** Baseline direction (X axis in 3D world space). */
   dirX: number;
   dirZ: number;
@@ -87,6 +98,8 @@ export interface SymbolicTextInput {
    * disappear behind the character.
    */
   targetPx?: number;
+  /** Does this label DEFINE the model's extent? Default true; see `uploadTexts` (#3359). */
+  definesExtent?: boolean;
 }
 
 // ─── Fill pipeline ──────────────────────────────────────────────────────────
@@ -97,10 +110,15 @@ export class SymbolicFillPipeline {
   private readonly sampleCount: number;
   private pipeline: GPURenderPipeline | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
-  private uniformBuffer: GPUBuffer | null = null;
-  private bindGroup: GPUBindGroup | null = null;
-  private vertexBuffer: GPUBuffer | null = null;
-  private vertexCount = 0;
+  /**
+   * Each partition owns its uniform resource. Queue writes happen before the
+   * encoded pass executes, so using one buffer for several partitions makes
+   * every draw observe the final anchor written that frame.
+   */
+  private partitions: Array<{
+    vertexBuffer: GPUBuffer; vertexCount: number; origin?: [number, number, number];
+    uniformBuffer: GPUBuffer; bindGroup: GPUBindGroup;
+  }> = [];
 
   constructor(device: GPUDevice, presentationFormat: GPUTextureFormat, sampleCount: number = 1) {
     this.device = device;
@@ -183,79 +201,77 @@ export class SymbolicFillPipeline {
       multisample: { count: this.sampleCount },
     });
 
-    this.uniformBuffer = this.device.createBuffer({
-      label: 'symbolic-fill-camera',
-      size: 64,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    this.bindGroup = this.device.createBindGroup({
-      label: 'symbolic-fill-bg',
-      layout: this.bindGroupLayout,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-    });
   }
 
   /**
-   * Upload a list of fill regions. Each region is triangulated (ear-clipping,
-   * holes-aware) into a single shared vertex buffer.
+   * Upload a list of fill regions. Each region is triangulated by the shared
+   * even-odd triangulator (`fill-triangulate.ts`) into a single vertex buffer.
    *
-   * Pass an empty array to clear. Triangulation skips degenerate rings
-   * (< 3 vertices) and silently drops any hole that can't be merged into the
-   * outer ring (rare; usually overlapping rings in malformed IFC).
+   * Pass an empty array to clear. Rings with fewer than 3 vertices are
+   * dropped, and so is any ring set that yields no triangle at all (a fully
+   * collinear bound). Inner bounds themselves are never dropped: since #2516
+   * the bridge always finds an anchor, so a hole cannot fall out of the
+   * result the way it used to when it "couldn't be merged".
    */
   upload(fills: readonly SymbolicFillInput[]): void {
     this.init();
 
     // Drop the previous buffer eagerly so swapping models doesn't accumulate.
-    if (this.vertexBuffer) {
-      this.vertexBuffer.destroy();
-      this.vertexBuffer = null;
+    for (const partition of this.partitions) {
+      partition.vertexBuffer.destroy();
+      partition.uniformBuffer.destroy();
     }
-    this.vertexCount = 0;
+    this.partitions = [];
 
     if (fills.length === 0) return;
 
-    // Triangulate everything into one big flat vertex stream.
-    const stream: number[] = [];
+    const legacy: number[] = [];
     for (const fill of fills) {
+      const stream: number[] = [];
       triangulateFillTo(stream, fill);
+      if (fill.origin) this.addPartition(stream, fill.origin); else legacy.push(...stream);
     }
-    if (stream.length === 0) return;
-
-    const data = new Float32Array(stream);
-    this.vertexBuffer = this.device.createBuffer({
-      label: 'symbolic-fill-vbuf',
-      size: data.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, data);
-    this.vertexCount = data.length / (FILL_VERTEX_STRIDE_BYTES / 4);
+    this.addPartition(legacy);
   }
 
   hasGeometry(): boolean {
-    return this.vertexCount > 0;
+    return this.partitions.length > 0;
   }
 
-  render(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
-    if (!this.pipeline || !this.uniformBuffer || !this.bindGroup || !this.vertexBuffer) return;
-    if (this.vertexCount === 0) return;
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, viewProj);
+  private addPartition(stream: number[], origin?: [number, number, number]): void {
+    if (stream.length === 0 || !this.bindGroupLayout) return;
+    const data = new Float32Array(stream);
+    uploadFillPartition(this.device, this.bindGroupLayout, data, (vertexBuffer, uniformBuffer, bindGroup) => {
+      this.partitions.push({ vertexBuffer, uniformBuffer, bindGroup,
+        vertexCount: data.length / (FILL_VERTEX_STRIDE_BYTES / 4), origin });
+    });
+  }
+
+  render(pass: GPURenderPassEncoder, viewProj: Float32Array, rteViewProj?: Float32Array, camera?: readonly [number, number, number]): void {
+    if (!this.pipeline) return;
     pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.setVertexBuffer(0, this.vertexBuffer);
-    pass.draw(this.vertexCount);
+    for (const partition of this.partitions) {
+      const uniform = new Float32Array(40); uniform.set(viewProj);
+      if (partition.origin && rteViewProj && camera) {
+        uniform.set(rteViewProj, 16);
+        // Outside this camera's RTE envelope: not rasterisable this frame (#6128).
+        if (!tryPackRteDrawableDelta(partition.origin, camera, uniform, 32)) continue;
+        uniform[35] = 1;
+      }
+      this.device.queue.writeBuffer(partition.uniformBuffer, 0, uniform);
+      pass.setBindGroup(0, partition.bindGroup);
+      pass.setVertexBuffer(0, partition.vertexBuffer); pass.draw(partition.vertexCount);
+    }
   }
 
   destroy(): void {
-    if (this.vertexBuffer) this.vertexBuffer.destroy();
-    if (this.uniformBuffer) this.uniformBuffer.destroy();
-    this.vertexBuffer = null;
-    this.uniformBuffer = null;
-    this.bindGroup = null;
+    for (const partition of this.partitions) {
+      partition.vertexBuffer.destroy();
+      partition.uniformBuffer.destroy();
+    }
+    this.partitions = [];
     this.bindGroupLayout = null;
     this.pipeline = null;
-    this.vertexCount = 0;
   }
 }
 
@@ -271,11 +287,15 @@ export class SymbolicTextPipeline {
   private uniformBuffer: GPUBuffer | null = null;
   private cornerBuffer: GPUBuffer | null = null;
   private instanceBuffer: GPUBuffer | null = null;
+  private rteDeltaBuffer: GPUBuffer | null = null;
   private atlasTexture: GPUTexture | null = null;
   private atlasView: GPUTextureView | null = null;
   private sampler: GPUSampler | null = null;
   private bindGroup: GPUBindGroup | null = null;
   private instanceCount = 0;
+  /** CPU-side dynamic delta stream; never derived from f32 instance lanes. */
+  private rteDeltaData: Float32Array | null = null;
+  private instanceAnchors: Array<WorldPoint | null> = [];
   private uploadedAtlasVersion = -1;
 
   constructor(
@@ -341,6 +361,15 @@ export class SymbolicTextPipeline {
               { shaderLocation: 8,  offset: (3 + 3 + 3 + 4 + 4 + 3 + 1) * 4,           format: 'float32'   }, // billboard
               { shaderLocation: 9,  offset: (3 + 3 + 3 + 4 + 4 + 3 + 1 + 1) * 4,       format: 'float32x4' }, // glyphOffsetSize
               { shaderLocation: 10, offset: (3 + 3 + 3 + 4 + 4 + 3 + 1 + 1 + 4) * 4,   format: 'float32'   }, // targetPxOverride
+            ],
+          },
+          {
+            // Per-frame f64-split drawable-minus-camera delta.
+            arrayStride: TEXT_RTE_DELTA_STRIDE_BYTES,
+            stepMode: 'instance',
+            attributes: [
+              { shaderLocation: 11, offset: 0, format: 'float32x4' },
+              { shaderLocation: 12, offset: 4 * 4, format: 'float32x4' },
             ],
           },
         ],
@@ -457,7 +486,13 @@ export class SymbolicTextPipeline {
       this.instanceBuffer.destroy();
       this.instanceBuffer = null;
     }
+    if (this.rteDeltaBuffer) {
+      this.rteDeltaBuffer.destroy();
+      this.rteDeltaBuffer = null;
+    }
     this.instanceCount = 0;
+    this.rteDeltaData = null;
+    this.instanceAnchors = [];
 
     if (texts.length === 0) return;
 
@@ -476,6 +511,7 @@ export class SymbolicTextPipeline {
       glyphOffsetSize: [number, number, number, number];
       // 0 → use renderer global default; otherwise override (in screen px).
       targetPxOverride: number;
+      rteAnchor: WorldPoint | null;
     }> = [];
 
     for (const text of texts) {
@@ -531,8 +567,8 @@ export class SymbolicTextPipeline {
         const pyBottom = isCenterV
           ? -glyph.heightPx * 0.5
           : -baselineOffset - (glyph.heightPx - glyph.baselinePx);
-        const widthAtlas = glyph.widthPx;
-        const heightGlyphAtlas = glyph.heightPx;
+        // Quad widened by the halo margin on every side (#5388).
+        const { qx0, qyBottom, widthAtlas, heightGlyphAtlas, uvBounds } = haloGlyphQuad(glyph, px0, pyBottom, this.atlas.atlasSize);
 
         // Convert atlas-pixel local coords to world-space offsets:
         //   right axis in world = (ux, 0, uz) * (widthAtlas * heightWorld / heightAtlas)
@@ -542,31 +578,37 @@ export class SymbolicTextPipeline {
         const heightGlyphWorld = heightGlyphAtlas * wScale;
 
         // Bottom-left origin of the glyph quad in world space.
-        const ox = text.worldPos[0] + ux * px0 * wScale;
-        const oy = text.worldPos[1] + pyBottom * wScale;
-        const oz = text.worldPos[2] + uz * px0 * wScale;
-
+        const anchored = text.origin !== undefined;
+        const ax = anchored ? text.origin![0] + text.worldPos[0] : text.worldPos[0];
+        const ay = anchored ? text.origin![1] + text.worldPos[1] : text.worldPos[1];
+        const az = anchored ? text.origin![2] + text.worldPos[2] : text.worldPos[2];
+        const ox = anchored ? ux * qx0 * wScale : ax + ux * qx0 * wScale;
+        const oy = anchored ? qyBottom * wScale : ay + qyBottom * wScale;
+        const oz = anchored ? uz * qx0 * wScale : az + uz * qx0 * wScale;
         layouts.push({
           origin: [ox, oy, oz],
           rightAxis: [ux * widthWorld, 0, uz * widthWorld],
           upAxis: [0, heightGlyphWorld, 0],
-          uvBounds: [glyph.u0, glyph.v0, glyph.u1, glyph.v1],
+          uvBounds,
           color: tint,
           // Shared per-label anchor (text.worldPos) lets the shader compute
           // one screen-space scale and apply it uniformly across all glyphs.
-          anchor: [text.worldPos[0], text.worldPos[1], text.worldPos[2]],
+          // Retain a world-f32 anchor for the legacy projection. The dynamic
+          // RTE draw rewrites the final two lanes from rteAnchor below.
+          anchor: [ax, ay, az],
           capHeight: heightWorld,
           billboard: text.billboard ? 1.0 : 0.0,
           // Per-glyph offset + size in world units. The shader uses these
           // (via cameraRight/cameraUp) when billboard=1 so the glyph quad
           // tracks the screen instead of the floor plane.
           glyphOffsetSize: [
-            px0 * wScale,         // offsetX from anchor along baseline
-            pyBottom * wScale,    // offsetY (ascender / descender / baseline)
+            qx0 * wScale,         // offsetX from anchor along baseline
+            qyBottom * wScale,    // offsetY (ascender / descender / baseline)
             widthAtlas * wScale,  // glyph width
             heightGlyphAtlas * wScale, // glyph height
           ],
           targetPxOverride: text.targetPx ?? 0,
+          rteAnchor: anchored ? [ax, ay, az] : null,
         });
       }
     }
@@ -574,7 +616,7 @@ export class SymbolicTextPipeline {
     if (layouts.length === 0) return;
 
     // Pack into a Float32Array.
-    const stride = TEXT_INSTANCE_STRIDE_BYTES / 4;
+    const stride = TEXT_INSTANCE_FLOATS;
     const data = new Float32Array(layouts.length * stride);
     let off = 0;
     for (const l of layouts) {
@@ -591,6 +633,7 @@ export class SymbolicTextPipeline {
       data[off + 22] = l.glyphOffsetSize[0]; data[off + 23] = l.glyphOffsetSize[1];
       data[off + 24] = l.glyphOffsetSize[2]; data[off + 25] = l.glyphOffsetSize[3];
       data[off + 26] = l.targetPxOverride;
+      this.instanceAnchors.push(l.rteAnchor);
       off += stride;
     }
 
@@ -600,12 +643,27 @@ export class SymbolicTextPipeline {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this.device.queue.writeBuffer(this.instanceBuffer, 0, data);
+    this.rteDeltaData = new Float32Array(layouts.length * TEXT_RTE_DELTA_FLOATS);
+    this.rteDeltaBuffer = this.device.createBuffer({
+      label: 'symbolic-text-rte-deltas',
+      size: this.rteDeltaData.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(this.rteDeltaBuffer, 0, this.rteDeltaData);
     this.instanceCount = layouts.length;
   }
 
-  hasGeometry(): boolean {
-    return this.instanceCount > 0;
+  /** Refresh the per-glyph delta stream; returns the glyph runs to draw (see `packTextRteDeltas`). */
+  private updateRteInstanceDeltas(camera: WorldPoint | undefined): InstanceRun[] {
+    if (!this.rteDeltaBuffer || !this.rteDeltaData || this.instanceAnchors.length === 0) {
+      return [{ first: 0, count: this.instanceCount }];
+    }
+    const runs = packTextRteDeltas(this.instanceAnchors, camera, this.rteDeltaData);
+    this.device.queue.writeBuffer(this.rteDeltaBuffer, 0, this.rteDeltaData);
+    return runs;
   }
+
+  hasGeometry(): boolean { return this.instanceCount > 0; }
 
   render(
     pass: GPURenderPassEncoder,
@@ -615,47 +673,68 @@ export class SymbolicTextPipeline {
     cameraRight: readonly [number, number, number],
     cameraUp: readonly [number, number, number],
     targetGlyphPx: number = DEFAULT_TEXT_TARGET_PX,
+    rteViewProj?: Float32Array,
+    rteCamera?: readonly [number, number, number],
   ): void {
-    if (!this.pipeline || !this.uniformBuffer || !this.cornerBuffer || !this.instanceBuffer) return;
+    if (!this.pipeline || !this.uniformBuffer || !this.cornerBuffer || !this.instanceBuffer || !this.rteDeltaBuffer) return;
     if (this.instanceCount === 0) return;
     this.syncAtlasTexture();
     this.ensureBindGroup();
     if (!this.bindGroup) return;
 
     // Pack the uniform:
-    //   [0..15]  viewProj                (64 B)
-    //   [16..19] (viewportW, viewportH, targetPx, pad)
-    //   [20..23] cameraRight.xyz + pad
-    //   [24..27] cameraUp.xyz + pad
+    //   [0..15]  legacy world-f32 viewProj
+    //   [16..31] anchored RTE viewProj
+    //   [32..35] (viewportW, viewportH, targetPx, pad)
+    //   [36..39] cameraRight.xyz + pad
+    //   [40..43] cameraUp.xyz + pad
+    //   [44..47] camera high.xyz + pad
+    //   [48..51] camera low.xyz + pad
     const uniformData = new Float32Array(TEXT_UNIFORM_BYTES / 4);
     uniformData.set(viewProj, 0);
-    uniformData[16] = viewportPxWidth;
-    uniformData[17] = viewportPxHeight;
-    uniformData[18] = targetGlyphPx;
-    uniformData[19] = 0;
-    uniformData[20] = cameraRight[0];
-    uniformData[21] = cameraRight[1];
-    uniformData[22] = cameraRight[2];
-    uniformData[23] = 0;
-    uniformData[24] = cameraUp[0];
-    uniformData[25] = cameraUp[1];
-    uniformData[26] = cameraUp[2];
-    uniformData[27] = 0;
+    uniformData.set(rteViewProj ?? viewProj, 16);
+    uniformData[32] = viewportPxWidth;
+    uniformData[33] = viewportPxHeight;
+    uniformData[34] = targetGlyphPx;
+    uniformData[35] = 0;
+    uniformData[36] = cameraRight[0];
+    uniformData[37] = cameraRight[1];
+    uniformData[38] = cameraRight[2];
+    uniformData[39] = 0;
+    uniformData[40] = cameraUp[0];
+    uniformData[41] = cameraUp[1];
+    uniformData[42] = cameraUp[2];
+    uniformData[43] = 0;
+    if (rteCamera) {
+      for (let axis = 0; axis < 3; axis++) {
+        const high = Math.fround(rteCamera[axis]);
+        uniformData[44 + axis] = high;
+        uniformData[48 + axis] = Math.fround(rteCamera[axis] - high);
+      }
+    }
+    // RTE text consumes CPU-packed per-instance drawable deltas. Retain the
+    // camera split slots above for the established 208-byte uniform ABI.
+    const runs = this.updateRteInstanceDeltas(rteViewProj && rteCamera ? rteCamera : undefined);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.setVertexBuffer(0, this.cornerBuffer);
     pass.setVertexBuffer(1, this.instanceBuffer);
-    pass.draw(4, this.instanceCount);
+    pass.setVertexBuffer(2, this.rteDeltaBuffer);
+    for (const run of runs) pass.draw(4, run.count, 0, run.first);
   }
 
   destroy(): void {
     if (this.instanceBuffer) this.instanceBuffer.destroy();
+    if (this.rteDeltaBuffer) this.rteDeltaBuffer.destroy();
     if (this.cornerBuffer) this.cornerBuffer.destroy();
     if (this.uniformBuffer) this.uniformBuffer.destroy();
     if (this.atlasTexture) this.atlasTexture.destroy();
     this.instanceBuffer = null;
+    this.rteDeltaBuffer = null;
+    this.rteDeltaData = null;
+    this.instanceAnchors = [];
     this.cornerBuffer = null;
     this.uniformBuffer = null;
     this.atlasTexture = null;
@@ -667,263 +746,4 @@ export class SymbolicTextPipeline {
     this.instanceCount = 0;
     this.uploadedAtlasVersion = -1;
   }
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/**
- * IFC BoxAlignment → normalized offsets in [-1, 0] for vertical and
- * horizontal axes. Returned offset is multiplied by the relevant span.
- *
- * Vertical:
- *   "top"     →  0   (no offset)
- *   "middle"  → -0.5
- *   "bottom"  → -1   (default per IFC)
- * Horizontal:
- *   "left"    →  0   (default per IFC)
- *   "center"  → -0.5
- *   "right"   → -1
- *
- * Unknown values fall back to ("bottom", "left"). Single-token values like
- * "center" are interpreted as { vertical: "middle", horizontal: "center" }.
- */
-function parseBoxAlignment(s: string): { horizontal: number; vertical: number } {
-  const norm = s.toLowerCase().trim();
-  let horizontal = 0;
-  let vertical = -1;
-
-  if (norm === '') return { horizontal, vertical };
-
-  if (norm.includes('top')) vertical = 0;
-  else if (norm.includes('middle')) vertical = -0.5;
-  else if (norm.includes('center') && !norm.includes('center-')) vertical = -0.5;
-  else vertical = -1;
-
-  if (norm.includes('right')) horizontal = -1;
-  else if (norm.includes('center')) horizontal = -0.5;
-  else horizontal = 0;
-
-  return { horizontal, vertical };
-}
-
-/**
- * Triangulate a polygon-with-holes via ear-clipping. Each output triangle is
- * appended to `stream` as 3 × (x, y, z, r, g, b, a) entries (matching the
- * fill pipeline's vertex layout). Holes that fully enclose nothing or have
- * < 3 valid vertices are silently dropped.
- *
- * Ear-clipping is O(n²) which is fine for fill regions (typically < 100
- * vertices). For pathological inputs we'd want earcut proper, but adding the
- * npm dependency for marginal gain isn't worth it.
- */
-function triangulateFillTo(stream: number[], fill: SymbolicFillInput): void {
-  const { points, holesOffsets, worldY, color } = fill;
-  if (points.length < 6) return;
-
-  // Convert the flat ring buffer into rings of {x, z} (Y is constant).
-  const totalVerts = points.length / 2;
-  const ringStarts: number[] = [0, ...Array.from(holesOffsets), totalVerts];
-  if (ringStarts.length < 2) return;
-
-  // Pull each ring's vertices out.
-  const rings: Array<Array<{ x: number; z: number }>> = [];
-  for (let r = 0; r < ringStarts.length - 1; r++) {
-    const start = ringStarts[r];
-    const end = ringStarts[r + 1];
-    if (end - start < 3) continue;
-    const ring: Array<{ x: number; z: number }> = [];
-    for (let v = start; v < end; v++) {
-      ring.push({ x: points[v * 2], z: points[v * 2 + 1] });
-    }
-    rings.push(ring);
-  }
-  if (rings.length === 0) return;
-
-  // Stitch each hole into the outer ring with a bridge edge from the hole's
-  // rightmost vertex to the nearest outer-ring vertex (the same approach
-  // earcut.js takes for polygon-with-holes input). Ear-clipping then runs on
-  // the resulting simple polygon. The hole's winding is reversed first so the
-  // combined ring's signed area stays consistent and the ear-test sign holds.
-  const outer = rings[0];
-  const holes = rings.slice(1);
-  const stitched = holes.length === 0 ? outer : joinHoles(outer, holes);
-  const triangles = earClip(stitched);
-  for (const tri of triangles) {
-    for (const idx of tri) {
-      const v = stitched[idx];
-      stream.push(v.x, worldY, v.z, color[0], color[1], color[2], color[3]);
-    }
-  }
-}
-
-/**
- * Stitch each hole into the outer ring with a single bridge edge so the
- * result is a simple polygon ear-clipping can handle. Mirrors mapbox/earcut's
- * `eliminateHoles` pass:
- *
- *   1. For each hole, pick its rightmost (max-x) vertex as the bridge start.
- *   2. Sort holes by descending bridge-start x so outer holes go in first.
- *   3. Walk the outer ring for the vertex on the right side of the bridge
- *      that's "visible" from the hole — closest match wins.
- *   4. Splice the hole (rotated to start at its bridge vertex, and reversed
- *      so its winding opposes the outer ring) into the outer ring at the
- *      anchor, closing both ends back to their starts to form a zero-area
- *      bridge edge.
- *
- * This breaks under pathological inputs (overlapping holes, holes outside
- * the outer ring) but those don't occur in well-formed `IfcAnnotationFillArea`
- * geometry — the IFC schema requires the outer bound to contain all inner
- * bounds.
- */
-export type Pt = { x: number; z: number };
-export function joinHoles(outer: Pt[], holes: Pt[][]): Pt[] {
-  if (holes.length === 0) return outer;
-
-  type HoleEntry = { ring: Pt[]; startIdx: number; startX: number; startZ: number };
-  const sorted: HoleEntry[] = holes
-    .map((h) => {
-      let bestI = 0;
-      for (let i = 1; i < h.length; i++) {
-        if (h[i].x > h[bestI].x) bestI = i;
-      }
-      return { ring: h, startIdx: bestI, startX: h[bestI].x, startZ: h[bestI].z };
-    })
-    .sort((a, b) => b.startX - a.startX);
-
-  let result: Pt[] = outer.slice();
-
-  for (const { ring, startIdx, startX, startZ } of sorted) {
-    // Find the outer-ring index with the smallest distance to the bridge
-    // start, preferring vertices to the right (x > startX). When nothing is
-    // to the right (hole touches the outer ring's right edge), fall back to
-    // global nearest.
-    let bestIdx = -1;
-    let bestDist = Infinity;
-    for (let i = 0; i < result.length; i++) {
-      const p = result[i];
-      if (p.x <= startX) continue;
-      const d = (p.x - startX) * (p.x - startX) + (p.z - startZ) * (p.z - startZ);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
-      }
-    }
-    if (bestIdx < 0) {
-      for (let i = 0; i < result.length; i++) {
-        const p = result[i];
-        const d = (p.x - startX) * (p.x - startX) + (p.z - startZ) * (p.z - startZ);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = i;
-        }
-      }
-    }
-    if (bestIdx < 0) continue;
-
-    // Hole reversed so its winding opposes outer (outer is CCW after earClip
-    // normalisation; holes should be CW for the combined ring's area to come
-    // out right). Rotate to start at the bridge vertex.
-    const reversed = ring.slice().reverse();
-    const reversedStartIdx = ring.length - 1 - startIdx;
-    const rotated = [
-      ...reversed.slice(reversedStartIdx),
-      ...reversed.slice(0, reversedStartIdx),
-    ];
-
-    result = [
-      ...result.slice(0, bestIdx + 1),
-      ...rotated,
-      rotated[0],
-      result[bestIdx],
-      ...result.slice(bestIdx + 1),
-    ];
-  }
-
-  return result;
-}
-
-/** Ear-clipping triangulation of a simple polygon. Returns triangle vertex indices. */
-export function earClip(ring: ReadonlyArray<{ x: number; z: number }>): number[][] {
-  const n = ring.length;
-  if (n < 3) return [];
-  if (n === 3) return [[0, 1, 2]];
-
-  // Working list of indices.
-  const indices: number[] = [];
-  // Determine winding: positive shoelace = CCW; otherwise reverse so the
-  // ear-test below uses a consistent sign.
-  let area = 0;
-  for (let i = 0; i < n; i++) {
-    const a = ring[i];
-    const b = ring[(i + 1) % n];
-    area += (a.x * b.z) - (b.x * a.z);
-  }
-  const ccw = area > 0;
-  for (let i = 0; i < n; i++) {
-    indices.push(ccw ? i : n - 1 - i);
-  }
-
-  const triangles: number[][] = [];
-  let safety = indices.length * indices.length;
-
-  while (indices.length > 3 && safety-- > 0) {
-    let found = false;
-    for (let i = 0; i < indices.length; i++) {
-      const ia = indices[(i + indices.length - 1) % indices.length];
-      const ib = indices[i];
-      const ic = indices[(i + 1) % indices.length];
-      const a = ring[ia];
-      const b = ring[ib];
-      const c = ring[ic];
-
-      // Convex check (cross product of (b-a) × (c-b) > 0 for CCW).
-      const cross = (b.x - a.x) * (c.z - b.z) - (b.z - a.z) * (c.x - b.x);
-      if (cross <= 0) continue;
-
-      // No other vertex inside triangle (a, b, c).
-      let containsOther = false;
-      for (let j = 0; j < indices.length; j++) {
-        const ij = indices[j];
-        if (ij === ia || ij === ib || ij === ic) continue;
-        if (pointInTriangle(ring[ij], a, b, c)) {
-          containsOther = true;
-          break;
-        }
-      }
-      if (containsOther) continue;
-
-      triangles.push([ia, ib, ic]);
-      indices.splice(i, 1);
-      found = true;
-      break;
-    }
-    if (!found) break; // degenerate polygon — emit what we have
-  }
-
-  if (indices.length === 3) {
-    triangles.push([indices[0], indices[1], indices[2]]);
-  }
-  return triangles;
-}
-
-function pointInTriangle(
-  p: { x: number; z: number },
-  a: { x: number; z: number },
-  b: { x: number; z: number },
-  c: { x: number; z: number },
-): boolean {
-  const s1 = sign(p, a, b);
-  const s2 = sign(p, b, c);
-  const s3 = sign(p, c, a);
-  const hasNeg = s1 < 0 || s2 < 0 || s3 < 0;
-  const hasPos = s1 > 0 || s2 > 0 || s3 > 0;
-  return !(hasNeg && hasPos);
-}
-
-function sign(
-  p1: { x: number; z: number },
-  p2: { x: number; z: number },
-  p3: { x: number; z: number },
-): number {
-  return (p1.x - p3.x) * (p2.z - p3.z) - (p2.x - p3.x) * (p1.z - p3.z);
 }

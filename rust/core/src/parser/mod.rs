@@ -10,9 +10,58 @@
 //! - [`tokenizer`]: nom-combinator tokenization ([`Token`], [`parse_entity`]).
 //! - [`scanner`]: a byte-level SIMD fast scanner ([`EntityScanner`]) that does
 //!   its own hand-rolled parsing and never touches [`Token`] or nom.
+//!
+//! [`lexical`] holds one small piece shared by both, and by other crates:
+//! [`skip_step_comment`] is the STEP `/* ... */` comment-skip rule, in one
+//! place so every scanner that has no reason to answer "what does an
+//! unterminated comment mean" differently gives the same answer (#3303).
+//! [`keyword`] is the other shared rule: the scanner returns the keyword as
+//! written and STEP keyword case is not significant, so every comparison
+//! against a literal goes through [`keyword_eq`] and its siblings.
+//! [`header`] reads ISO 10303-21 header records for exporters and source views.
+//!
+//! One STEP grammar (F4, #7778): a raw read of STEP text goes through
+//! [`lexical`] (trivia, framing), [`numeric_literal`], `scanner_attributes`
+//! (the top-level split) and [`header::find_keyword_then`] (keywords), or
+//! `step_encoding` (literals). Do not write a new splitter, quote walker,
+//! number parser or keyword finder. `AttributeValue::String` and `get_string()`
+//! are already decoded, so never call `decode_ifc_string` on them again.
 
+pub mod header;
+mod keyword;
+mod lexical;
+mod malformed_records;
+mod numeric_literal;
+mod oversized_ids;
+mod record_strings;
+mod report_sink;
 mod scanner;
 mod tokenizer;
 
-pub use scanner::{entity_count, EntityScanner};
+pub use keyword::{find_keyword, keyword_ends_with, keyword_eq, keyword_starts_with};
+pub use header::declared_schema_bounded;
+pub use lexical::skip_step_comment;
+// The one STEP whitespace set and trivia rule, for the raw-byte readers in
+// `decoder` (#3733) and for the export crate's record-frame reader (#7682), so
+// the writer that edits a record agrees with the scanner that found it.
+pub use lexical::{is_step_space, skip_step_trivia};
+// The one STEP numeric-literal grammar for every raw-byte reader (#5266).
+pub(crate) use numeric_literal::parse_step_numeric;
+pub use numeric_literal::{parse_step_real, read_step_number, StepNumber};
+pub use malformed_records::report_malformed_records;
+pub use oversized_ids::{oversized_id_report, report_oversized_ids, set_report_sink};
+pub use scanner::{
+    entity_count, nth_attribute_is_present, split_top_level_args, split_top_level_args_str,
+    EntityScanner, StepListItems,
+};
+pub(crate) use scanner::argument_list_start;
 pub use tokenizer::{parse_entity, Token};
+pub(crate) use tokenizer::is_decodable_number;
+
+/// [`report_oversized_ids`] + [`report_malformed_records`] in one call — the
+/// two diagnostics every whole-file `EntityScanner` walk in this workspace
+/// emits after a scan, so every call site needs only one line, not two.
+pub fn report_scan_diagnostics(skipped_oversized_ids: usize, malformed_record_found: bool) {
+    report_oversized_ids(skipped_oversized_ids);
+    report_malformed_records(malformed_record_found);
+}

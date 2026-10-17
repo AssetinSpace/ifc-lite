@@ -1,6 +1,6 @@
 # @ifc-lite/create
 
-Create valid IFC4 STEP files from scratch, programmatically. `IfcCreator` builds a complete spatial structure (project, site, building, storeys) and adds building elements with real geometry, property sets, quantities, and materials. Inputs are in metres and elements are placed relative to an identity placement unless you specify otherwise.
+Create valid IFC4 STEP files from scratch, programmatically. `IfcCreator` builds a complete spatial structure (project, site, building, storeys) and adds building elements with real geometry, property sets, quantities, and materials. Inputs are in metres. Element coordinates are relative to the storey you add the element to: the storey placement carries `Elevation` and every element chains to it, so an element standing on a storey at `Elevation: 3` is created with `Z = 0`.
 
 ## Install
 
@@ -26,9 +26,38 @@ const { content } = creator.toIfc(); // IFC STEP text
 
 - Element builders: walls, slabs, columns, beams, stairs, roofs, doors, windows, ramps, railings, plates, members, footings, piles, spaces, curtain walls, furnishing, proxies, and parametric profile shapes (I, L, T, U, C, hollow sections)
 - Openings: `addIfcWallDoor` and `addIfcWallWindow` cut hosted doors and windows into walls
+- Loaded-model hosted placement: `addHostedElementInStore(store, editor, hostId, spec)`
+  is the shared atomic operation behind viewer tools, SDK methods and MCP
+  `place_opening` / `place_door` / `place_window`. Wall cuts must fit and avoid
+  existing openings; unreadable bounds or placements are refused. Omitted
+  optional axes use IFC defaults; explicit missing, zero or parallel axes and
+  incomplete body/profile references are refused.
+- Loaded-model wall joins: `joinWallsInStore` atomically rewrites wall bodies,
+  axes and `IfcRelConnectsPathElements`. Hosted openings must remain inside
+  both joined end faces; unreadable cuts refuse the join.
 - Property sets, element quantities, materials, and colors
 - 4D scheduling entities: IfcWorkSchedule, IfcTask, IfcRelSequence
 - In-store builders (`addWallToStore`, `addSlabToStore`, ...) that emit elements into an existing parsed model
+- `addOrdinaryElementInStore(editor, anchor, element)` commits the eight ordinary
+  builders atomically. Its anchor can be resolved or supplied by a synchronous
+  draft-editor callback so existing host preparation shares that transaction.
+  Failed creation leaves no helpers, journal entries or consumed IDs.
+- `resolveSpatialAnchor(store, storeyId, view)` reads the live mutation view when
+  authoring into an edited model. Pass the same view as the `StoreEditor` so a
+  created storey or placement, and deletions or retypes of source anchors, are
+  reflected before an element is emitted. Omitting `view` reads the parsed model.
+- Source-empty transported models cannot reconstruct edited source relationship records. Native spatial authoring suppresses their original indexed graph edges instead of treating the original endpoints as current membership. Complete authored relationship records remain readable. Load the original IFC to resolve unavailable source membership.
+- `applyStylesInStore` reads styled items and representation chains from the
+  editor's live overlay, so a deleted style can be replaced and an authored
+  style is found before adding another one to the same representation item.
+- Loaded-model cost builders (`addCostScheduleToStore`, `addCostItemToStore`, `addCostValueToStore`,
+  `addCostQuantityToStore`) plus relationship helpers for nesting, schedule/object assignment, value lists,
+  and safe removal. They require a `CostAnchor` for schema/owner-history/GUID allocation, accept existing
+  relationship maps from the host, reject IFC2X3 authoring, and make destructive removal explicit with
+  `{ detach: true }` when surviving references must be rewritten. Removal referrer data distinguishes
+  required relationship endpoints (whose relationship is deleted) from optional scalar and list
+  attributes on non-relationship owners. Optional scalars are rewritten to `$`; optional lists retain
+  their surviving members, or become `$` when emptied, so detaching a cost value never deletes its owner.
 - Space generation: `generateSpacesFromWalls` and `detectEnclosedAreas` derive IfcSpace footprints from wall layouts
 - Fully typed parameter objects for every element
 
@@ -40,3 +69,32 @@ const { content } = creator.toIfc(); // IFC STEP text
 ## License
 
 MPL-2.0
+
+`linearProfileFrame(Start, End)` returns the existing native beam/member extrusion frame (`origin`, `u`, `v`, `along`, `length`) in the coordinates and units supplied. The in-store beam/member builders and reviewed viewer section ghosts share it, including the near-vertical reference-axis fallback. Non-finite or coincident endpoints are refused.
+
+### Current storey plan frames
+
+`storeyPlanFrame(store, storeyExpressId, mutationView)` reads current named and positional placement edits, authored records and deletions through the canonical native metadata reader. Omitting the mutation view retains source-only behavior. A live chain is limited to 256 placements and returns `null` when unreadable, non-planar, cyclic or oversized; callers must disclose unavailable geometry rather than use old coordinates. Coordinates remain metres; directions are dimensionless. This planar reader does not support tilted storey placement or infer a transform from unavailable source data.
+
+Native split placement snapshots and their writers honor current `ObjectPlacement`, `PlacementRelTo`, `RelativePlacement`, axis and direction edits. Named edits use the canonical schema layout; positional edits win for the same slot. The existing source attribute callback still supplies source records, and disabling it still makes source-only placement unreadable. Deleted leaves and cyclic or oversized parent chains are refused. This does not make unsupported body/profile layouts editable or infer geometry from missing source records.
+
+### Generic group lifecycle
+
+`addGroupToStore`, `readGroupInStore`, `updateGroupInStore`, and
+`removeGroupInStore` share a current, bounded IFC4/IFC4X3 graph owner. Supply the
+parsed `store`, its live `mutationView`, and current `ownerHistoryId` (or `null`
+where absent). Group/member identities pin `expressId` and current `GlobalId`.
+Create/update require the complete explicit `RelatedObjects` list; updates and
+deletions also require a complete current `GroupSnapshot`. `readGroupEvidenceInStore`
+provides selected native roots, owned membership and immediate incoming records
+with the actual source content identity for review; it refuses partial evidence.
+
+The owner preserves group identity, reuses/removes exact membership edges,
+protects other incoming dependencies, retains member objects and shared other
+memberships, and publishes all records atomically. Specialized groups and
+specialized assignment relationships are refused by this generic lifecycle.
+Replacement also refuses typed `RelatedObjectsType` assignments and multiple
+assignments with distinct OwnerHistory, Name or Description; a single complete
+member list cannot express their separate semantics. Reads and safe deletion
+remain available, and refusal preserves the entire graph and allocator.
+Native hosts provide their history publisher; the viewer publishes one Undo.

@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { asSourceBytes } from '@ifc-lite/parser';
+
 /**
  * Hook for IFC file caching operations
  * Handles loading from and saving to binary cache for fast subsequent loads
@@ -18,22 +20,23 @@ import {
   openGeometryChunksV13,
   readInstancedShards,
   BufferReader,
+  toCacheDataStore,
   type CachedEntityIndexColumns,
   type CacheDataStore,
   type GeometryData,
 } from '@ifc-lite/cache';
 import { SpatialHierarchyBuilder, StepTokenizer, CompactEntityIndex, CompactEntityIndexBuilder, extractLengthUnitScale, attachDataStoreAccessors, type IfcDataStore, type IfcStoreData } from '@ifc-lite/parser';
-import { buildSpatialIndexGuarded } from '../utils/loadingUtils.js';
 import { makeColdGeometryProvider } from '../utils/coldGeometryProvider.js';
 import { getGlobalRenderer } from './useBCF.js';
-import { computeFullSourceHash } from '../utils/sourceContentHash.js';
 import type { MeshData } from '@ifc-lite/geometry';
+import { NOOP_LOAD_TRACE, type LoadTrace } from '@ifc-lite/load-trace';
 
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '../store/index.js';
 import { getCached, setCached, deleteCached, type CacheResult } from '../services/cacheService.js';
 import { rebuildSpatialHierarchy, rebuildOnDemandMaps } from '../utils/spatialHierarchy.js';
 import { calculateStoreyHeights } from '../utils/localParsingUtils.js';
+import { recordFirstVisible } from '../lib/perf/loadTrace.js';
 
 // Re-export types for convenience
 export type { CacheResult } from '../services/cacheService.js';
@@ -102,7 +105,7 @@ function hydrateCacheStore(
     entityCount: cacheStore.entityCount,
     fileSize: extras.fileSize,
     parseTime: 0,
-    source: extras.source,
+    source: asSourceBytes(extras.source),
     strings: cacheStore.strings,
     entities: cacheStore.entities,
     properties: cacheStore.properties,
@@ -180,11 +183,41 @@ export function useIfcCache() {
   const loadFromCache = useCallback(async (
     cacheResult: CacheResult,
     fileName: string,
+    // Owning model id for the restored instanced shards (#1912) — this path
+    // is PRIMARY-only (a federated add never caches), so its id-offset is
+    // always 0 and the modelId only needs to match the model useIfcLoader.ts
+    // registers via `upsertModel` for the same load.
+    modelId: string,
     cacheKey?: string,
     fallbackSourceBuffer?: ArrayBufferLike,
+    /**
+     * Optional staleness check — returns true if this load has been
+     * superseded. Same contract as `loadFromServer`'s (useIfcServer.ts:120),
+     * and it exists for the same reason: an IndexedDB read is slow enough to
+     * finish after a newer load has already painted, and the writes below go
+     * straight into the ACTIVE model slot. Without it a superseded cache hit
+     * blanks the new model's geometry and then repopulates it with the
+     * previous file's.
+     *
+     * Optional so existing callers are unaffected; a caller that omits it
+     * keeps the old behaviour.
+     */
+    isStale?: () => boolean,
+    trace: LoadTrace = NOOP_LOAD_TRACE, // #6956: the J2 (warm open) spans land on the caller's load trace
   ): Promise<CacheLoadResult> => {
     try {
       const cacheLoadStart = performance.now();
+
+      // Re-check before the first write — and `setProgress` below IS a write
+      // into the shared (active-model) progress state, so the check has to come
+      // first: `getCached` was awaited by the caller, so a newer load can
+      // already own the active slot by now, and a superseded load posting
+      // "Loading from cache" over the newer load's progress is visible to the
+      // user even though no geometry moved.
+      if (isStale?.()) {
+        return { success: false, meshCount: 0, totalVertices: 0, totalTriangles: 0 };
+      }
+
       setProgress({ phase: 'Loading from cache', percent: 10 });
 
       // Reset geometry first so Viewport detects this as a new file
@@ -192,13 +225,12 @@ export function useIfcCache() {
 
       const reader = new BinaryCacheReader();
 
-      // No full-file hash on the repeat-open path (the #1 un-flag blocker). The
-      // hit is already validated by the strengthened, spread-sampled cache key
-      // (`sourceFingerprint.ts`): a key match means the exact byte length AND a
-      // 64-bit hash of a ~160KB spread (head + tail + interior windows) match, so
-      // a genuinely different file can never key the same entry. That makes the
-      // former ~0.7-1.7s `xxhash64(fullSource)` recompute here redundant, and
-      // dropping it removes the main-thread stall for BOTH cache tiers. A
+      // No SYNCHRONOUS full-file hash on the repeat-open path (the former
+      // ~0.7-1.7s `xxhash64(fullSource)` main-thread stall). The spread-sampled
+      // cache key (`@ifc-lite/cache`'s `source-fingerprint.ts`) only KEYS the lookup — it cannot see
+      // a byte-length-preserving edit between its sample windows; staleness is
+      // gated by the mtime guard + off-thread full-hash revalidation in
+      // `cacheTier.ts` / `useIfcLoader` (#4269). A
       // truncated/corrupt cache buffer still fails fast in `reader.read` below →
       // the catch deletes the entry and returns a graceful miss.
       // Blob entries (cold-tier writes) are disk-backed: materialize once
@@ -207,7 +239,7 @@ export function useIfcCache() {
       const rawCacheBuffer = cacheResult.buffer;
       const cacheBlob = rawCacheBuffer instanceof Blob ? rawCacheBuffer : null;
       const cacheBuffer: ArrayBuffer = rawCacheBuffer instanceof Blob
-        ? await rawCacheBuffer.arrayBuffer()
+        ? await trace.span('cache.read', () => rawCacheBuffer.arrayBuffer())
         : rawCacheBuffer;
 
       // Geometry streams chunk-by-chunk below (first paint after the FIRST
@@ -222,8 +254,7 @@ export function useIfcCache() {
         throw new Error(`unexpected pre-v13 cache entry (v${headerInfo.version})`);
       }
       const geometrySection = headerInfo.sections.find((s) => s.type === SectionType.Geometry);
-      const result = await reader.read(cacheBuffer, { skipGeometry: true });
-      const cacheReadTime = performance.now() - cacheLoadStart;
+      const result = await trace.span('cache.decode', () => reader.read(cacheBuffer, { skipGeometry: true }));
 
       // Restore the source buffer — required for on-demand property extraction
       // AND the lazy entity accessors (getEntity/getProperties/...). The web
@@ -246,17 +277,21 @@ export function useIfcCache() {
         } else {
           // Backward compatibility for v3 caches: rebuild byte offsets from the
           // source once, then future v4 writes persist this section.
+          // Key `byType` in upper case, as a fresh parse and a v4 load do: not
+          // every scan path canonicalises type names (#4712).
           const tokenizer = new StepTokenizer(source);
+          // @raw-entity-enumeration-ok cache hydration sizes a source-index builder from the cached parsed table
           const estimatedCount = cacheStore.entities?.count ?? 100_000;
           const indexBuilder = new CompactEntityIndexBuilder(estimatedCount);
           const byType = new Map<string, number[]>();
 
           for (const ref of tokenizer.scanEntitiesFast()) {
             indexBuilder.add(ref.expressId, ref.type, ref.offset, ref.length);
-            let typeList = byType.get(ref.type);
+            const typeKey = ref.type.toUpperCase();
+            let typeList = byType.get(typeKey);
             if (!typeList) {
               typeList = [];
-              byType.set(ref.type, typeList);
+              byType.set(typeKey, typeList);
             }
             typeList.push(ref.expressId);
           }
@@ -278,14 +313,14 @@ export function useIfcCache() {
       // Typed cache→runtime hydration (#952): builds the parser-shaped
       // IfcDataStore with compiler-checked field mapping (no `as unknown` cast)
       // and wires the lazy accessors via attachDataStoreAccessors.
-      const dataStore = hydrateCacheStore(cacheStore, {
+      const dataStore = trace.span('cache.hydrate', () => hydrateCacheStore(cacheStore, {
         source,
         fileSize: sourceBuffer?.byteLength ?? 0,
         entityIndex,
         onDemandPropertyMap,
         onDemandQuantityMap,
         onDemandMaterialMap,
-      });
+      }));
 
       // Rebuild spatial hierarchy from cache data (cache doesn't serialize it)
       // Use SpatialHierarchyBuilder to extract elevations from source buffer
@@ -311,12 +346,7 @@ export function useIfcCache() {
             }
           }
         } else {
-          console.warn('[useIfcCache] Missing data for elevation extraction:', {
-            hasSource: !!dataStore.source,
-            sourceLength: dataStore.source?.length ?? 0,
-            hasEntityIndex: !!dataStore.entityIndex,
-            hasStrings: !!dataStore.strings,
-          });
+          console.warn('[useIfcCache] Missing data for elevation extraction:', { hasSource: !!dataStore.source, sourceLength: dataStore.source?.length ?? 0, hasEntityIndex: !!dataStore.entityIndex, hasStrings: !!dataStore.strings });
           // Fallback: use simplified rebuild if source data not available
           dataStore.spatialHierarchy = rebuildSpatialHierarchy(
             dataStore.entities,
@@ -343,34 +373,70 @@ export function useIfcCache() {
         loadedTotalVertices = open.totalVertices;
         loadedTotalTriangles = open.totalTriangles;
 
+        // Re-check before the streaming flag: `reader.read` above was awaited,
+        // so a newer load can own the slot by now. The flag is global
+        // (active-model) state — a superseded load raising it here, or lowering
+        // it in the `finally` below, would drive the NEWER load's stream.
+        if (isStale?.()) {
+          return { success: false, meshCount: 0, totalVertices: 0, totalTriangles: 0 };
+        }
+
         setGeometryStreamingActive(true);
         const allMeshes: MeshData[] = [];
+        let superseded = false;
+        let firstVisible: Promise<void> | undefined;
         try {
           for (let i = 0; i < open.chunks.length; i++) {
             const chunkMeshes = await open.readChunk(i);
+            // Per-chunk re-check: every iteration awaits `readChunk` AND yields
+            // to the event loop at the end of the body, so supersession can
+            // land BETWEEN chunks. Without this, the remaining chunks of the
+            // old file keep appending into the new model's geometry.
+            if (isStale?.()) {
+              superseded = true;
+              break;
+            }
             allMeshes.push(...chunkMeshes);
-            appendGeometryBatch(chunkMeshes, open.coordinateInfo);
+            appendGeometryBatch(modelId, chunkMeshes, open.coordinateInfo);
+            if (i === 0) firstVisible = recordFirstVisible(trace, trace.milestone('geometry.firstAppend')); // every load: ifc_model_loaded reads it (#6961)
             if ((i & 3) === 3 || i === open.chunks.length - 1) {
               setProgress({
                 phase: 'Loading geometry from cache',
                 percent: 20 + Math.round((70 * (i + 1)) / open.chunks.length),
               });
             }
-            // Yield so the animation loop can drain the mesh queue between
-            // chunks (paint progresses during the load, like a fresh stream).
+            // Yield so the animation loop drains the mesh queue between chunks (paint progresses, like a fresh stream).
             await new Promise<void>((resolve) => setTimeout(resolve, 0));
           }
         } catch (chunkErr) {
           // A corrupt/truncated entry can fail AFTER earlier chunks were
           // already appended. Roll the partial geometry back so the caller's
           // fallback fresh stream starts from a clean scene instead of
-          // appending onto half a cached model.
-          setGeometryResult(null);
+          // appending onto half a cached model. Only when we still own the
+          // slot: for a superseded load the partial geometry is the NEWER
+          // model's, and clearing it would blank the file the user is looking
+          // at (this path's own fallback reparse is abandoned anyway).
+          if (!isStale?.()) setGeometryResult(null);
           throw chunkErr;
         } finally {
-          setGeometryStreamingActive(false);
+          // Same ownership condition: only the load that raised the flag (and
+          // still owns the slot) may lower it. A superseded load lowering it
+          // ends the newer load's stream early and finalizes half a model.
+          if (!isStale?.()) setGeometryStreamingActive(false);
         }
+
+        await firstVisible; // bounded (rAF or 250 ms); ahead of the ownership re-check below
+        // Re-check after the chunk loop: it awaits per chunk (and yields to the
+        // event loop after each append), so a newer load can have taken the
+        // active slot mid-stream — including after the LAST chunk's yield. This
+        // sits ahead of the shard append, which is an active-slot write too:
+        // shards from the old file would be instanced into the new model.
+        if (superseded || isStale?.()) {
+          return { success: false, meshCount: 0, totalVertices: 0, totalTriangles: 0 };
+        }
+
         meshCount = allMeshes.length;
+        trace.milestone('geometry.streamComplete');
 
         // Restore the GPU-instancing shards (opaque repeated occurrences that
         // were partitioned off the flat meshes).
@@ -379,11 +445,10 @@ export function useIfcCache() {
           const shardsReader = new BufferReader(cacheBuffer);
           shardsReader.position = shardsSection.offset;
           const shards = readInstancedShards(shardsReader);
-          if (shards.length > 0) appendInstancedShards(shards);
+          if (shards.length > 0) appendInstancedShards(modelId, shards);
         }
 
         setIfcDataStore(dataStore);
-        buildSpatialIndexGuarded(allMeshes, dataStore, setIfcDataStore);
 
         // Cold-storage provider (issue #1682 phase 3b): with this wired the
         // scene may drop CPU meshData for cold chunks and restore them from
@@ -400,9 +465,19 @@ export function useIfcCache() {
           }));
         }
       } else {
+        // The no-geometry entry bypasses BOTH guards in the geometry branch
+        // above, yet it still crosses the awaited `reader.read` (and the
+        // Blob `arrayBuffer()` materialization) after the entry check — so it
+        // needs its own re-check before writing the store and the progress
+        // line below, or a superseded metadata-only hit hands the new model the
+        // previous file's entities.
+        if (isStale?.()) {
+          return { success: false, meshCount: 0, totalVertices: 0, totalTriangles: 0 };
+        }
         setIfcDataStore(dataStore);
       }
 
+      trace.milestone('cache.storeReady'); // #6961: spatial tree and properties are queryable from here
       setProgress({ phase: 'Complete (from cache)', percent: 100 });
       const totalCacheTime = performance.now() - cacheLoadStart;
       console.log(`[useIfcCache] ✓ ${fileName} (cached) → ${meshCount} meshes | ${totalCacheTime.toFixed(0)}ms`);
@@ -442,7 +517,7 @@ export function useIfcCache() {
     geometry: GeometryData,
     sourceBuffer: ArrayBuffer,
     fileName: string,
-    options: { persistSource?: boolean; lastModified?: number } = {}
+    options: { persistSource?: boolean; lastModified?: number; fullSourceHash?: Promise<string | undefined> } = {}
   ): Promise<void> => {
     // `persistSource` (default true) is the classic <=150MB tier: the raw source
     // is stored alongside the cache so lazy property/quantity accessors + re-export
@@ -453,45 +528,31 @@ export function useIfcCache() {
     // The header's full-file `xxhash64` is OMITTED (`omitSourceHash`) so a 400MB
     // cold-load write pays no full-file main-thread hash. The source-decoupled hit
     // is instead validated by the source File's `lastModified` (mtime guard) plus
-    // a TRUE full-file SHA-256 computed OFF the main thread (`computeFullSourceHash`,
-    // via Web Crypto), both stored in the IndexedDB record — distinct from the
-    // header hash and the key's spread fingerprint. This whole block is
-    // backgrounded on a cold load, so the off-thread hash costs the user nothing.
+    // a full-content SHA-256 (`fullSourceHash`: the load's own placement identity,
+    // #7022, so the write never hashes the source a second time), both stored in
+    // the IndexedDB record — distinct from the header hash and the key's spread
+    // fingerprint. The loader re-validates a served hit against it (#4269).
     const { persistSource = true, lastModified } = options;
     try {
       console.log(`[useIfcCache] Starting cache write for: ${fileName} (persistSource=${persistSource})`);
       const writer = new BinaryCacheWriter();
 
-      // Adapt dataStore to cache format
-      const cacheDataStore: CacheDataStore = {
-        schema: dataStore.schemaVersion === 'IFC4' ? 1 : dataStore.schemaVersion === 'IFC4X3' ? 2 : 0,
-        entityCount: dataStore.entityCount || dataStore.entities?.count || 0,
-        strings: dataStore.strings,
-        entities: dataStore.entities,
-        properties: dataStore.properties,
-        quantities: dataStore.quantities,
-        relationships: dataStore.relationships,
-        spatialHierarchy: dataStore.spatialHierarchy,
-        entityIndex: dataStore.entityIndex,
-      };
-
-      // Compute the true full-file validation hash off the main thread (runs in
-      // parallel with the cache-buffer serialization below). ONLY for the
-      // source-decoupled tier: the source-persisting tier serves cached geometry
-      // AND cached source together (self-consistent) and never consults it, so
-      // its <=150MB write path stays exactly as it was.
-      const fullHashPromise = persistSource
-        ? Promise.resolve<string | null>(null)
-        : computeFullSourceHash(sourceBuffer);
+      // Adapt dataStore to cache format. `toCacheDataStore` is the package's
+      // own runtime→cache adapter and now the ONLY schemaVersion→SchemaVersion
+      // mapping: this hook used to keep an inline copy that spelled the enum
+      // out as bare 1/2/0 literals, so the two could drift apart silently.
+      // It carries the same entityCount fallback the inline copy had.
+      const cacheDataStore: CacheDataStore = toCacheDataStore(dataStore);
 
       console.log('[useIfcCache] Writing cache buffer...');
       const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, {
-        includeGeometry: true,
+        includeGeometry: true, compressGeometryChunksInWorker: true,
         omitSourceHash: true,
       });
       console.log('[useIfcCache] Cache buffer written:', cacheBuffer.byteLength, 'bytes');
 
-      const fullSourceHash = (await fullHashPromise) ?? undefined;
+      // BOTH tiers (#4269): the only gate for an mtime-preserved, length-preserving edit.
+      const fullSourceHash = await options.fullSourceHash;
 
       console.log('[useIfcCache] Saving to cache storage...');
       await setCached(

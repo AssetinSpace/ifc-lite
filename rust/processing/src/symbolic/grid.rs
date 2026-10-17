@@ -2,9 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use super::output_cap::SymbolicAccumulator;
+use super::rebase::RenderFrameRebase;
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 
-use super::primitives::{SymbolicData, SymbolicGridAxis, SymbolicPolyline, SymbolicText};
+use super::primitives::{SymbolicGridAxis, SymbolicPolyline, SymbolicText};
 use super::transform::Transform2D;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -22,11 +24,10 @@ pub(super) fn extract_grid(
     grid: &DecodedEntity,
     grid_id: u32,
     decoder: &mut EntityDecoder,
-    unit_scale: f32,
+    unit_scale: f64,
     transform: &Transform2D,
-    rtc_x: f32,
-    rtc_z: f32,
-    out: &mut SymbolicData,
+    rebase: RenderFrameRebase,
+    out: &mut SymbolicAccumulator,
 ) {
     for axis_attr_idx in [7usize, 8, 9] {
         let Some(axes_attr) = grid.get(axis_attr_idx) else { continue };
@@ -45,12 +46,22 @@ pub(super) fn extract_grid(
                 continue;
             };
 
-            let a = (p0.0 - rtc_x, -p0.1 + rtc_z);
-            let b = (p1.0 - rtc_x, -p1.1 + rtc_z);
-            let world_y = transform.tz;
+            let a = rebase.plan(p0.0, p0.1);
+            let b = rebase.plan(p1.0, p1.1);
+            // Same finiteness hazard as items.rs's polyline/curve paths and
+            // fill.rs's boundary rings (a non-finite STEP REAL survives
+            // unsanitized to here): unlike a multi-point polyline, an axis is
+            // exactly two points defining a segment, so there is no partial
+            // point to drop — a non-finite endpoint drops the whole axis
+            // (grid_express_id, bubbles included), matching items.rs's
+            // whole-item IfcCircle convention rather than the per-point one.
+            if !a.0.is_finite() || !a.1.is_finite() || !b.0.is_finite() || !b.1.is_finite() {
+                continue;
+            }
+            let world_y = rebase.elevation(transform.tz);
 
             // Compact server-friendly entry — keeps the existing endpoint-pair shape.
-            out.grid_axes.push(SymbolicGridAxis {
+            out.push_grid_axis(SymbolicGridAxis {
                 express_id: axis_id,
                 grid_express_id: grid_id,
                 tag: tag.clone(),
@@ -59,7 +70,7 @@ pub(super) fn extract_grid(
             });
 
             // Axis line (browser pipeline: SymbolicPolyline + bubble texts).
-            out.polylines.push(SymbolicPolyline {
+            out.push_polyline(SymbolicPolyline {
                 express_id: axis_id,
                 ifc_type: "IfcGridAxis".to_string(),
                 points: vec![a.0, a.1, b.0, b.1],
@@ -92,8 +103,8 @@ pub(super) fn extract_grid(
 /// Emit a bubble (transparent interior + black outline ○ + tag text) as
 /// two stacked text instances. The shader's per-instance `target_px` keeps
 /// them at the right relative size at every zoom level.
-fn emit_bubble(axis_id: u32, cx: f32, cy: f32, world_y: f32, tag: &str, out: &mut SymbolicData) {
-    out.texts.push(SymbolicText {
+fn emit_bubble(axis_id: u32, cx: f32, cy: f32, world_y: f32, tag: &str, out: &mut SymbolicAccumulator) {
+    out.push_text(SymbolicText {
         express_id: axis_id,
         ifc_type: "IfcGridAxis".to_string(),
         x: cx,
@@ -108,7 +119,7 @@ fn emit_bubble(axis_id: u32, cx: f32, cy: f32, world_y: f32, tag: &str, out: &mu
         target_px: BUBBLE_TARGET_PX,
         representation: "Axis".to_string(),
     });
-    out.texts.push(SymbolicText {
+    out.push_text(SymbolicText {
         express_id: axis_id,
         ifc_type: "IfcGridAxis".to_string(),
         x: cx,
@@ -131,9 +142,9 @@ fn emit_bubble(axis_id: u32, cx: f32, cy: f32, world_y: f32, tag: &str, out: &mu
 fn sample_grid_axis_endpoints(
     curve: &DecodedEntity,
     decoder: &mut EntityDecoder,
-    unit_scale: f32,
+    unit_scale: f64,
     transform: &Transform2D,
-) -> Option<((f32, f32), (f32, f32))> {
+) -> Option<((f64, f64), (f64, f64))> {
     if curve.ifc_type != IfcType::IfcPolyline {
         return None;
     }
@@ -142,13 +153,13 @@ fn sample_grid_axis_endpoints(
     if point_entities.len() < 2 {
         return None;
     }
-    let extract = |pe: &DecodedEntity| -> Option<(f32, f32)> {
+    let extract = |pe: &DecodedEntity| -> Option<(f64, f64)> {
         if pe.ifc_type != IfcType::IfcCartesianPoint {
             return None;
         }
         let coords = pe.get(0)?.as_list()?;
-        let x = coords.first()?.as_float()? as f32 * unit_scale;
-        let y = coords.get(1)?.as_float()? as f32 * unit_scale;
+        let x = coords.first()?.as_float()? * unit_scale;
+        let y = coords.get(1)?.as_float()? * unit_scale;
         Some(transform.transform_point(x, y))
     };
     let first = extract(&point_entities[0])?;

@@ -11,7 +11,9 @@ import {
   QuantityTableBuilder,
   RelationshipGraphBuilder,
 } from '@ifc-lite/data';
-import { buildIfcxDataStore } from './viewerModelIngest.js';
+import { isSourceBytes } from '@ifc-lite/parser';
+
+import { buildIfcxDataStore, convertIfcxMeshes } from './viewerModelIngest.js';
 
 /**
  * Build a minimal IFCX parse-result shape: a populated entity table (so the
@@ -71,4 +73,86 @@ describe('buildIfcxDataStore (IFCX selection accessor path)', () => {
     assert.equal(store.getEntitiesByType('ifcwall').length, 1, 'type match is case-insensitive');
     assert.deepEqual(store.getEntitiesByType('IfcDoor'), [], 'absent type → empty list');
   });
+});
+
+/**
+ * The IFCX store is built through an `as unknown as IfcStoreData` cast, because
+ * the IFCX tables do not have the STEP shape. That cast silences every field
+ * inside the literal, so when `source` became an `IfcSourceBytes` accessor
+ * (#2183) this producer went on handing over a bare `Uint8Array` and the
+ * whole-monorepo typecheck stayed green.
+ *
+ * The damage was not theoretical: consumers converted in the same change call
+ * `source.materialize()` (collab seeding, federation overlays, CSV/IDS/USD
+ * export) and would have thrown `TypeError: materialize is not a function` for
+ * every IFCX model, while `source.contentKey` returned `undefined` and silently
+ * disabled grid and alignment overlays -- a failure with no error at all.
+ *
+ * So assert the contract at runtime here, where no cast can hide it.
+ */
+describe('buildIfcxDataStore source contract (#2183)', () => {
+  const buffer = new TextEncoder().encode('{"header":{},"data":[]}').buffer as ArrayBuffer;
+
+  it('produces an IfcSourceBytes accessor, not a raw Uint8Array', () => {
+    const store = buildIfcxDataStore(makeIfcxResult(), buffer);
+    assert.equal(isSourceBytes(store.source), true);
+    assert.equal(store.source instanceof Uint8Array, false);
+  });
+
+  it('serves the accessor methods the converted consumers actually call', () => {
+    const store = buildIfcxDataStore(makeIfcxResult(), buffer);
+    // Each of these threw TypeError on a raw Uint8Array.
+    assert.ok(store.source.materialize() instanceof Uint8Array);
+    assert.equal(store.source.withMaterialized((b) => b.byteLength), buffer.byteLength);
+    assert.equal(store.source.decodeUtf8(0, 1), '{');
+    assert.equal(store.source.toTransferable().kind, 'contiguous');
+  });
+
+  it('exposes a non-null contentKey, so overlays are not silently skipped', () => {
+    // sourceKey() is `store?.source.contentKey ?? null`; on a raw Uint8Array
+    // that is `undefined ?? null` -> null, and every per-source overlay hook
+    // bails on a null key without reporting anything.
+    const store = buildIfcxDataStore(makeIfcxResult(), buffer);
+    assert.equal(typeof store.source.contentKey, 'string');
+    assert.ok((store.source.contentKey ?? '').length > 0);
+  });
+
+  it('carries the actual bytes, not an empty placeholder', () => {
+    const store = buildIfcxDataStore(makeIfcxResult(), buffer);
+    assert.equal(store.source.byteLength, buffer.byteLength);
+    assert.equal(store.source.length, buffer.byteLength);
+    // Lengths alone would pass on a zero-filled placeholder of the right size.
+    assert.deepEqual(store.source.materialize(), new Uint8Array(buffer));
+  });
+});
+
+
+it('retains IFCX texture bytes and UV associations at the canonical viewer ingest boundary (#4325)', () => {
+  const uvs = new Float32Array([0, 0, 1, 0, 0, 1]);
+  const rgba = new Uint8Array([255, 20, 40, 128]);
+  const result = convertIfcxMeshes([{
+    expressId: 8, positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+    indices: new Uint32Array([0, 1, 2]), normals: new Float32Array(9), uvs,
+    texture: { rgba, width: 1, height: 1, repeatS: true, repeatT: false },
+  }]);
+  assert.equal(result[0].expressId, 8);
+  assert.equal(result[0].uvs, uvs);
+  assert.equal(result[0].texture?.rgba, rgba);
+  assert.equal(result[0].texture?.repeatS, true);
+});
+
+it('carries projected IFCX placement into the canonical store georeference consumer', async () => {
+  const { parseIfcx, extractGeoreferencingOnDemand } = await import('@ifc-lite/parser');
+  const bytes = new TextEncoder().encode(JSON.stringify({ header: { ifcxVersion: 'ifcx_alpha' }, imports: [], schemas: {}, data: [{
+    path: 'site', attributes: { 'ifclite::georeference::v1': {
+      IfcProjectedCRS: { Name: 'EPSG:32632', MapUnit: 'METRE' },
+      IfcMapConversion: { Eastings: 500000, Northings: 6000000, OrthogonalHeight: 0, XAxisAbscissa: 1, XAxisOrdinate: 0, Scale: 1 },
+    } },
+  }] })).buffer;
+  const parsed = await parseIfcx(bytes);
+  const store = buildIfcxDataStore(parsed, bytes);
+  const placement = extractGeoreferencingOnDemand(store);
+  assert.equal(placement?.projectedCRS?.name, 'EPSG:32632');
+  assert.equal(placement?.mapConversion?.eastings, 500000);
+  assert.equal(placement?.mapConversion?.orthogonalHeight, 0);
 });

@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import { evaluateLens, evaluateAutoColorLens } from './engine.js';
 import { GHOST_COLOR, hexToRgba } from './colors.js';
-import type { Lens, LensDataProvider, AutoColorSpec } from './types.js';
+import type { Lens, LensRule, LensDataProvider, AutoColorSpec } from './types.js';
 
 /** Simple mock provider from entity list */
 function createMockProvider(entities: Array<{
@@ -25,17 +25,21 @@ function createMockProvider(entities: Array<{
   };
 }
 
+function typeGroups(ifcType: string): NonNullable<LensRule['groups']> {
+  return [{ rules: [{ kind: 'ifcType', op: 'in', values: [ifcType] }], combinator: 'AND' }];
+}
+
 describe('evaluateLens', () => {
   it('should return empty results for lens with no enabled rules', () => {
     const lens: Lens = {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Disabled', enabled: false, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#FF0000' },
+        { id: 'r1', name: 'Disabled', enabled: false, groups: typeGroups('IfcWall'), action: 'colorize', color: '#FF0000' },
       ],
     };
     const provider = createMockProvider([{ id: 1, type: 'IfcWall' }]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map());
 
     expect(result.colorMap.size).toBe(0);
     expect(result.hiddenIds.size).toBe(0);
@@ -47,14 +51,16 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Walls', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#FF0000' },
+        { id: 'r1', name: 'Walls', enabled: true,
+          groups: typeGroups('IfcWall'),
+          action: 'colorize', color: '#FF0000' },
       ],
     };
     const provider = createMockProvider([
       { id: 1, type: 'IfcWall' },
       { id: 2, type: 'IfcSlab' },
     ]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([['r1', new Set([1])]]));
 
     expect(result.colorMap.get(1)).toEqual(hexToRgba('#FF0000', 1));
     expect(result.colorMap.get(2)).toEqual(GHOST_COLOR);
@@ -66,14 +72,14 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Hide Slabs', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcSlab' }, action: 'hide', color: '#000000' },
+        { id: 'r1', name: 'Hide Slabs', enabled: true, groups: typeGroups('IfcSlab'), action: 'hide', color: '#000000' },
       ],
     };
     const provider = createMockProvider([
       { id: 1, type: 'IfcSlab' },
       { id: 2, type: 'IfcWall' },
     ]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([['r1', new Set([1])]]));
 
     expect(result.hiddenIds.has(1)).toBe(true);
     expect(result.hiddenIds.has(2)).toBe(false);
@@ -86,11 +92,11 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Transparent Walls', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'transparent', color: '#00FF00' },
+        { id: 'r1', name: 'Transparent Walls', enabled: true, groups: typeGroups('IfcWall'), action: 'transparent', color: '#00FF00' },
       ],
     };
     const provider = createMockProvider([{ id: 1, type: 'IfcWall' }]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([['r1', new Set([1])]]));
 
     const color = result.colorMap.get(1);
     expect(color).toBeDefined();
@@ -102,12 +108,14 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Walls Red', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#FF0000' },
-        { id: 'r2', name: 'Walls Blue', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#0000FF' },
+        { id: 'r1', name: 'Walls Red', enabled: true, groups: typeGroups('IfcWall'), action: 'colorize', color: '#FF0000' },
+        { id: 'r2', name: 'Walls Blue', enabled: true, groups: typeGroups('IfcWall'), action: 'colorize', color: '#0000FF' },
       ],
     };
     const provider = createMockProvider([{ id: 1, type: 'IfcWall' }]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([
+      ['r1', new Set([1])], ['r2', new Set([1])],
+    ]));
 
     // First rule (red) should win
     expect(result.colorMap.get(1)).toEqual(hexToRgba('#FF0000', 1));
@@ -120,8 +128,8 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r-wall', name: 'Walls', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#FF0000' },
-        { id: 'r-slab', name: 'Slabs', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcSlab' }, action: 'colorize', color: '#0000FF' },
+        { id: 'r-wall', name: 'Walls', enabled: true, groups: typeGroups('IfcWall'), action: 'colorize', color: '#FF0000' },
+        { id: 'r-slab', name: 'Slabs', enabled: true, groups: typeGroups('IfcSlab'), action: 'colorize', color: '#0000FF' },
       ],
     };
     const provider = createMockProvider([
@@ -130,7 +138,9 @@ describe('evaluateLens', () => {
       { id: 3, type: 'IfcSlab' },
       { id: 4, type: 'IfcDoor' },
     ]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([
+      ['r-wall', new Set([1, 2])], ['r-slab', new Set([3])],
+    ]));
 
     expect(result.ruleCounts.get('r-wall')).toBe(2);
     expect(result.ruleCounts.get('r-slab')).toBe(1);
@@ -143,11 +153,11 @@ describe('evaluateLens', () => {
       id: 'test',
       name: 'Test',
       rules: [
-        { id: 'r1', name: 'Walls', enabled: true, criteria: { type: 'ifcType', ifcType: 'IfcWall' }, action: 'colorize', color: '#FF0000' },
+        { id: 'r1', name: 'Walls', enabled: true, groups: typeGroups('IfcWall'), action: 'colorize', color: '#FF0000' },
       ],
     };
     const provider = createMockProvider([{ id: 1, type: 'IfcWall' }]);
-    const result = evaluateLens(lens, provider);
+    const result = evaluateLens(lens, provider, new Map([['r1', new Set([1])]]));
 
     expect(typeof result.executionTime).toBe('number');
     expect(result.executionTime).toBeGreaterThanOrEqual(0);
@@ -205,7 +215,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 3, type: 'IfcSlab' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getEntityAttribute = (id: number, attr: string) => {
+    provider.getEntityAttribute = (id: number, attr: string) => {
       if (attr === 'Name') {
         if (id === 1) return 'Wall A';
         if (id === 2) return 'Wall A';
@@ -300,6 +310,62 @@ describe('evaluateAutoColorLens', () => {
     }
   });
 
+  it('renders a multi-material element in its LARGEST material group colour (#1366)', () => {
+    // The test above proves a multi-material element joins every bucket, but
+    // only that it gets *some* colour. Which one is the load-bearing part: an
+    // element renders once, so the engine keeps the first assignment and the
+    // groups are sorted by count desc — i.e. the element takes the colour of
+    // its biggest material group.
+    //
+    // Gypsum:     1, 2, 3, 5  (4 elements — the larger group)
+    // Insulation: 3, 4, 5     (3 elements)
+    // Element 3 lists Gypsum first, element 5 lists Insulation first. Both
+    // must end up Gypsum-coloured, which discriminates "largest group wins"
+    // from "whichever material the element happens to list first".
+    const materials = new Map<number, string[]>([
+      [1, ['Gypsum']],
+      [2, ['Gypsum']],
+      [3, ['Gypsum', 'Insulation']],
+      [4, ['Insulation']],
+      [5, ['Insulation', 'Gypsum']],
+    ]);
+    const provider: LensDataProvider = {
+      getEntityCount: () => materials.size,
+      forEachEntity: (cb) => { for (const id of materials.keys()) cb(id, 'm1'); },
+      getEntityType: () => 'IfcWall',
+      getPropertyValue: () => undefined,
+      getPropertySets: () => [],
+      getMaterialNames: (id) => materials.get(id) ?? [],
+    };
+
+    const result = evaluateAutoColorLens({ source: 'material' }, provider);
+
+    const byName = new Map(result.legend.map(e => [e.name, e]));
+    const gypsum = byName.get('Gypsum')!;
+    const insulation = byName.get('Insulation')!;
+    expect(gypsum.count).toBe(4);
+    expect(insulation.count).toBe(3);
+    // Legend is ordered by count desc, so Gypsum is allocated first.
+    expect(result.legend[0].name).toBe('Gypsum');
+
+    const gypsumRgba = hexToRgba(gypsum.color, 1);
+    const insulationRgba = hexToRgba(insulation.color, 1);
+    expect(gypsumRgba).not.toEqual(insulationRgba);
+
+    // Single-material elements anchor each colour (positive controls).
+    expect(result.colorMap.get(1)).toEqual(gypsumRgba);
+    expect(result.colorMap.get(4)).toEqual(insulationRgba);
+    // Shared elements take the larger group's colour, regardless of the order
+    // their own material list happens to be in.
+    expect(result.colorMap.get(3)).toEqual(gypsumRgba);
+    expect(result.colorMap.get(5)).toEqual(gypsumRgba);
+    expect(result.colorMap.get(3)).not.toEqual(insulationRgba);
+    expect(result.colorMap.get(5)).not.toEqual(insulationRgba);
+    // Membership is still multi-valued — the colour choice must not have
+    // narrowed the buckets.
+    expect(new Set(result.ruleEntityIds.get(insulation.id))).toEqual(new Set([3, 4, 5]));
+  });
+
   it('falls back to single getMaterialName when getMaterialNames is absent', () => {
     const provider: LensDataProvider = {
       getEntityCount: () => 1,
@@ -321,7 +387,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 3, type: 'IfcSlab' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getPropertyValue = (id: number, pset: string, prop: string) => {
+    provider.getPropertyValue = (id: number, pset: string, prop: string) => {
       if (pset === 'Pset_WallCommon' && prop === 'IsExternal') {
         if (id === 1) return 'True';
         if (id === 2) return 'False';
@@ -344,7 +410,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 3, type: 'IfcSlab' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getQuantityValue = (id: number, qset: string, qname: string) => {
+    provider.getQuantityValue = (id: number, qset: string, qname: string) => {
       if (qset === 'Qto_WallBaseQuantities' && qname === 'Width') {
         if (id === 1) return 0.3;
         if (id === 2) return 0.3;
@@ -368,7 +434,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 3, type: 'IfcColumn' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getClassifications = (id: number) => {
+    provider.getClassifications = (id: number) => {
       if (id === 1) return [{ system: 'Uniclass', identification: 'EF_25_10', name: 'Walls' }];
       if (id === 2) return [{ system: 'Uniclass', identification: 'EF_25_30', name: 'Floors' }];
       return [];
@@ -390,7 +456,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 2, type: 'IfcSlab' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getClassifications = (id: number) => {
+    provider.getClassifications = (id: number) => {
       // Code only, no name.
       if (id === 1) return [{ system: 'Uniclass', identification: 'EF_25_10' }];
       // Name repeats the bare code -> no redundant parenthetical.
@@ -408,7 +474,7 @@ describe('evaluateAutoColorLens', () => {
   it('drops the parenthetical when the name repeats the full System: Code string (#1469)', () => {
     const entities = [{ id: 1, type: 'IfcWall' }];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getClassifications = () => [
+    provider.getClassifications = () => [
       // Some exports store the whole "System: Code" string in the name attribute.
       { system: 'Uniclass', identification: 'EF_25_10', name: 'Uniclass: EF_25_10' },
     ];
@@ -427,7 +493,7 @@ describe('evaluateAutoColorLens', () => {
     const provider = createMockProvider(entities);
     // Each entity carries references from two classification systems. The first
     // reference is Uniclass; psetName must steer grouping to OmniClass instead.
-    (provider as Record<string, unknown>).getClassifications = (id: number) => {
+    provider.getClassifications = (id: number) => {
       if (id === 1) {
         return [
           { system: 'Uniclass', identification: 'EF_25_10', name: 'Walls' },
@@ -453,6 +519,126 @@ describe('evaluateAutoColorLens', () => {
     expect(result.legend[0].count).toBe(2);
   });
 
+  it('ghosts entities whose classifications never include the selected system, instead of grouping them under an unrelated one (#1923)', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall' },
+      { id: 2, type: 'IfcDoor' },
+      { id: 3, type: 'IfcColumn' },
+    ];
+    const provider = createMockProvider(entities);
+    // Entity 1 is classified under the selected system. Entity 2 carries a
+    // classification, but from an entirely different system ('CCI Construction' —
+    // mirrors the reported bug's second, unrelated system). Entity 3 has none.
+    // Selecting "NL-SfB tabel 1" must filter to entity 1 only: entity 2 must not
+    // leak into the legend under its unrelated system, and must ghost like entity 3.
+    provider.getClassifications = (id: number) => {
+      if (id === 1) return [{ system: 'NL-SfB tabel 1', identification: '22.11', name: 'Walls' }];
+      if (id === 2) return [{ system: 'CCI Construction', identification: 'L-AD', name: 'Wall construction' }];
+      return [];
+    };
+
+    const spec: AutoColorSpec = { source: 'classification', psetName: 'NL-SfB tabel 1' };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    expect(result.legend.length).toBe(1);
+    expect(result.legend[0].name).toBe('NL-SfB tabel 1: 22.11 (Walls)');
+    expect(result.legend[0].count).toBe(1);
+    // Entity 2 (unrelated system) and entity 3 (no classification) both ghost —
+    // neither is silently absorbed into entity 1's group or its own bogus group.
+    expect(result.colorMap.get(2)).toEqual(GHOST_COLOR);
+    expect(result.colorMap.get(3)).toEqual(GHOST_COLOR);
+  });
+
+  it('gives unclassified entities real legend entries, split into two buckets, when includeUnclassified opts in', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall' },
+      { id: 2, type: 'IfcWall' },
+      { id: 3, type: 'IfcWall' },
+      { id: 4, type: 'IfcWall' },
+      { id: 5, type: 'IfcDoor' },
+      { id: 6, type: 'IfcDoor' },
+      { id: 7, type: 'IfcDoor' },
+      { id: 8, type: 'IfcColumn' },
+      { id: 9, type: 'IfcColumn' },
+    ];
+    const provider = createMockProvider(entities);
+    // 4 entities properly classified under the selected system (NL-SfB tabel 1).
+    // 3 entities classified, but only in an unrelated system (CCI Construction) —
+    // "not in this system". 2 entities carry no classification at all — "no
+    // classification". Three distinct counts (4 / 3 / 2) so no bucket can pass
+    // by coincidentally matching another's size.
+    provider.getClassifications = (id: number) => {
+      if (id >= 1 && id <= 4) return [{ system: 'NL-SfB tabel 1', identification: '22.11', name: 'Walls' }];
+      if (id >= 5 && id <= 7) return [{ system: 'CCI Construction', identification: 'L-AD', name: 'Wall construction' }];
+      return [];
+    };
+
+    const spec: AutoColorSpec = { source: 'classification', psetName: 'NL-SfB tabel 1', includeUnclassified: true };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    // One real value group + two absence buckets = 3 legend entries.
+    expect(result.legend.length).toBe(3);
+
+    const realGroup = result.legend.find((e) => !e.isAbsent);
+    expect(realGroup?.name).toBe('NL-SfB tabel 1: 22.11 (Walls)');
+    expect(realGroup?.count).toBe(4);
+
+    const notInSystem = result.legend.find((e) => e.id === 'auto-absent-not-in-system');
+    expect(notInSystem).toBeDefined();
+    expect(notInSystem!.name).toBe('Not in this system');
+    expect(notInSystem!.count).toBe(3);
+    expect(notInSystem!.isAbsent).toBe(true);
+
+    const noClassification = result.legend.find((e) => e.id === 'auto-absent-no-classification');
+    expect(noClassification).toBeDefined();
+    expect(noClassification!.name).toBe('No classification');
+    expect(noClassification!.count).toBe(2);
+    expect(noClassification!.isAbsent).toBe(true);
+
+    // Every formerly-ghosted entity now has a real, non-ghost color and is
+    // reachable through ruleEntityIds (i.e. clickable/isolatable).
+    for (const id of [5, 6, 7, 8, 9]) {
+      const color = result.colorMap.get(id);
+      expect(color).toBeDefined();
+      expect(color).not.toEqual(GHOST_COLOR);
+    }
+    expect(result.ruleEntityIds.get('auto-absent-not-in-system')?.sort()).toEqual([5, 6, 7]);
+    expect(result.ruleEntityIds.get('auto-absent-no-classification')?.sort()).toEqual([8, 9]);
+
+    // Absence buckets get reserved neutral colors, not palette-ranked ones —
+    // they must not collide with the real group's rank-assigned color.
+    expect(notInSystem!.color).toBe('#bdbdbd');
+    expect(noClassification!.color).toBe('#8a8a8a');
+    expect(realGroup?.color).not.toBe(notInSystem!.color);
+    expect(realGroup?.color).not.toBe(noClassification!.color);
+  });
+
+  it('collapses to a single "No classification" bucket when includeUnclassified is on but no system (psetName) is named', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall' },
+      { id: 2, type: 'IfcDoor' },
+      { id: 3, type: 'IfcColumn' },
+    ];
+    const provider = createMockProvider(entities);
+    // Entity 1 is classified (any system counts, since none is named).
+    // Entities 2 and 3 have none.
+    provider.getClassifications = (id: number) => {
+      if (id === 1) return [{ system: 'Uniclass', identification: 'EF_25_10', name: 'Walls' }];
+      return [];
+    };
+
+    // No psetName -> there is no specific system to be "not in", so only one
+    // absence bucket can ever mean anything.
+    const spec: AutoColorSpec = { source: 'classification', includeUnclassified: true };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    const absentEntries = result.legend.filter((e) => e.isAbsent);
+    expect(absentEntries.length).toBe(1);
+    expect(absentEntries[0].id).toBe('auto-absent-no-classification');
+    expect(absentEntries[0].name).toBe('No classification');
+    expect(absentEntries[0].count).toBe(2);
+  });
+
   it('should auto-color by material when provider supports getMaterialName', () => {
     const entities = [
       { id: 1, type: 'IfcWall' },
@@ -460,7 +646,7 @@ describe('evaluateAutoColorLens', () => {
       { id: 3, type: 'IfcSlab' },
     ];
     const provider = createMockProvider(entities);
-    (provider as Record<string, unknown>).getMaterialName = (id: number) => {
+    provider.getMaterialName = (id: number) => {
       if (id === 1) return 'Concrete';
       if (id === 2) return 'Concrete';
       if (id === 3) return 'Steel';
@@ -620,5 +806,54 @@ describe('evaluateAutoColorLens — By Zone', () => {
     const result = evaluateAutoColorLens({ source: 'group' }, provider);
     expect(result.legend).toHaveLength(1);
     expect(result.colorMap.get(2)).toEqual(GHOST_COLOR);
+  });
+
+  it('falls back to "Type #id" when a group has neither a name nor an ObjectType', () => {
+    // Last-resort bucket key so completely unnamed groups still get their own
+    // distinct legend entry instead of silently merging into another group.
+    const provider = createGroupProvider([
+      { id: 1, groups: [{ id: 500, type: 'IfcGroup' }] },
+    ]);
+    const result = evaluateAutoColorLens({ source: 'group' }, provider);
+    expect(result.legend).toHaveLength(1);
+    expect(result.legend[0].name).toBe('IfcGroup #500');
+  });
+});
+
+describe('evaluateLens - shared selections', () => {
+  const provider = createMockProvider([
+    { id: 1, type: 'IfcWall' }, { id: 2, type: 'IfcWall' },
+    { id: 3, type: 'IfcSlab' },
+  ]);
+
+  it('uses shared selected IDs even when the group would select other entities (#5896)', () => {
+    const lens: Lens = {
+      id: 'l1',
+      name: 'Slabs',
+      rules: [{
+        id: 'r1',
+        name: 'Selected slabs',
+        enabled: true,
+        groups: typeGroups('IfcWall'),
+        action: 'colorize',
+        color: '#E53935',
+      }],
+    };
+    const result = evaluateLens(lens, provider, new Map([['r1', new Set([3])]]));
+    expect(result.ruleCounts.get('r1')).toBe(1);
+    expect(result.ruleEntityIds.get('r1')).toEqual([3]);
+    expect(result.colorMap.get(3)).toEqual(hexToRgba('#E53935', 1));
+    expect(result.colorMap.get(1)).toEqual(GHOST_COLOR);
+    expect(result.colorMap.get(2)).toEqual(GHOST_COLOR);
+    const missingSelection = evaluateLens(lens, provider, new Map());
+    expect(missingSelection.ruleCounts.get('r1')).toBe(0);
+    expect(missingSelection.colorMap.get(1)).toEqual(GHOST_COLOR);
+
+    const unreadable: Lens = { ...lens, rules: [{ ...lens.rules[0],
+      unreadableLegacy: { criteria: { type: 'material', materialName: 'Concrete' }, reason: 'Unrepresentable' },
+    }] };
+    const guarded = evaluateLens(unreadable, provider, new Map([['r1', new Set([3])]]));
+    expect(guarded.ruleCounts.get('r1')).toBe(0);
+    expect(guarded.colorMap.get(3)).toEqual(GHOST_COLOR);
   });
 });

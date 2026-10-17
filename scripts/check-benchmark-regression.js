@@ -24,6 +24,7 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
+import { requireTimingUploads } from './lib/benchmark-upload-mode.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -93,6 +94,32 @@ function formatPct(value) {
   return `${sign}${value.toFixed(1)}%`;
 }
 
+/**
+ * The causes when the sample lost its GPU device (`gpuHealth`, written by
+ * viewer-benchmark.spec.ts since #6993), else null. A result from an older
+ * harness carries no `gpuHealth` and is compared as before.
+ */
+function gpuContamination(payload) {
+  const health = payload.gpuHealth;
+  if (!health || health.contaminated !== true) return null;
+  return Array.isArray(health.reasons) && health.reasons.length > 0 ? health.reasons : ['GPU device lost'];
+}
+
+/** Every reason a model was not compared, as headline phrases (#6993 review). */
+function notComparedReasons(gpuExcluded, missingBaseline, total) {
+  const out = [];
+  if (gpuExcluded > 0) out.push(`${gpuExcluded} of ${total} model(s) lost their GPU device mid-sample (#6993/#7164)`);
+  if (missingBaseline > 0) out.push(`${missingBaseline} of ${total} model(s) had NO baseline entry`);
+  return out;
+}
+
+function gpuNoVerdictText(excluded, total) {
+  return (
+    `No verdict: ${excluded} of ${total} model(s) lost their GPU device mid-sample (#6993/#7164); ` +
+    'their timings measured a re-upload onto a replacement device and were not compared.'
+  );
+}
+
 function loadResults() {
   if (!existsSync(resultsDir)) {
     throw new Error('No benchmark results directory found. Run `pnpm test:benchmark:viewer` first.');
@@ -106,6 +133,7 @@ function loadResults() {
   return files.map((name) => {
     const path = join(resultsDir, name);
     const payload = loadJson(path);
+    requireTimingUploads(payload);
     return { name, path, payload };
   });
 }
@@ -131,10 +159,14 @@ function compareResults() {
       baselineEnvironment: baselineEntry?.environment ?? null,
       missingBaseline: !baselineEntry?.metrics,
       baselineLikelyLocal: !!baselineEntry?.metrics && !looksCiRecorded(baselineEntry?.environment),
+      gpuContaminated: gpuContamination(payload),
       rows: [],
     };
 
-    if (!model.missingBaseline) {
+    // A sample that lost its GPU device measured a different load (the
+    // renderer re-uploaded everything onto a replacement device), so it is
+    // excluded, never compared as if clean (#6993).
+    if (!model.missingBaseline && !model.gpuContaminated) {
       for (const metricName of Object.keys(thresholds)) {
         const threshold = thresholds[metricName];
         const currentValue = metrics[metricName];
@@ -147,6 +179,20 @@ function compareResults() {
           increasePct,
           threshold,
           regressed: increasePct !== null && increasePct > threshold,
+          // A metric that stops being EMITTED gives `percentIncrease` a
+          // non-number and therefore `null`, which `regressed` reads as "fine"
+          // (#3200, finding 8). It is not fine — it is an unmeasured metric,
+          // and rendering it with the same ✅ as a measured pass silently
+          // retires it. Renaming one harness field is enough to do that to a
+          // single metric while the other five keep working.
+          unmeasured: increasePct === null,
+          // LOST is the narrower, actionable half: the BASELINE had a number
+          // and this run does not. Absent on both sides is ordinary — two of
+          // the four committed baseline entries carry only 2 of the 6 metrics,
+          // so failing on plain `unmeasured` would hard-fail the lane the
+          // moment either model entered VIEWER_BENCHMARK_FILES. Only `lost`
+          // gates the exit; `unmeasured` still controls the ⚠ in the report.
+          lost: typeof baselineValue === 'number' && typeof currentValue !== 'number',
         });
       }
     }
@@ -164,6 +210,10 @@ function printConsoleReport(models) {
     console.log(`\n${model.fileName}`);
     console.log(`  Result source: ${model.source}`);
 
+    if (model.gpuContaminated) {
+      console.log(`  ⚠ EXCLUDED: ${model.gpuContaminated.join('; ')}. Timings not compared.`);
+      continue;
+    }
     if (model.missingBaseline) {
       console.log('  ⚠ No baseline entry for this model');
       continue;
@@ -183,6 +233,8 @@ function printConsoleReport(models) {
       const line = `  - ${row.metricName}: ${formatMs(row.currentValue)} vs ${formatMs(row.baselineValue)} (${formatPct(row.increasePct)})`;
       if (row.regressed) {
         console.log(`${line}  ❌ threshold +${row.threshold}%`);
+      } else if (row.unmeasured) {
+        console.log(`${line}  ⚠️  NOT MEASURED (no comparable number on one side)`);
       } else {
         console.log(`${line}  ✅`);
       }
@@ -190,23 +242,95 @@ function printConsoleReport(models) {
   }
 }
 
-function buildMarkdownReport(models, regressions) {
+/** Metrics whose delta could not be computed at all — see `unmeasured`. */
+function unmeasuredCount(models) {
+  return models.reduce((n, m) => n + m.rows.filter((r) => r.unmeasured).length, 0);
+}
+
+/** Metrics the BASELINE had and this run does not — see `lost`. */
+function lostMetrics(models) {
+  return models.flatMap((m) =>
+    m.rows.filter((r) => r.lost).map((r) => `${m.fileName} :: ${r.metricName}`)
+  );
+}
+
+function buildMarkdownReport(models, regressions, harnessFaults = []) {
+  const unmeasured = unmeasuredCount(models);
+  const uncompared = models.filter((m) => m.missingBaseline && !m.gpuContaminated).length;
+  const gpuExcluded = models.filter((m) => m.gpuContaminated).length;
+  const notCompared = notComparedReasons(gpuExcluded, uncompared, models.length);
   const lines = [];
   lines.push('<!-- viewer-benchmark-report -->');
   lines.push('## Viewer benchmark');
   lines.push('');
-  if (regressions.length > 0) {
+  // THE MARKDOWN IS THE PRIMARY ARTEFACT: `benchmark.yml` publishes it to the
+  // step summary and the sticky PR comment, and that is what a human actually
+  // reads. An earlier version of this change refused a clean verdict on the
+  // CONSOLE only, so on a renamed fixture the console said "no verdict" while
+  // the PR comment said `✅ No threshold regressions detected.` — with no rows,
+  // `unmeasured` is 0 and that headline is trivially true and entirely
+  // misleading. Fixing one and not the other reproduces the mixed signal this
+  // change exists to remove, in the louder of the two channels.
+  if (harnessFaults.length > 0) {
+    lines.push(
+      `❌ **No verdict: the benchmark did not run.** ${harnessFaults.length} harness fault(s):`
+    );
+    lines.push('');
+    for (const f of harnessFaults) {
+      lines.push(`- ${f.split('\n')[0].trim()}`);
+    }
+    lines.push('');
+    lines.push(
+      'Threshold results below (if any) are reported for completeness and are NOT a pass.'
+    );
+  } else if (regressions.length > 0) {
     lines.push(
       `⚠ **${regressions.length} metric(s) exceeded the regression threshold**` +
         (advisory ? ' (advisory only, not blocking).' : '.')
     );
+  } else if (gpuExcluded > 0 && gpuExcluded === models.length) {
+    lines.push(`⚠️ **${gpuNoVerdictText(gpuExcluded, models.length)}**`);
+    lines.push('');
+    lines.push('Nothing was compared. This is NOT a pass: rerun the benchmark for a verdict.');
+  } else if (notCompared.length > 0) {
+    // ONE headline for every reason a model was not compared, so no reason can
+    // pre-empt another (#6993 review: a GPU-lost headline used to say "no
+    // regressions among the rest" over a renamed fixture that was never
+    // compared either). The `comparable.length === 0` harness fault only fires
+    // when EVERY model missed its baseline; renaming ONE of the two fixtures is
+    // the likelier accident (#3200). Some models were compared, so this is a
+    // partial, non-blocking verdict, never a clean bill of health.
+    const compared = models.length - gpuExcluded - uncompared;
+    lines.push(
+      `⚠️ **Partial verdict: ${compared} of ${models.length} model(s) compared. NOT compared: ` +
+        `${notCompared.join('; ')}.** No threshold regressions among the ${compared} compared` +
+        (unmeasured > 0 ? `, but ${unmeasured} metric(s) were NOT MEASURED` : '') +
+        '; the rest are not a pass.'
+    );
+  } else if (unmeasured > 0) {
+    lines.push(
+      `⚠ **No threshold regressions — but ${unmeasured} metric(s) were NOT MEASURED** ` +
+        '(no comparable number on one side), so this is not a clean bill of health.'
+    );
   } else {
     lines.push('✅ No threshold regressions detected.');
+  }
+  // The headline above can be about something else (a regression, a fault);
+  // a model that was not compared must still be visible at the top (#6993).
+  if (notCompared.length > 0 && (harnessFaults.length > 0 || regressions.length > 0)) {
+    lines.push('');
+    lines.push(`⚠️ **Also NOT compared: ${notCompared.join('; ')}.**`);
   }
   lines.push('');
 
   for (const model of models) {
     lines.push(`### ${model.fileName}`);
+    if (model.gpuContaminated) {
+      lines.push('');
+      lines.push(`⚠ Excluded: ${model.gpuContaminated.join('; ')}. Timings not compared.`);
+      lines.push('');
+      continue;
+    }
     if (model.missingBaseline) {
       lines.push('');
       lines.push('⚠ No baseline entry for this model.');
@@ -235,7 +359,7 @@ function buildMarkdownReport(models, regressions) {
     lines.push('| Metric | Current | Baseline | Delta | Threshold | Status |');
     lines.push('|---|---|---|---|---|---|');
     for (const row of model.rows) {
-      const status = row.regressed ? '❌' : '✅';
+      const status = row.regressed ? '❌' : row.unmeasured ? '⚠️ not measured' : '✅';
       lines.push(
         `| ${row.metricName} | ${formatMs(row.currentValue)} | ${formatMs(row.baselineValue)} | ` +
           `${formatPct(row.increasePct)} | +${row.threshold}% | ${status} |`
@@ -259,11 +383,52 @@ function main() {
   const regressions = models.flatMap((m) =>
     m.rows.filter((r) => r.regressed).map((r) => ({ fileName: m.fileName, ...r }))
   );
-  const missingBaseline = models.filter((m) => m.missingBaseline).map((m) => m.fileName);
+  const missingBaseline = models.filter((m) => m.missingBaseline && !m.gpuContaminated).map((m) => m.fileName);
+  const gpuExcluded = models.filter((m) => m.gpuContaminated).map((m) => m.fileName);
 
   printConsoleReport(models);
 
+  // Harness faults are computed and reported BEFORE the regression branch, and
+  // are NOT covered by `--advisory` (#3200). An earlier version of this put them
+  // after, where the advisory `return` on any threshold regression skipped them
+  // entirely -- so the one run most likely to have a broken harness was the one
+  // that never checked. Thresholds are +50% on a shared runner, so that branch
+  // is taken often.
+  //
+  // `--advisory` exists so a NOISY benchmark cannot block a PR. A benchmark that
+  // did not RUN is a different thing, and has no verdict to soften.
+  const unmeasured = unmeasuredCount(models);
+  const lost = lostMetrics(models);
+  const comparable = models.filter((m) => !m.missingBaseline && !m.gpuContaminated);
+  const harnessFaults = [];
+
+  // #6993/#7164: a GPU-lost sample is NOT a harness fault. The harness ran and
+  // reported what happened; the runner's software GPU lost its device (on
+  // GitHub's SwiftShader in ~40% of main runs for BOTH fixtures at once). That
+  // is a no-verdict WARNING with exit 0, with or without --advisory, never a
+  // red job and never a pass.
+  const noVerdictGpu = models.length > 0 && comparable.length === 0 && gpuExcluded.length > 0;
+  if (models.length > 0 && comparable.length === 0 && missingBaseline.length > 0) {
+    harnessFaults.push(
+      `${models.length} model(s) ran and NOT ONE had a baseline entry to compare against.\n` +
+        "   Baselines are keyed on the result payload's `file` name, so a renamed fixture misses\n" +
+        '   every lookup and this check then reports a clean run having compared nothing.'
+    );
+  }
+  if (lost.length > 0) {
+    harnessFaults.push(
+      `${lost.length} metric(s) the BASELINE had are not produced by this run:\n` +
+        lost.map((l) => `     - ${l}`).join('\n') +
+        '\n   A metric that stops being emitted is not a passing metric. Check the harness field\n' +
+        '   names before reading anything else as green.'
+    );
+  }
+
   console.log('\n' + '='.repeat(80));
+  if (gpuExcluded.length > 0) {
+    console.log(`Excluded after GPU device loss: ${gpuExcluded.length}`);
+    for (const fileName of gpuExcluded) console.log(`  - ${fileName}`);
+  }
   if (missingBaseline.length > 0) {
     console.log(`Missing baseline entries: ${missingBaseline.length}`);
     for (const fileName of missingBaseline) {
@@ -271,9 +436,20 @@ function main() {
     }
   }
 
+  // Written BEFORE any exit: on a harness fault this report IS the diagnosis.
   if (markdownPath) {
-    writeFileSync(markdownPath, buildMarkdownReport(models, regressions));
+    writeFileSync(markdownPath, buildMarkdownReport(models, regressions, harnessFaults));
     console.log(`Markdown report written to ${markdownPath}`);
+  }
+
+  /** Print every harness fault and exit 1. Never softened by --advisory. */
+  function reportHarnessFaults() {
+    if (harnessFaults.length === 0) return;
+    for (const f of harnessFaults) console.error(`\n\u274c ${f}`);
+    console.error(
+      '\n   Not softened by --advisory: these say the check did not run, not that it is slow.'
+    );
+    process.exit(1);
   }
 
   if (regressions.length > 0) {
@@ -284,17 +460,42 @@ function main() {
           `(${reg.currentValue}ms vs ${reg.baselineValue}ms, allowed +${reg.threshold}%)`
       );
     }
-    if (advisory) {
-      console.log('\nAdvisory mode: regressions reported but not failing the run.');
-      return;
+    if (!advisory) {
+      // Harness faults FIRST, then exit. They used to be printed after this
+      // `process.exit(1)`, so a run with both a regression and a lost metric
+      // printed only "Found 1 regression(s)" on the console -- the ❌ lines and
+      // "Not softened by --advisory" went to the markdown and nowhere else. CI
+      // always passes --advisory so the lane never saw it; a local
+      // `pnpm benchmark:check` did. Reporting the SOFTER of two problems and
+      // hiding the harder one is the shape this gate exists to remove.
+      reportHarnessFaults();
+      process.exit(1);
     }
-    process.exit(1);
+    console.log('\nAdvisory mode: regressions reported but not failing the run.');
+  } else if (harnessFaults.length > 0) {
+    // Say NOTHING clean here. Printing "No threshold regressions detected."
+    // above an ❌ is the mixed signal this gate exists to remove: with no
+    // baseline matched there are no rows, so there are trivially no
+    // regressions, and that sentence is true and useless. A reader skimming
+    // for a verdict finds the reassuring one first.
+    console.log('\nNo verdict: see the harness fault(s) below.');
+  } else if (noVerdictGpu) {
+    console.warn(`\n⚠ ${gpuNoVerdictText(gpuExcluded.length, models.length)}`);
+  } else if (gpuExcluded.length > 0 || missingBaseline.length > 0) {
+    // Same single headline as the markdown: a PARTIAL comparison is not a clean run.
+    console.log(
+      `\nPartial verdict: ${comparable.length} of ${models.length} model(s) compared, no threshold regressions among them. ` +
+        `NOT compared (never compared): ${notComparedReasons(gpuExcluded.length, missingBaseline.length, models.length).join('; ')}.`
+    );
+  } else if (unmeasured > 0) {
+    console.log('\nNo threshold regressions among the metrics that WERE measured.');
+  } else {
+    console.log('\nNo threshold regressions detected.');
   }
 
-  console.log('\nNo threshold regressions detected.');
-  if (missingBaseline.length > 0) {
-    console.log('Some models are missing baseline entries (warning only).');
-  }
+  reportHarnessFaults();
+
+
 }
 
 try {

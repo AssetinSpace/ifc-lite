@@ -1,3 +1,8 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import { viewerAliases } from './vite-aliases';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import Icons from 'unplugin-icons/vite';
@@ -8,9 +13,13 @@ import topLevelAwait from 'vite-plugin-top-level-await';
 import path from 'path';
 import fs from 'fs';
 import { cesiumStaticAssets } from './vite-plugins/cesium-assets';
+import { oauthCallbackRoutes } from './vite-plugins/oauth-callback';
+// Same allowlist the production relay uses, so dev and prod cannot disagree
+// about which Dalux node a request reaches (#2792).
+import { daluxRelayRoute } from './vite-plugins/dalux-relay';
+import { deploymentAssetsDir } from '../../scripts/lib/deployment-assets-dir.mjs';
 
 // --- Build-time changelog parser ---
-
 interface ReleaseHighlight {
   type: 'feature' | 'fix' | 'perf';
   text: string;
@@ -36,12 +45,10 @@ const SKIP_BOLD_LOWER = new Set([
   'renderer fixes', 'parser fixes', 'viewer integration', 'fixes', 'features',
   'breaking', 'minor changes', 'patch changes', 'dependencies',
 ]);
-
 function isInternalName(text: string): boolean {
   // Skip PascalCase single-word class names like "PolygonalFaceSetProcessor"
   return /^[A-Z][a-zA-Z]+$/.test(text) && !text.includes(' ');
 }
-
 function categorizeHighlight(text: string): 'feature' | 'fix' | 'perf' {
   const lower = text.toLowerCase();
   if (lower.startsWith('fixed ') || lower.startsWith('fix ')) return 'fix';
@@ -72,15 +79,6 @@ function extractBulletDescription(line: string): string | null {
   if (prPattern) return prPattern[1].trim();
 
   return null;
-}
-
-function compareSemver(a: string, b: string): number {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return pa[i] - pb[i];
-  }
-  return 0;
 }
 
 function parseChangelogs(): PackageChangelog[] {
@@ -241,6 +239,11 @@ export default defineConfig({
     wasm(),
     topLevelAwait(),
     cesiumStaticAssets(),
+    oauthCallbackRoutes(),
+    // Dalux's API sends no CORS headers, so it must go through a same-origin
+    // relay. Dev runs the SAME handler production does (#2792), rather than a
+    // second proxy config that can drift from it.
+    daluxRelayRoute(),
   ],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
@@ -251,34 +254,7 @@ export default defineConfig({
     CESIUM_BASE_URL: JSON.stringify('/cesium'),
   },
   resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-      '@ifc-lite/parser/browser': path.resolve(__dirname, '../../packages/parser/src/browser.ts'),
-      '@ifc-lite/parser': path.resolve(__dirname, '../../packages/parser/src'),
-      '@ifc-lite/geometry': path.resolve(__dirname, '../../packages/geometry/src'),
-      '@ifc-lite/renderer': path.resolve(__dirname, '../../packages/renderer/src'),
-      '@ifc-lite/query': path.resolve(__dirname, '../../packages/query/src'),
-      '@ifc-lite/server-client': path.resolve(__dirname, '../../packages/server-client/src'),
-      '@ifc-lite/spatial': path.resolve(__dirname, '../../packages/spatial/src'),
-      '@ifc-lite/data': path.resolve(__dirname, '../../packages/data/src'),
-      '@ifc-lite/export': path.resolve(__dirname, '../../packages/export/src'),
-      '@ifc-lite/cache': path.resolve(__dirname, '../../packages/cache/src'),
-      '@ifc-lite/collab': path.resolve(__dirname, '../../packages/collab/src'),
-      '@ifc-lite/ifcx': path.resolve(__dirname, '../../packages/ifcx/src'),
-      '@ifc-lite/pointcloud': path.resolve(__dirname, '../../packages/pointcloud/src'),
-      '@ifc-lite/wasm': path.resolve(__dirname, '../../packages/wasm/pkg/ifc-lite.js'),
-      '@ifc-lite/sdk': path.resolve(__dirname, '../../packages/sdk/src'),
-      '@ifc-lite/create': path.resolve(__dirname, '../../packages/create/src'),
-      '@ifc-lite/sandbox/schema': path.resolve(__dirname, '../../packages/sandbox/src/bridge-schema.ts'),
-      '@ifc-lite/sandbox': path.resolve(__dirname, '../../packages/sandbox/src'),
-      '@ifc-lite/lens': path.resolve(__dirname, '../../packages/lens/src'),
-      '@ifc-lite/mutations': path.resolve(__dirname, '../../packages/mutations/src'),
-      '@ifc-lite/bcf': path.resolve(__dirname, '../../packages/bcf/src'),
-      '@ifc-lite/drawing-2d': path.resolve(__dirname, '../../packages/drawing-2d/src'),
-      '@ifc-lite/encoding': path.resolve(__dirname, '../../packages/encoding/src'),
-      '@ifc-lite/ids': path.resolve(__dirname, '../../packages/ids/src'),
-      '@ifc-lite/lists': path.resolve(__dirname, '../../packages/lists/src'),
-    },
+    alias: viewerAliases,
   },
   server: {
     port: 3000,
@@ -292,6 +268,7 @@ export default defineConfig({
       allow: ['../..'],
     },
     proxy: {
+      '/api/autodesk': { target: 'http://127.0.0.1:3002', changeOrigin: false },
       '/api/chat': {
         // Single API source of truth lives at repo-root `api/chat.ts`.
         // For local dev, run `pnpm dev:api` from repo root.
@@ -307,11 +284,10 @@ export default defineConfig({
   },
   build: {
     target: 'esnext',
+    assetsDir: deploymentAssetsDir(process.env.VERCEL_DEPLOYMENT_ID, process.env.VERCEL_SKEW_PROTECTION_ENABLED), // #4886
     chunkSizeWarningLimit: 6000,
-    // Opt-in production source maps, for PostHog error tracking. Without them
-    // every captured stack frame is unreadable minified soup ("Could not find
-    // sourcemap for source url"), which is why triaging a production crash has
-    // meant hand-fetching the deployed bundle from its immutable deployment URL.
+    // Opt-in production source maps for PostHog error tracking: without them every
+    // captured stack frame is minified soup ("Could not find sourcemap for source url").
     //
     // Gated on VITE_SOURCEMAP rather than always-on for two reasons: rollup's
     // map generation for this bundle costs real build time and memory, and the
@@ -328,11 +304,22 @@ export default defineConfig({
       // longer ships a desktop app; downstream desktop builders supply
       // @tauri-apps in their own host layer.
       external: ['@tauri-apps/api/event'],
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        // E2E-only, not linked from the app UI: reads the laz-perf wasm
+        // asset pipeline through the real build so
+        // tests/e2e/laz-wasm.e2e.spec.ts can assert it end to end (#2097).
+        lazProbe: path.resolve(__dirname, 'laz-probe.html'),
+      },
       output: {
         manualChunks(id) {
+          // Assistant text edits need ChangeSet, not the lazy CodeMirror editor UI.
+          // Keep state separate so sharing it cannot pull the whole editor into startup.
+          if (id.includes('/node_modules/@codemirror/state/')) return 'codemirror-state';
           if (id.includes('/packages/sandbox/')) return 'sandbox';
           if (id.includes('/packages/export/')) return 'exporters';
           if (id.includes('/packages/server-client/')) return 'server-client';
+          if (id.includes('/packages/bcf-api/')) return 'bcf-api';
           if (id.includes('/packages/bcf/')) return 'bcf';
           if (id.includes('/packages/ids/')) return 'ids';
           if (id.includes('/packages/lens/')) return 'lens';
@@ -341,12 +328,26 @@ export default defineConfig({
           if (id.includes('/node_modules/apache-arrow/')) return 'arrow';
           if (id.includes('/node_modules/parquet-wasm/')) return 'parquet';
           if (id.includes('/node_modules/cesium/')) return 'cesium';
+          // ECharts (+ zrender) and the dashboard grid: reached only through the lazy Charts panel (#3944).
+          if (id.includes('/node_modules/echarts/') || id.includes('/node_modules/zrender/')) return 'echarts';
+          if (id.includes('/node_modules/react-grid-layout/')) return 'grid-layout';
+          // @radix-ui/@floating-ui run synchronous, top-level module-init
+          // code (e.g. react-tooltip's `createPopperScope()` at module
+          // scope). The default chunker otherwise merges them into whatever
+          // chunk also touches @/store, and the store transitively pulls in
+          // WASM modules that use real top-level await — vite-plugin-top-level-await
+          // then wraps that WHOLE merged chunk's body in a deferred
+          // `.then()`, so the synchronous radix init runs late. A sibling
+          // chunk that imports the same merged chunk but has no async taint
+          // of its own evaluates synchronously and calls into the
+          // not-yet-populated binding — "C is not a function" at module
+          // scope (issue #2243). Keep radix/floating-ui in their own chunk,
+          // clear of the store's async taint, so their module-init always
+          // finishes before anything can import from them.
+          if (id.includes('/node_modules/@radix-ui/') || id.includes('/node_modules/@floating-ui/')) return 'radix-ui';
           // three.js + addons — only the /mcp landing imports them, keep
           // the main viewer / pages off the hook.
-          if (
-            id.includes('/node_modules/three/') ||
-            id.includes('/node_modules/.pnpm/three@')
-          ) return 'three';
+          if (id.includes('/node_modules/three/') || id.includes('/node_modules/.pnpm/three@')) return 'three';
           return undefined;
         },
       },

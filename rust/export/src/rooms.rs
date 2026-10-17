@@ -4,9 +4,12 @@
 //! Source = `ifc_lite_geometry::extract_profiles` (analytic, NOT the render mesh — the
 //! render mesh drops sliver triangles and breaks watertightness; proven in the spike).
 //! `ExtractedProfile` is in renderer **Y-up** space (matching the JS bridge), so points
-//! and the extrusion direction are converted to Honeybee **Z-up** here. Coordinates are
-//! rebased to a model origin to keep f32 survey magnitudes (national-grid models) from
-//! collapsing precision. Pure geometry predicates live in [`crate::geom`].
+//! and the extrusion direction are converted to Honeybee **Z-up** here. The profile's
+//! world transform is f64 end to end (#7684), and its f64 world translation is rebased to
+//! the model origin, so national-grid models export small, full-precision coordinates.
+//! Pure geometry predicates live in [`crate::geom`].
+
+use std::collections::HashMap;
 
 use ifc_lite_geometry::ExtractedProfile;
 
@@ -15,21 +18,39 @@ use crate::geom::{
     polygon_area, xf, zup,
 };
 use crate::hbjson::{Face, Face3D, Room};
+use crate::ident::space_room_identifier;
 
-/// Build Honeybee Rooms from the `IfcSpace` profiles in `profiles`.
-///
-/// Returns the rooms, the model-wide rebase origin (so the openings pass can place window/
-/// door geometry in the same frame), and the count of `IfcSpace` profiles skipped as
-/// degenerate (so callers can report coverage rather than silently truncate).
+/// One `IfcSpace`'s cleaned floor profile in Honeybee Z-up space, rebased to the model
+/// origin: the simple, deduped-vertex floor ring plus the (Z-up) extrusion direction and
+/// depth. This is the analytic source both the HBJSON room builder (which extrudes it into
+/// a watertight prism) and the DFJSON Room2D builder (which projects it to 2D + heights)
+/// start from, so the floor-footprint extraction stays single-sourced.
+pub(crate) struct FloorProfile {
+    pub express_id: u32,
+    /// Which of the space's extruded items this is, counting from 0 in profile order
+    /// over every item (skipped ones included, so a sibling's skip never renames it).
+    /// Names the room via [`space_room_identifier`].
+    pub piece: u32,
+    /// Cleaned, simple, rebased Z-up floor ring.
+    pub floor: Vec<[f64; 3]>,
+    /// Z-up extrusion direction (unit).
+    pub dir: [f64; 3],
+    /// Extrusion depth in metres (signed along `dir`).
+    pub depth: f64,
+}
+
+/// Extract every `IfcSpace`'s cleaned floor ring + extrusion, with the model-wide rebase
+/// origin. Skips spaces that are degenerate (< 3 points / self-intersecting) or carry inner
+/// rings (holes are a follow-up); `skipped` counts those so callers can report coverage.
 // The `k` loops iterate the three coordinate components in lockstep; a range
 // loop over 0..3 reads more clearly than zipping the arrays.
 #[allow(clippy::needless_range_loop)]
-pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64; 3], usize) {
+pub(crate) fn floor_profiles(profiles: &[ExtractedProfile], tol: f64) -> (Vec<FloorProfile>, [f64; 3], usize) {
     let mut skipped = 0usize;
     let spaces: Vec<&ExtractedProfile> =
         profiles.iter().filter(|p| p.ifc_type == "IfcSpace").collect();
 
-    // Model-wide origin to rebase against (kills survey-coordinate f32 collapse).
+    // Model-wide origin the f64 world coordinates are rebased to (#7684).
     let mut origin = [f64::MAX; 3];
     for s in &spaces {
         let n = s.outer_points.len() / 2;
@@ -44,8 +65,14 @@ pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64;
         return (Vec::new(), [0.0; 3], skipped);
     }
 
-    let mut rooms = Vec::new();
+    let mut out = Vec::new();
+    let mut pieces: HashMap<u32, u32> = HashMap::new();
     for s in &spaces {
+        let piece = {
+            let next = pieces.entry(s.express_id).or_insert(0);
+            *next += 1;
+            *next - 1
+        };
         let n = s.outer_points.len() / 2;
         if n < 3 {
             skipped += 1;
@@ -74,6 +101,27 @@ pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64;
             skipped += 1;
             continue;
         }
+        out.push(FloorProfile { express_id: s.express_id, piece, floor, dir, depth });
+    }
+    (out, origin, skipped)
+}
+
+/// Build Honeybee Rooms from the `IfcSpace` profiles in `profiles`.
+///
+/// Returns the rooms, the model-wide rebase origin (so the openings pass can place window/
+/// door geometry in the same frame), and the count of `IfcSpace` profiles skipped as
+/// degenerate (so callers can report coverage rather than silently truncate).
+// The `k` loops iterate the three coordinate components in lockstep; a range
+// loop over 0..3 reads more clearly than zipping the arrays.
+#[allow(clippy::needless_range_loop)]
+pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64; 3], usize) {
+    let (fps, origin, mut skipped) = floor_profiles(profiles, tol);
+
+    let mut rooms = Vec::new();
+    for fp in &fps {
+        let floor = fp.floor.clone();
+        let dir = fp.dir;
+        let depth = fp.depth;
         let extruded: Vec<[f64; 3]> = floor
             .iter()
             .map(|p| [p[0] + dir[0] * depth, p[1] + dir[1] * depth, p[2] + dir[2] * depth])
@@ -132,15 +180,16 @@ pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64;
 
         // P1: ground the floor, everything else Outdoors. Interior adjacency (Surface BCs)
         // is solved downstream in Honeybee once gap-closing lands (P5).
+        let room_id = space_room_identifier(fp.express_id, fp.piece);
         let faces: Vec<Face> = oriented
             .into_iter()
             .enumerate()
             .map(|(fi, (b, face_type))| {
                 let bc = if face_type == "Floor" { "Ground" } else { "Outdoors" };
-                Face::new(format!("R{}_F{}", s.express_id, fi), Face3D::new(b), face_type, bc)
+                Face::new(format!("{room_id}_F{fi}"), Face3D::new(b), face_type, bc)
             })
             .collect();
-        rooms.push(Room::new(format!("R{}", s.express_id), faces));
+        rooms.push(Room::new(room_id, faces));
     }
 
     // Drop duplicate / strongly-overlapping spaces (Revit often carries an overlapping copy).
@@ -194,7 +243,10 @@ fn dedupe_colliding(rooms: Vec<Room>) -> (Vec<Room>, usize) {
     let sigs: Vec<Option<Sig>> = rooms.iter().map(room_signature).collect();
     let mut order: Vec<usize> = (0..rooms.len()).collect();
     let area_of = |i: usize| sigs[i].as_ref().map_or(0.0, |s| s.area);
-    order.sort_by(|&a, &b| area_of(b).partial_cmp(&area_of(a)).unwrap_or(std::cmp::Ordering::Equal));
+    // Largest first. A NaN area sorts first but is never a duplicate of anything
+    // (`is_duplicate` is false for it either way round), so the kept set does not
+    // depend on where it lands (#7674).
+    order.sort_by(|&a, &b| ifc_lite_geometry::cmp_f64_nan_last(area_of(b), area_of(a)));
     let mut keep = vec![false; rooms.len()];
     let mut kept: Vec<usize> = Vec::new();
     for &i in &order {
@@ -210,4 +262,95 @@ fn dedupe_colliding(rooms: Vec<Room>) -> (Vec<Room>, usize) {
     let dropped = keep.iter().filter(|k| !**k).count();
     let out = rooms.into_iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, r)| r).collect();
     (out, dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Column-major 4x4 (`xf`'s `c(row, col) = t[col*4+row]`) that maps a local 2D profile
+    // point `(px, py)` to the renderer Y-up world point `(px, 0, -py)` — i.e. a flat
+    // horizontal footprint whose local (px, py) becomes world (X, Z) once `zup` converts
+    // it to Honeybee Z-up `(px, py, 0)`. Paired with `extrusion_dir = [0, 1, 0]` (Y-up
+    // "up", `zup`'d to world `+Z`), this reproduces a real horizontal IfcSpace footprint
+    // extruded vertically — an all-identity transform instead leaves the profile's local
+    // Y axis mapped onto world Z, i.e. coplanar with the extrusion, so no test fixture may
+    // use plain identity here.
+    const FLAT_FOOTPRINT_TRANSFORM: [f64; 16] =
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+    fn space(express_id: u32, outer_points: Vec<f32>) -> ExtractedProfile {
+        ExtractedProfile {
+            express_id,
+            ifc_type: "IfcSpace".to_string(),
+            outer_points,
+            hole_counts: Vec::new(),
+            hole_points: Vec::new(),
+            transform: FLAT_FOOTPRINT_TRANSFORM,
+            extrusion_dir: [0.0, 1.0, 0.0], // Y-up "up" (becomes Z-up after conversion)
+            extrusion_depth: 3.0,
+            model_index: 0,
+        }
+    }
+
+    /// A well-formed 4x4m square footprint alongside a degenerate 2-point "footprint"
+    /// (malformed/collapsed profile, <3 points): `build_rooms` must skip only the
+    /// degenerate one and still emit the good room — this is the coverage contract
+    /// `HbjsonStats.skipped` exists to report (see `export_hbjson_with_stats`).
+    #[test]
+    fn build_rooms_skips_degenerate_profile_but_keeps_good_one() {
+        let good = space(1, vec![0.0, 0.0, 4.0, 0.0, 4.0, 4.0, 0.0, 4.0]);
+        let degenerate = space(2, vec![0.0, 0.0, 1.0, 1.0]); // only 2 points, <3 required
+        let profiles = vec![good, degenerate];
+
+        let (rooms, _origin, skipped) = build_rooms(&profiles, 0.01);
+
+        assert_eq!(skipped, 1, "expected exactly the 2-point profile to be skipped");
+        assert_eq!(rooms.len(), 1, "the well-formed square should still export");
+    }
+
+    /// #7674: the duplicate-room pass ordered rooms by floor area with
+    /// `partial_cmp(..).unwrap_or(Equal)`. A NaN area (a NaN floor vertex) past
+    /// the 20-element insertion-sort cutoff could panic the sort. A NaN-area room
+    /// is never a duplicate, so it is kept; a real duplicate still drops.
+    #[test]
+    fn dedupe_rooms_with_nan_areas_past_insertion_sort_cutoff_7674() {
+        let room = |id: u32, x: f64| -> Room {
+            let y = if id.is_multiple_of(3) { f64::NAN } else { 1.0 + x * 0.01 };
+            let floor = vec![[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x + 1.0, y, 0.0], [x, 1.0, 0.0]];
+            let roof: Vec<[f64; 3]> = floor.iter().map(|p| [p[0], p[1], 3.0]).collect();
+            Room::new(
+                format!("r{id}"),
+                vec![
+                    Face::new(format!("f{id}"), Face3D::new(floor), "Floor", "Ground"),
+                    Face::new(format!("c{id}"), Face3D::new(roof), "RoofCeiling", "Outdoors"),
+                ],
+            )
+        };
+        let mut rooms: Vec<Room> = (0..40u32).map(|i| room(i, i as f64 * 5.0)).collect();
+        rooms.push(Room { identifier: "copy".to_string(), ..room(1, 5.0) });
+        let (kept, dropped) = dedupe_colliding(rooms);
+        assert_eq!(dropped, 1);
+        let ids: Vec<String> = kept.iter().map(|r| r.identifier.clone()).collect();
+        assert_eq!(ids, (0..40).map(|i| format!("r{i}")).collect::<Vec<_>>());
+    }
+
+    /// `HbjsonStats` must round-trip through `serde_json` (it crosses the wasm boundary
+    /// via `serde_wasm_bindgen::to_value`, which relies on `Serialize`).
+    #[test]
+    fn hbjson_stats_serializes_camel_case() {
+        let stats = crate::HbjsonStats {
+            spaces: 2,
+            rooms: 1,
+            skipped: 1,
+            apertures: 0,
+            doors: 0,
+            shades: 0,
+            constructions: 0,
+            interior_adjacencies: 0,
+        };
+        let json = serde_json::to_string(&stats).expect("HbjsonStats serializes");
+        assert!(json.contains("\"interiorAdjacencies\""), "expected camelCase field, got {json}");
+        assert!(json.contains("\"skipped\":1"));
+    }
 }

@@ -21,7 +21,7 @@ my-tool/
         └── hello.js
 ```
 
-The scaffolded `hello.js` contributes one command (`ext.starter.hello`) and prints a greeting to the console. It passes `ext validate` as-is, but note the scaffold uses `export default async function hello(ctx)`; before it will run in the sandbox you must convert that to a plain top-level `async function hello(ctx)` (see [Writing entry code](#writing-entry-code) - entry files allow no `export` and no `import`). Validate it:
+The scaffolded `hello.js` contributes one command (`ext.starter.hello`) and returns a fixed greeting. It follows the entry-script contract as scaffolded: a plain top-level `function run(ctx)`, no `export`, no `ctx.log`/`ctx.notify` (see [Writing entry code](#writing-entry-code) - entry files allow no `export` and no `import`, and `ctx` is `{ bim }`). Validate it:
 
 ```bash
 npx @ifc-lite/cli ext validate my-tool
@@ -89,7 +89,7 @@ The manifest is the contract between your bundle and the host. Every field is ha
 
 | Field | Purpose |
 |-------|---------|
-| `manifestVersion` | Schema version (currently `1`). The migration chain handles future versions. |
+| `manifestVersion` | Schema version (currently `1`). New contribution types are added without a bump: a host ignores `contributes` keys it does not know, so a bundle using a newer contribution still loads, minus that contribution, in an older viewer. |
 | `id` | Stable reverse-DNS identifier, lowercase, dot/underscore/hyphen-separated. |
 | `name` | Display name shown in the Extensions panel and Command Palette. |
 | `description` | One-paragraph explanation. |
@@ -112,9 +112,31 @@ The manifest is the contract between your bundle and the host. Every field is ha
 | `contextMenu` | Items in `contextMenu.entity` / `contextMenu.canvas` / `contextMenu.tree`. |
 | `keybindings` | Keyboard shortcuts bound to a command. |
 | `lenses` | Visualisation presets registered in the lens library. |
-| `exporters` | Custom export formats added to the export menu. |
+| `exporters` | Custom export formats added to the export menu, the ribbon's Export group and the command palette. The file is named after the active model. |
 | `idsValidators` | Custom IDS rule validators. |
 | `statusBar` | Items in `statusBar.left` / `statusBar.right`. |
+| `flows` | `.flow.json` graphs shipped with the bundle, listed in the viewer's Flow panel (since #5167 Phase 4.2). Older viewers skip this key and load the rest of the extension. |
+
+#### Shipping a flow graph
+
+```json
+"contributes": {
+  "flows": [
+    {
+      "id": "fire-rating-audit",
+      "name": "Fire rating audit",
+      "description": "Flags walls missing Pset_WallCommon.FireRating.",
+      "path": "flows/fire-rating-audit.flow.json"
+    }
+  ]
+}
+```
+
+`path` is a bundle-relative path to the `*.flow.json` file, cross-referenced against the bundle's file list the same way `exporters[].handler` is — a missing file fails the bundle build. The graph itself is validated when the extension loads: `parseFlowDocument` (structural) and `validateFlowWiring` (registry-aware, the same check the viewer runs on a graph you draw by hand). A graph that fails either check is skipped — named by extension and graph id in a console diagnostic — without taking down the extension's other contributions.
+
+The graph's own `capabilities` array is bounded by what the user actually granted your extension at install (`grantedCapabilities`), not by what your manifest merely declares — a graph asking for more than your extension was granted is rejected the same way a malformed graph is.
+
+In the Flow panel, a contributed graph appears in its own group, marked with its source extension, and is **read-only**: it can be run, but not edited or deleted, until the user clicks "Duplicate to my graphs", which copies it into their own saved graphs under a fresh id. Contributed graph ids are namespaced `ext:<extensionId>:<graphId>` so they can never collide with, or overwrite, a user's own saved graph; uninstalling or disabling the extension removes its graphs from the panel.
 
 #### Writing an exporter that produces CSV
 
@@ -123,6 +145,11 @@ That path escapes leading `=`, `+`, `-`, `@`, tab and carriage return, which
 Excel, Sheets and LibreOffice otherwise treat as a live formula (CWE-1236). A
 model can carry those characters in any text property, so a hand-built CSV
 exports them straight into a spreadsheet as executable content.
+
+A cell that is wholly a number (`-0.35`, `+1`) is deliberately left unescaped,
+so exported measures still sum. It cannot carry a formula: the only characters
+it may contain are `+ - . e E` and the digits, which spell no function name and
+no cell reference. `-0.35=cmd` is not wholly a number and is still escaped.
 
 The host cannot add that guard for you. What an exporter returns is an opaque
 blob, and escaping it would mean parsing arbitrary third-party CSV and would
@@ -414,3 +441,26 @@ The signature commits to a canonical hash of the bundle contents + the `signedAt
 - [Extensions](extensions.md) — install and use extensions
 - [Flavors](flavors.md) — bundle your extensions into a shareable profile
 - [CLI reference](cli.md#ext-extension-toolkit) — every `ext` subcommand with flags
+
+For native integrations, `NetworkDeniedError.dispatched` from
+`@ifc-lite/sandbox/network` is `false` for a URL/scheme/host refusal before
+network dispatch, `true` for a refused redirect response, and otherwise
+unqualified. A refused redirect does not prove that a POST had no effect;
+preserve unresolved write intent instead of retrying automatically.
+
+Direct BCF create errors expose safe failure class and valid HTTP status instead of
+remote response bodies, detail URLs or causes. Local preflight diagnostics and
+publication gateway refusal/recovery text are retained after actual bearer
+redaction. An actual non-2xx redirect response remains uncertain even when the
+HTTP client reports it as an API error; it never authorizes an automatic retry.
+
+BCF write receipts keep the validated primary `guid` and optional comment
+`topic_guid`, `viewpoint_guid` and `reply_to_comment_guid` values and their fixed
+protocol keys unchanged, including null optional relationships. If the server
+returns an identifier containing the actual bearer, the
+write reports an unknown outcome before owned receipt settlement or output;
+there is no automatic retry. DTO data and dynamic keys remain redacted. A short
+bearer matching part of the fixed protocol field name does not rename that key.
+The browser journal validates closed intent/payload schemas and inspects known
+credential values and dynamic keys; fixed names such as `topicGuid` are protocol
+names. Unknown fields and credential values or syntax remain refused.

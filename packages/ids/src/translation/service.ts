@@ -17,17 +17,19 @@ import type {
   RequirementOptionality,
 } from '../types.js';
 
+import {
+  describeConstraint as renderConstraint,
+  interpolate as interpolateTemplate,
+} from './describe-constraint.js';
 import { en } from './locales/en.js';
 import { de } from './locales/de.js';
 import { fr } from './locales/fr.js';
+import { it } from './locales/it.js';
+import { describeWithNestedFacets } from '../preview/partof-nested.js';
 
 type Translations = typeof en;
 
-const LOCALES: Record<SupportedLocale, Translations> = {
-  en,
-  de,
-  fr,
-};
+const LOCALES: Record<SupportedLocale, Translations> = { en, de, fr, it };
 
 /**
  * Create a translation service for the specified locale
@@ -83,23 +85,21 @@ class IDSTranslationServiceImpl implements TranslationService {
     template: string,
     params: Record<string, string | number>
   ): string {
-    return template.replace(/\{(\w+)\}/g, (match, key) => {
-      if (key in params) {
-        return String(params[key]);
-      }
-      return match;
-    });
+    return interpolateTemplate(template, params);
   }
 
   /**
-   * Describe a facet in human-readable form
+   * Describe a constraint value in human-readable form
    */
+  describeConstraint(constraint: IDSConstraint): string {
+    return renderConstraint(constraint, this.translations);
+  }
+
+  /** Describe a facet in human-readable form */
   describeFacet(
     facet: IDSFacet,
     context: 'applicability' | 'requirement'
   ): string {
-    const t = this.translations;
-
     switch (facet.type) {
       case 'entity':
         return this.describeEntityFacet(facet, context);
@@ -111,8 +111,8 @@ class IDSTranslationServiceImpl implements TranslationService {
         return this.describeClassificationFacet(facet, context);
       case 'material':
         return this.describeMaterialFacet(facet, context);
-      case 'partOf':
-        return this.describePartOfFacet(facet, context);
+      case 'partOf': // IDS 1.1 PREVIEW nested facets, if any, follow in brackets
+        return describeWithNestedFacets(facet, this.describePartOfFacet(facet, context), (n) => this.describeFacet(n, 'applicability'));
       default:
         return 'Unknown facet';
     }
@@ -331,7 +331,7 @@ class IDSTranslationServiceImpl implements TranslationService {
     context: 'applicability' | 'requirement'
   ): string {
     const t = this.translations;
-    const relation = this.getRelationDescription(facet.relation);
+    const relation = facet.anyRelation ? t.anyRelation : this.getRelationDescription(facet.relation);
 
     if (context === 'applicability') {
       if (facet.entity) {
@@ -359,76 +359,7 @@ class IDSTranslationServiceImpl implements TranslationService {
     }
   }
 
-  /**
-   * Describe a constraint value in human-readable form
-   */
-  describeConstraint(constraint: IDSConstraint): string {
-    const t = this.translations;
-
-    switch (constraint.type) {
-      case 'simpleValue':
-        return this.interpolate(t.constraints.simpleValue, {
-          value: constraint.value,
-        });
-
-      case 'pattern':
-        return this.interpolate(t.constraints.pattern, {
-          pattern: constraint.pattern,
-        });
-
-      case 'enumeration':
-        if (constraint.values.length === 1) {
-          return this.interpolate(t.constraints.enumeration.single, {
-            value: constraint.values[0],
-          });
-        }
-        return this.interpolate(t.constraints.enumeration.multiple, {
-          values: constraint.values.map((v) => `"${v}"`).join(', '),
-        });
-
-      case 'bounds':
-        return this.describeBounds(constraint);
-
-      default:
-        return 'unknown constraint';
-    }
-  }
-
-  private describeBounds(constraint: IDSConstraint & { type: 'bounds' }): string {
-    const t = this.translations.constraints.bounds;
-
-    if (
-      constraint.minInclusive !== undefined &&
-      constraint.maxInclusive !== undefined
-    ) {
-      return this.interpolate(t.between, {
-        min: constraint.minInclusive,
-        max: constraint.maxInclusive,
-      });
-    }
-
-    if (constraint.minInclusive !== undefined) {
-      return this.interpolate(t.atLeast, { min: constraint.minInclusive });
-    }
-
-    if (constraint.maxInclusive !== undefined) {
-      return this.interpolate(t.atMost, { max: constraint.maxInclusive });
-    }
-
-    if (constraint.minExclusive !== undefined) {
-      return this.interpolate(t.greaterThan, { min: constraint.minExclusive });
-    }
-
-    if (constraint.maxExclusive !== undefined) {
-      return this.interpolate(t.lessThan, { max: constraint.maxExclusive });
-    }
-
-    return 'any value';
-  }
-
-  /**
-   * Describe a failure in human-readable form
-   */
+  /** Describe a failure in human-readable form */
   describeFailure(result: IDSRequirementResult): string {
     const t = this.translations.failures;
 
@@ -488,9 +419,7 @@ class IDSTranslationServiceImpl implements TranslationService {
             available: context.availablePsets,
           });
         }
-        return this.interpolate(t.psetMissing, {
-          pset: field || expected || '?',
-        });
+        return this.interpolate(t.psetMissing, { pset: field || expected || '?' });
 
       case 'PROPERTY_MISSING':
         if (context?.availableProperties) {
@@ -505,6 +434,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           pset: context?.propertySet || '?',
         });
 
+      case 'PROPERTY_EMPTY':
+        return this.interpolate(t.propertyEmpty, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field) });
       case 'PROPERTY_VALUE_MISMATCH':
         return this.interpolate(t.propertyValueMismatch, {
           pset: this.extractPsetFromField(field),
@@ -513,6 +444,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'PROPERTY_DATATYPE_UNKNOWN':
+        return this.interpolate(t.propertyDatatypeUnknown, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field), expected: expected || '?' });
       case 'PROPERTY_DATATYPE_MISMATCH':
         return this.interpolate(t.propertyDatatypeMismatch, {
           pset: this.extractPsetFromField(field),
@@ -557,9 +490,14 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'CLASSIFICATION_UNRESOLVED':
+        return field === 'presence' ? t.classificationPresenceUnresolved : t.classificationUnresolved;
+
       // Material failures
       case 'MATERIAL_MISSING':
         return t.materialMissing;
+      case 'MATERIAL_UNRESOLVED':
+        return t.materialUnresolved;
 
       case 'MATERIAL_VALUE_MISMATCH':
         if (context?.availableMaterials) {
@@ -574,20 +512,15 @@ class IDSTranslationServiceImpl implements TranslationService {
         });
 
       // PartOf failures
-      case 'PARTOF_RELATION_MISSING':
-        if (context?.entity) {
-          return this.interpolate(t.partOfMissing, {
-            relation: this.getRelationDescription(
-              field as PartOfRelation || 'IfcRelContainedInSpatialStructure'
-            ),
-            entity: context.entity,
-          });
-        }
-        return this.interpolate(t.partOfMissingSimple, {
-          relation: this.getRelationDescription(
-            field as PartOfRelation || 'IfcRelContainedInSpatialStructure'
-          ),
-        });
+      case 'PARTOF_RELATION_MISSING': {
+        // 'part of' is the facet's key for no relation: any relation counts (#7401).
+        const relation = field === 'part of'
+          ? this.translations.anyRelation
+          : this.getRelationDescription((field as PartOfRelation) || 'IfcRelContainedInSpatialStructure');
+        return context?.entity
+          ? this.interpolate(t.partOfMissing, { relation, entity: context.entity })
+          : this.interpolate(t.partOfMissingSimple, { relation });
+      }
 
       case 'PARTOF_ENTITY_MISMATCH':
         return this.interpolate(t.partOfEntityMismatch, {
@@ -656,9 +589,7 @@ class IDSTranslationServiceImpl implements TranslationService {
       .replace(/^Doit/i, 'Devrait');
   }
 
-  /**
-   * Get status text
-   */
+  /** Get status text */
   getStatusText(status: 'pass' | 'fail' | 'not_applicable'): string {
     return this.translations.status[status];
   }

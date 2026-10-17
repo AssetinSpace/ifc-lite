@@ -23,7 +23,8 @@ import { evaluateLens, BUILTIN_LENSES } from '@ifc-lite/lens';
 // columns red, beams blue, slabs yellow, footings green
 const structural = BUILTIN_LENSES.find((l) => l.id === 'lens-structural')!;
 
-const result = evaluateLens(structural, provider);
+declare const selectedByRule: ReadonlyMap<string, ReadonlySet<number>>;
+const result = evaluateLens(structural, provider, selectedByRule);
 
 result.colorMap;      // Map<expressId (number), [r, g, b, a]> (0-1 range)
 result.hiddenIds;     // Set<expressId (number)> from 'hide' rules
@@ -32,6 +33,10 @@ result.executionTime; // ms
 ```
 
 The `provider` is a `LensDataProvider`, an adapter interface over your parsed model data (entity types, property values, materials, and so on), so the package is renderer- and parser-agnostic.
+
+A saved `Lens.capturedScope` pins exact selected or visible members at capture time. It applies to manual rules, their unassigned context, and automatic color buckets; later selection and visibility changes do not change the captured population. For automatic color, pass the same metadata as the optional third argument to `evaluateAutoColorLens(spec, provider, capturedScope)`. A provider serving a captured lens must implement `resolveCapturedScope(scope)` and return its validated native global IDs. A provider without that capability refuses the run.
+
+The shared Rules `resolveCapturedEntityScope` validates the full source identity and every member before evaluation. Missing or ambiguous files, replaced source bytes, deleted members, and reused authored IDs refuse rather than becoming an unscoped lens. Authored members also need their original authored record creation identity; reconstructing a view without that identity requires a new capture. Normal authored edits and delete undo retain membership.
 
 ## Built-in Lenses
 
@@ -44,31 +49,24 @@ The `provider` is a `LensDataProvider`, an adapter interface over your parsed mo
 | `lens-envelope` | Building Envelope | Roofs, curtain walls, windows, doors, walls |
 | `lens-openings` | Openings & Circulation | Doors, windows, stairs, ramps, railings |
 | `lens-auto-material` | By Material | Auto-colors by material name |
+| `lens-by-stage` | By Stage | Auto-colors vendor `CESIUM.Stage` property values |
 | `lens-by-model` | By Model | Auto-colors by source model (federation) |
 | `lens-by-zone` | By Zone | Auto-colors by IfcZone/IfcGroup membership |
 
-## Rule Criteria
+## Rule Filters
 
-`LensCriteria.type` selects the axis, and the matching fields provide the values:
-
-| Type | Fields | Matches |
-|------|--------|---------|
-| `ifcType` | `ifcType` | Entity class (e.g. `IfcWall`) |
-| `property` | `propertySet`, `propertyName`, `operator?`, `propertyValue?` | A pset property value |
-| `material` | `materialName` | Associated material |
-| `attribute` | `attributeName`, `attributeValue?` | Direct attribute (Name, ObjectType, ...) |
-| `quantity` | `quantitySet`, `quantityName`, `quantityValue?` | A quantity value |
-| `classification` | `classificationSystem`, `classificationCode?` | Classification reference |
-| `model` | `modelId` | Source model in a federation |
-| `group` | `groupName` | IfcZone/IfcGroup membership |
-
-Operators for value comparison: `equals` (exact; booleans compared case-insensitively), `contains` (case-insensitive substring), and `exists` (the property is present at all).
-
-Each rule holds exactly one criterion; there is no compound AND. A property rule matches any entity carrying that property, regardless of class. To test a single entity programmatically, use `matchesCriteria(criteria, globalId, provider)`.
+The viewer Lens editor now authors `FilterGroup[]` chips using the same selector
+as Search and Lists. Saved v1 `criteria` are converted when their meaning is
+exactly representable; other saved conditions remain visible with a warning
+until the user explicitly replaces them. For programmatic evaluation, pass a
+map of rule IDs to selected global IDs as the required third argument to
+`evaluateLens`. Missing rule IDs match nothing. The viewer keeps the saved v1
+criteria shape private to its JSON migration path; the published Lens package
+exposes only shared group based manual rules.
 
 ## Worked Example: Color by Fire Rating
 
-Hand-authored rules, one per rating value you care about:
+Hand-authored groups, one rule per rating value you care about:
 
 ```typescript
 import { evaluateLens, type Lens } from '@ifc-lite/lens';
@@ -81,13 +79,13 @@ const fireLens: Lens = {
       id: 'fr-90',
       name: 'REI 90',
       enabled: true,
-      criteria: {
-        type: 'property',
-        propertySet: 'Pset_WallCommon',
-        propertyName: 'FireRating',
-        operator: 'equals',
-        propertyValue: '90',
-      },
+      groups: [{
+        combinator: 'AND',
+        rules: [{
+          kind: 'property', setName: 'Pset_WallCommon', setNameKind: 'literal',
+          propertyName: 'FireRating', propertyNameKind: 'literal', op: 'eq', value: '90',
+        }],
+      }],
       action: 'colorize',
       color: '#E53935',
     },
@@ -95,7 +93,10 @@ const fireLens: Lens = {
   ],
 };
 
-const result = evaluateLens(fireLens, provider);
+// Evaluate each rule's groups with @ifc-lite/rules, then map its rows to
+// global IDs before applying the Lens actions.
+declare const selectedByRule: ReadonlyMap<string, ReadonlySet<number>>;
+const result = evaluateLens(fireLens, provider, selectedByRule);
 ```
 
 Or let auto-color enumerate every distinct rating and build the palette and legend for you:
@@ -134,21 +135,22 @@ const sources = discoverDataSources(provider, { properties: true, materials: tru
 
 ## Applying Results to the Renderer
 
-`result.colorMap` is a `Map<number, [r, g, b, a]>` with components in the 0-1 range, which is exactly what `Scene.setColorOverrides` in `@ifc-lite/renderer` accepts:
+`result.colorMap` is a `Map<number, [r, g, b, a]>` with components in the 0-1 range, which is exactly what `SceneContents.setColorOverrides` in `@ifc-lite/renderer` accepts:
 
 ```typescript
 import { evaluateLens, BUILTIN_LENSES } from '@ifc-lite/lens';
 
-const lensResult = evaluateLens(BUILTIN_LENSES[0], provider);
+declare const selectedByRule: ReadonlyMap<string, ReadonlySet<number>>;
+const lensResult = evaluateLens(BUILTIN_LENSES[0], provider, selectedByRule);
 
-// scene is a Scene from @ifc-lite/renderer
+// scene is a SceneContents, from renderer.getScene()
 scene.setColorOverrides(lensResult.colorMap, device, pipeline);
 
 // remove the lens
 scene.clearColorOverrides();
 ```
 
-Color overrides are rendered as overlay batches on top of the original geometry, so the base model is never modified; `hiddenIds` is applied separately through your visibility mechanism. Ghosted (unmatched) entries carry a shared ghost color you can detect with `isGhostColor` if you want to filter them out of legends.
+Color overrides are shaded from a per-entity color table during opaque model draws, so the base model is never modified or copied. An eligible opaque mesh that streams in after the call is painted too; `hiddenIds` is applied separately through your visibility mechanism. Ghosted (unmatched) entries carry a shared ghost color you can detect with `isGhostColor` if you want to filter them out of legends.
 
 This is exactly how the viewer wires it: the Lens panel evaluates the active lens, pushes `colorMap` into the store, and the geometry streaming hook calls `scene.setColorOverrides` on the next frame. See [Rendering](rendering.md) for the renderer setup.
 
@@ -156,11 +158,16 @@ This is exactly how the viewer wires it: the Lens panel evaluates the active len
 
 | Export | Description |
 |--------|-------------|
-| `evaluateLens(lens, provider)` | Run rule-based lens, returns `LensEvaluationResult` |
-| `evaluateAutoColorLens(spec, provider)` | Group-by-value colorization with legend |
-| `matchesCriteria(criteria, globalId, provider)` | Test one entity against one criterion |
+| `evaluateLens(lens, provider, matchedByRule)` | Apply rule actions to shared evaluator global-ID sets; returns `LensEvaluationResult` |
+| `evaluateAutoColorLens(spec, provider, capturedScope?)` | Group-by-value colorization with legend and optional captured membership |
 | `discoverClasses(provider)` / `discoverDataSources(provider, categories)` | Populate editor UIs |
 | `BUILTIN_LENSES` | The seven built-in presets |
 | `hexToRgba` / `rgbaToHex` / `uniqueColor` / `isGhostColor` / `GHOST_COLOR` | Color helpers |
 
-Key types: `Lens`, `LensRule`, `LensCriteria`, `AutoColorSpec`, `LensEvaluationResult`, `LensDataProvider`, `RGBAColor`.
+Key types: `Lens`, `LensRule`, `AutoColorSpec`, `LensEvaluationResult`, `LensDataProvider`, `RGBAColor`.
+
+## Construction-stage tagging
+
+In **Author → Bulk Edit**, choose **Construction stage preset**. It targets the current selection and prepares an integer `CESIUM.Stage` property, initially `1`. Review the selection and value before applying. Assignments support workspace undo and are preserved in exported IFC. Select the **By Stage** Lens to color the assigned stages; unassigned elements are ghosted.
+
+`CESIUM.Stage` is vendor metadata, separate from standard IFC tasks and schedules. The preset and Lens adapt the workflow published by the [GeoBIM MPL fork](https://github.com/christof2304/ifc-lite/releases/tag/geobim-2026-09-24), using IFClite's existing editing and visualization paths.

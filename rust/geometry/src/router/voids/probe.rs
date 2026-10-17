@@ -8,7 +8,6 @@ use super::geom::*;
 use super::{GeometryRouter, RectParam, MAX_EXTRUSION_EXTRACT_DEPTH};
 use crate::profile::Profile2D;
 use crate::profiles::ProfileProcessor;
-use crate::router::is_body_representation;
 use crate::{Error, Mesh, Point3, Result, Vector3};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use nalgebra::{Matrix3, Matrix4};
@@ -111,20 +110,15 @@ impl GeometryRouter {
                     let rep_attr = source.get(1)?;
                     let rep = decoder.resolve_ref(rep_attr).ok()??;
 
-                    // MappingTarget (attribute 1) -> instance transform
-                    if let Some(target_attr) = current.get(1) {
-                        if !target_attr.is_null() {
-                            if let Ok(Some(target)) = decoder.resolve_ref(target_attr) {
-                                if let Ok(map) =
-                                    self.parse_cartesian_transformation_operator(&target, decoder)
-                                {
-                                    mapping_chain = Some(match mapping_chain.take() {
-                                        Some(chain) => chain * map,
-                                        None => map,
-                                    });
-                                }
-                            }
-                        }
+                    // MappingTarget · MappingOrigin -> instance transform (#1985).
+                    // A composition that fails to parse abandons the probe (the
+                    // caller falls back to the exact kernel) rather than reporting
+                    // an extrusion direction resolved in the wrong frame.
+                    if let Some(map) = self.mapped_item_transform(&current, &source, decoder).ok()? {
+                        mapping_chain = Some(match mapping_chain.take() {
+                            Some(chain) => chain * map,
+                            None => map,
+                        });
                     }
 
                     // Get first item from representation
@@ -244,7 +238,7 @@ impl GeometryRouter {
     /// the main mesh path (`process_element` /
     /// `process_element_with_submeshes_impl`): the effective representation type
     /// (`RepresentationType`, falling back to the `RepresentationIdentifier`
-    /// when blank — CATIA #1661) filtered by [`is_body_representation`], with a
+    /// when blank — CATIA #1661) filtered by [`crate::router::is_body_representation`], with a
     /// `MappedRepresentation` skipped when the element also carries direct body
     /// geometry (the mesh path's de-dup, so the fast path reads the same solids
     /// the renderer draws). Items from EVERY qualifying representation are
@@ -269,7 +263,7 @@ impl GeometryRouter {
         // is skipped only when the element ALSO carries direct body geometry.
         let has_direct_geometry = reps.iter().any(|sr| {
             sr.ifc_type == IfcType::IfcShapeRepresentation
-                && crate::router::effective_rep_type(sr)
+                && crate::router::effective_element_rep_type(element, sr)
                     .map(crate::router::is_direct_body_representation)
                     .unwrap_or(false)
         });
@@ -278,7 +272,7 @@ impl GeometryRouter {
             if sr.ifc_type != IfcType::IfcShapeRepresentation {
                 continue;
             }
-            let Some(rt) = crate::router::effective_rep_type(&sr) else {
+            let Some(rt) = crate::router::effective_element_rep_type(element, &sr) else {
                 continue;
             };
             if rt == "MappedRepresentation" && has_direct_geometry {
@@ -298,50 +292,6 @@ impl GeometryRouter {
             None
         } else {
             Some(items)
-        }
-    }
-
-    /// Whether an `IfcMappedItem`'s `RepresentationMap.MappingOrigin` (attr 0) is
-    /// a geometric no-op for the fast-path solid recovery.
-    ///
-    /// The `IfcMappedItem` MESH path drops `MappingOrigin` entirely and applies
-    /// ONLY the `MappingTarget` operator (see
-    /// [`GeometryRouter::process_mapped_item_cached`] and
-    /// `profile_extractor::extract_mapped_item_profiles`, whose composed
-    /// transform is `elem_transform · mapping_target`). To stay bit-for-bit
-    /// consistent with that rendered geometry — the very geometry the exact void
-    /// kernel also cuts — this fast path must drop it too. A non-identity origin
-    /// would shift the recovered solid off the rendered mesh, so we only proceed
-    /// when the origin provably has no effect; otherwise the caller defers the
-    /// whole opening/host to the exact kernel. Returns `true` when the origin is
-    /// absent / null / an identity `IfcAxis2Placement3D`, `false` when it is
-    /// non-identity, a 2D placement, or cannot be confirmed identity.
-    fn mapping_origin_is_identity(
-        &self,
-        source: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-    ) -> bool {
-        let Some(origin_attr) = source.get(0) else {
-            return true; // no MappingOrigin attribute -> no effect
-        };
-        if origin_attr.is_null() {
-            return true;
-        }
-        let origin = match decoder.resolve_ref(origin_attr) {
-            Ok(Some(e)) => e,
-            _ => return false, // present but unresolvable -> defer
-        };
-        // Only a 3D identity placement is a provable no-op for the 3D solid
-        // recovery; a 2D placement (or anything else) -> defer.
-        if origin.ifc_type != IfcType::IfcAxis2Placement3D {
-            return false;
-        }
-        match self.parse_axis2_placement_3d(&origin, decoder) {
-            Ok(m) => {
-                let id = Matrix4::<f64>::identity();
-                m.iter().zip(id.iter()).all(|(a, b)| (a - b).abs() < 1e-9)
-            }
-            Err(_) => false,
         }
     }
 
@@ -369,22 +319,19 @@ impl GeometryRouter {
                 IfcType::IfcMappedItem => {
                     let source = decoder.resolve_ref(current.get(0)?).ok()??;
                     let mapped_rep = decoder.resolve_ref(source.get(1)?).ok()??;
-                    // The mesh path drops MappingOrigin (applies only
-                    // MappingTarget); a non-identity origin would shift the
-                    // recovered box off the rendered solid, so defer.
-                    if !self.mapping_origin_is_identity(&source, decoder) {
-                        return None;
-                    }
-                    if let Some(t) = current.get(1) {
-                        if !t.is_null() {
-                            if let Ok(Some(te)) = decoder.resolve_ref(t) {
-                                if let Ok(m) =
-                                    self.parse_cartesian_transformation_operator(&te, decoder)
-                                {
-                                    chain *= m;
-                                }
-                            }
-                        }
+                    // MappingTarget · MappingOrigin, matching the mesh path
+                    // exactly (#1985 taught the mesh path the origin; before
+                    // that this probe had to DEFER whenever the origin was
+                    // non-identity, since the recovered box would have sat off
+                    // the rendered solid).
+                    //
+                    // A composition that FAILS to parse defers the whole item to
+                    // the exact kernel (`?`) instead of continuing with an
+                    // identity chain: swallowing the error would recover a box in
+                    // the wrong frame, which is exactly what the removed
+                    // non-identity-origin guard used to prevent.
+                    if let Some(m) = self.mapped_item_transform(&current, &source, decoder).ok()? {
+                        chain *= m;
                     }
                     current =
                         decoder.resolve_ref_list(mapped_rep.get(3)?).ok()?.into_iter().next()?;
@@ -423,9 +370,25 @@ impl GeometryRouter {
         let w = dir_local.try_normalize(1e-12)?;
         let m = placement * chain * solid_pos;
         let rot = m.fixed_view::<3, 3>(0, 0).into_owned();
-        let uu = (rot * u).try_normalize(1e-9)?;
-        let vv = (rot * v).try_normalize(1e-9)?;
-        let ww = (rot * w).try_normalize(1e-9)?;
+        let (ru, rv, rw) = (rot * u, rot * v, rot * w);
+        let uu = ru.try_normalize(1e-9)?;
+        let vv = rv.try_normalize(1e-9)?;
+        let ww = rw.try_normalize(1e-9)?;
+        // A mapped chain can carry SCALE (an IfcCartesianTransformationOperator's
+        // Scale / Scale2 / Scale3), which normalizing the axes above discards. The
+        // profile's authored XDim/YDim/Depth must pick it up from the transformed
+        // axis LENGTHS, or a Scale = 1000 mapped opening recovers a cutter 1000x
+        // too small while the mesh renders the big one. Exactly 1.0 is substituted
+        // for a length that is 1 to within 1e-9, so a pure-rotation chain (every
+        // corpus opening) keeps its previous bits. #1985
+        let axis_scale = |n: f64| if (n - 1.0).abs() < 1e-9 { 1.0 } else { n };
+        let (su, sv, sw) = (axis_scale(ru.norm()), axis_scale(rv.norm()), axis_scale(rw.norm()));
+        // A RectParam is an ORIENTED BOX, so the transformed axes must stay mutually
+        // perpendicular. A shearing chain would silently recover a box that is not
+        // the rendered solid; defer it to the exact kernel instead.
+        if uu.dot(&vv).abs() > 1e-6 || uu.dot(&ww).abs() > 1e-6 || vv.dot(&ww).abs() > 1e-6 {
+            return None;
+        }
         let center_local = Point3::new(off_x, off_y, 0.0) + w * (depth * 0.5);
         let center_native = m.transform_point(&center_local);
         let s = self.unit_scale;
@@ -437,7 +400,11 @@ impl GeometryRouter {
                 center_native.y * s - ry,
                 center_native.z * s - rz,
             ),
-            half: [x_dim * 0.5 * s, y_dim * 0.5 * s, depth * 0.5 * s],
+            half: [
+                x_dim * 0.5 * su * s,
+                y_dim * 0.5 * sv * s,
+                depth * 0.5 * sw * s,
+            ],
         })
     }
 
@@ -521,15 +488,10 @@ impl GeometryRouter {
 
         let mut item_meshes = Vec::new();
 
-        for shape_rep in representations {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
-            if let Some(rep_type) = crate::router::effective_rep_type(&shape_rep) {
-                if !is_body_representation(rep_type) {
-                    continue;
-                }
-            }
+        // The representations the mesh path meshes: body only, and a
+        // MappedRepresentation skipped when direct body geometry duplicates
+        // it, so one void yields one cutter, not two (ROUTER-28, #7690).
+        for shape_rep in crate::router::meshed_representations(element, &representations) {
             let items_attr = match shape_rep.get(3) {
                 Some(attr) => attr,
                 None => continue,
@@ -540,19 +502,26 @@ impl GeometryRouter {
             };
 
             for item in items {
-                let mut mesh = match self.process_representation_item(&item, decoder) {
-                    Ok(m) if !m.is_empty() => m,
-                    _ => continue,
+                // A raw national-grid cutter rebases in this opening's own
+                // frame, like the host it cuts (#5698).
+                // A mapped source mixing frames yields one cutter per frame (#6446).
+                let item_parts = match self.process_raw_item_for_element(&item, element, decoder) {
+                    Ok(Some(mesh)) => Ok(vec![mesh]),
+                    Ok(None) => self.process_representation_item_parts(&item, decoder),
+                    Err(error) => Err(error),
                 };
+                let Ok(item_parts) = item_parts else { continue };
+                for mut mesh in item_parts.into_iter().filter(|mesh| !mesh.is_empty()) {
+                    // Keep ordinary opening cutters in the world/RTC frame. A large
+                    // mapped origin, or a cutter far from the RTC origin (#6478),
+                    // would lose its fractional translation when the world point is
+                    // cast to f32; the void context folds each cutter's origin into
+                    // the host frame before cutting.
+                    let frame_cutter = self.needs_local_frame(&mesh, &placement_transform);
+                    self.transform_mesh_world_framed(&mut mesh, &placement_transform, frame_cutter);
 
-                // Keep the host in absolute world/RTC coordinates here: the void cut
-                // (`apply_void_context`) matches it against world-coordinate opening
-                // cutters, so relativizing the host now would silently break every
-                // cut. The per-element local-origin relativization is applied to the
-                // CSG OUTPUT instead (shared host+cutter frame).
-                self.transform_mesh_world_framed(&mut mesh, &placement_transform, false);
-
-                item_meshes.push(mesh);
+                    item_meshes.push(mesh);
+                }
             }
         }
 
@@ -594,18 +563,8 @@ impl GeometryRouter {
 
         let mut bounds_list = Vec::new();
 
-        for shape_rep in representations {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
-
-            // Check representation type
-            if let Some(rep_type) = crate::router::effective_rep_type(&shape_rep) {
-                if !is_body_representation(rep_type) {
-                    continue;
-                }
-            }
-
+        // Same representation selection as `get_opening_item_meshes_world`.
+        for shape_rep in crate::router::meshed_representations(element, &representations) {
             // Get items list
             let items_attr = match shape_rep.get(3) {
                 Some(attr) => attr,
@@ -640,77 +599,87 @@ impl GeometryRouter {
                     None
                 };
 
-                // Get mesh bounds (same as original function)
-                let mesh = match self.process_representation_item(&item, decoder) {
-                    Ok(m) if !m.is_empty() => m,
-                    _ => continue,
+                // Get mesh bounds (same as original function), one entry per frame
+                // part in the order `get_opening_item_meshes_world` emits them (#6446).
+                let Ok(item_parts) = self.process_representation_item_parts(&item, decoder) else {
+                    continue;
                 };
+                for mesh in item_parts.into_iter().filter(|mesh| !mesh.is_empty()) {
+                    // Mesh::bounds is local to mesh.positions. Mapped items can
+                    // carry a large f64 origin that must be folded in before the
+                    // element placement, or the cutter box lands near zero.
+                    let (mesh_min, mesh_max) = mesh.bounds();
 
-                // Get bounds and transform to world coordinates
-                let (mesh_min, mesh_max) = mesh.bounds();
+                    // Transform corner points to world coordinates
+                    let corners = [
+                        Point3::new(mesh_min.x as f64, mesh_min.y as f64, mesh_min.z as f64),
+                        Point3::new(mesh_max.x as f64, mesh_min.y as f64, mesh_min.z as f64),
+                        Point3::new(mesh_min.x as f64, mesh_max.y as f64, mesh_min.z as f64),
+                        Point3::new(mesh_max.x as f64, mesh_max.y as f64, mesh_min.z as f64),
+                        Point3::new(mesh_min.x as f64, mesh_min.y as f64, mesh_max.z as f64),
+                        Point3::new(mesh_max.x as f64, mesh_min.y as f64, mesh_max.z as f64),
+                        Point3::new(mesh_min.x as f64, mesh_max.y as f64, mesh_max.z as f64),
+                        Point3::new(mesh_max.x as f64, mesh_max.y as f64, mesh_max.z as f64),
+                    ];
 
-                // Transform corner points to world coordinates
-                let corners = [
-                    Point3::new(mesh_min.x as f64, mesh_min.y as f64, mesh_min.z as f64),
-                    Point3::new(mesh_max.x as f64, mesh_min.y as f64, mesh_min.z as f64),
-                    Point3::new(mesh_min.x as f64, mesh_max.y as f64, mesh_min.z as f64),
-                    Point3::new(mesh_max.x as f64, mesh_max.y as f64, mesh_min.z as f64),
-                    Point3::new(mesh_min.x as f64, mesh_min.y as f64, mesh_max.z as f64),
-                    Point3::new(mesh_max.x as f64, mesh_min.y as f64, mesh_max.z as f64),
-                    Point3::new(mesh_min.x as f64, mesh_max.y as f64, mesh_max.z as f64),
-                    Point3::new(mesh_max.x as f64, mesh_max.y as f64, mesh_max.z as f64),
-                ];
+                    // Transform all corners and compute new AABB
+                    let transformed: Vec<Point3<f64>> = corners
+                        .iter()
+                        .map(|p| {
+                            let source = Point3::new(
+                                p.x + mesh.origin[0],
+                                p.y + mesh.origin[1],
+                                p.z + mesh.origin[2],
+                            );
+                            placement_transform.transform_point(&source)
+                        })
+                        .collect();
 
-                // Transform all corners and compute new AABB
-                let transformed: Vec<Point3<f64>> = corners
-                    .iter()
-                    .map(|p| placement_transform.transform_point(p))
-                    .collect();
+                    let world_min = Point3::new(
+                        transformed
+                            .iter()
+                            .map(|p| p.x)
+                            .fold(f64::INFINITY, f64::min),
+                        transformed
+                            .iter()
+                            .map(|p| p.y)
+                            .fold(f64::INFINITY, f64::min),
+                        transformed
+                            .iter()
+                            .map(|p| p.z)
+                            .fold(f64::INFINITY, f64::min),
+                    );
+                    let world_max = Point3::new(
+                        transformed
+                            .iter()
+                            .map(|p| p.x)
+                            .fold(f64::NEG_INFINITY, f64::max),
+                        transformed
+                            .iter()
+                            .map(|p| p.y)
+                            .fold(f64::NEG_INFINITY, f64::max),
+                        transformed
+                            .iter()
+                            .map(|p| p.z)
+                            .fold(f64::NEG_INFINITY, f64::max),
+                    );
 
-                let world_min = Point3::new(
-                    transformed
-                        .iter()
-                        .map(|p| p.x)
-                        .fold(f64::INFINITY, f64::min),
-                    transformed
-                        .iter()
-                        .map(|p| p.y)
-                        .fold(f64::INFINITY, f64::min),
-                    transformed
-                        .iter()
-                        .map(|p| p.z)
-                        .fold(f64::INFINITY, f64::min),
-                );
-                let world_max = Point3::new(
-                    transformed
-                        .iter()
-                        .map(|p| p.x)
-                        .fold(f64::NEG_INFINITY, f64::max),
-                    transformed
-                        .iter()
-                        .map(|p| p.y)
-                        .fold(f64::NEG_INFINITY, f64::max),
-                    transformed
-                        .iter()
-                        .map(|p| p.z)
-                        .fold(f64::NEG_INFINITY, f64::max),
-                );
+                    // Apply RTC offset to opening bounds so they match wall mesh coordinate system
+                    // Wall mesh positions have RTC subtracted during transform_mesh, so opening bounds must match
+                    let rtc = self.rtc_offset;
+                    let rtc_min = Point3::new(
+                        world_min.x - rtc.0,
+                        world_min.y - rtc.1,
+                        world_min.z - rtc.2,
+                    );
+                    let rtc_max = Point3::new(
+                        world_max.x - rtc.0,
+                        world_max.y - rtc.1,
+                        world_max.z - rtc.2,
+                    );
 
-                // Apply RTC offset to opening bounds so they match wall mesh coordinate system
-                // Wall mesh positions have RTC subtracted during transform_mesh, so opening bounds must match
-                let rtc = self.rtc_offset;
-                let rtc_min = Point3::new(
-                    world_min.x - rtc.0,
-                    world_min.y - rtc.1,
-                    world_min.z - rtc.2,
-                );
-                let rtc_max = Point3::new(
-                    world_max.x - rtc.0,
-                    world_max.y - rtc.1,
-                    world_max.z - rtc.2,
-                );
-
-                bounds_list.push((rtc_min, rtc_max, extrusion_direction));
+                    bounds_list.push((rtc_min, rtc_max, extrusion_direction));
+                }
             }
         }
 
@@ -742,25 +711,13 @@ impl GeometryRouter {
                 IfcType::IfcMappedItem => {
                     let source = decoder.resolve_ref(current.get(0)?).ok()??;
                     let mapped_rep = decoder.resolve_ref(source.get(1)?).ok()??;
-                    // The mesh path drops MappingOrigin (applies only
-                    // MappingTarget); a non-identity origin would shift the
-                    // re-extruded footprint off the rendered solid, so defer the
-                    // whole opening to the exact kernel.
-                    if !self.mapping_origin_is_identity(&source, decoder) {
-                        return None;
-                    }
-                    // A non-null MappingTarget MUST resolve + parse to a valid
-                    // transform: silently dropping it would misplace the
-                    // re-extruded footprint, so any failure defers the whole
-                    // opening to the exact kernel rather than continuing with an
-                    // identity transform.
-                    if let Some(t) = current.get(1) {
-                        if !t.is_null() {
-                            let te = decoder.resolve_ref(t).ok()??;
-                            let mm =
-                                self.parse_cartesian_transformation_operator(&te, decoder).ok()?;
-                            chain *= mm;
-                        }
+                    // MappingTarget · MappingOrigin, matching the mesh path
+                    // (#1985). The composition MUST parse: silently dropping it
+                    // would misplace the re-extruded footprint, so any failure
+                    // defers the whole opening to the exact kernel rather than
+                    // continuing with an identity transform.
+                    if let Some(mm) = self.mapped_item_transform(&current, &source, decoder).ok()? {
+                        chain *= mm;
                     }
                     // Require EXACTLY ONE mapped representation item. A multi-item
                     // mapped opening would otherwise be reduced to its first
@@ -779,9 +736,14 @@ impl GeometryRouter {
         };
 
         let profile_entity = decoder.resolve_ref(solid.get(0)?).ok()??;
-        let profile = ProfileProcessor::new(self.schema.clone())
-            .process(&profile_entity, decoder, self.tessellation_quality)
-            .ok()?;
+        // The 2D path re-extrudes ONE outer ring with holes; a composite of
+        // several disjoint areas (#7685) defers to the 3D path.
+        let [profile] = <[_; 1]>::try_from(
+            ProfileProcessor::new(self.schema.clone())
+                .process_regions(&profile_entity, decoder, self.tessellation_quality)
+                .ok()?,
+        )
+        .ok()?;
         if profile.outer.len() < 3 {
             return None;
         }
@@ -856,3 +818,7 @@ impl GeometryRouter {
         Some(out)
     }
 }
+
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod tests;

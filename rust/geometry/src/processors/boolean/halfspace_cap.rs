@@ -2,7 +2,33 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use crate::bool2d::{compute_signed_area, point_in_contour};
 use crate::{Mesh, Point2, Point3, Vector3};
+use crate::math::tol;
+
+// Test-only seam for the `outer_filled == outer_count` accounting
+// (`cap_half_space_clip`, below): forces `triangulate_polygon_with_holes_refined`
+// to fail for one specific OUTER ring index, so a "partial cap" (some outer
+// regions triangulate, one CDT-fails) is reproducible without needing to
+// construct real degenerate geometry that trips earcutr/CDT internals — the
+// robustness `safe_earcut` deliberately provides makes that near-impossible
+// to hit organically (kernel-gate review, PR #2260: "needs a CDT-failure
+// fixture, which is genuinely harder"). `#[cfg(test)]`-gated in both
+// directions, so it compiles to nothing (no thread-local, no branch) outside
+// `cargo test` on this crate.
+#[cfg(test)]
+thread_local! {
+    static FORCE_CDT_FAIL_ON_RING: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set which outer-ring index (0-based, in processing order) should fail
+/// triangulation on the NEXT `cap_half_space_clip` call. `None` disables it.
+/// Test-only; see [`FORCE_CDT_FAIL_ON_RING`].
+#[cfg(test)]
+pub(crate) fn force_cdt_fail_on_ring_for_test(ring: Option<usize>) {
+    FORCE_CDT_FAIL_ON_RING.with(|c| c.set(ring));
+}
 
 /// Close the planar cut left by an unbounded `IfcHalfSpaceSolid` DIFFERENCE.
 ///
@@ -22,23 +48,38 @@ use crate::{Mesh, Point2, Point3, Vector3};
 /// the kept `+clip_normal` material). If the boundary is non-manifold or does
 /// not close (a non-watertight host), we bail and leave the mesh unchanged —
 /// never worse than the uncapped output.
-pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, clip_normal: Vector3<f64>) {
+///
+/// Returns whether the cut was actually closed. This MUST be measured, never
+/// seeded: the #2171 TS clipper set `capped: true` up front and relied on the
+/// capping pass to correct it on failure, which is invisible whenever a plane
+/// runs (the common case) but silently lies — reporting a watertight result
+/// for what is actually an open shell — the moment a caller runs this over an
+/// EMPTY plane list (a documented, supported input, e.g. a solid with no
+/// applicable half-space cuts). Any future "no planes ran" path must return
+/// `false` from having never called this, not inherit a seeded `true`.
+#[must_use = "capped must be measured (this bool), never seeded — a discarded \
+              result is exactly the #2171 bug where a caller assumed `true`"]
+pub(crate) fn cap_half_space_clip(
+    mesh: &mut Mesh,
+    plane_point: Point3<f64>,
+    clip_normal: Vector3<f64>,
+) -> bool {
     use crate::triangulation::{project_to_2d, triangulate_polygon_with_holes_refined};
     use std::collections::{HashMap, HashSet};
 
     // Escape hatch: revert to the pre-fix (uncapped) plane clip without a
     // rebuild, should the section cap ever misbehave on an unforeseen host.
     if std::env::var_os("IFC_LITE_HALFSPACE_CAP_OFF").is_some() {
-        return;
+        return false;
     }
     let tri_n = mesh.indices.len() / 3;
     let vcount = mesh.positions.len() / 3;
     if tri_n == 0 || vcount < 3 {
-        return;
+        return false;
     }
-    let n = match clip_normal.try_normalize(1e-12) {
+    let n = match clip_normal.try_normalize(tol::DIRECTION_MIN_LEN) {
         Some(v) => v,
-        None => return,
+        None => return false,
     };
 
     // Diagonal-relative tolerance for "lies on the cut plane".
@@ -100,6 +141,12 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
             welded[mesh.indices[t * 3 + 1] as usize],
             welded[mesh.indices[t * 3 + 2] as usize],
         ];
+        // #5314: edge-grazing clips can leave slivers that collapse in the
+        // weld. A collapsed triangle contributes both directions of its
+        // remaining edge, hiding a real section boundary as an interior edge.
+        if v[0] == v[1] || v[1] == v[2] || v[2] == v[0] {
+            continue;
+        }
         for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
             if a != b {
                 present.insert((a, b));
@@ -115,11 +162,11 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
             continue; // not the cut section
         }
         if next.insert(a, b).is_some() {
-            return; // non-manifold cut boundary → bail
+            return false; // non-manifold cut boundary → bail
         }
     }
     if next.is_empty() {
-        return;
+        return false;
     }
 
     // Chain the boundary half-edges into closed loops.
@@ -127,6 +174,12 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
     starts.sort_unstable();
     let mut visited: HashSet<u32> = HashSet::new();
     let mut loops: Vec<Vec<u32>> = Vec::new();
+    // Set whenever a chain fails to close back on its own start — a dead end
+    // (no continuation) or a merge into a vertex already visited by another
+    // chain (or by itself, mid-walk). Either shape leaves boundary edges
+    // open; a `false` here overrides `outer_count`/`outer_filled`, which only
+    // ever see the loops that DID close and say nothing about the rest.
+    let mut boundary_incomplete = false;
     for &s in &starts {
         if visited.contains(&s) {
             continue;
@@ -135,12 +188,22 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
         let mut cur = s;
         loop {
             if !visited.insert(cur) {
+                // Walked into an already-visited vertex without returning to
+                // `s` first: an unclosed chain merging into another chain
+                // (or itself). Do NOT push it as if it were a closed loop —
+                // clear the partial walk so it can never reach the
+                // `loop_v.len() >= 3` push below and leak garbage triangles
+                // into the mesh despite the correctly-`false` verdict.
+                boundary_incomplete = true;
+                loop_v.clear();
                 break;
             }
             loop_v.push(cur);
             match next.get(&cur) {
                 Some(&nx) => cur = nx,
                 None => {
+                    // Dead end: this chain never returns to `s`.
+                    boundary_incomplete = true;
                     loop_v.clear();
                     break;
                 }
@@ -154,7 +217,7 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
         }
     }
     if loops.is_empty() {
-        return;
+        return false;
     }
 
     // Project every loop into one shared 2D basis whose +w faces the cap's
@@ -172,31 +235,6 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
     }
     let (all2d, u_axis, v_axis, origin) = project_to_2d(&all3d, &cap_outward);
 
-    let signed_area = |ring: &[Point2<f64>]| -> f64 {
-        let mut s = 0.0;
-        let m = ring.len();
-        for i in 0..m {
-            let j = (i + 1) % m;
-            s += ring[i].x * ring[j].y - ring[j].x * ring[i].y;
-        }
-        s * 0.5
-    };
-    let point_in_ring = |pt: &Point2<f64>, ring: &[Point2<f64>]| -> bool {
-        let mut inside = false;
-        let m = ring.len();
-        let mut j = m - 1;
-        for i in 0..m {
-            let (pi, pj) = (ring[i], ring[j]);
-            if ((pi.y > pt.y) != (pj.y > pt.y))
-                && (pt.x < (pj.x - pi.x) * (pt.y - pi.y) / (pj.y - pi.y) + pi.x)
-            {
-                inside = !inside;
-            }
-            j = i;
-        }
-        inside
-    };
-
     let rings: Vec<Vec<Point2<f64>>> = ranges
         .iter()
         .map(|&(a, b)| all2d[a..b].to_vec())
@@ -207,7 +245,7 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
         .map(|i| {
             let probe = rings[i][0];
             (0..rings.len())
-                .filter(|&j| j != i && point_in_ring(&probe, &rings[j]))
+                .filter(|&j| j != i && point_in_contour(&probe, &rings[j]))
                 .count()
         })
         .collect();
@@ -215,13 +253,26 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
     let cap_normal = [cap_outward.x as f32, cap_outward.y as f32, cap_outward.z as f32];
     let lift = |p: &Point2<f64>| -> Point3<f64> { origin + u_axis * p.x + v_axis * p.y };
 
+    // "Capped" means every outer region actually got triangulated — a partial
+    // cap (one outer ring's CDT fails while others succeed) still leaves an
+    // open boundary, so the count, not just "we attempted this loop", decides
+    // the return value.
+    let outer_count = depth.iter().filter(|&&d| d.is_multiple_of(2)).count();
+    let mut outer_filled = 0usize;
+    // 0-based index among OUTER rings only, in processing order — distinct
+    // from `oi` (which also counts holes). Used only to address the
+    // `#[cfg(test)]` CDT-failure seam above, so it does not exist at all
+    // outside a test build.
+    #[cfg(test)]
+    let mut outer_count_seen = 0usize;
+
     for (oi, ring) in rings.iter().enumerate() {
         if !depth[oi].is_multiple_of(2) {
             continue; // hole — emitted with its outer ring
         }
         // Outer ring CCW; its immediate holes (depth+1, contained) CW.
         let mut outer = ring.clone();
-        if signed_area(&outer) < 0.0 {
+        if compute_signed_area(&outer) < 0.0 {
             outer.reverse();
         }
         let mut holes: Vec<Vec<Point2<f64>>> = Vec::new();
@@ -229,20 +280,37 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
             if hi == oi || depth[hi] != depth[oi] + 1 {
                 continue;
             }
-            if !point_in_ring(&hring[0], ring) {
+            if !point_in_contour(&hring[0], ring) {
                 continue;
             }
             let mut h = hring.clone();
-            if signed_area(&h) > 0.0 {
+            if compute_signed_area(&h) > 0.0 {
                 h.reverse();
             }
             holes.push(h);
         }
 
-        let (verts2d, indices) = match triangulate_polygon_with_holes_refined(&outer, &holes) {
+        #[cfg(test)]
+        let forced_fail = FORCE_CDT_FAIL_ON_RING.with(|c| c.get() == Some(outer_count_seen));
+        #[cfg(not(test))]
+        let forced_fail = false;
+        #[cfg(test)]
+        {
+            outer_count_seen += 1;
+        }
+
+        let cdt_result = if forced_fail {
+            Err(crate::Error::TriangulationError(
+                "forced CDT failure (test seam)".to_string(),
+            ))
+        } else {
+            triangulate_polygon_with_holes_refined(&outer, &holes)
+        };
+        let (verts2d, indices) = match cdt_result {
             Ok(r) => r,
             Err(_) => continue,
         };
+        outer_filled += 1;
         let verts3d: Vec<Point3<f64>> = verts2d.iter().map(lift).collect();
         let base = (mesh.positions.len() / 3) as u32;
         for p in &verts3d {
@@ -263,4 +331,6 @@ pub(crate) fn cap_half_space_clip(mesh: &mut Mesh, plane_point: Point3<f64>, cli
                 .extend_from_slice(&[base + tri[0] as u32, base + i1 as u32, base + i2 as u32]);
         }
     }
+
+    outer_count > 0 && outer_filled == outer_count && !boundary_incomplete
 }

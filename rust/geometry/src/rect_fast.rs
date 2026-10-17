@@ -50,6 +50,7 @@ pub struct RectFastStats {
     pub defer_off_face: u64,
     pub defer_near_edge: u64,
     pub defer_no_openings: u64,
+    /// Over the opening cap, or a cell grid whose cells x openings is too large.
     pub defer_too_many_openings: u64,
 }
 
@@ -117,16 +118,9 @@ pub fn param_set_enabled_override(v: Option<bool>) {
     );
 }
 
-static PARAM_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Count one parametric fast-path fire (the analytic cut was emitted).
-pub fn param_record_fire() {
-    PARAM_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-/// Read + reset the parametric fast-path fire counter.
-pub fn take_param_fires() -> u64 {
-    PARAM_FIRES.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
+#[path = "rect_fast/param_stats.rs"]
+mod param_stats;
+pub use param_stats::{param_record_fire, take_param_fires};
 
 // rect_fast engagement counters are now REQUEST-LOCAL: each cut records into its
 // router via `GeometryRouter::record_rect_fast` (drained by `take_rect_fast_stats`),
@@ -238,6 +232,11 @@ pub fn subtract_rect_openings(
     // hang. 128 is far above any real wall (1-20 openings); defer the pathological
     // case to the exact kernel (bounded per-element, #1121) rather than hang.
     const MAX_FAST_OPENINGS: usize = 128;
+    // cells x openings. Real hosts stay tiny: across the 120-file IFC corpus
+    // the largest firing is 1860 (a 20-window wall is ~1e4). A 128-opening
+    // staggered curtain host is ~1.7e7 cells (257^3) but ~2e9 cells x openings.
+    // Past this cap the exact kernel's per-element bound wins.
+    const MAX_FAST_CELL_TESTS: usize = 1 << 25;
     if openings.len() > MAX_FAST_OPENINGS {
         stats.defer_too_many_openings += 1;
         return None;
@@ -322,6 +321,15 @@ pub fn subtract_rect_openings(
         }
     }
 
+    // build_cellular tests every cell against every opening, so its work is
+    // cells x openings, and 128 openings staggered on all three axes make
+    // 257^3 cells: seconds per element in a path that exists to be fast
+    // (#7675, PROC-16). The opening cap alone bounds the wrong quantity.
+    let work = grid.iter().try_fold(clamped.len(), |acc, g| acc.checked_mul(g.len() - 1));
+    if work.is_none_or(|w| w > MAX_FAST_CELL_TESTS) {
+        stats.defer_too_many_openings += 1;
+        return None;
+    }
     let cut = build_cellular(&grid, &clamped);
     stats.fired += 1;
     stats.openings_cut += clamped.len() as u64;
@@ -407,12 +415,18 @@ impl Builder {
 fn build_cellular(grid: &[Vec<f64>; 3], openings: &[[[f64; 3]; 2]]) -> Mesh {
     let nc = [grid[0].len() - 1, grid[1].len() - 1, grid[2].len() - 1];
     let center = |axis: usize, i: usize| (grid[axis][i] + grid[axis][i + 1]) * 0.5;
-    let solid = |c: [usize; 3]| -> bool {
-        let p = [center(0, c[0]), center(1, c[1]), center(2, c[2])];
-        !openings
-            .iter()
-            .any(|o| (0..3).all(|a| p[a] > o[0][a] && p[a] < o[1][a]))
-    };
+    // Each cell's solidity once (cells x openings), not once per neighbour
+    // query (7x that); indexed (i * ny + j) * nz + k, the loop order below.
+    let mut solid_cells = Vec::with_capacity(nc[0] * nc[1] * nc[2]);
+    for i in 0..nc[0] {
+        for j in 0..nc[1] {
+            for k in 0..nc[2] {
+                let p = [center(0, i), center(1, j), center(2, k)];
+                solid_cells.push(!openings.iter().any(|o| (0..3).all(|a| p[a] > o[0][a] && p[a] < o[1][a])));
+            }
+        }
+    }
+    let solid = |c: [usize; 3]| solid_cells[(c[0] * nc[1] + c[1]) * nc[2] + c[2]];
     let mut b = Builder {
         positions: Vec::new(),
         normals: Vec::new(),
@@ -486,6 +500,7 @@ fn build_cellular(grid: &[Vec<f64>; 3], openings: &[[[f64; 3]; 2]]) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::voids::geom::mesh_signed_volume;
 
     /// Closed axis-aligned box, 12 outward triangles.
     fn box_mesh(min: [f64; 3], max: [f64; 3]) -> Mesh {
@@ -524,19 +539,10 @@ mod tests {
     /// directed edge cancelled by its reverse — catches both cracks AND
     /// inconsistent winding.
     fn open_edges(m: &Mesh) -> usize {
-        use std::collections::HashMap;
-        let key = |i: u32| {
-            let b = i as usize * 3;
-            (m.positions[b].to_bits(), m.positions[b + 1].to_bits(), m.positions[b + 2].to_bits())
-        };
-        let mut edges: HashMap<_, i64> = HashMap::new();
-        for t in m.indices.chunks_exact(3) {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *edges.entry((key(a), key(b))).or_insert(0) += 1;
-                *edges.entry((key(b), key(a))).or_insert(0) -= 1;
-            }
-        }
-        edges.values().filter(|&&c| c != 0).count()
+        use crate::mesh_check::{Degenerate, EdgeLedger, VertexKey};
+        // `unbalanced` lists each open edge once; the directed audit counted it
+        // in both directions.
+        2 * EdgeLedger::build(m, VertexKey::Bits, Degenerate::SkipEdge).unbalanced().count()
     }
 
     fn degenerate(m: &Mesh) -> usize {
@@ -561,25 +567,6 @@ mod tests {
         n
     }
 
-    /// Signed volume × 6 (divergence), about origin.
-    fn vol6(m: &Mesh) -> f64 {
-        let v = |i: u32| {
-            let b = i as usize * 3;
-            [m.positions[b] as f64, m.positions[b + 1] as f64, m.positions[b + 2] as f64]
-        };
-        let mut s = 0.0;
-        for t in m.indices.chunks_exact(3) {
-            let (a, b, c) = (v(t[0]), v(t[1]), v(t[2]));
-            let cr = [
-                b[1] * c[2] - b[2] * c[1],
-                b[2] * c[0] - b[0] * c[2],
-                b[0] * c[1] - b[1] * c[0],
-            ];
-            s += a[0] * cr[0] + a[1] * cr[1] + a[2] * cr[2];
-        }
-        s
-    }
-
     // 4m × 0.2m × 3m wall (thin along Y). Opening boxes poke through Y.
     fn wall(base: [f64; 3]) -> Mesh {
         box_mesh(base, [base[0] + 4.0, base[1] + 0.2, base[2] + 3.0])
@@ -599,7 +586,7 @@ mod tests {
         assert_eq!(open_edges(&cut), 0, "{label}: not watertight");
         assert_eq!(degenerate(&cut), 0, "{label}: degenerate triangles");
         // Removed volume ≈ Σ opening∩host volume.
-        let removed = (vol6(&host) - vol6(&cut)) / 6.0;
+        let removed = mesh_signed_volume(&host) - mesh_signed_volume(&cut);
         let mut expect = 0.0;
         let (hmn, hmx) = (base, [base[0] + 4.0, base[1] + 0.2, base[2] + 3.0]);
         for (omn, omx) in openings {

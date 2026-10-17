@@ -4,6 +4,7 @@
 
 import { useViewerStore } from './index.js';
 import { getGlobalRenderer } from '../hooks/useBCF.js';
+import { captureViewportFrame } from '@/lib/viewport-capture';
 
 type BasketViewSource = 'selection' | 'visible' | 'hierarchy' | 'manual';
 
@@ -14,6 +15,8 @@ interface SelectionSnapshot {
   selectedEntitiesSet: Set<string>;
   selectedEntities: ReturnType<typeof useViewerStore.getState>['selectedEntities'];
   selectedModelId: string | null;
+  chartOwned: boolean;
+  selectionRevision: number;
 }
 
 function hasSelection(snapshot: SelectionSnapshot): boolean {
@@ -35,6 +38,9 @@ function snapshotSelectionState(): SelectionSnapshot {
     selectedEntitiesSet: new Set(state.selectedEntitiesSet),
     selectedEntities: state.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: state.selectedModelId,
+    chartOwned: state.chartSelectionRevision != null
+      && state.chartSelectionRevision === state.selectionRevision,
+    selectionRevision: state.selectionRevision,
   };
 }
 
@@ -46,6 +52,22 @@ function restoreSelectionState(snapshot: SelectionSnapshot): void {
     selectedEntitiesSet: new Set(snapshot.selectedEntitiesSet),
     selectedEntities: snapshot.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: snapshot.selectedModelId,
+    selectionRevision: snapshot.selectionRevision,
+    ...(snapshot.chartOwned
+      ? { chartSelectionRevision: snapshot.selectionRevision }
+      : {}),
+  });
+}
+
+/** Hide the outline for capture without publishing a new selection write. */
+function temporarilyClearSelectionState(): void {
+  useViewerStore.setState({
+    selectedEntity: null,
+    selectedEntitiesSet: new Set(),
+    selectedEntities: [],
+    selectedEntityId: null,
+    selectedEntityIds: new Set(),
+    selectedModelId: null,
   });
 }
 
@@ -53,20 +75,17 @@ async function captureCanvasThumbnail(): Promise<string | null> {
   const src = document.querySelector('canvas[data-viewport="main"]') as HTMLCanvasElement | null;
   if (!src) return null;
 
-  // Ensure submitted GPU work is complete before sampling the canvas.
   const renderer = getGlobalRenderer();
-  const device = renderer?.getGPUDevice();
-  if (device) {
-    await device.queue.onSubmittedWorkDone();
-  }
-
-  await new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
+  if (!renderer) return null;
 
   try {
     // Capture from the WebGPU canvas first (reliable), then downscale.
-    const fullFrameDataUrl = src.toDataURL('image/png');
+    const captured = await captureViewportFrame(renderer, { canvas: src,
+      options: { selectedId: null, selectedIds: undefined, selectedModelIndex: undefined, hoverOutline: null },
+      read: canvas => ({ image: canvas.toDataURL('image/png'), width: canvas.width, height: canvas.height }),
+    });
+    if (!captured) return null;
+    const fullFrameDataUrl = captured.image;
 
     const thumb = document.createElement('canvas');
     thumb.width = 320;
@@ -85,8 +104,8 @@ async function captureCanvasThumbnail(): Promise<string | null> {
       img.src = fullFrameDataUrl;
     });
 
-    const srcW = img.naturalWidth || src.width || src.clientWidth;
-    const srcH = img.naturalHeight || src.height || src.clientHeight;
+    const srcW = img.naturalWidth || captured.width;
+    const srcH = img.naturalHeight || captured.height;
     if (srcW <= 0 || srcH <= 0) return null;
 
     const scale = Math.max(thumb.width / srcW, thumb.height / srcH);
@@ -96,7 +115,8 @@ async function captureCanvasThumbnail(): Promise<string | null> {
     const offsetY = Math.floor((thumb.height - drawH) / 2);
     ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
     return thumb.toDataURL('image/jpeg', 0.75);
-  } catch {
+  } catch (error) {
+    console.warn('[basket] Thumbnail capture failed:', error);
     return null;
   }
 }
@@ -106,16 +126,18 @@ export async function saveBasketViewWithThumbnailFromStore(
 ): Promise<string | null> {
   const before = snapshotSelectionState();
   const hadSelection = hasSelection(before);
+  let clearedSelectionRevision: number | null = null;
 
   if (hadSelection) {
-    useViewerStore.getState().clearEntitySelection();
+    temporarilyClearSelectionState();
+    clearedSelectionRevision = useViewerStore.getState().selectionRevision;
   }
 
   try {
     const thumbnailDataUrl = await captureCanvasThumbnail();
     return useViewerStore.getState().saveCurrentBasketView({ source, thumbnailDataUrl });
   } finally {
-    if (hadSelection) {
+    if (hadSelection && useViewerStore.getState().selectionRevision === clearedSelectionRevision) {
       restoreSelectionState(before);
     }
   }

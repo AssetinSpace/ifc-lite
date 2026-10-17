@@ -22,17 +22,19 @@ export type BYOKProvider = 'anthropic' | 'openai';
 
 /**
  * Provider-specific shape checks. Tight enough to avoid false positives on
- * random clipboard contents, permissive enough to cover the key formats each
- * provider currently issues.
+ * random clipboard contents. These are recognition heuristics, not credential
+ * validation: the provider decides whether a key is valid and authorized.
  *
- *   Anthropic console keys: `sk-ant-api03-` + ≥50 chars of [A-Za-z0-9_-]
+ *   Anthropic console keys: `sk-ant-` + ≥20 chars of [A-Za-z0-9_-]
  *   OpenAI keys:            `sk-`, `sk-proj-`, `sk-svcacct-`, `sk-admin-` + ≥20 chars
  *
  * The OpenAI pattern uses a negative lookahead for `ant-` so an Anthropic key
  * doesn't accidentally satisfy the OpenAI tab — they both start with `sk-`.
  */
 const PROVIDER_PATTERNS: Record<BYOKProvider, RegExp> = {
-  anthropic: /^sk-ant-api03-[A-Za-z0-9_-]{50,}$/,
+  // The console documents sk-ant-, not a fixed API-key version or length.
+  // Identity-linked keys must not be rejected just because api03 changed.
+  anthropic: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
   openai: /^sk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}$/,
 };
 
@@ -66,6 +68,27 @@ export async function readClipboardKey(provider: BYOKProvider): Promise<string |
 }
 
 /**
+ * Recognised provider prefixes, longest-first so `sk-proj-` etc. win over the
+ * bare `sk-` they all start with. Anchored at the start of the string.
+ *
+ * Deliberately NOT `lastIndexOf('-')` on the whole key: the secret alphabet
+ * ([A-Za-z0-9_-], see `PROVIDER_PATTERNS`) permits a dash anywhere in the
+ * body, and `lastIndexOf` would find the RIGHTMOST dash in the string —
+ * which, the moment a secret's random tail contains one, is a dash inside
+ * the secret, not the provider prefix. That mis-measured "prefix" then gets
+ * displayed in plaintext, leaking part of the key. This must match a KNOWN
+ * prefix and nothing else.
+ */
+const KEY_PREFIX_PATTERNS: readonly RegExp[] = [
+  /^sk-ant-api03-/,
+  /^sk-ant-/,
+  /^sk-proj-/,
+  /^sk-svcacct-/,
+  /^sk-admin-/,
+  /^sk-/,
+];
+
+/**
  * Render-safe key mask. Preserves the provider prefix so the user can confirm
  * the right key is detected, hides the secret middle, shows the last 4 chars
  * for disambiguation.
@@ -76,8 +99,10 @@ export async function readClipboardKey(provider: BYOKProvider): Promise<string |
  */
 export function maskKey(key: string): string {
   if (key.length < 12) return '••••';
-  const dashIdx = key.lastIndexOf('-');
-  const prefixEnd = dashIdx > 0 && dashIdx < 14 ? dashIdx + 1 : Math.min(14, key.length - 4);
+  const prefixMatch = KEY_PREFIX_PATTERNS.map((pattern) => pattern.exec(key)?.[0]).find(
+    (match) => match !== undefined,
+  );
+  const prefixEnd = prefixMatch !== undefined ? prefixMatch.length : 0;
   return `${key.slice(0, prefixEnd)}••••${key.slice(-4)}`;
 }
 

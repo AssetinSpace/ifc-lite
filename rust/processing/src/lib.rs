@@ -7,12 +7,20 @@
 //! This crate extracts the core processing logic so it can be used by both
 //! the HTTP server and the native FFI library.
 
+pub mod appearance;
+pub mod data_model;
+pub mod analytic_export;
+pub mod pdf_vector;
 pub mod determinism;
+mod fingerprint;
 pub(crate) mod parallel_scan;
 mod shard_classes;
-pub use parallel_scan::{build_entity_index_parallel, scan_shard, ShardRecords};
+pub use parallel_scan::{
+    build_entity_index_parallel, scan_shard, scan_shard_with_refusals, ShardRecords, ShardRefusals,
+};
 pub use shard_classes::{
-    classify_type_name, scan_shard_classified, PREPASS_CLASS_CODE_MASK,
+    classify_type_name, scan_shard_classified, scan_shard_classified_with_refusals,
+    PREPASS_CLASS_CODE_MASK,
     PREPASS_CLASS_FLAG_GEOMETRY_JOB, PREPASS_CLASS_FLAG_TYPE_CANDIDATE,
     PREPASS_CLASS_INDEXED_COLOUR_MAP, PREPASS_CLASS_MATERIAL_DEF_REPR,
     PREPASS_CLASS_MAPPED_ITEM, PREPASS_CLASS_MATERIAL_LAYER_SET, PREPASS_CLASS_NONE,
@@ -31,13 +39,25 @@ pub use shard_classes::{
 #[path = "determinism_tests.rs"]
 mod determinism_tests;
 pub mod element;
+mod geometry_pool;
+pub use geometry_pool::{
+    geometry_pool, geometry_pool_builder, run_on_geometry_pool, GEOMETRY_STACK_BYTES,
+};
+// Declared here rather than inside `geometry_pool.rs` so the revert oracle can
+// attribute it to the lib test target.
+#[cfg(test)]
+mod geometry_pool_tests;
 pub mod geometry_export;
 mod georeferencing;
 pub mod pipeline_diagnostics;
 pub mod prepass;
 mod prepass_styled;
 pub use prepass_styled::flat_styles_rgba8_from_geometry_columns;
+mod prepass_type_material;
 mod processor;
+pub(crate) mod point_pca;
+pub mod scan_proposals;
+pub mod scan_segmentation;
 pub(crate) mod simplify_math;
 pub mod simplify_session;
 // `simplify_session` unit tests live in a sibling `_tests.rs` file so the
@@ -46,23 +66,50 @@ pub mod simplify_session;
 #[cfg(test)]
 #[path = "simplify_session_tests.rs"]
 mod simplify_session_tests;
+mod mesh_frame;
+pub use mesh_frame::{MeshCoordinateSpace, MeshFrame};
 pub mod stream_meta;
 pub mod style;
 mod symbolic;
 mod types;
 
-pub use geometry_export::{build_geometry_data_export, ExportedElement, GeometryDataExport};
-pub use georeferencing::{extract_georeferencing, Georeferencing};
+pub use geometry_export::{
+    build_geometry_data_export, build_colored_geometry_data_export, ColoredGeometryDataExport,
+    ExportedElement, GeometryDataExport,
+};
+pub use analytic_export::{check_swept_disk, extract_analytic_quantity_sources,
+    AnalyticQuantitySources, extract_swept_disk_definitions,
+    extract_swept_disk_descriptions, extract_swept_disk_views,
+    extract_extrusion_definitions,
+    extrusion_nominal_quantities, DirectrixMetrics,
+    DirectrixSegmentMetrics, ExtrusionNominalQuantities, SweptDiskCheckError,
+    SweptDiskCheckFinding, SweptDiskCheckOptions, SweptDiskCheckReport,
+    SweptDiskDefinition, SweptDiskDefinitions, SweptDiskDescriptions,
+    SweptDiskFindingCode, SweptDiskInstance, SweptDiskNominalQuantities,
+    SweptDiskOccurrence, SweptDiskSourceContext, SweptDiskSourceKey,
+    AnalyticSourceContext, AnalyticSourceKey, ExtrusionDefinition,
+    ExtrusionDefinitions, ExtrusionInstance};
+pub use georeferencing::{
+    extract_georeferencing, extract_georeferencing_with_index, Georeferencing,
+};
 pub use pipeline_diagnostics::{
     PipelineDiagnostics, PipelinePhaseTimings, PIPELINE_DIAGNOSTICS_SCHEMA_VERSION,
 };
 /// Re-exported so the server can name the quality level without a direct
 /// `ifc-lite-geometry` dependency edge for one enum.
 pub use ifc_lite_geometry::TessellationQuality;
+/// The don't-bake occurrence → flat `MeshData` recovery, shared with the browser
+/// batch (`rust/wasm-bindings/src/api/gpu_meshes/instancing.rs`) so the mapping
+/// has one home rather than two clones. See its doc comment.
+pub use processor::instancing::recover_occurrences_flat;
 pub use processor::{
-    convert_mesh_to_site_local, process_geometry, process_geometry_filtered,
-    process_geometry_filtered_with_quality, process_geometry_with_index,
+    convert_mesh_to_site_local, detect_schema_version, is_quick_spatial_type_ci, native_to_baked,
+    process_geometry,
+    process_geometry_filtered,
+    process_geometry_filtered_with_quality, process_geometry_filtered_with_quality_and_ids,
+    process_geometry_with_index,
     process_geometry_streaming, process_geometry_streaming_filtered,
+    process_geometry_streaming_filtered_with_baked_basis,
     process_geometry_streaming_filtered_with_options, process_geometry_streaming_with_options,
     process_geometry_streaming_with_options_and_bootstrap,
     OpeningFilterMode, ProcessingResult, StreamingOptions,
@@ -70,11 +117,16 @@ pub use processor::{
 pub use simplify_session::{simplify_element, SimplifiedElement, SimplifyRecordInput, SimplifySkip};
 pub use style::{default_color_for_type, Rgba, TRANSPARENCY_ALPHA_THRESHOLD};
 pub use symbolic::{
-    extract_symbolic_data, SymbolicCircle, SymbolicData, SymbolicFillArea, SymbolicGridAxis,
-    SymbolicPolyline, SymbolicText,
+    extract_symbolic_data, extract_symbolic_data_with_provenance,
+    extract_symbolic_data_with_provenance_in_frame, SymbolicDataWithProvenance, SymbolicCircle, SymbolicData, SymbolicFillArea, SymbolicGridAxis,
+    SymbolicPolyline, SymbolicText, SymbolicTruncation, SymbolicTruncationReason,
 };
-pub use types::mesh::{InstanceRecord, MeshData, RawInstanceOccurrence};
+// `MeshTextureData` is the type of `MeshData::texture`, a public field: without
+// this re-export no consumer outside the crate can name it, so a textured
+// `MeshData` can be read but never constructed or matched.
+pub use types::mesh::{InstanceRecord, MeshData, MeshTextureData, RawInstanceOccurrence};
 pub use types::response::{
     CoordinateInfo, ModelMetadata, ParseResponse, ProcessingStats,
-    QuickMetadataBootstrap, QuickMetadataEntitySummary, QuickMetadataSpatialNode,
+    QuickMetadataBootstrap, QuickMetadataEntitySummary, QuickMetadataPrunedEdge,
+    QuickMetadataPrunedEdgeKind, QuickMetadataSpatialNode,
 };

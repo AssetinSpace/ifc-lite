@@ -21,6 +21,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from './protocol.js';
+import { normalizePointStride } from './stride.js';
 // Format-specific decoders are lazy-imported in `createSource` below. That
 // keeps the IIFE bundle this worker ships in (see scripts/build-worker-bundle.mjs)
 // small — only the format the consumer actually opens gets pulled into the
@@ -52,27 +53,70 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     case 'abort':
       handleAbort(msg.sourceId);
       return;
+    case 'copc-open':
+    case 'copc-page':
+    case 'copc-node':
+    case 'copc-cancel':
+      void handleCopc(msg);
+      return;
   }
 };
 
+/** COPC readers are closed by the same `close` message as stream sources. */
+let closeCopcSource: ((sourceId: number) => boolean) | undefined;
+
+async function handleCopc(
+  msg: Extract<WorkerRequest, { kind: 'copc-open' | 'copc-page' | 'copc-node' | 'copc-cancel' }>,
+): Promise<void> {
+  try {
+    // Lazy like the format sources below: only COPC sessions load it.
+    const host = await import('../copc/copc-worker-host.js');
+    closeCopcSource = host.closeCopcSource;
+    await host.handleCopcRequest(msg, post, () => nextSourceId++);
+  } catch (err) {
+    if (msg.kind !== 'copc-cancel') post({ kind: 'error', requestId: msg.requestId, message: errMessage(err) });
+  }
+}
+
 async function handleOpen(msg: Extract<WorkerRequest, { kind: 'open' }>): Promise<void> {
+  // Hoisted so the catch below can release a source that was created
+  // (and possibly opened) but never made it into `sources` — see the
+  // comment at the `post()` call.
+  let opened: OpenSource | undefined;
   try {
     const source = await createSource(msg.format, msg.blob, {
       label: msg.label,
-      downsample: { stride: Math.max(1, msg.stride | 0) },
+      downsample: { stride: normalizePointStride(msg.stride) },
       originOffset: msg.originOffset,
     });
     const abort = new AbortController();
     const info = await source.open(abort.signal);
+    opened = { source, abort };
     const sourceId = nextSourceId++;
-    sources.set(sourceId, { source, abort });
+    // Report success to the client BEFORE registering the source. If
+    // `post()` throws (e.g. a future `PointSourceInfo` field that isn't
+    // structured-cloneable), the client never learns `sourceId` and can
+    // therefore never send `close`/`abort` for it — so it must not be
+    // reachable through `sources` either, or the underlying file
+    // reader / native buffers would leak for the life of the worker.
+    // The catch below releases `source` in that case.
     post({
       kind: 'opened',
       requestId: msg.requestId,
       sourceId,
       info,
     });
+    sources.set(sourceId, { source, abort });
+    opened = undefined; // ownership transferred to `sources`
   } catch (err) {
+    if (opened) {
+      try {
+        opened.abort.abort();
+        opened.source.close();
+      } catch (closeErr) {
+        console.warn('[decode-worker] cleanup after failed open() post failed:', errMessage(closeErr));
+      }
+    }
     post({
       kind: 'error',
       requestId: msg.requestId,
@@ -122,6 +166,7 @@ async function handleNext(msg: Extract<WorkerRequest, { kind: 'next' }>): Promis
 }
 
 function handleClose(sourceId: number): void {
+  if (closeCopcSource?.(sourceId)) return;
   const open = sources.get(sourceId);
   if (!open) return;
   try {
@@ -152,8 +197,10 @@ async function createSource(
   opts: {
     label?: string;
     downsample: { stride: number };
-    /** See `decodeLasPoints`'s `originOffset` param (issue #1804);
-     *  only the LAS/LAZ sources consume it. */
+    /** See `decodeLasPoints`'s `originOffset` param (issue #1804) — every
+     *  format source consumes it, subtracting in f64 before narrowing to
+     *  f32 (extended to E57/PLY/PCD/PTS/XYZ alongside the original
+     *  LAS/LAZ support). */
     originOffset?: readonly [number, number, number];
   },
 ): Promise<StreamingPointSource> {

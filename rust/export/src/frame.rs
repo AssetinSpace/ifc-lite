@@ -9,62 +9,133 @@
 //! GLB/OBJ exporters must redo the identical conversion to match:
 //!
 //! - positions + normals: `(x, y, z) -> (x, z, -y)`
-//! - triangle winding reversed (mirrors `MeshDataJs::new`, keeps front faces)
+//! - triangle winding preserved: this is a determinant +1 rotation, not a reflection
 //! - per-element `origin` swapped the same way
 //!
 //! The from-meshes GLB path (the viewer's own `MeshData`) is already Y-up and
 //! must NOT be re-swapped — only this from-bytes path applies it.
 
-/// Convert a single IFC Z-up point/vector to WebGL Y-up: `(x, y, z) -> (x, z, -y)`.
+use ifc_lite_geometry::math::frame::{self, zup_to_yup};
+
+/// The same frame change applied to a whole column-major 4x4, so a placement
+/// authored in IFC Z-up can ride on a glTF node: `C * M * C_inv` for the basis
+/// change `C: (x, y, z) -> (x, z, -y)`, not just the translation column.
+/// Conjugation is storage-agnostic, so the column-major array goes straight
+/// through geometry's `frame::conjugate_zup_to_yup` (the one definition).
 #[inline]
-pub(crate) fn yup_f32(p: [f32; 3]) -> [f32; 3] {
-    [p[0], p[2], -p[1]]
+pub(crate) fn yup_matrix4(m: &[f64]) -> [f64; 16] {
+    debug_assert!(m.len() >= 16);
+    let mut a = [0.0f64; 16];
+    a.copy_from_slice(&m[..16]);
+    frame::conjugate_zup_to_yup(&a)
 }
 
-/// Same conversion for an f64 point (the per-element `origin`).
-#[inline]
-pub(crate) fn yup_f64(p: [f64; 3]) -> [f64; 3] {
-    [p[0], p[2], -p[1]]
+/// The frame a from-meshes writer was told its meshes were baked in: the
+/// column-major 4x4 `world = M · baked` (IFC Z-up, metres) as a
+/// [`MeshFrame`], so it restores through the same `world_matrix` / `to_world`
+/// arithmetic as a `ProcessingResult` does (#7734). `None` is an unshifted
+/// model. Refuses anything that is not 16 finite numbers: a NaN here would
+/// move the whole model, and glTF JSON has no spelling for it.
+pub(crate) fn mesh_frame_from_world_matrix(
+    world: Option<&[f64]>,
+) -> Result<ifc_lite_processing::MeshFrame, crate::error::ExportError> {
+    use ifc_lite_processing::MeshFrame;
+    let Some(m) = world else {
+        return Ok(MeshFrame::RawIfc);
+    };
+    if m.len() != 16 || m.iter().any(|v| !v.is_finite()) {
+        return Err(crate::error::ExportError::MalformedMeshInput {
+            detail: format!(
+                "`world_matrix` must be 16 finite numbers (a column-major 4x4); got {} values{}",
+                m.len(),
+                if m.iter().any(|v| !v.is_finite()) { " including a non-finite one" } else { "" }
+            ),
+        });
+    }
+    // The root carries the matrix as glTF TRS, which has no spelling for a
+    // projective row, a shear or a mirror, and a frame never is one: a bake
+    // only ever subtracts a translation and a site's proper rotation. Anything
+    // else would come out as a root whose rotation disagrees with the matrix.
+    if !is_rigid(m) {
+        return Err(crate::error::ExportError::MalformedMeshInput {
+            detail: "`world_matrix` must be a rigid transform (an orthonormal rotation with \
+                     determinant +1, a translation, bottom row 0 0 0 1)"
+                .to_owned(),
+        });
+    }
+    Ok(MeshFrame::from_world_matrix(m))
 }
 
-/// One mesh's geometry converted from the IFC Z-up `process_geometry` frame into
-/// the WebGL Y-up frame (owned buffers), ready to feed the shared glTF assembler.
-pub(crate) struct YUpMesh {
+/// `m` (column-major, 16 finite numbers) is a proper rotation plus a
+/// translation, within a tolerance well above f64 placement noise.
+fn is_rigid(m: &[f64]) -> bool {
+    const TOL: f64 = 1e-6;
+    let col = |c: usize| [m[c * 4], m[c * 4 + 1], m[c * 4 + 2]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (x, y, z) = (col(0), col(1), col(2));
+    let cross = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    let bottom = [m[3], m[7], m[11], m[15] - 1.0];
+    bottom.iter().all(|v| v.abs() <= TOL)
+        && [(x, x, 1.0), (y, y, 1.0), (z, z, 1.0), (x, y, 0.0), (x, z, 0.0), (y, z, 0.0)]
+            .iter()
+            .all(|&(a, b, want)| (dot(a, b) - want).abs() <= TOL)
+        && dot(cross, z) > 0.0
+}
+
+/// Reusable owned buffers for the streaming Y-up conversion. The streaming/bounded
+/// export passes convert one mesh at a time and drop it; reusing a single scratch across
+/// meshes (clear + refill, capacity persists) avoids the 3 fresh heap allocations per
+/// mesh that allocating fresh buffers would incur — on a million-submesh model, per pass.
+pub(crate) struct YUpScratch {
     pub positions: Vec<f32>,
     pub normals: Vec<f32>,
     pub indices: Vec<u32>,
     pub origin: [f64; 3],
 }
 
-/// Convert Z-up `positions`/`normals`/`indices`/`origin` to Y-up owned buffers.
-///
-/// The faceted-brep per-face vertex duplication is now collapsed at the mesh
-/// SOURCE (`ifc_lite_processing::element::build_mesh_data` runs
-/// `ifc_lite_geometry::mesh_weld::weld_indexed` on every element), so
-/// `process_geometry`'s `MeshData` arrives pre-welded and this frame conversion
-/// is a faithful pass-through — no export-local re-weld.
-pub(crate) fn to_yup(
+impl YUpScratch {
+    pub(crate) fn new() -> Self {
+        Self { positions: Vec::new(), normals: Vec::new(), indices: Vec::new(), origin: [0.0; 3] }
+    }
+}
+
+/// Convert into reusable buffers, preserving triangle winding. The scratch is
+/// cleared and refilled, so its capacity is retained across calls.
+pub(crate) fn to_yup_into(
+    scratch: &mut YUpScratch,
     positions: &[f32],
     normals: &[f32],
     indices: &[u32],
     origin: [f64; 3],
-) -> YUpMesh {
-    let mut p = Vec::with_capacity(positions.len());
+) {
+    scratch.positions.clear();
+    scratch.positions.reserve(positions.len());
     for c in positions.chunks_exact(3) {
-        p.extend_from_slice(&yup_f32([c[0], c[1], c[2]]));
+        scratch.positions.extend_from_slice(&zup_to_yup([c[0], c[1], c[2]]));
     }
-    let mut n = Vec::with_capacity(normals.len());
+    scratch.normals.clear();
+    scratch.normals.reserve(normals.len());
     for c in normals.chunks_exact(3) {
-        n.extend_from_slice(&yup_f32([c[0], c[1], c[2]]));
+        scratch.normals.extend_from_slice(&zup_to_yup([c[0], c[1], c[2]]));
     }
-    // Reverse winding to compensate the handedness convention (identical to
-    // `MeshDataJs::new`): swap the 2nd/3rd index of every triangle.
-    let mut idx = indices.to_vec();
-    let tri_end = idx.len() - idx.len() % 3;
-    let mut i = 0;
-    while i < tri_end {
-        idx.swap(i + 1, i + 2);
-        i += 3;
-    }
-    YUpMesh { positions: p, normals: n, indices: idx, origin: yup_f64(origin) }
+    scratch.indices.clear();
+    scratch.indices.extend_from_slice(indices);
+    scratch.origin = zup_to_yup(origin);
 }
+
+/// In-place variant of [`to_yup_into`], without allocating new buffers.
+/// The determinant +1 frame rotation preserves triangle indices and winding.
+pub(crate) fn to_yup_in_place(
+    positions: &mut [f32],
+    normals: &mut [f32],
+    _indices: &mut [u32],
+    origin: &mut [f64; 3],
+) {
+    frame::zup_to_yup_in_place(positions);
+    frame::zup_to_yup_in_place(normals);
+    *origin = zup_to_yup(*origin);
+}
+
+#[cfg(test)]
+#[path = "frame_tests.rs"]
+mod frame_tests;

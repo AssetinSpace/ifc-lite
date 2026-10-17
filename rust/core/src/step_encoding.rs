@@ -1,4 +1,13 @@
-//! STEP string escape decoding/encoding (ISO 10303-21 / IFC).
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! STEP string escape decoding (ISO 10303-21 / IFC).
+//!
+//! Decoding only. The one writer is `ifc_lite_export::escape_step_string`
+//! (a second, literal-unsafe encoder here was deleted: architecture review
+//! behind #4577, F6). The round trip `decode_ifc_string(escape(s)) == s` is
+//! pinned in `rust/export/tests/step_escape_parity.rs`.
 //!
 //! IFC string attribute values encode non-ASCII characters with backslash
 //! escape sequences. This module decodes them to native UTF-8 so the Rust
@@ -9,15 +18,95 @@
 //! Supported escapes:
 //! - `\X2\HHHH..\X0\` UTF-16 code units, 4 hex digits each (surrogate pairs ok)
 //! - `\X4\HHHHHHHH..\X0\` Unicode scalar values, 8 hex digits each
-//! - `\X\HH` single ISO-8859-1 byte
-//! - `\S\C` extended ASCII: code point of `C` plus 128
-//! - `\PC\` code-page directive, consumed and dropped
+//! - `\X\HH` single ISO-8859-1 byte (NOT code-page dependent: always the ISO
+//!   10646 row-0 value, per ISO 10303-21 6.4.3)
+//! - `\S\C` extended ASCII: code point of `C` plus 128, mapped through the
+//!   currently selected `\P?\` code page (default ISO 8859-1)
+//! - `\PA\`..`\PI\` code-page directive (A=ISO 8859-1 .. I=ISO 8859-9):
+//!   tracked for subsequent `\S\` escapes, then dropped. Any other letter is
+//!   dropped without changing the active page.
+//!
+//! ISO 10303-21 also doubles the reverse solidus inside a string literal, so
+//! `\\` decodes to one `\`. That arm sits AFTER the directive arms: a directive
+//! immediately followed by an escaped backslash ends in three backslashes
+//! (`\X2\00FC\X0\` + `\\`), and collapsing pairs first would eat the
+//! directive's own terminator.
 //!
 //! Unknown or malformed escapes are passed through unchanged. The `''`
 //! doubled-quote escape is NOT handled here — the tokenizer's consumers strip
 //! the surrounding quotes and un-double before calling this.
 
 use std::borrow::Cow;
+
+#[path = "step_codepages.rs"]
+mod step_codepages;
+use step_codepages::resolve_extended_char;
+
+/// Whether the apostrophe at `pos`, inside a STEP string literal, is the
+/// operand of the PAGE directive `\S\` (#7540). Tested before a doubled `''`:
+/// `'5\S\''` is "5§" and closes at its last quote. No other legal string unit
+/// ends in `\S\` right before an apostrophe, so this cannot misfire on a legal
+/// file.
+#[inline]
+pub fn is_page_quote_operand(bytes: &[u8], pos: usize) -> bool {
+    pos >= 3 && bytes[pos - 1] == b'\\' && bytes[pos - 2] == b'S' && bytes[pos - 3] == b'\\'
+}
+
+/// Index just past the apostrophe closing the STEP string literal whose
+/// opening apostrophe is at `open`, or `None` when it never closes (#7589).
+///
+/// The one rule for every walker that splits, rewrites or scans STEP text:
+/// `''` is an escaped quote and a `\S\` operand is text. A walker that ends
+/// the literal at the operand misreads every later comma, paren and
+/// reference in the record. The TypeScript twin is `stepStringLiteralEnd` in
+/// `@ifc-lite/encoding`.
+pub fn step_string_literal_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut p = open + 1;
+    loop {
+        p += memchr::memchr(b'\'', bytes.get(p..)?)?;
+        if is_page_quote_operand(bytes, p) {
+            p += 1;
+        } else if bytes.get(p + 1) == Some(&b'\'') {
+            p += 2;
+        } else {
+            return Some(p + 1);
+        }
+    }
+}
+
+/// Decode one STEP string literal, quotes included (`'O''Brien'`), to its
+/// text: strip the quotes, un-double `''`, then resolve the backslash escapes
+/// (F4-2, CORE-16). The one funnel for "literal bytes to text": the token
+/// converter, the header reader and every raw-byte reader go through it.
+///
+/// The order is load-bearing: un-doubling FIRST, because decoding first would
+/// let two separately escaped apostrophes (`\X\27\X\27`) become `''` and
+/// collapse into one. The TypeScript twin is `decodeStepStringLiteral` in
+/// `@ifc-lite/encoding`.
+///
+/// Borrowed from `raw` when there is nothing to undo (no `''`, no `\`).
+/// Bytes that are not UTF-8 decode lossily. `None` when `raw` is not
+/// wrapped in a pair of apostrophes.
+pub fn decode_step_literal(raw: &[u8]) -> Option<Cow<'_, str>> {
+    let inner = raw.strip_prefix(b"'")?.strip_suffix(b"'")?;
+    Some(decode_step_literal_inner(inner))
+}
+
+/// [`decode_step_literal`] for the bytes between the quotes, which is what
+/// the tokenizer's `Token::String` holds.
+#[inline]
+pub(crate) fn decode_step_literal_inner(inner: &[u8]) -> Cow<'_, str> {
+    let text = String::from_utf8_lossy(inner);
+    // One byte search settles the common literal: no apostrophe inside, so
+    // there is no `''` to undouble.
+    if memchr::memchr(b'\'', inner).is_none() {
+        return match text {
+            Cow::Borrowed(t) => decode_ifc_string(t),
+            Cow::Owned(t) => Cow::Owned(decode_ifc_string(&t).into_owned()),
+        };
+    }
+    Cow::Owned(decode_ifc_string(&text.replace("''", "'")).into_owned())
+}
 
 /// Decode IFC STEP string escapes to UTF-8.
 ///
@@ -37,6 +126,8 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
     let n = bytes.len();
     let mut out = String::with_capacity(n);
     let mut i = 0;
+    let mut codepage: u8 = 1;
+    let mut terminator = X0Search::default();
 
     while i < n {
         if bytes[i] != b'\\' {
@@ -48,18 +139,26 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
             continue;
         }
 
-        // `\PC\` code-page directive: consume four bytes and drop.
+        // `\PC\` code-page directive: track A..I as codepage 1..9 for
+        // subsequent `\S\` escapes, then drop the four bytes. Any other
+        // letter (or an unrecognized custom-page form) is dropped without
+        // changing the active page.
         if i + 3 < n && bytes[i + 1] == b'P' && bytes[i + 3] == b'\\' {
+            let letter = bytes[i + 2];
+            if (b'A'..=b'I').contains(&letter) {
+                codepage = letter - b'A' + 1;
+            }
             i += 4;
             continue;
         }
 
-        // `\S\C`: byte value is the code point of `C` plus 128. Read `C` as a
-        // whole char and advance by its UTF-8 length so a malformed multi-byte
-        // `C` can't leave `i` mid-character (which would panic the next slice).
+        // `\S\C`: byte value is the code point of `C` plus 128, mapped
+        // through the active code page. Read `C` as a whole char and advance
+        // by its UTF-8 length so a malformed multi-byte `C` can't leave `i`
+        // mid-character (which would panic the next slice).
         if i + 3 < n && bytes[i + 1] == b'S' && bytes[i + 2] == b'\\' {
             let c = s[i + 3..].chars().next().unwrap();
-            let code = c as u32 + 128;
+            let code = resolve_extended_char(codepage, c as u32 + 128);
             out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
             i += 3 + c.len_utf8();
             continue;
@@ -78,7 +177,7 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
         // `\X2\HHHH..\X0\`: UTF-16 code units (decoded as a unit, so surrogate
         // pairs spanning two groups combine correctly).
         if starts_with(bytes, i, b"\\X2\\") {
-            if let Some(end) = find(bytes, i + 4, b"\\X0\\") {
+            if let Some(end) = terminator.next_from(bytes, i + 4) {
                 let hex = &s[i + 4..end];
                 if !hex.is_empty()
                     && hex.len().is_multiple_of(4)
@@ -97,7 +196,7 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
 
         // `\X4\HHHHHHHH..\X0\`: Unicode scalar values.
         if starts_with(bytes, i, b"\\X4\\") {
-            if let Some(end) = find(bytes, i + 4, b"\\X0\\") {
+            if let Some(end) = terminator.next_from(bytes, i + 4) {
                 let hex = &s[i + 4..end];
                 if !hex.is_empty()
                     && hex.len().is_multiple_of(8)
@@ -113,6 +212,16 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
             }
         }
 
+        // `\\`: one literal reverse solidus (ISO 10303-21 doubles it inside a
+        // string literal). Checked after the directive arms so a `\X0\`/`\X\`
+        // terminator adjacent to an escaped backslash is consumed by its own
+        // directive first, never paired with the escape that follows it.
+        if i + 1 < n && bytes[i + 1] == b'\\' {
+            out.push('\\');
+            i += 2;
+            continue;
+        }
+
         // Unknown escape: keep the backslash and advance one byte.
         out.push('\\');
         i += 1;
@@ -121,35 +230,9 @@ pub fn decode_ifc_string(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Encode a UTF-8 string back to IFC STEP escapes. Inverse of
-/// [`decode_ifc_string`] for the canonical (non-overlong) forms; kept for STEP
-/// writers and round-trip tests.
-///
-/// Printable ASCII is preserved; everything else (and backslash) is escaped as
-/// `\X\HH`, `\X2\HHHH\X0\`, or `\X4\HHHHHHHH\X0\` by code point.
-pub fn encode_ifc_string(s: &str) -> Cow<'_, str> {
-    if s.bytes().all(|b| (0x20..=0x7E).contains(&b) && b != b'\\') {
-        return Cow::Borrowed(s);
-    }
-
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cp = ch as u32;
-        if (0x20..=0x7E).contains(&cp) && ch != '\\' {
-            out.push(ch);
-        } else if cp <= 0xFF {
-            out.push_str(&format!("\\X\\{cp:02X}"));
-        } else if cp <= 0xFFFF {
-            out.push_str(&format!("\\X2\\{cp:04X}\\X0\\"));
-        } else {
-            out.push_str(&format!("\\X4\\{cp:08X}\\X0\\"));
-        }
-    }
-    Cow::Owned(out)
-}
-
+/// Value of one ASCII hex digit (either case), `None` for anything else.
 #[inline]
-fn hex_val(b: u8) -> Option<u8> {
+pub fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -158,80 +241,66 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Decode a STEP binary literal (`"0FF"`) to its bytes: the one home for
+/// byte decoding of `BINARY` values (F4-1).
+///
+/// `raw` is the literal's content, as [`crate::AttributeValue::Binary`]
+/// holds it, or the literal with its surrounding quotes. The first hex digit
+/// is the number of unused bits in the last byte; the rest is whole bytes,
+/// two hex digits each, either case.
+///
+/// Refuses (`None`) what it cannot decode exactly, instead of the old
+/// "skip the indicator and stop at the first bad digit": a non-zero
+/// indicator (D18: the bytes are not byte-aligned, so no whole-byte reader
+/// can use them), an indicator above `3`, an odd count of hex digits and a
+/// non-hex byte. `"0"` is the empty binary.
+pub fn decode_step_binary(raw: &[u8]) -> Option<Vec<u8>> {
+    let raw = raw.strip_prefix(b"\"").unwrap_or(raw);
+    let raw = raw.strip_suffix(b"\"").unwrap_or(raw);
+    let (&indicator, hex) = raw.split_first()?;
+    if indicator != b'0' || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    hex.chunks_exact(2)
+        .map(|pair| Some((hex_val(pair[0])? << 4) | hex_val(pair[1])?))
+        .collect()
+}
+
 #[inline]
 fn starts_with(bytes: &[u8], at: usize, pat: &[u8]) -> bool {
     bytes.len() >= at + pat.len() && &bytes[at..at + pat.len()] == pat
 }
 
-fn find(bytes: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
-    if pat.is_empty() || from + pat.len() > bytes.len() {
-        return None;
+/// The next `\X0\` terminator at or after a position, memoised (CORE-28).
+///
+/// The decoder's cursor only moves forward, so one search answers every later
+/// one: a miss means no terminator exists past any later position either, and
+/// a hit at `p` is still the first terminator for every position up to `p`.
+/// Without it, N unterminated `\X2\` / `\X4\` openers each searched to the
+/// end of the input, which is quadratic in a hostile attribute value.
+#[derive(Default)]
+struct X0Search {
+    /// `Some(None)`: no terminator remains. `Some(Some(p))`: the first one at
+    /// or after the position it was searched from sits at `p`.
+    last: Option<Option<usize>>,
+}
+
+impl X0Search {
+    fn next_from(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
+        match self.last {
+            Some(None) => return None,
+            Some(Some(p)) if p >= from => return Some(p),
+            _ => {}
+        }
+        let found = bytes
+            .get(from..)
+            .and_then(|rest| memchr::memmem::find(rest, b"\\X0\\"))
+            .map(|off| from + off);
+        self.last = Some(found);
+        found
     }
-    bytes[from..]
-        .windows(pat.len())
-        .position(|w| w == pat)
-        .map(|p| from + p)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_backslash_is_borrowed_and_unchanged() {
-        assert!(matches!(decode_ifc_string("Hello World"), Cow::Borrowed(_)));
-        // A typical base64 IFC GUID contains no backslash.
-        assert_eq!(decode_ifc_string("3Bvg7$qHb0gP37$Qz2vN1k"), "3Bvg7$qHb0gP37$Qz2vN1k");
-    }
-
-    #[test]
-    fn decodes_x2_bmp() {
-        assert_eq!(decode_ifc_string(r"Br\X2\00FC\X0\cke"), "Br\u{FC}cke");
-    }
-
-    #[test]
-    fn decodes_x2_surrogate_pair() {
-        assert_eq!(decode_ifc_string(r"\X2\D83DDE00\X0\"), "\u{1F600}");
-    }
-
-    #[test]
-    fn decodes_x4_astral() {
-        assert_eq!(decode_ifc_string(r"\X4\0001F600\X0\"), "\u{1F600}");
-    }
-
-    #[test]
-    fn decodes_x_and_s() {
-        assert_eq!(decode_ifc_string(r"\X\E9"), "\u{E9}");
-        assert_eq!(decode_ifc_string(r"\S\a"), "\u{E1}");
-    }
-
-    #[test]
-    fn drops_code_page_directive() {
-        assert_eq!(decode_ifc_string(r"\PA\Hello"), "Hello");
-    }
-
-    #[test]
-    fn keeps_unknown_escape() {
-        assert_eq!(decode_ifc_string(r"a\Qb"), r"a\Qb");
-        // Malformed (no terminator) is passed through, not panicked on.
-        assert_eq!(decode_ifc_string(r"\X2\00FC"), r"\X2\00FC");
-    }
-
-    #[test]
-    fn s_escape_before_multibyte_char_does_not_panic() {
-        // A malformed `\S\` followed by a multi-byte UTF-8 char must not leave
-        // the cursor mid-character (previously panicked via a non-boundary
-        // slice, aborting the whole wasm instance under panic=abort).
-        let _ = decode_ifc_string("\\S\\\u{00E9}tail");
-        let _ = decode_ifc_string("x\\S\\\u{1F600}y");
-        // The canonical single-ASCII form is unchanged.
-        assert_eq!(decode_ifc_string(r"\S\a"), "\u{E1}");
-    }
-
-    #[test]
-    fn round_trips_through_encode() {
-        for s in ["plain", "Br\u{FC}cke", "\u{1F600}", "a\u{E9}b"] {
-            assert_eq!(decode_ifc_string(&encode_ifc_string(s)), s);
-        }
-    }
-}
+#[path = "step_encoding_tests.rs"]
+mod tests;

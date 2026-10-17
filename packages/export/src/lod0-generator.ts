@@ -5,11 +5,15 @@
 import {
   EntityExtractor,
   extractLengthUnitScale,
-  getAllAttributesForEntity,
+  getAttributeNamesAcrossSchemas,
   scanIfcEntities,
 } from '@ifc-lite/parser';
+import { isProperSubtypeOfAny, type HierarchyRegistry } from '@ifc-lite/codegen/schema-hierarchy';
+import * as IFC4_SCHEMA from '@ifc-lite/codegen/ifc4';
+import * as IFC4X3_SCHEMA from '@ifc-lite/codegen/ifc4x3';
 
 import type { EntityRef } from '@ifc-lite/parser';
+import { firstProjAxis, walkPlacementChain } from '@ifc-lite/data';
 import type { Lod0Json, Lod0Element, LodInput, Vec3 } from './lod-geometry-types.js';
 import {
   aabbFromPoints,
@@ -47,10 +51,47 @@ function buildEntityIndex(entityRefs: EntityRef[]): Index {
 }
 
 function findAttrIndex(typeName: string, attrName: string): number | null {
-  const attrs = getAllAttributesForEntity(typeName);
-  if (!attrs || attrs.length === 0) return null;
-  const idx = attrs.findIndex((a) => a?.name === attrName);
+  // Cross-schema union, not the parser's IFC4-pinned registry. With the
+  // pinned lookup an IFC4X3-only leaf (IfcSignal, IfcPavement, IfcCourse, …)
+  // resolves zero attributes, so `ObjectPlacement` comes back null and the
+  // element is dropped from the LOD0 export entirely by the `continue` at the
+  // top of the walk — silently, with no skip reason recorded. Same defect as
+  // #2032 in demesh-writer.ts, which shared this helper verbatim.
+  const names = getAttributeNamesAcrossSchemas(typeName);
+  if (!names || names.length === 0) return null;
+  const idx = names.indexOf(attrName);
   return idx >= 0 ? idx : null;
+}
+
+/**
+ * The schema registries `isMaterialDefinition` checks against — IFC4 and
+ * IFC4X3, unioned for the same reason as `isNonRootedClassifiableResourceType`
+ * in `@ifc-lite/ids` (ifc-lite #3999): a server-parsed store's `EntityRef.type`
+ * names an entity, not a schema version, so a type introduced in only one
+ * schema must still be recognised when the other is in play.
+ */
+const HIERARCHY_REGISTRIES: readonly HierarchyRegistry[] = [
+  IFC4_SCHEMA.SCHEMA_REGISTRY,
+  IFC4X3_SCHEMA.SCHEMA_REGISTRY,
+];
+
+/**
+ * Is `typeUpper` a concrete `IfcMaterialDefinition` subtype (`IfcMaterial`,
+ * `IfcMaterialConstituent(Set)`, `IfcMaterialLayer(Set)`,
+ * `IfcMaterialProfile(Set)`, …)? Answered from the schema hierarchy rather
+ * than `startsWith('IFCMATERIAL')`, which also matched `IfcMaterialList`,
+ * `IfcMaterialLayerSetUsage`, `IfcMaterialDefinitionRepresentation` and
+ * `IfcMaterialRelationship` — none an `IfcMaterialDefinition` — the same
+ * over-broad-prefix bug fixed for `@ifc-lite/ids`'s
+ * `isNonRootedClassifiableResourceType` (ifc-lite #3999). Those excluded
+ * non-element types were never going to reach `elements` regardless — the
+ * `ObjectPlacement`-declared check just below independently drops any
+ * non-`IfcProduct` type, materials included — so narrowing this filter is a
+ * precision fix, not a behavior change: see
+ * `lod0-generator.material-membership.test.ts` for the equivalence proof.
+ */
+export function isMaterialDefinition(typeUpper: string): boolean {
+  return isProperSubtypeOfAny(HIERARCHY_REGISTRIES, typeUpper, 'IfcMaterialDefinition');
 }
 
 function isCandidateElementType(typeUpper: string): boolean {
@@ -59,7 +100,7 @@ function isCandidateElementType(typeUpper: string): boolean {
   if (typeUpper.startsWith('IFCREL')) return false;
   if (typeUpper.startsWith('IFCPROPERTY')) return false;
   if (typeUpper.startsWith('IFCQUANTITY')) return false;
-  if (typeUpper.startsWith('IFCMATERIAL')) return false;
+  if (isMaterialDefinition(typeUpper)) return false;
   if (typeUpper.startsWith('IFCPRESENTATION')) return false;
   if (typeUpper.startsWith('IFCREPRESENTATION')) return false;
   if (typeUpper.startsWith('IFCSTYLE')) return false;
@@ -86,6 +127,7 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
 
   const getEntity = (id: number): any | null => {
     if (entityCache.has(id)) return entityCache.get(id) ?? null;
+    // @raw-entity-enumeration-ok LOD0 receives only input bytes and scans its own immutable source index
     const ref = entityIndex.byId.get(id);
     const ent = ref ? extractor.extractEntity(ref) : null;
     entityCache.set(id, ent);
@@ -142,7 +184,9 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
       const tVec = typeof locRef === 'number' ? (getPoint(locRef) ?? [0, 0, 0]) : [0, 0, 0];
 
       const zAxis = typeof axisRef === 'number' ? (getDirection(axisRef) ?? [0, 0, 1]) : [0, 0, 1];
-      const xAxis0 = typeof refDirRef === 'number' ? (getDirection(refDirRef) ?? [1, 0, 0]) : [1, 0, 0];
+      // A `$` (or unreadable) RefDirection takes the renderer's fill (#5922).
+      const xAxis0 = (typeof refDirRef === 'number' ? getDirection(refDirRef) : null)
+        ?? firstProjAxis(zAxis as Vec3);
       const zN = vec3Normalize(zAxis as Vec3, [0, 0, 1]);
       const xN0 = vec3Normalize(xAxis0 as Vec3, [1, 0, 0]);
       const yN = vec3Normalize(vec3Cross(zN, xN0), [0, 1, 0]);
@@ -163,25 +207,53 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
     return m;
   };
 
-  const getPlacementMatrix = (id: number): Float64Array => {
-    const cached = placementCache.get(id);
-    if (cached) return cached;
-    const ent = getEntity(id);
-    if (!ent || String(ent.type || '').toUpperCase() !== 'IFCLOCALPLACEMENT') {
-      const ident = mat4Identity();
-      placementCache.set(id, ident);
-      return ident;
+  // Placements on a `PlacementRelTo` cycle (or leading into one) have no world
+  // matrix: refused, and reported through `skipped` (#7790; D3/D27).
+  const cyclicPlacements = new Set<number>();
+  /**
+   * World matrix of an IfcLocalPlacement, or null when its `PlacementRelTo`
+   * chain revisits a placement. Iterative with a visited set: a placement that
+   * references itself (or any cycle) must not overflow the stack.
+   */
+  const getPlacementMatrix = (startId: number): Float64Array | null => {
+    const isLocalPlacement = (id: number): boolean => {
+      const ent = getEntity(id);
+      return !!ent && String(ent.type || '').toUpperCase() === 'IFCLOCALPLACEMENT';
+    };
+    // Walk up to the first cached link, root, non-placement or revisit — the
+    // shared `walkPlacementChain` (#7791): a visited set, no depth cap.
+    const walked = walkPlacementChain(
+      startId,
+      (id) => {
+        if (!isLocalPlacement(id)) return null;
+        // IfcLocalPlacement: (PlacementRelTo, RelativePlacement)
+        const relTo: unknown = getEntity(id)?.attributes?.[0];
+        return typeof relTo === 'number' ? relTo : null;
+      },
+      { stopAt: (id) => cyclicPlacements.has(id) || placementCache.has(id) },
+    );
+    const last = walked.ids[walked.ids.length - 1]!;
+    if (walked.end === 'cycle' || (walked.end === 'stopped' && cyclicPlacements.has(last))) {
+      for (const member of walked.ids) cyclicPlacements.add(member);
+      return null;
     }
-
-    // IfcLocalPlacement: (PlacementRelTo, RelativePlacement)
-    const relTo = ent.attributes?.[0];
-    const relPlacement = ent.attributes?.[1];
-
-    const local = typeof relPlacement === 'number' ? getAxisPlacementMatrix(relPlacement) : mat4Identity();
-    const parent = typeof relTo === 'number' ? getPlacementMatrix(relTo) : mat4Identity();
-    const world = mat4Mul(parent, local);
-    placementCache.set(id, world);
-    return world;
+    let base: Float64Array = mat4Identity();
+    let chain = walked.ids;
+    if (walked.end === 'stopped') {
+      base = placementCache.get(last)!;
+      chain = walked.ids.slice(0, -1);
+    } else if (!isLocalPlacement(last)) {
+      placementCache.set(last, base);
+      chain = walked.ids.slice(0, -1);
+    }
+    // Compose from the top of the chain down.
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const relPlacement = getEntity(chain[i])?.attributes?.[1];
+      const local = typeof relPlacement === 'number' ? getAxisPlacementMatrix(relPlacement) : mat4Identity();
+      base = mat4Mul(base, local);
+      placementCache.set(chain[i], base);
+    }
+    return base;
   };
 
   const computeWorldAabbFromLocalAabb = (m: Float64Array, minL: Vec3, maxL: Vec3): { min: Vec3; max: Vec3 } => {
@@ -244,7 +316,9 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
   };
 
   const elements: Lod0Element[] = [];
+  const skipped: NonNullable<Lod0Json['skipped']> = [];
 
+  // @raw-entity-enumeration-ok this index was built from the input bytes above; no live mutation view is accepted by generateLod0
   for (const [id, ref] of entityIndex.byId) {
     const typeUpper = ref.type;
     if (!isCandidateElementType(typeUpper)) continue;
@@ -267,6 +341,10 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
 
     const placementRef = attrs[objPlacementIdx];
     const worldM = typeof placementRef === 'number' ? getPlacementMatrix(placementRef) : mat4Identity();
+    if (worldM === null) {
+      skipped.push({ expressID: id, reason: `PlacementRelTo cycle through #${placementRef as number}; element not placed.` });
+      continue;
+    }
 
     let bboxSource: 'shape' | 'fallback' = 'fallback';
     let localAabb: { min: Vec3; max: Vec3 } | null = null;
@@ -310,5 +388,6 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
     lod: 0,
     units: 'm',
     elements,
+    ...(skipped.length > 0 ? { skipped } : {}),
   };
 }

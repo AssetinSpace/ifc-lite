@@ -142,6 +142,25 @@ fn world_host_bounds_folds_the_origin_back_in() {
     assert!((mxz - 3001.5).abs() < 0.01, "max.z {mxz}");
 }
 
+/// A local-frame cut may itself carry an origin. Returning it through a rotated
+/// parent frame must rotate and compose that offset with the parent's centre;
+/// assigning the centre loses a nested cut's translation (#3446).
+#[test]
+fn rotate_mesh_from_frame_composes_a_nested_origin() {
+    let mut inner = Mesh::new();
+    inner.positions = vec![1.0, 0.0, 0.0];
+    inner.origin = [2.0, 3.0, 4.0];
+    let quarter_turn = Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    let out = geom::rotate_mesh_from_frame(
+        &inner,
+        &quarter_turn,
+        &Point3::new(1000.0, 2000.0, 3000.0),
+    );
+
+    assert_eq!(out.positions, vec![0.0, 1.0, 0.0], "positions rotate without a far f32 translation");
+    assert_eq!(out.origin, [997.0, 2002.0, 3004.0], "parent centre must compose rotated inner origin");
+}
+
 /// End-to-end: a host stored in a per-element local frame (nonzero
 /// `mesh.origin`, the wasm default) reports a WORLD-space `bbox` in the
 /// drained per-host diagnostic — NOT the near-zero local box. Regression
@@ -366,4 +385,18 @@ fn budget_tripped_engulfing_cutter_skips_aabb_fallback() {
 fn opening_obb_if_malformed_bails_on_nan_vertex_not_panic() {
     let cutter = box_cutter_mesh([1.0, 1.0, 1.0], &[[f64::NAN, 0.0, 0.0]]);
     assert!(opening_obb_if_malformed(&cutter).is_none());
+}
+
+/// ROUTER-30 (#7674): `thin_axis` was `partial_cmp(..).unwrap()`, which aborts
+/// the wasm worker on a NaN half-extent. `OpeningBox::thin_axis` was a second
+/// copy of it and now calls this one. Finite triples keep the old answer
+/// (first minimum wins, `-0.0 == +0.0`); a NaN is never the thin axis.
+#[test]
+fn thin_axis_is_total_on_nan_half_extents_7674() {
+    assert_eq!(thin_axis(&[2.0, 0.1, 1.0]), 1);
+    assert_eq!(thin_axis(&[0.1, 0.1, 1.0]), 0, "a tie keeps the first minimum");
+    assert_eq!(thin_axis(&[0.0, -0.0, 1.0]), 0, "-0 and +0 tie; the first wins");
+    assert_eq!(thin_axis(&[f64::NAN, 0.3, 0.2]), 2, "a NaN half-extent is never the thin axis");
+    assert_eq!(thin_axis(&[0.3, -f64::NAN, 0.2]), 2, "nor is a negative NaN");
+    assert_eq!(thin_axis(&[f64::NAN; 3]), 0);
 }

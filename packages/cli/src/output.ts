@@ -55,6 +55,20 @@ export async function writeOutput(content: string | Uint8Array, outPath?: string
 }
 
 /**
+ * A number for human-readable CLI text, grouped the en-US way (`2,500`) on
+ * every host.
+ *
+ * `toLocaleString()` with no argument follows the host's `LC_ALL` / `LANG`, so
+ * `ifc-lite info` printed `2 500` on a Swedish machine and `2.500` on a German
+ * one (#7027). The CLI's text is English and gets pasted into issues and
+ * diffed, so its numbers are en-US wherever it runs. `--json` output does not
+ * come through here: it carries plain numbers.
+ */
+export function formatCount(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
+/**
  * Format data as a simple ASCII table.
  */
 export function formatTable(headers: string[], rows: string[][]): string {
@@ -141,6 +155,49 @@ export function validateViewerPort(raw: string | undefined, flagName = '--viewer
     fatal(`Invalid ${flagName} port: "${raw}" (must be 1–65535)`);
   }
   return port;
+}
+
+/**
+ * Parse a `--limit`-shaped flag into a non-negative integer. Calls fatal() on
+ * anything that isn't one (garbage, negative, fractional) instead of letting
+ * `parseInt` silently coerce it to `NaN` — `Array.prototype.slice(0, NaN)`
+ * quietly returns an empty array, which turns a typo'd limit into a
+ * zero-row/zero-entity result reported as success (#see export --limit).
+ */
+export function validateLimit(raw: string | undefined, flagName = '--limit'): number | undefined {
+  if (raw === undefined) return undefined;
+  // Reject blank/whitespace-only before Number(): Number('   ') is 0, so an
+  // untrimmed check would silently accept "  " as a deliberate --limit 0.
+  if (raw.trim() === '') {
+    fatal(`Invalid ${flagName}: "${raw}" (must be a non-negative integer)`);
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    fatal(`Invalid ${flagName}: "${raw}" (must be a non-negative integer)`);
+  }
+  return n;
+}
+
+/**
+ * A candidate string is absent for display/grouping purposes when it is
+ * undefined/null OR blank/whitespace-only (`IFCMATERIAL('',$,$)`,
+ * `IFCBUILDINGSTOREY('...','',...)`, or a whitespace-only source value — a
+ * real shape, see #3714). Chaining raw candidates with `??` only falls
+ * through on null/undefined, so a present-but-blank `Name` short-circuits
+ * the chain and is emitted verbatim (an empty-string JSON key, a blank
+ * label) where a placeholder belongs. Mirrors the shape introduced in
+ * `packages/mcp/src/material-naming.ts` for the same defect family.
+ */
+export function isBlank(value: string | undefined | null): boolean {
+  return value === undefined || value === null || value.trim() === '';
+}
+
+/** First candidate that is not blank per `isBlank`, or undefined if none. */
+export function firstNonBlank(...candidates: Array<string | undefined | null>): string | undefined {
+  for (const candidate of candidates) {
+    if (!isBlank(candidate)) return candidate ?? undefined;
+  }
+  return undefined;
 }
 
 /**

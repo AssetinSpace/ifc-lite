@@ -94,6 +94,9 @@ ifc-lite clash model.ifc --a "IfcPipeSegment*"
 
 # Export clashes as a BCF archive
 ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
+
+# Export every clash as one CSV row for Excel / Power BI
+ifc-lite clash model.ifc --matrix --csv clashes.csv
 ```
 
 | Flag | Description |
@@ -104,10 +107,11 @@ ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
 | `--mode <m>` | `hard` (default) or `clearance` |
 | `--tolerance <m>` | Penetration tolerance in metres (hard mode) |
 | `--clearance <m>` | Required clearance in metres (clearance mode) |
-| `--bcf <file>` | Write results as a BCF archive |
+| `--bcf <file>` | Write results as a BCF archive (viewpoint cameras in IFC world coordinates) |
 | `--group <g>` | BCF topic grouping: `cluster` (default), `rule`, `typePair`, `element` |
 | `--bcf-status <s>` | Topic status for exported BCF topics |
 | `--max-topics <N>` | Cap the number of BCF topics |
+| `--csv <file>` | Write every clash as one row of a CSV table (see [CSV table export](#csv-table-export)) |
 | `--json` | JSON output |
 
 The human summary reports the total, a severity breakdown, and the top clashes with their signed distance (`penetration 0.043m` or `gap 0.012m`). `--json` emits the full summary and clash list (capped for display).
@@ -129,8 +133,74 @@ reviews.set(key, { status: 'accepted', comment: 'Coordinated with structural' })
 const topicStatus = aggregateReviewStatus(members.map((c) => reviews.get(clashReviewKey(c))?.status ?? 'open'));
 ```
 
+### Saved reports
+
+A new run replaces the result on screen. To keep one, open **Saved clash
+reports** in the viewer's Clash panel header, give the result a name and
+choose **Save current result**. The report records the clashes as the panel
+shows them (after your exclusions), each with the review status, comment,
+group and storey it had at that moment, together with the rules and settings
+of the run and the names and source identities of the models it ran on.
+Later reviews, regrouping and re-runs leave a saved report unchanged; only
+its name can be edited.
+
+The dialog says before you save when the result is not a complete, current
+run, and the report keeps that fact: a run that stopped at its candidate-pair
+limit is saved as a **Partial run**, a result whose model was edited or
+moved after the run is saved as **Models changed before saving**, and a
+result your exclusion rules are narrowing is saved as **N hidden by
+exclusions**, with the number of clashes they hide. Run the check again
+first if you want a current result, and switch the exclusions off first if
+you want the whole run.
+
+Saved reports are stored in this browser's saved content library with saved
+validation reports and comparisons. They survive a reload and are part of
+**Storage and backup → Download library backup**; importing a backup brings
+them back, and a report that conflicts with one you already have arrives as a
+separate copy. Deleting a report warns that charts reading it will show it as
+unavailable.
+
+The dialog also says whether the reports are stored. If the browser refuses a
+write (storage full or blocked), the report stays in the list for this tab
+only, the dialog says so and offers **Retry save**; if the saved reports
+cannot be read, it says that instead of showing an empty list. **Storage and
+backup** is in the same dialog.
+
+Each [clash chart](charts.md#saved-clash-report-charts) can read the current
+result or one saved report, which is how two charts show two runs side by
+side. A saved report is evidence of the model it ran on. It is never matched
+to a different revision: when the loaded model is another revision, charts
+label the report as historical and keep showing the recorded results.
+
 ### BCF export
 
-`groupClashes` clusters related clashes into the unit of a single BCF topic, and `createBCFFromClashResult` (from `@ifc-lite/clash/bcf`) turns those groups into a BCF project you write with `@ifc-lite/bcf`. On export, review status maps to a BCF 2.1 `TopicStatus` through `reviewStatusToBcfTopicStatus`, using only the two universally supported statuses (`Open` and `Closed`) so any BCF tool round-trips the archive. Both `resolved` and `accepted` are terminal and close the topic; the finer distinction is preserved in the topic description rather than the status field. See the [BCF Collaboration](bcf.md) guide for the round-trip.
+In the viewer, once a result is on screen the panel header offers **Re-run**, the same place IDS and Compare keep theirs. It repeats the run that produced the result ("Detect all clashes", the enabled rule set, a single rule, or "Find duplicates"), with the current mode and tolerance settings, and its tooltip names what it will repeat. While a run is in flight it reads **Cancel**. The status bar's **Activity** tray also offers **Cancel** for clash detection, rule preparation and duplicate scanning. It stops the owned run and records **Cancelled**, retaining the previous completed result. Closing the Clash panel leaves the job running and its tray cancellation available. A newer run supersedes the previous one; an older row cannot stop the newer run. Detection stops at the native engine's next cancellation checkpoint; a duplicate scan can be stopped before its synchronous scan begins. Before the first run, with no model of your own open, **Try with demo data** loads the demo revision B, which carries one injected clash.
+
+`groupClashes` clusters related clashes into the unit of a single BCF topic, and `createBCFFromClashResult` (from `@ifc-lite/clash/bcf`) turns those groups into a BCF project you write with `@ifc-lite/bcf`. On export, review status maps to a BCF 2.1 `TopicStatus` through `reviewStatusToBcfTopicStatus`, using only the two universally supported statuses (`Open` and `Closed`) so any BCF tool round-trips the archive. Both `resolved` and `accepted` are terminal and close the topic; the finer distinction is preserved in the topic description rather than the status field. Clash bounds are in the mesher's shifted render frame, so pass `worldOffset: renderFrameWorldOffset(geometryResult.coordinateInfo)` (from `@ifc-lite/geometry/world-frame`) to write world-coordinate cameras; the CLI and the viewer do. See the [BCF Collaboration](bcf.md) guide for the round-trip and the coordinate frames.
+
+### CSV table export
+
+For spreadsheets and BI tools the run is also a flat table: one row per clash, both elements on the row, keyed by their bare IfcGUIDs so the rows join back to the model's own element tables. In the viewer, the **CSV** format of the clash panel's export split button (beside **BCF**, the archive) downloads the whole run (after exclusions — the panel's review-status and "hide touching" filters are for reading, and a BI reader filters in their own tool); on the CLI it is `--csv <file>`. Both go through `clashTableRows` and the shared `tableToCsv` writer, so the file has the same columns everywhere:
+
+| Column | Meaning |
+|--------|---------|
+| `ClashId`, `Rule`, `Status`, `Severity` | The detection: `Status` is `hard` / `clearance` / `touch` |
+| `Review`, `ReviewComment`, `ReviewUpdatedAt` | The coordinator's triage (`open` / `resolved` / `accepted`), joined by `clashReviewKey`; `open` when never reviewed |
+| `GlobalIdA`, `GlobalIdB` | Bare IfcGUIDs — empty for an element without one (a model whose roots carry no GlobalId, or an IFCx prim) |
+| `KeyA`, `KeyB` | The adapter's durable key as the run saw it (`IfcGUID`, `IfcGUID:occurrence`, `expressid:model:n`, or a USD prim path) |
+| `ModelA`, `ModelB`, `TypeA`, `TypeB`, `NameA`, `NameB`, `StoreyA`, `StoreyB` | Where and what; the storey is resolved from the loaded model's spatial hierarchy and left empty when the element no longer resolves |
+| `PointX`, `PointY`, `PointZ`, `Distance`, `DistanceKind` | The contact point in the run's world frame and the signed distance (`<0` penetration, `>0` gap), with its provenance (`mesh` / `estimate`) |
+| `Group` | Title of the cluster / rule / type-pair group the clash was put in, when groups were computed |
+
+```typescript
+import { clashTableRows, CLASH_TABLE_COLUMNS } from '@ifc-lite/clash';
+import { tableToCsv } from '@ifc-lite/export';
+
+const storeys = new Map<string, string>(); // element key -> storey name, from your own model index
+
+// `storeyOf` / `modelNameOf` are the consumer's lookups: the result carries a model id and no storey.
+const rows = clashTableRows(clashResult.clashes, { reviews, storeyOf: (ref) => storeys.get(ref.key) });
+const csv = tableToCsv(CLASH_TABLE_COLUMNS, rows);
+```
 
 For the full API, see the [`@ifc-lite/clash` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/clash).

@@ -4,12 +4,78 @@
 
 //! Simple median-split AABB BVH for spatial queries.
 //!
-//! Faithful port of the `build` / `queryAABB` behaviour in
+//! Faithful port of the `build` / `queryAABB` / `raycast` behaviour in
 //! `packages/spatial/src/bvh.ts`: longest-axis split, sort items by center
 //! along that axis, split the sorted list in half, and re-check leaf bounds on
 //! query. Each item carries an `id` (returned by queries) and its bounds.
 
 use crate::aabb::Aabb;
+use crate::vec3::Vec3;
+
+/// `Math.max` semantics, which differ from Rust's `f64::max` on NaN: JS
+/// propagates the NaN, Rust returns the non-NaN operand. The slab test below
+/// must reject NaN geometry exactly the way the TS BVH does, or the two kernels
+/// disagree on meshes with NaN coordinates. `pub(crate)` so `tri_mesh.rs`'s
+/// `tri_bounds` (per-triangle leaf bounds, matching `tri-mesh.ts`'s
+/// `Math.min`/`Math.max`-based `triBounds`) can share this instead of
+/// reimplementing it — see #5220.
+#[inline]
+pub(crate) fn js_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `Math.min` semantics — see [`js_max`].
+#[inline]
+pub(crate) fn js_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Slab-method ray/AABB test, operation for operation the TS
+/// `BVH.rayIntersectsAABB`. Conservative: any box the ray truly enters at
+/// `t >= 0` passes.
+fn ray_intersects_aabb(origin: Vec3, direction: Vec3, aabb: &Aabb) -> bool {
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+
+    for i in 0..3 {
+        if direction[i] == 0.0 {
+            // Ray parallel to this axis' slab; reject if the origin is outside
+            // it. Avoids 0 * Infinity = NaN poisoning tmin/tmax below.
+            if origin[i] < aabb.min[i] || origin[i] > aabb.max[i] {
+                return false;
+            }
+            continue;
+        }
+        let inv_d = 1.0 / direction[i];
+        let mut t0 = (aabb.min[i] - origin[i]) * inv_d;
+        let mut t1 = (aabb.max[i] - origin[i]) * inv_d;
+
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+
+        tmin = js_max(tmin, t0);
+        tmax = js_min(tmax, t1);
+
+        if tmax < tmin {
+            return false;
+        }
+    }
+
+    tmax >= 0.0
+}
 
 struct Node {
     bounds: Aabb,
@@ -47,6 +113,45 @@ impl Bvh {
             self.query_node(root, query, &mut results);
         }
         results
+    }
+
+    /// Return the ids of items whose bounds the ray from `origin` along
+    /// `direction` may hit. Mirrors the TS `BVH.raycast`, including its
+    /// normalisation of `direction` and its left-then-right traversal.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3) -> Vec<u32> {
+        let mut results = Vec::new();
+        let Some(root) = &self.root else {
+            return results;
+        };
+        // Normalize direction. The only caller passes a vector that is already
+        // exactly unit-length, so this is the identity there — it is kept so the
+        // two BVH implementations stay line-for-line comparable.
+        let len =
+            (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+                .sqrt();
+        let dir = [direction[0] / len, direction[1] / len, direction[2] / len];
+        self.raycast_node(root, origin, dir, &mut results);
+        results
+    }
+
+    fn raycast_node(&self, node: &Node, origin: Vec3, direction: Vec3, results: &mut Vec<u32>) {
+        if !ray_intersects_aabb(origin, direction, &node.bounds) {
+            return;
+        }
+        if !node.ids.is_empty() {
+            for &idx in &node.ids {
+                if ray_intersects_aabb(origin, direction, &self.bounds[idx as usize]) {
+                    results.push(self.ids[idx as usize]);
+                }
+            }
+        } else {
+            if let Some(left) = &node.left {
+                self.raycast_node(left, origin, direction, results);
+            }
+            if let Some(right) = &node.right {
+                self.raycast_node(right, origin, direction, results);
+            }
+        }
     }
 
     fn query_node(&self, node: &Node, query: &Aabb, results: &mut Vec<u32>) {
@@ -87,6 +192,32 @@ fn compute_bounds(indices: &[usize], bounds: &[Aabb]) -> Aabb {
     Aabb::new(min, max)
 }
 
+/// Port of `compareCenters` in `packages/spatial/src/bvh.ts`: centre along
+/// `axis` ascending, a NaN centre after every number, then the item index.
+/// That is a total order, so `sort_by` cannot panic on the NaN centres a
+/// NaN-vertex triangle produces (#5220, #7674). `<`/`>` rather than
+/// `total_cmp`, because TS treats `-0` and `+0` as equal and lets the index
+/// decide. The index tie-break also makes each child's order independent of
+/// the parent's sort, which is how the TS quickselect sees it.
+fn compare_centers(bounds: &[Aabb], a: usize, b: usize, axis: usize) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ca = (bounds[a].min[axis] + bounds[a].max[axis]) / 2.0;
+    let cb = (bounds[b].min[axis] + bounds[b].max[axis]) / 2.0;
+    if ca < cb {
+        Ordering::Less
+    } else if ca > cb {
+        Ordering::Greater
+    } else if ca.is_nan() != cb.is_nan() {
+        if ca.is_nan() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }
+    } else {
+        a.cmp(&b)
+    }
+}
+
 fn build_node(indices: &mut [usize], bounds: &[Aabb]) -> Box<Node> {
     if indices.len() == 1 {
         let idx = indices[0];
@@ -114,13 +245,8 @@ fn build_node(indices: &mut [usize], bounds: &[Aabb]) -> Box<Node> {
         2
     };
 
-    // Sort by center along axis. The TS comparator subtracts centers; a stable
-    // sort by that key reproduces the same ordering.
-    indices.sort_by(|&a, &b| {
-        let ca = (bounds[a].min[axis] + bounds[a].max[axis]) / 2.0;
-        let cb = (bounds[b].min[axis] + bounds[b].max[axis]) / 2.0;
-        ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort by center along axis with the TS `compareCenters` order (#7674).
+    indices.sort_by(|&a, &b| compare_centers(bounds, a, b, axis));
 
     let mid = indices.len() / 2;
     let (left_indices, right_indices) = indices.split_at_mut(mid);
@@ -131,3 +257,7 @@ fn build_node(indices: &mut [usize], bounds: &[Aabb]) -> Box<Node> {
         ids: Vec::new(),
     })
 }
+
+#[cfg(test)]
+#[path = "bvh_tests.rs"]
+mod tests;

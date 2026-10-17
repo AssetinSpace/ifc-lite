@@ -31,6 +31,24 @@
       "@ifc-lite/wasm/*": [
         "packages/wasm/pkg/*"
       ],
+      "@ifc-lite/wasm-lifecycle": [
+        "packages/wasm-lifecycle/dist/index.d.ts"
+      ],
+      "@ifc-lite/wasm-lifecycle/*": [
+        "packages/wasm-lifecycle/dist/*"
+      ],
+      "@ifc-lite/ai": [
+        "packages/ai/dist/index.d.ts"
+      ],
+      "@ifc-lite/ai/*": [
+        "packages/ai/dist/*"
+      ],
+      "@ifc-lite/load-trace": [
+        "packages/load-trace/dist/index.d.ts"
+      ],
+      "@ifc-lite/load-trace/*": [
+        "packages/load-trace/dist/*"
+      ],
       "@ifc-lite/geometry": [
         "packages/geometry/dist/index.d.ts"
       ],
@@ -73,17 +91,59 @@
       "@ifc-lite/encoding/*": [
         "packages/encoding/dist/*"
       ],
+      "@ifc-lite/regex-guard": [
+        "packages/regex-guard/dist/index.d.ts"
+      ],
+      "@ifc-lite/regex-guard/*": [
+        "packages/regex-guard/dist/*"
+      ],
+      "@ifc-lite/flow": [
+        "packages/flow/dist/index.d.ts"
+      ],
+      "@ifc-lite/flow/*": [
+        "packages/flow/dist/*"
+      ],
+      "@ifc-lite/flow-nodes": [
+        "packages/flow-nodes/dist/index.d.ts"
+      ],
+      "@ifc-lite/flow-nodes/*": [
+        "packages/flow-nodes/dist/*"
+      ],
       "@ifc-lite/ids": [
         "packages/ids/dist/index.d.ts"
       ],
       "@ifc-lite/ids/*": [
         "packages/ids/dist/*"
       ],
+      "@ifc-lite/ids-authoring": [
+        "packages/ids-authoring/dist/index.d.ts"
+      ],
+      "@ifc-lite/ids-authoring/*": [
+        "packages/ids-authoring/dist/*"
+      ],
+      "@ifc-lite/ids-agent": [
+        "packages/ids-agent/dist/index.d.ts"
+      ],
+      "@ifc-lite/ids-agent/anthropic": [
+        "packages/ids-agent/dist/providers/anthropic.d.ts"
+      ],
+      "@ifc-lite/ids-agent/openai": [
+        "packages/ids-agent/dist/providers/openai.d.ts"
+      ],
+      "@ifc-lite/ids-agent/testing": [
+        "packages/ids-agent/dist/testing/index.d.ts"
+      ],
       "@ifc-lite/lists": [
         "packages/lists/dist/index.d.ts"
       ],
       "@ifc-lite/lists/*": [
         "packages/lists/dist/*"
+      ],
+      "@ifc-lite/rules": [
+        "packages/rules/dist/index.d.ts"
+      ],
+      "@ifc-lite/rules/*": [
+        "packages/rules/dist/*"
       ],
       "@ifc-lite/sdk": [
         "packages/sdk/dist/index.d.ts"
@@ -108,6 +168,45 @@
       ],
       "@ifc-lite/viewer/*": [
         "packages/viewer/dist/*"
+      ],
+      "@ifc-lite/plugin-api": [
+        "packages/plugin-api/dist/index.d.ts"
+      ],
+      "@ifc-lite/source-dalux": [
+        "packages/source-dalux/dist/index.d.ts"
+      ],
+      "@ifc-lite/source-dalux/*": [
+        "packages/source-dalux/dist/*"
+      ],
+      "@ifc-lite/oauth-pkce": [
+        "packages/oauth-pkce/dist/index.d.ts"
+      ],
+      "@ifc-lite/oauth-pkce/*": [
+        "packages/oauth-pkce/dist/*"
+      ],
+      "@ifc-lite/source-dropbox": [
+        "packages/source-dropbox/dist/index.d.ts"
+      ],
+      "@ifc-lite/source-dropbox/*": [
+        "packages/source-dropbox/dist/*"
+      ],
+      "@ifc-lite/source-msgraph": [
+        "packages/source-msgraph/dist/index.d.ts"
+      ],
+      "@ifc-lite/source-msgraph/*": [
+        "packages/source-msgraph/dist/*"
+      ],
+      "@ifc-lite/plugin-api/*": [
+        "packages/plugin-api/dist/*"
+      ],
+      "@ifc-lite/semantic": [
+        "packages/semantic/dist/index.d.ts"
+      ],
+      "@ifc-lite/semantic/*": [
+        "packages/semantic/dist/*"
+      ],
+      "@ifc-lite/source-autodesk": [
+        "packages/source-autodesk/dist/index.d.ts"
       ]
     }
   },

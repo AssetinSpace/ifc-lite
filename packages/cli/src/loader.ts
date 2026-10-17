@@ -9,8 +9,8 @@
 import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { basename } from 'node:path';
-import { IfcParser, unwrapIfcZipView, type IfcDataStore } from '@ifc-lite/parser';
-import { createBimContext, type BimContext, type ViewerBackendMethods, type VisibilityBackendMethods } from '@ifc-lite/sdk';
+import { IfcParser, IfcInputError, validateStepInput, type IfcDataStore } from '@ifc-lite/parser';
+import { createBimContext, type BimContext } from '@ifc-lite/sdk';
 import { HeadlessBackend } from './headless-backend.js';
 import { createStreamingViewerAdapter, createStreamingVisibilityAdapter } from './streaming-viewer.js';
 
@@ -34,31 +34,50 @@ export async function loadIfcBytes(
   bytes: Uint8Array,
   label = 'input',
 ): Promise<IfcDataStore> {
-  // Validate the file is a STEP/IFC file
-  if (bytes.byteLength === 0) {
-    process.stderr.write(`Error: ${label} is empty (0 bytes)\n`);
-    process.exit(1);
-  }
-
-  // Transparent .ifcZIP unwrap (issue #1494) — cheap magic-byte no-op for an
-  // ordinary .ifc file. `unwrapIfcZipView` returns an ArrayBuffer over the
-  // model bytes (the input unchanged when it isn't a zip container), so this
-  // covers both the disk-read path and callers that already hold the buffer.
   try {
-    bytes = new Uint8Array(await unwrapIfcZipView(bytes));
+    return await parseIfcBytes(bytes, label);
   } catch (err) {
-    process.stderr.write(`Error: ${label}: ${(err as Error).message}\n`);
+    if (!(err instanceof IfcBytesRejectedError)) throw err;
+    process.stderr.write(`Error: ${err.message}\n`);
     process.exit(1);
   }
+}
 
-  // Check for STEP file signature ("ISO-10303-21") in the first 256 bytes.
-  // TextDecoder (not Buffer.toString) so a plain Uint8Array view works too.
-  const headerSnippet = new TextDecoder('latin1').decode(
-    bytes.subarray(0, Math.min(bytes.byteLength, 256)),
-  );
-  if (!headerSnippet.includes('ISO-10303-21')) {
-    process.stderr.write(`Error: ${label} is not a valid IFC/STEP file\n`);
-    process.exit(1);
+/** Bytes {@link parseIfcBytes} refused before parsing: empty, not STEP, truncated, or with no DATA section. */
+/** The `scan:` diagnostics each loaded store was parsed with (#7610). */
+const incompleteScans = new WeakMap<IfcDataStore, readonly string[]>();
+
+/**
+ * The scan diagnostics `store` was loaded with: empty when every record the
+ * file declares was read, otherwise the lines already warned on stderr. Lets
+ * a command explain an answer the missing records change, such as an id that
+ * is "not found" because the scan refused its record.
+ */
+export function scanCompletenessWarnings(store: IfcDataStore): readonly string[] {
+  return incompleteScans.get(store) ?? [];
+}
+
+export class IfcBytesRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IfcBytesRejectedError';
+  }
+}
+
+/**
+ * {@link loadIfcBytes} for a caller that must survive a bad file (a flow's
+ * `model.openFromSource` mid-run): the same checks, but a rejection throws
+ * {@link IfcBytesRejectedError} instead of exiting the process.
+ */
+export async function parseIfcBytes(
+  bytes: Uint8Array,
+  label = 'input',
+): Promise<IfcDataStore> {
+  try {
+    bytes = await validateStepInput(bytes, label);
+  } catch (error) {
+    if (!(error instanceof IfcInputError)) throw error;
+    throw new IfcBytesRejectedError(error.message);
   }
 
   const parser = new IfcParser();
@@ -84,11 +103,23 @@ export async function loadIfcBytes(
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength,
     ) as ArrayBuffer;
+    const scanWarnings: string[] = [];
     const store = await parser.parseColumnar(arrayBuffer, {
-      // The structured diagnostic channel, captured directly.
-      onDiagnostic: (m: string) => logger.debug(`parser: ${m}`),
+      // The structured diagnostic channel, captured directly. A `scan:` line
+      // says the model is SHORT: records were dropped (#3695, #7541) or
+      // skipped (#3395). Like the truncation check above, that is not debug
+      // detail: every command would otherwise answer, and `mutate`/`export`
+      // write, from a model missing records with nothing said (#7610). So
+      // those go to stderr at warn level, which keeps stdout clean for
+      // payloads; the rest stays debug.
+      onDiagnostic: (m: string) => {
+        if (!m.startsWith('scan: ')) return logger.debug(`parser: ${m}`);
+        scanWarnings.push(m);
+        logger.warn(`Warning: ${label}: ${m}`);
+      },
     });
     store.fileSize = bytes.byteLength;
+    if (scanWarnings.length > 0) incompleteScans.set(store, scanWarnings);
     return store;
   } finally {
     console.log = origLog;
@@ -99,11 +130,11 @@ export async function loadIfcBytes(
 /**
  * Create a BimContext backed by a headless backend from an IFC file.
  */
-export async function createHeadlessContext(filePath: string): Promise<{ bim: BimContext; store: IfcDataStore }> {
+export async function createHeadlessContext(filePath: string): Promise<{ bim: BimContext; store: IfcDataStore; backend: HeadlessBackend }> {
   const store = await loadIfcFile(filePath);
   const backend = new HeadlessBackend(store, basename(filePath));
   const bim = createBimContext({ backend });
-  return { bim, store };
+  return { bim, store, backend };
 }
 
 /**
@@ -119,9 +150,7 @@ export async function createStreamingContext(
   const store = await loadIfcFile(filePath);
   const backend = new HeadlessBackend(store, basename(filePath));
 
-  // Replace the no-op viewer/visibility adapters with streaming ones
-  (backend as unknown as { viewer: ViewerBackendMethods }).viewer = createStreamingViewerAdapter(viewerPort);
-  (backend as unknown as { visibility: VisibilityBackendMethods }).visibility = createStreamingVisibilityAdapter(viewerPort);
+  backend.attachStreamingAdapters(createStreamingViewerAdapter(viewerPort), createStreamingVisibilityAdapter(viewerPort));
 
   const bim = createBimContext({ backend });
   return { bim, store };

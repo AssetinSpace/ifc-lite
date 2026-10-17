@@ -10,8 +10,12 @@ use wasm_bindgen::prelude::*;
 
 mod mesh;
 mod symbolic;
+mod symbolic_from_data;
+mod symbolic_truncation;
+#[cfg(test)]
+mod symbolic_tests;
 
-pub use mesh::{MeshCollection, MeshDataJs};
+pub use mesh::{GeometryFingerprint, MeshCollection, MeshDataJs};
 pub use symbolic::{
     SymbolicCircle, SymbolicFillArea, SymbolicPolyline, SymbolicRepresentationCollection,
     SymbolicText,

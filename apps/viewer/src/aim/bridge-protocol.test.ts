@@ -51,6 +51,14 @@ describe('isInboundMessage', () => {
     assert.equal(isInboundMessage('FOCUS'), false);
   });
 
+  it('accepts SELECT with one GUID and rejects a missing, empty or non-string guid (D-082)', () => {
+    assert.ok(isInboundMessage({ source: SOURCE, type: 'SELECT', guid: '0MJFXziqDE$gGyPWwro9fq' }));
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'SELECT' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'SELECT', guid: '' }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'SELECT', guid: ['a'] }), false);
+    assert.equal(isInboundMessage({ source: SOURCE, type: 'SELECT', guids: ['a'] }), false);
+  });
+
   it('rejects FOCUS/HIGHLIGHT_FILTER with a missing or malformed guids payload', () => {
     // Regression: the envelope-only guard let `{type:'FOCUS'}` through and the
     // handler threw a TypeError iterating `undefined` — remotely pokeable noise.

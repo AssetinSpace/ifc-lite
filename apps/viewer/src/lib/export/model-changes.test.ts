@@ -5,15 +5,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { IfcDataStore, ScheduleExtraction } from '@ifc-lite/parser';
-import type { MutablePropertyView } from '@ifc-lite/mutations';
+import { MutablePropertyView as RealMutablePropertyView, type MutablePropertyView } from '@ifc-lite/mutations';
+import { PropertyValueType } from '@ifc-lite/data';
 import type { FederatedModel, SchemaVersion } from '@/store/types';
 import type { GeorefMutationData } from '@/store/slices/mutationSlice';
 import {
   collectChangedModels,
   totalChangeCount,
   buildChangedArtifacts,
-  uniqueArtifactBase,
-  mapStepSchema,
   LEGACY_MODEL_ID,
   type ChangesExportState,
   type BuildArtifactsDeps,
@@ -58,6 +57,8 @@ function mkState(partial: Partial<ChangesExportState>): ChangesExportState {
     scheduleData: null,
     scheduleIsEdited: false,
     scheduleSourceModelId: null,
+    collabRoomId: null,
+    collabRoomModels: new Map(),
     ...partial,
   };
 }
@@ -297,25 +298,66 @@ describe('collectChangedModels', () => {
   });
 });
 
-// ── pure helpers ─────────────────────────────────────────────────────────────
+// ── badge-vs-dialog agreement (maintainer finding on #1967) ────────────────────
+//
+// `collectChangedModels`'s per-model `changeCount` (the toolbar badge number,
+// via `totalChangeCount`) and `ExportChangesReviewDialog`'s itemized rows (via
+// `getEffectiveChanges()`) both ultimately read `MutablePropertyView`. Before
+// this fix, a create -> edit -> delete entity left `getModifiedEntityCount()`
+// (which `changeCount` uses) reporting 1 while `getEffectiveChanges()`
+// (which the dialog itemizes) already reported zero rows for it — a reachable
+// trap state: the toolbar badge stays permanently amber with a change that
+// will never actually export anything, and the review dialog it opens says
+// "No pending changes to export" with Export disabled. These tests use the
+// REAL `MutablePropertyView` (not the `mkView` count stub above) because the
+// bug is specifically in how the two readers can diverge on the same live
+// overlay.
+describe('badge-vs-dialog agreement (maintainer finding on #1967)', () => {
+  it('a create->edit->delete entity does not leave a phantom entry in the changed-model set', () => {
+    const view = new RealMutablePropertyView(null, 'model-1');
+    view.setExpressIdWatermark(0);
+    const created = view.createEntity('IfcSpace', ['guid', null, 'New Space']);
+    view.setAttribute(created.expressId, 'Name', 'Edited Space');
+    view.setProperty(created.expressId, 'Pset_X', 'A', 'v', PropertyValueType.Label);
+    view.deleteEntity(created.expressId);
 
-describe('uniqueArtifactBase', () => {
-  it('dedupes same name+ext, leaves different ext alone', () => {
-    const used = new Set<string>();
-    assert.strictEqual(uniqueArtifactBase('model', 'ifc', used), 'model');
-    assert.strictEqual(uniqueArtifactBase('model', 'ifc', used), 'model-2');
-    assert.strictEqual(uniqueArtifactBase('model', 'ifc', used), 'model-3');
-    // same base, different extension is a distinct filename -> no suffix.
-    assert.strictEqual(uniqueArtifactBase('model', 'ifcx', used), 'model');
+    const models = new Map<string, FederatedModel>([['model-1', mkModel('model-1', 'model-1.ifc')]]);
+    const mutationViews = new Map<string, MutablePropertyView>([['model-1', view]]);
+    const state = mkState({ models, mutationViews });
+
+    const result = collectChangedModels(state);
+
+    // The model must not appear at all — a `changeCount > 0` entry here is
+    // exactly what kept the toolbar badge amber for a change with nothing
+    // behind it.
+    assert.strictEqual(result.models.length, 0);
+    assert.strictEqual(totalChangeCount(result), 0);
   });
-});
 
-describe('mapStepSchema', () => {
-  it('maps schema versions to STEP tokens', () => {
-    assert.strictEqual(mapStepSchema('IFC2X3'), 'IFC2X3');
-    assert.strictEqual(mapStepSchema('IFC4'), 'IFC4');
-    assert.strictEqual(mapStepSchema('IFC4X3'), 'IFC4X3');
-    assert.strictEqual(mapStepSchema('IFC5'), 'IFC4'); // caller routes IFC5 elsewhere
+  it('a real edit alongside a create->edit->delete phantom is counted once, not twice', () => {
+    const view = new RealMutablePropertyView(null, 'model-1');
+    view.setOnDemandExtractor((entityId) => entityId === 7 ? [{
+      name: 'Pset_Base',
+      globalId: 'g',
+      properties: [{ name: 'Status', type: PropertyValueType.Label, value: 'Original' }],
+    }] : []);
+    view.setExpressIdWatermark(0);
+    view.setProperty(7, 'Pset_Base', 'Status', 'Edited', PropertyValueType.Label);
+    const created = view.createEntity('IfcSpace', ['guid', null, 'New Space']);
+    view.setProperty(created.expressId, 'Pset_X', 'A', 'v', PropertyValueType.Label);
+    view.deleteEntity(created.expressId);
+
+    const models = new Map<string, FederatedModel>([['model-1', mkModel('model-1', 'model-1.ifc')]]);
+    const mutationViews = new Map<string, MutablePropertyView>([['model-1', view]]);
+    const state = mkState({ models, mutationViews });
+
+    const result = collectChangedModels(state);
+    assert.strictEqual(result.models.length, 1);
+    // Badge count agrees with the one real, itemizable change — not inflated
+    // by the phantom entity.
+    assert.strictEqual(result.models[0].changeCount, 1);
+    assert.strictEqual(totalChangeCount(result), 1);
+    assert.strictEqual(view.getEffectiveChanges().length, 1);
   });
 });
 
@@ -503,5 +545,70 @@ describe('buildChangedArtifacts', () => {
     assert.strictEqual(files[0].modelId, 'b');
     assert.strictEqual(skipped.length, 1);
     assert.strictEqual(skipped[0].reason, 'boom');
+  });
+
+  // #4444: a recipient's room model is keyed by `/<slotId>/<GlobalId>`; the
+  // one-click "Export changes" route must un-home it the same way the Export
+  // dialog does, and leave the owner's own model of the same room alone.
+  it('hands the IFCX exporter the room slot prefix for a recipient room model only', async () => {
+    const roomId = 'r1';
+    const guestId = `room:${roomId}:m1`;
+    const models = new Map<string, FederatedModel>([
+      [guestId, mkModel(guestId, 'shared.ifcx (2)', 'IFC5')],
+      ['own', mkModel('own', 'own.ifcx', 'IFC5')],
+    ]);
+    const mutationViews = new Map<string, MutablePropertyView>([
+      [guestId, mkView(1)],
+      ['own', mkView(1)],
+    ]);
+    const prefixes = new Map<string, string | undefined>();
+    const { deps } = fakeDeps({
+      exportIfcx: async (modelId, _ds, _view, inv): Promise<ChangesExportArtifact> => {
+        prefixes.set(modelId, inv.stripPathPrefix);
+        return { content: `IFCX:${modelId}`, ext: 'ifcx', mime: 'application/json' };
+      },
+    });
+    const state = mkState({
+      models,
+      mutationViews,
+      collabRoomId: roomId,
+      collabRoomModels: new Map([
+        [guestId, { slotId: 'm1', pathPrefix: '/m1' }],
+        ['own', { slotId: 'm0', pathPrefix: '/m0' }],
+      ]),
+    });
+    const { files } = await buildChangedArtifacts(state, deps);
+    assert.strictEqual(prefixes.get(guestId), '/m1');
+    assert.strictEqual(prefixes.get('own'), undefined);
+    // The copy suffix survives the extension strip, so the two files differ.
+    assert.deepStrictEqual(files.map((f) => `${f.base}.${f.ext}`).sort(), ['own.ifcx', 'shared -2.ifcx']);
+
+    // Off a session the same models export with their own paths untouched.
+    prefixes.clear();
+    await buildChangedArtifacts(mkState({ models, mutationViews }), deps);
+    assert.strictEqual(prefixes.get(guestId), undefined);
+  });
+
+  // #5201: an empty pset has no IFCX spelling, so the exporter counts it as
+  // skipped; that count must reach the file list the success toast reads,
+  // not stop at the exporter.
+  it('carries the IFCX exporter\'s skipped count onto the artifact file', async () => {
+    const models = new Map<string, FederatedModel>([
+      ['x', mkModel('x', 'x.ifcx', 'IFC5')],
+      ['s', mkModel('s', 's.ifc')],
+    ]);
+    const mutationViews = new Map<string, MutablePropertyView>([
+      ['x', mkView(1)],
+      ['s', mkView(1)],
+    ]);
+    const { deps } = fakeDeps({
+      exportIfcx: async (modelId): Promise<ChangesExportArtifact> => (
+        { content: `IFCX:${modelId}`, ext: 'ifcx', mime: 'application/json', skippedCount: 2 }
+      ),
+    });
+    const { files } = await buildChangedArtifacts(mkState({ models, mutationViews }), deps);
+    const byModel = new Map(files.map((f) => [f.modelId, f.skippedCount]));
+    assert.strictEqual(byModel.get('x'), 2);
+    assert.strictEqual(byModel.get('s'), 0);
   });
 });

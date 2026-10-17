@@ -31,6 +31,7 @@
 //! This test pins both halves of the finding so any future regression of
 //! the unit-scale pathway or the per-element placement chain is caught.
 
+
 use ifc_lite_core::{EntityDecoder, IfcType};
 use ifc_lite_geometry::GeometryRouter;
 
@@ -63,12 +64,7 @@ fn approx(a: f32, b: f32, tol: f32) -> bool {
 /// door bbox-IoU failures will return.
 #[test]
 fn advanced_model_door_world_bbox_matches_ios_in_metres() {
-    let path = "../../tests/models/ara3d/advanced_model.ifc";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: fixture missing at {path}");
-        return;
-    }
-    let content = std::fs::read_to_string(path).expect("read");
+    let content = ifc_lite_testkit::fixture_text_or_skip!("ara3d/advanced_model.ifc");
     let entity_index = ifc_lite_core::build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
@@ -109,12 +105,7 @@ fn advanced_model_door_world_bbox_matches_ios_in_metres() {
 /// drift on a future change.
 #[test]
 fn duplex_m_fixed_window_world_bbox_matches_ios() {
-    let path = "../../tests/models/ara3d/duplex.ifc";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: fixture missing at {path}");
-        return;
-    }
-    let content = std::fs::read_to_string(path).expect("read");
+    let content = ifc_lite_testkit::fixture_text_or_skip!("ara3d/duplex.ifc");
     let entity_index = ifc_lite_core::build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);

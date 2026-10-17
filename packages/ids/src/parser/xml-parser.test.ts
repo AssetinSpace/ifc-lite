@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { parseIDS, IDSParseError } from './xml-parser.js';
+import { matchConstraint } from '../constraints/index.js';
+import type { IDSBoundsConstraint } from '../types.js';
 
 // ============================================================================
 // Valid IDS XML Parsing
@@ -430,6 +432,41 @@ describe('parseIDS — valid documents', () => {
     }
   });
 
+  it('parses XSD restriction with totalDigits/fractionDigits (a standalone digit facet used to fall through to an empty enumeration, which fails every value)', () => {
+    const xml = `<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>T</title></info>
+  <specifications>
+    <specification name="Test" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <property>
+          <propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet>
+          <baseName><simpleValue>ThermalTransmittance</simpleValue></baseName>
+          <value>
+            <xs:restriction base="xs:decimal">
+              <xs:fractionDigits value="2"/>
+            </xs:restriction>
+          </value>
+        </property>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+    const doc = parseIDS(xml);
+    const facet = doc.specifications[0].requirements[0].facet;
+    if (facet.type === 'property') {
+      expect(facet.value).toEqual({
+        type: 'bounds',
+        base: 'xs:decimal',
+        fractionDigits: 2,
+      });
+    }
+  });
+
   it('handles ArrayBuffer input', () => {
     const xml = `<ids xmlns="http://standards.buildingsmart.org/IDS">
   <info><title>Buffer Test</title></info>
@@ -529,3 +566,238 @@ describe('parseIDS — error handling', () => {
 });
 
 // ============================================================================
+
+// ============================================================================
+// Parser -> matcher wiring for the string-length facets (#2746 follow-up)
+// ============================================================================
+
+/**
+ * `constraints.test.ts` pins `matchBounds` against `IDSBoundsConstraint`
+ * objects built by hand, so it cannot see the parser at all. Measured: making
+ * the parser drop all three length facets
+ *
+ *   bounds.length    = readInt(facetEls.length)    -> undefined
+ *   bounds.minLength = readInt(facetEls.minLength) -> undefined
+ *   bounds.maxLength = readInt(facetEls.maxLength) -> undefined
+ *
+ * left the whole packages/ids suite green at 322/322. In user terms an IDS
+ * author writes `<xs:maxLength value="8"/>`, the restriction is silently
+ * dropped, and every element PASSES: a rule that stops restricting reports
+ * success. These cases assert the extracted facets and then drive the matcher
+ * with them, so the parse-to-match path has to survive as a whole.
+ */
+describe('parseIDS: xs:length / xs:minLength / xs:maxLength reach the matcher', () => {
+  const idsWith = (facets: string): string => `<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>T</title></info>
+  <specifications>
+    <specification name="Test" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <attribute>
+          <name><simpleValue>Name</simpleValue></name>
+          <value>
+            <xs:restriction>
+${facets}
+            </xs:restriction>
+          </value>
+        </attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+  /** Asserts the facet type rather than guarding on it: a conditional would
+   *  skip its assertions silently if the shape ever changed. */
+  const boundsOf = (xml: string): IDSBoundsConstraint => {
+    const facet = parseIDS(xml).specifications[0].requirements[0].facet;
+    expect(facet.type).toBe('attribute');
+    const value = (facet as { value?: unknown }).value as IDSBoundsConstraint;
+    expect(value.type).toBe('bounds');
+    return value;
+  };
+
+  it('carries xs:length through the parser and enforces it in the matcher', () => {
+    const bounds = boundsOf(idsWith('              <xs:length value="5"/>'));
+    expect(bounds.length).toBe(5);
+
+    expect(matchConstraint(bounds, 'abcde')).toBe(true);
+    expect(matchConstraint(bounds, 'abcd')).toBe(false);
+    expect(matchConstraint(bounds, 'abcdef')).toBe(false);
+  });
+
+  it('carries xs:minLength through the parser and enforces it in the matcher', () => {
+    const bounds = boundsOf(idsWith('              <xs:minLength value="3"/>'));
+    expect(bounds.minLength).toBe(3);
+
+    expect(matchConstraint(bounds, 'abc')).toBe(true);
+    expect(matchConstraint(bounds, 'ab')).toBe(false);
+  });
+
+  it('carries xs:maxLength through the parser and enforces it in the matcher', () => {
+    const bounds = boundsOf(idsWith('              <xs:maxLength value="8"/>'));
+    expect(bounds.maxLength).toBe(8);
+
+    expect(matchConstraint(bounds, 'abcdefgh')).toBe(true);
+    expect(matchConstraint(bounds, 'abcdefghi')).toBe(false);
+  });
+
+  it('carries a combined minLength/maxLength range', () => {
+    const bounds = boundsOf(idsWith('              <xs:minLength value="2"/>\n              <xs:maxLength value="4"/>'));
+    expect(bounds.minLength).toBe(2);
+    expect(bounds.maxLength).toBe(4);
+
+    expect(matchConstraint(bounds, 'ab')).toBe(true);
+    expect(matchConstraint(bounds, 'abcd')).toBe(true);
+    expect(matchConstraint(bounds, 'a')).toBe(false);
+    expect(matchConstraint(bounds, 'abcde')).toBe(false);
+  });
+});
+
+// ============================================================================
+// A malformed numeric facet must not silently become "unbounded"
+// ============================================================================
+
+/**
+ * `readNumber`/`readInt` (parse-restriction.ts) used to drop a facet to
+ * `undefined` whenever `parseFloat`/`parseInt` failed — identical to the
+ * facet never being present. `matchBounds` then treated an all-`undefined`
+ * bounds constraint as an unconditional pass, so a typo like
+ * `<xs:minInclusive value="not-a-number"/>` silently disabled the
+ * restriction instead of rejecting the malformed IDS (or the value it was
+ * meant to bound). `parseRestriction` now records the facet name and raw
+ * value in `unparseableFacets`, and `matchBounds` fails closed whenever
+ * that list is non-empty.
+ */
+describe('parseIDS: a facet present but unparseable fails closed, not open', () => {
+  const idsWith = (facets: string): string => `<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>T</title></info>
+  <specifications>
+    <specification name="Test" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <attribute>
+          <name><simpleValue>Name</simpleValue></name>
+          <value>
+            <xs:restriction base="xs:double">
+${facets}
+            </xs:restriction>
+          </value>
+        </attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+  const boundsOf = (xml: string): IDSBoundsConstraint => {
+    const facet = parseIDS(xml).specifications[0].requirements[0].facet;
+    expect(facet.type).toBe('attribute');
+    const value = (facet as { value?: unknown }).value as IDSBoundsConstraint;
+    expect(value.type).toBe('bounds');
+    return value;
+  };
+
+  it('a non-numeric xs:minInclusive is recorded, dropped from the numeric field, and rejects every value', () => {
+    const bounds = boundsOf(idsWith('              <xs:minInclusive value="not-a-number"/>'));
+    expect(bounds.minInclusive).toBeUndefined();
+    expect(bounds.unparseableFacets).toEqual([
+      { facet: 'minInclusive', rawValue: 'not-a-number' },
+    ]);
+
+    // Pre-fix this was `true` for any number, including one the author
+    // meant to reject (FireRating=0 with an intended `minInclusive=60`).
+    expect(matchConstraint(bounds, 0)).toBe(false);
+    expect(matchConstraint(bounds, 60)).toBe(false);
+    expect(matchConstraint(bounds, -999999999)).toBe(false);
+  });
+
+  it('a negative xs:totalDigits is recorded and rejects every value', () => {
+    // `readInt` requires `v >= 0`; a negative totalDigits is nonsensical
+    // XSD and used to vanish exactly like an absent facet.
+    const bounds = boundsOf(idsWith('              <xs:totalDigits value="-3"/>'));
+    expect(bounds.totalDigits).toBeUndefined();
+    expect(bounds.unparseableFacets).toEqual([
+      { facet: 'totalDigits', rawValue: '-3' },
+    ]);
+
+    expect(matchConstraint(bounds, 123456)).toBe(false);
+  });
+
+  it('the European decimal comma is unparseable, not read as its integer part (#7399)', () => {
+    // `parseFloat` stopped at the comma, so "60,0" (meant as 60.0) read
+    // as 60 and a "6,5" silently became 6. A bound is now read only when
+    // its whole text is in the base's lexical space, so the comma fails
+    // the restriction closed like any other malformed bound.
+    const bounds = boundsOf(idsWith('              <xs:minInclusive value="60,0"/>'));
+    expect(bounds.minInclusive).toBeUndefined();
+    expect(bounds.unparseableFacets).toEqual([
+      { facet: 'minInclusive', rawValue: '60,0' },
+    ]);
+    expect(matchConstraint(bounds, 0)).toBe(false);
+    expect(matchConstraint(bounds, 60)).toBe(false);
+  });
+
+  it('a legitimately absent facet is unaffected — no unparseableFacets, still unbounded on that side', () => {
+    const bounds = boundsOf(idsWith('              <xs:maxInclusive value="100"/>'));
+    expect(bounds.minInclusive).toBeUndefined();
+    expect(bounds.maxInclusive).toBe(100);
+    expect(bounds.unparseableFacets).toBeUndefined();
+
+    expect(matchConstraint(bounds, -999999)).toBe(true);
+    expect(matchConstraint(bounds, 100)).toBe(true);
+    expect(matchConstraint(bounds, 101)).toBe(false);
+  });
+
+  it('a well-formed bound keeps working exactly as before', () => {
+    const bounds = boundsOf(idsWith('              <xs:minInclusive value="60"/>'));
+    expect(bounds.minInclusive).toBe(60);
+    expect(bounds.unparseableFacets).toBeUndefined();
+
+    expect(matchConstraint(bounds, 0)).toBe(false);
+    expect(matchConstraint(bounds, 60)).toBe(true);
+    expect(matchConstraint(bounds, 61)).toBe(true);
+  });
+});
+
+describe('parseIDS: the facet @uri attribute (bSDD references)', () => {
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ids xmlns="http://standards.buildingsmart.org/IDS" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>uri</title></info>
+  <specifications>
+    <specification name="s" ifcVersion="IFC4">
+      <applicability><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>
+      <requirements>
+        <property dataType="IFCLABEL" uri="https://identifier.buildingsmart.org/uri/example/demo/1.0/prop/FireRating" cardinality="required">
+          <propertySet><simpleValue>Pset_WallCommon</simpleValue></propertySet>
+          <baseName><simpleValue>FireRating</simpleValue></baseName>
+        </property>
+        <classification uri=" https://identifier.buildingsmart.org/uri/example/demo/1.0/class/EW " cardinality="required">
+          <value><simpleValue>EW</simpleValue></value>
+          <system><simpleValue>Demo</simpleValue></system>
+        </classification>
+        <material uri="" cardinality="optional"><value><simpleValue>Concrete</simpleValue></value></material>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+  it('keeps a trimmed uri on property and classification facets and drops a blank one', () => {
+    const [property, classification, material] = parseIDS(xml).specifications[0].requirements.map((r) => r.facet);
+    expect(property).toMatchObject({ type: 'property', uri: 'https://identifier.buildingsmart.org/uri/example/demo/1.0/prop/FireRating' });
+    expect(classification).toMatchObject({ type: 'classification', uri: 'https://identifier.buildingsmart.org/uri/example/demo/1.0/class/EW' });
+    expect(material.type).toBe('material');
+    expect('uri' in material).toBe(false);
+  });
+
+  it('leaves an applicability @uri (IDS 1.1) to the preview pass', () => {
+    const inApplicability = xml.replace('<applicability><entity><name><simpleValue>IFCWALL</simpleValue></name></entity></applicability>',
+      '<applicability><entity><name><simpleValue>IFCWALL</simpleValue></name></entity><classification uri="https://example.org/c/EW"><system><simpleValue>Demo</simpleValue></system></classification></applicability>');
+    expect(parseIDS(inApplicability).specifications[0].applicability.facets[1]).not.toHaveProperty('uri');
+    expect(parseIDS(inApplicability, { preview: { ids11: true } }).specifications[0].applicability.facets[1]).toMatchObject({ uri: 'https://example.org/c/EW' });
+  });
+});

@@ -144,14 +144,10 @@ ENDSEC;
 END-ISO-10303-21;
 "#;
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const FNV_OFFSET_BASIS: u64 = ifc_lite_core::hash::FNV64_OFFSET;
 
 fn fnv1a_bytes(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(FNV_PRIME);
-    }
+    *h = ifc_lite_core::hash::fnv1a64_extend(*h, bytes);
 }
 
 fn fnv1a_u32s(h: &mut u64, vals: &[u32]) {
@@ -256,18 +252,7 @@ fn resolve_fixture_wires(content: &[u8]) -> FixtureWires {
     let mut spans = PrepassSpans::default();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        match type_name {
-            "IFCSTYLEDITEM" => spans.styled_items.push((id, start, end)),
-            "IFCINDEXEDCOLOURMAP" => spans.indexed_colour_maps.push((id, start, end)),
-            "IFCMATERIALDEFINITIONREPRESENTATION" => {
-                spans.material_def_reprs.push((id, start, end))
-            }
-            "IFCRELASSOCIATESMATERIAL" => spans.rel_associates_material.push((id, start, end)),
-            "IFCRELVOIDSELEMENT" => spans.void_rels.push((id, start, end)),
-            "IFCRELFILLSELEMENT" => spans.fills_rels.push((id, start, end)),
-            "IFCRELAGGREGATES" => spans.aggregate_rels.push((id, start, end)),
-            _ => {}
-        }
+        spans.stash(type_name, id, start, end);
     }
     let resolved = resolve_prepass(&spans, &mut decoder, ResolveOptions::default());
     let (void_keys, void_counts, void_values) = flat_voids(&resolved.void_index);

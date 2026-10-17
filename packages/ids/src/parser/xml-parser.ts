@@ -22,15 +22,22 @@ import type {
   IDSPartOfFacet,
   IDSConstraint,
   IDSSimpleValue,
-  IDSPatternConstraint,
-  IDSEnumerationConstraint,
-  IDSBoundsConstraint,
   IFCVersion,
   RequirementOptionality,
   PartOfRelation,
 } from '../types.js';
 
-const IDS_NAMESPACE = 'http://standards.buildingsmart.org/IDS';
+import {
+  getChildElement,
+  getChildElements,
+  getChildElementNS,
+  getChildText,
+  uriOf,
+} from './dom.js';
+import { parseRestriction } from './parse-restriction.js';
+import { applyIds11Preview } from '../preview/parse-ids11.js';
+import type { IDSPreviewFlags } from '../preview/types.js';
+
 const XS_NAMESPACE = 'http://www.w3.org/2001/XMLSchema';
 
 /** Error thrown when parsing invalid IDS XML */
@@ -72,10 +79,11 @@ if (!DOMParserImpl && isNodeRuntime) {
   DOMParserImpl = xmldom.DOMParser;
 }
 
-/**
- * Parse IDS XML content into an IDSDocument
- */
-export function parseIDS(xmlContent: string | ArrayBuffer): IDSDocument {
+/** Options for `parseIDS`. `preview.ids11` also reads IDS 1.1 PREVIEW candidates (unstable). */
+export interface ParseIDSOptions { preview?: IDSPreviewFlags }
+
+/** Parse IDS XML content into an IDSDocument (IDS 1.0 unless `options.preview.ids11`). */
+export function parseIDS(xmlContent: string | ArrayBuffer, options?: ParseIDSOptions): IDSDocument {
   let xmlString =
     typeof xmlContent === 'string'
       ? xmlContent
@@ -138,7 +146,7 @@ export function parseIDS(xmlContent: string | ArrayBuffer): IDSDocument {
     );
   }
 
-  return {
+  const document: IDSDocument = {
     info: parseInfo(root),
     specifications: parseSpecifications(root),
     schemaLocation:
@@ -146,11 +154,11 @@ export function parseIDS(xmlContent: string | ArrayBuffer): IDSDocument {
       root.getAttributeNS('http://www.w3.org/2001/XMLSchema-instance', 'schemaLocation') ||
       undefined,
   };
+  if (options?.preview?.ids11 === true) applyIds11Preview(root, document, parseFacet);
+  return document;
 }
 
-/**
- * Parse the <info> section
- */
+/** Parse the <info> section */
 function parseInfo(root: Element): IDSInfo {
   const info = getChildElement(root, 'info');
   if (!info) {
@@ -169,9 +177,7 @@ function parseInfo(root: Element): IDSInfo {
   };
 }
 
-/**
- * Parse the <specifications> section
- */
+/** Parse the <specifications> section */
 function parseSpecifications(root: Element): IDSSpecification[] {
   const specsContainer = getChildElement(root, 'specifications');
   if (!specsContainer) {
@@ -303,9 +309,7 @@ function parseFacets(parent: Element): IDSFacet[] {
   return facets;
 }
 
-/**
- * Parse a single facet element
- */
+/** Parse a single facet element (also used by the IDS 1.1 preview pass). */
 function parseFacet(el: Element): IDSFacet | null {
   const localName = el.localName.toLowerCase();
 
@@ -365,9 +369,7 @@ function parseAttributeFacet(el: Element): IDSAttributeFacet {
   };
 }
 
-/**
- * Parse property facet
- */
+/** Parse property facet */
 function parsePropertyFacet(el: Element): IDSPropertyFacet {
   const propertySetEl = getChildElement(el, 'propertySet');
   const baseNameEl = getChildElement(el, 'baseName');
@@ -401,9 +403,7 @@ function parsePropertyFacet(el: Element): IDSPropertyFacet {
   };
 }
 
-/**
- * Parse classification facet
- */
+/** Parse classification facet */
 function parseClassificationFacet(el: Element): IDSClassificationFacet {
   const systemEl = getChildElement(el, 'system');
   const valueEl = getChildElement(el, 'value');
@@ -415,9 +415,7 @@ function parseClassificationFacet(el: Element): IDSClassificationFacet {
   };
 }
 
-/**
- * Parse material facet
- */
+/** Parse material facet */
 function parseMaterialFacet(el: Element): IDSMaterialFacet {
   const valueEl = getChildElement(el, 'value');
 
@@ -436,35 +434,27 @@ function parsePartOfFacet(el: Element): IDSPartOfFacet {
   const entityEl = getChildElement(el, 'entity');
 
   const relation = normalizePartOfRelation(relationAttr);
-  // When the source attribute didn't map cleanly onto one of the known
-  // relations (or was missing), preserve the original string so the
-  // auditor can flag the discrepancy without us breaking the existing
-  // narrow `PartOfRelation` enum.
-  const recognised = isRecognisedPartOfRelation(relationAttr);
   const facet: IDSPartOfFacet = {
     type: 'partOf',
     relation,
     entity: entityEl ? parseEntityFacet(entityEl) : undefined,
   };
-  if (!recognised && relationAttrRaw) {
-    facet.rawRelation = relationAttrRaw;
-  }
+  // Only an ABSENT relation means any part-of relation (IDS 1.0, #7401);
+  // an unrecognised one, empty included, keeps its source for the auditor.
+  if (relationAttrRaw === null) facet.anyRelation = true;
+  else if (!isRecognisedPartOfRelation(relationAttrRaw)) facet.rawRelation = relationAttrRaw;
   return facet;
 }
 
+/** The `ids.xsd` `relations` tokens (what IDS 1.0 files and `writeIdsXml` carry), then the lenient PascalCase spellings. */
+const RECOGNISED_PARTOF_RELATIONS = new Set([
+  'IFCRELAGGREGATES', 'IFCRELASSIGNSTOGROUP', 'IFCRELCONTAINEDINSPATIALSTRUCTURE', 'IFCRELNESTS', 'IFCRELVOIDSELEMENT IFCRELFILLSELEMENT',
+  'IfcRelAggregates', 'IfcRelContainedInSpatialStructure', 'IfcRelNests', 'IfcRelVoidsElement', 'IfcRelFillsElement',
+  'IfcRelAssignsToGroup', 'IfcRelVoidsElement IfcRelFillsElement',
+]);
+
 function isRecognisedPartOfRelation(relation: string): boolean {
-  switch (relation) {
-    case 'IfcRelAggregates':
-    case 'IfcRelContainedInSpatialStructure':
-    case 'IfcRelNests':
-    case 'IfcRelVoidsElement':
-    case 'IfcRelFillsElement':
-    case 'IfcRelAssignsToGroup':
-    case 'IfcRelVoidsElement IfcRelFillsElement':
-      return true;
-    default:
-      return false;
-  }
+  return RECOGNISED_PARTOF_RELATIONS.has(relation);
 }
 
 /**
@@ -498,7 +488,10 @@ function parseRequirements(parent: Element): IDSRequirement[] {
   let reqIndex = 0;
 
   for (const child of Array.from(parent.children)) {
-    const facet = parseFacet(child);
+    const parsed = parseFacet(child);
+    // IDS 1.0 allows @uri on property, classification and material facets in
+    // requirements only (in applicability it is IDS 1.1, read by the preview pass).
+    const facet = parsed && (parsed.type === 'property' || parsed.type === 'classification' || parsed.type === 'material') ? { ...parsed, ...uriOf(child) } : parsed;
     if (facet) {
       // IDS 1.0 uses `cardinality="required|optional|prohibited"` on the
       // requirement facet. 0.9.7 used minOccurs/maxOccurs. Honour both;
@@ -557,12 +550,12 @@ function parseRequirements(parent: Element): IDSRequirement[] {
  * Parse a constraint element (can be simpleValue, restriction with pattern/enumeration/bounds)
  */
 function parseConstraintElement(el: Element): IDSConstraint {
-  // Check for simpleValue child
+  // `<simpleValue>` is `xs:string`: keep verbatim, don't trim (#6117).
   const simpleValueEl = getChildElement(el, 'simpleValue');
   if (simpleValueEl) {
     return {
       type: 'simpleValue',
-      value: simpleValueEl.textContent?.trim() || '',
+      value: simpleValueEl.textContent ?? '',
     } satisfies IDSSimpleValue;
   }
 
@@ -574,8 +567,8 @@ function parseConstraintElement(el: Element): IDSConstraint {
     return parseRestriction(restrictionEl);
   }
 
-  // Check direct text content (simple case)
-  const textContent = el.textContent?.trim();
+  // Direct text content (simple case) — same verbatim rule.
+  const textContent = el.textContent ?? '';
   if (textContent) {
     return {
       type: 'simpleValue',
@@ -590,178 +583,3 @@ function parseConstraintElement(el: Element): IDSConstraint {
   };
 }
 
-/**
- * Parse XSD restriction element
- */
-function parseRestriction(el: Element): IDSConstraint {
-  // Capture the `@base` attribute so the auditor can compare against
-  // an IFC dataType's backing XSD type without inferring from the
-  // restriction shape (which is ambiguous for numeric enumerations).
-  const base = el.getAttribute('base') || undefined;
-
-  // Check for pattern(s). Multiple `<xs:pattern>` siblings inside a
-  // single restriction are OR'd per the XSD spec, so collect every
-  // candidate and join them with `|` (each wrapped in a non-capturing
-  // group so anchors apply uniformly).
-  const patternEls = (() => {
-    const ns = getChildElementsNS(el, 'pattern', XS_NAMESPACE);
-    if (ns.length > 0) return ns;
-    return getChildElements(el, 'pattern');
-  })();
-  if (patternEls.length > 0) {
-    const parts = patternEls
-      .map((p) => p.getAttribute('value') || p.textContent || '')
-      .filter((s) => s.length > 0);
-    const pattern =
-      parts.length === 1
-        ? parts[0]
-        : parts.map((p) => `(?:${p})`).join('|');
-    return {
-      type: 'pattern',
-      pattern,
-      base,
-    } satisfies IDSPatternConstraint;
-  }
-
-  // Check for enumeration
-  const enumEls = getChildElementsNS(el, 'enumeration', XS_NAMESPACE);
-  if (enumEls.length === 0) {
-    // Try without namespace
-    const enumElsNoNS = getChildElements(el, 'enumeration');
-    if (enumElsNoNS.length > 0) {
-      return {
-        type: 'enumeration',
-        values: enumElsNoNS.map(
-          (e) => e.getAttribute('value') || e.textContent || ''
-        ),
-        base,
-      } satisfies IDSEnumerationConstraint;
-    }
-  } else {
-    return {
-      type: 'enumeration',
-      values: enumEls.map(
-        (e) => e.getAttribute('value') || e.textContent || ''
-      ),
-      base,
-    } satisfies IDSEnumerationConstraint;
-  }
-
-  // Check for bounds (minInclusive, maxInclusive, minExclusive,
-  // maxExclusive, length, minLength, maxLength).
-  const facetEls: Record<string, Element | null> = {};
-  for (const facet of [
-    'minInclusive',
-    'maxInclusive',
-    'minExclusive',
-    'maxExclusive',
-    'length',
-    'minLength',
-    'maxLength',
-  ]) {
-    facetEls[facet] =
-      getChildElementNS(el, facet, XS_NAMESPACE) ||
-      getChildElement(el, facet);
-  }
-
-  if (Object.values(facetEls).some((e) => e !== null)) {
-    const bounds: IDSBoundsConstraint = { type: 'bounds', base };
-    const readNumber = (e: Element | null): number | undefined => {
-      if (!e) return undefined;
-      const v = parseFloat(e.getAttribute('value') || e.textContent || '');
-      return Number.isFinite(v) ? v : undefined;
-    };
-    const readInt = (e: Element | null): number | undefined => {
-      if (!e) return undefined;
-      const v = parseInt(e.getAttribute('value') || e.textContent || '', 10);
-      return Number.isFinite(v) && v >= 0 ? v : undefined;
-    };
-    bounds.minInclusive = readNumber(facetEls.minInclusive);
-    bounds.maxInclusive = readNumber(facetEls.maxInclusive);
-    bounds.minExclusive = readNumber(facetEls.minExclusive);
-    bounds.maxExclusive = readNumber(facetEls.maxExclusive);
-    bounds.length = readInt(facetEls.length);
-    bounds.minLength = readInt(facetEls.minLength);
-    bounds.maxLength = readInt(facetEls.maxLength);
-    return bounds;
-  }
-
-  // No recognised pattern/enumeration/bounds child. If the element only
-  // carries a `base` attribute (the common "empty restriction" authoring
-  // mistake — e.g. `<xs:restriction base="xs:string"/>`), surface an
-  // empty enumeration so the coherence auditor can flag it. Otherwise
-  // fall through to text content.
-  const text = el.textContent?.trim() || '';
-  if (base && text === '') {
-    return {
-      type: 'enumeration',
-      values: [],
-      base,
-    } satisfies IDSEnumerationConstraint;
-  }
-  if (text) {
-    return { type: 'simpleValue', value: text };
-  }
-  return { type: 'enumeration', values: [], base } satisfies IDSEnumerationConstraint;
-}
-
-// ============================================================================
-// DOM Helper Functions
-// ============================================================================
-
-function getChildElement(parent: Element, localName: string): Element | null {
-  for (const child of Array.from(parent.children)) {
-    if (child.localName.toLowerCase() === localName.toLowerCase()) {
-      return child;
-    }
-  }
-  return null;
-}
-
-function getChildElements(parent: Element, localName: string): Element[] {
-  const elements: Element[] = [];
-  for (const child of Array.from(parent.children)) {
-    if (child.localName.toLowerCase() === localName.toLowerCase()) {
-      elements.push(child);
-    }
-  }
-  return elements;
-}
-
-function getChildElementNS(
-  parent: Element,
-  localName: string,
-  namespace: string
-): Element | null {
-  for (const child of Array.from(parent.children)) {
-    if (
-      child.localName.toLowerCase() === localName.toLowerCase() &&
-      child.namespaceURI === namespace
-    ) {
-      return child;
-    }
-  }
-  return null;
-}
-
-function getChildElementsNS(
-  parent: Element,
-  localName: string,
-  namespace: string
-): Element[] {
-  const elements: Element[] = [];
-  for (const child of Array.from(parent.children)) {
-    if (
-      child.localName.toLowerCase() === localName.toLowerCase() &&
-      child.namespaceURI === namespace
-    ) {
-      elements.push(child);
-    }
-  }
-  return elements;
-}
-
-function getChildText(parent: Element, localName: string): string | undefined {
-  const child = getChildElement(parent, localName);
-  return child?.textContent?.trim() || undefined;
-}

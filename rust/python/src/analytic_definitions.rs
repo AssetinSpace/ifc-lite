@@ -1,0 +1,54 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Opt-in Python source/instance views for authored analytic solids.
+
+use std::collections::HashSet;
+use ifc_lite_processing::{extract_extrusion_definitions, extract_swept_disk_definitions};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use super::run_geometry;
+
+/// Return reusable source definitions and occurrence transforms without meshing.
+#[pyfunction]
+#[pyo3(signature = (ifc_bytes, ids = None))]
+pub(super) fn swept_disk_definitions(
+    py: Python<'_>, ifc_bytes: Vec<u8>, ids: Option<HashSet<u32>>,
+) -> PyResult<Py<PyAny>> {
+    let view = run_geometry(py, "swept-disk definition", move || {
+        extract_swept_disk_definitions(&ifc_bytes, ids.as_ref())
+    })?;
+    let json = crate::finite_json::to_json_string(&view)?;
+    definition_view_to_python(py, json)
+}
+
+/// Return exact authored extrusion profiles and their placed occurrences.
+#[pyfunction]
+#[pyo3(signature = (ifc_bytes, ids = None))]
+pub(super) fn extrusion_definitions(
+    py: Python<'_>, ifc_bytes: Vec<u8>, ids: Option<HashSet<u32>>,
+) -> PyResult<Py<PyAny>> {
+    let view = run_geometry(py, "extrusion definition", move || {
+        extract_extrusion_definitions(&ifc_bytes, ids.as_ref())
+    })?;
+    let json = crate::finite_json::to_json_string(&view)?;
+    definition_view_to_python(py, json)
+}
+
+fn definition_view_to_python(py: Python<'_>, json: String) -> PyResult<Py<PyAny>> {
+    let module = py.import("json")?;
+    let root = module.call_method1("loads", (json,))?;
+    let dict = root.cast::<PyDict>()?;
+    let instances = dict.get_item("instances")?.expect("serialized instances");
+    let instances = instances.cast::<PyDict>()?;
+    let numbered = PyDict::new(py);
+    for (key, value) in instances.iter() {
+        let id = key.extract::<String>()?.parse::<u32>()
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        numbered.set_item(id, value)?;
+    }
+    dict.set_item("instances", numbered)?;
+    Ok(root.unbind())
+}

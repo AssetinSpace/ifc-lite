@@ -29,6 +29,10 @@
  *     --out-dir /path/outside/repo/wg-bench [--results-dir benchmark/results] \
  *     [--baselines always-clean,heuristic-text,oracle-kernel]
  *
+ * If the reporting split's salt is configured (WORLD_GYM_SALT_TEST) and the
+ * split IS the reporting split, both the models and the truth are generated
+ * under it, and every emitted row records the salt fingerprint.
+ *
  * Submission JSONL files go to --out-dir (corpus-scale artifacts, never the
  * repo). Leaderboard rows + the split summary (small JSONs) go to
  * --results-dir (committed).
@@ -43,9 +47,12 @@ import {
 } from '../lib/checks.mjs';
 import {
   BENCHMARK_NAME, SPEC_VERSION, CORRUPT_RATE, FAMILY, TASK_NAMES, DEFECT_TYPES, QUANTITY_KEYS, seedsForSplit,
+  SALT_ENV_VAR,
 } from './splits.mjs';
 import { parseSubmission } from './submission.mjs';
-import { regenerateTruth, scoreSubmission } from './score.mjs';
+import { regenerateTruth, scoreSubmission, resolveScoringSalt } from './score.mjs';
+import { saltFingerprint, redactSalt } from '../lib/salt.mjs';
+import { isMainEntry } from '../../../scripts/lib/is-main-entry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const BASELINE_NAMES = ['always-clean', 'heuristic-text', 'oracle-kernel'];
@@ -227,6 +234,12 @@ async function main() {
     process.exit(1);
   }
   const outDir = resolve(outDirRaw);
+  // Same universe rule as the scorer: the reporting split's salt if one is
+  // configured, the public universe otherwise. Baselines MUST run in the same
+  // universe they are scored in, or the anchors describe a different corpus
+  // than the rows they anchor.
+  const salt = resolveScoringSalt(split);
+  const saltId = saltFingerprint(salt);
   await mkdir(outDir, { recursive: true });
   await mkdir(resultsDir, { recursive: true });
 
@@ -237,7 +250,7 @@ async function main() {
   }
 
   const seeds = seedsForSplit(split);
-  process.stderr.write(`Baselines [${which.join(', ')}] over split "${split}" (${seeds.length} models, spec ${SPEC_VERSION})...\n`);
+  process.stderr.write(`Baselines [${which.join(', ')}] over split "${split}" (${seeds.length} models, spec ${SPEC_VERSION}, ${saltId ? `salted ${saltId}` : 'unsalted'})...\n`);
 
   const predictions = Object.fromEntries(which.map((b) => [b, []]));
   // Split summary bookkeeping (from generation ground truth, not from checks).
@@ -250,7 +263,7 @@ async function main() {
   const t0 = performance.now();
   let done = 0;
   for (const seed of seeds) {
-    const model = generateModel(seed, FAMILY, { corruptRate: CORRUPT_RATE });
+    const model = generateModel(seed, FAMILY, { corruptRate: CORRUPT_RATE, salt });
 
     summaryAcc.models++;
     if (model.corrupted) summaryAcc.corrupted++; else summaryAcc.clean++;
@@ -273,7 +286,7 @@ async function main() {
   // Round-trip each baseline through the REAL submission file + validator +
   // scorer - the baselines exercise the exact external-submitter path.
   process.stderr.write('Regenerating ground truth for scoring...\n');
-  const truthBySeed = regenerateTruth(split);
+  const truthBySeed = regenerateTruth(split, { salt });
 
   const rows = [];
   for (const name of which) {
@@ -285,7 +298,7 @@ async function main() {
       process.stderr.write(`BUG: baseline "${name}" produced an invalid submission:\n${parsed.errors.map((e) => `  - ${e}`).join('\n')}\n`);
       process.exit(1);
     }
-    const row = scoreSubmission(parsed.header, parsed.lines, split, truthBySeed);
+    const row = scoreSubmission(parsed.header, parsed.lines, split, truthBySeed, { salt });
     rows.push(row);
     await writeFile(join(resultsDir, `row-${name}-${split}.json`), `${JSON.stringify(row, null, 2)}\n`, 'utf-8');
     process.stderr.write(`  ${name}: aggregate=${row.scores.aggregate} defect=${row.scores['defect-detection']} quantity=${row.scores['quantity-estimation']} triage=${row.scores['validity-triage']} (submission: ${subPath})\n`);
@@ -296,6 +309,8 @@ async function main() {
     benchmark: BENCHMARK_NAME,
     specVersion: SPEC_VERSION,
     split,
+    salted: saltId !== null,
+    saltId,
     models: summaryAcc.models,
     clean: summaryAcc.clean,
     corrupted: summaryAcc.corrupted,
@@ -315,6 +330,8 @@ async function main() {
     benchmark: BENCHMARK_NAME,
     specVersion: SPEC_VERSION,
     split,
+    salted: saltId !== null,
+    saltId,
     note: 'Reference baselines (leaderboard anchors). Rows sorted by aggregate, descending.',
     rows: rows
       .slice()
@@ -326,10 +343,13 @@ async function main() {
   process.stdout.write(`${JSON.stringify(leaderboard, null, 2)}\n`);
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const isMain = isMainEntry(import.meta.url);
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(`${err.stack ?? err.message}\n`);
+    // Same rule as score.mjs: this CLI runs with the live reporting salt in its
+    // environment, so nothing it prints on the way out may carry it.
+    const text = err?.name === 'SaltFormatError' ? `error: ${err.message}` : (err.stack ?? err.message);
+    process.stderr.write(`${redactSalt(text, process.env[SALT_ENV_VAR])}\n`);
     process.exit(1);
   });
 }

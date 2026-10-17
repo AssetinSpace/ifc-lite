@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { ActivityBar } from './ActivityBar';
 import { SidebarPanelHost } from './SidebarPanelHost';
 
@@ -28,6 +29,7 @@ const MIN_WIDTH_PCT = 14;
 const MAX_WIDTH_PCT = 60;
 
 export function SidebarDock() {
+  const { t } = useTranslation();
   const mode = useViewerStore((s) => s.sidebarMode);
   const widthPct = useViewerStore((s) => s.sidebarWidthPct);
   const setSidebarWidthPct = useViewerStore((s) => s.setSidebarWidthPct);
@@ -107,13 +109,13 @@ export function SidebarDock() {
             className="w-1.5 shrink-0 cursor-col-resize bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors"
             role="separator"
             aria-orientation="vertical"
-            aria-label="Resize sidebar"
+            aria-label={t('shellChrome.sidebarDock.resizeAriaLabel')}
           />
           <div
-            className="h-full min-w-0 overflow-hidden panel-container"
+            className="h-full min-w-0 overflow-hidden panel-container flex flex-col"
             style={{ width: contentPx ?? `${effectivePct}%` }}
           >
-            <SidebarPanelHost />
+            <div className="min-h-0 flex-1"><SidebarPanelHost /></div>
           </div>
         </>
       )}

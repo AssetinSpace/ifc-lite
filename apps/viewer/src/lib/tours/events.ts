@@ -28,7 +28,7 @@ export const EVENT_FILE_DOWNLOADED = 'ifc-lite:file-downloaded';
 /**
  * Add a model to the CURRENT federation set (detail: File) - unlike
  * `ifc-lite:load-file`, which replaces the loaded model. Listener lives in
- * MainToolbar next to the load-file one; used by the compare tour to bring
+ * useFileCommands next to the load-file one; used by the compare tour to bring
  * in the demo revision B.
  */
 export const EVENT_ADD_MODEL = 'ifc-lite:add-model';
@@ -37,6 +37,12 @@ export const EVENT_ADD_MODEL = 'ifc-lite:add-model';
 export const EVENT_LOAD_FILE = 'ifc-lite:load-file';
 export const EVENT_SHOW_SHORTCUTS = 'ifc-lite:show-shortcuts';
 export const EVENT_OPEN_COMMAND_PALETTE = 'ifc-lite:open-command-palette';
+
+/** All visible palette entry points use the viewer's existing event listener. */
+export function emitOpenCommandPalette(): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new Event(EVENT_OPEN_COMMAND_PALETTE));
+}
 
 export type CameraGestureKind = 'orbit' | 'pan' | 'zoom' | 'preset';
 
@@ -48,6 +54,9 @@ export function emitCameraInteracted(kind: CameraGestureKind): void {
 
 export function emitFileDownloaded(filename: string): void {
   if (typeof window === 'undefined') return;
-  const kind = filename.includes('.') ? filename.slice(filename.lastIndexOf('.') + 1).toLowerCase() : 'file';
+  const extension = filename.includes('.') ? filename.slice(filename.lastIndexOf('.') + 1).toLowerCase() : 'file';
+  // BCF's download extension changed for Solibri interoperability (#6459),
+  // while the existing tour/analytics archive-format identifier stays bcfzip.
+  const kind = extension === 'bcf' ? 'bcfzip' : extension;
   window.dispatchEvent(new CustomEvent(EVENT_FILE_DOWNLOADED, { detail: { kind } }));
 }

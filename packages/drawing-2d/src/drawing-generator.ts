@@ -16,11 +16,9 @@
 import type { MeshData } from '@ifc-lite/geometry';
 import type {
   SectionConfig,
-  SectionPlaneConfig,
   SectionAxis,
   Drawing2D,
   DrawingLine,
-  DrawingPolygon,
   CutSegment,
   Bounds2D,
   LineCategory,
@@ -45,9 +43,10 @@ import {
   outlineToProjectionLines,
 } from './projection-bands.js';
 import { isFeatureElementType } from './feature-elements.js';
+import { projectionBandMeshes, clipMeshToProjectionWindow } from './projection-clip.js';
+import { removeCoveredOverhead } from './projection-overlap.js';
 import {
   boundsEmpty,
-  boundsExtendPoint,
   boundsExtendLine,
   lineLength,
 } from './math.js';
@@ -73,8 +72,25 @@ export interface GeneratorOptions {
    * this footprint outline instead of the normal-based mesh silhouette (which
    * ifc-lite's unreliable winding can break). Return `null` to fall back to
    * silhouette extraction for that mesh.
+   *
+   * CARDINAL planes only: the callback receives just (axis, flipped) and its
+   * output is in cardinal projection space, so on a custom (face-picked)
+   * plane the generator bypasses it and uses the plane-aware silhouette path
+   * instead (PR #2644 review).
    */
   outlineProvider?: (mesh: MeshData, axis: SectionAxis, flipped: boolean) => MeshOutline2D | null;
+  /**
+   * Pre-projected lines merged in BEFORE the hidden-line stage (issue #2042):
+   * the section RIM of a CPU half-space clip. Build them with
+   * `projectWorldLineSeeds`, never a hand-rolled projection — they must share
+   * this config's plane basis and view-depth convention.
+   *
+   * They are classified alongside the projection lines even though they carry
+   * `category: 'cut'`: cutter-produced cut lines sit in the plane at view
+   * depth 0 and can never be occluded, but on an oblique 3D view a rim edge
+   * can sit behind other geometry and must print dashed.
+   */
+  extraLines?: DrawingLine[];
   /** Progress callback */
   onProgress?: (stage: string, progress: number) => void;
 }
@@ -221,7 +237,7 @@ export class Drawing2DGenerator {
       // The Rust extractor already skips them at the source, but a CI-lagged
       // WASM bundle can still emit opening profiles, and opening MESHES always
       // reach `meshes` — so this TS filter is the load-bearing guard.
-      const projectionProfiles = profiles?.filter((p) => !isFeatureElementType(p.ifcType));
+      const projectionProfiles = (config.clipProjectionBands ? undefined : profiles)?.filter((p) => !isFeatureElementType(p.ifcType));
 
       // Per-element dedup: elements with an extracted profile take their
       // projection from the clean profile path only; the silhouette fallback
@@ -247,29 +263,48 @@ export class Drawing2DGenerator {
         );
 
         const viewDir = getViewDirectionForPlane(config.plane);
-        for (const mesh of meshesForSilhouette) {
-          const outline = opts.outlineProvider
-            ? opts.outlineProvider(mesh, config.plane.axis, config.plane.flipped)
-            : null;
-          if (outline && outline.contours.length > 0) {
-            projectionLines.push(
-              ...outlineToProjectionLines(
-                outline,
-                {
-                  entityId: mesh.expressId,
-                  ifcType: mesh.ifcType ?? 'Unknown',
-                  modelIndex: mesh.modelIndex ?? 0,
-                },
-                config.plane,
-                bands,
-              ),
-            );
-          } else {
-            const edges = this.edgeExtractor.extractEdges(mesh);
-            const silhouettes = this.edgeExtractor.extractSilhouettes(edges, viewDir);
-            projectionLines.push(
-              ...this.edgeExtractor.edgesToProjectionLines(silhouettes, config.plane, bands),
-            );
+
+        // The outline provider contract is CARDINAL-only: it receives just
+        // (axis, flipped) and returns contours and axisMin/axisMax in cardinal
+        // projection space (the Rust `meshOutline2d` binding knows nothing of
+        // custom planes). The depth raster and every other line producer work
+        // in the custom tangent/bitangent basis when `customPlane` is set, so
+        // provider output would be band-classified against the wrong offset
+        // and occlusion-sampled against a raster in a DIFFERENT coordinate
+        // system (PR #2644 review). Bypass the provider on custom planes and
+        // take the silhouette path below, which is plane-aware end to end.
+        // Do NOT "optimise" the provider back in here without making its
+        // callback contract (and the WASM binding behind it) custom-basis
+        // aware.
+        const outlineProvider = config.plane.customPlane ? undefined : opts.outlineProvider;
+
+        for (const source of meshesForSilhouette) {
+          const clipped = config.clipProjectionBands
+            ? projectionBandMeshes(source, config.plane, bands.below, bands.above) : [source];
+          for (const mesh of clipped) {
+            const outline = outlineProvider
+              ? outlineProvider(mesh, config.plane.axis, config.plane.flipped)
+              : null;
+            if (outline && outline.contours.length > 0) {
+              projectionLines.push(
+                ...outlineToProjectionLines(
+                  outline,
+                  {
+                    entityId: mesh.expressId,
+                    ifcType: mesh.ifcType ?? 'Unknown',
+                    modelIndex: mesh.modelIndex ?? 0,
+                  },
+                  config.plane,
+                  bands,
+                ),
+              );
+            } else {
+              const edges = this.edgeExtractor.extractEdges(mesh);
+              const silhouettes = this.edgeExtractor.extractSilhouettes(edges, viewDir);
+              projectionLines.push(
+                ...this.edgeExtractor.edgesToProjectionLines(silhouettes, config.plane, bands),
+              );
+            }
           }
         }
       }
@@ -285,53 +320,53 @@ export class Drawing2DGenerator {
         projectionLines = projectionLines.filter((line) => lineLength(line.line) <= maxLineLength);
       }
 
+      if (config.clipProjectionBands && config.plane.axis === 'y' && !config.plane.customPlane) {
+        projectionLines = removeCoveredOverhead(projectionLines);
+      }
       report('edges', 1);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE 5: Hidden Line Removal
     // ─────────────────────────────────────────────────────────────────────────
-    let allLines = [...cutLines, ...projectionLines];
+    // Caller-supplied rim lines (issue #2042) are classifiable like projection
+    // lines despite their 'cut' category — see `GeneratorOptions.extraLines`.
+    const extraLines = opts.extraLines ?? [];
+    const classifiable = [...extraLines, ...projectionLines];
+    let allLines = [...cutLines, ...classifiable];
 
-    if (opts.includeHiddenLines && projectionLines.length > 0) {
+    if ((opts.includeHiddenLines || config.clipProjectionBands) && classifiable.length > 0) {
       report('hidden', 0);
 
       // Compute bounds for depth buffer
       const bounds = this.computeBounds(allLines);
 
-      // The depth buffer must cover everything projection can emit — including
-      // the (possibly wider) construction-projection bands — or in-band lines
-      // beyond projectionDepth would be classified against an incomplete buffer
-      // and wrongly stay visible because their occluders were never rasterized.
-      const occluderDepth = Math.max(
-        config.projectionDepth,
-        config.projectionBelowDepth ?? config.projectionDepth,
-        config.projectionAboveDepth ?? config.projectionDepth,
-      );
-
-      // Build depth buffer and classify lines. The occluder set deliberately
-      // keeps the FULL `meshes` (incl. feature-element/opening meshes that are
-      // filtered out of projection above): an opening mesh is coincident with
-      // the void in its host wall, which writes the same depth, so it never
-      // changes occlusion — and dropping it could only ever REVEAL a
-      // through-wall line that should stay hidden. Don't "tidy" this to the
-      // filtered set.
-      this.hiddenLineClassifier.buildDepthBuffer(
-        meshes,
-        config.plane.axis,
-        config.plane.position,
-        occluderDepth,
-        config.plane.flipped,
-        bounds
-      );
+      const occluderDepth = config.clipProjectionBands
+        ? (config.projectionBelowDepth ?? config.projectionDepth)
+        : Math.max(config.projectionDepth, config.projectionBelowDepth ?? config.projectionDepth,
+          config.projectionAboveDepth ?? config.projectionDepth);
+      const occluders = config.clipProjectionBands
+        ? meshes.map(mesh => clipMeshToProjectionWindow(mesh, config.plane, 0, occluderDepth))
+          .filter((mesh): mesh is MeshData => mesh !== null)
+        : meshes;
+      this.hiddenLineClassifier.buildDepthBuffer(occluders, config.plane, occluderDepth, bounds);
 
       // Occlusion only DOWNGRADES visible → hidden; it can never reveal an
       // already-dashed OVERHEAD line. So classify the visible (below-cut)
       // projection lines and pass overhead lines through unchanged — otherwise
       // an unoccluded overhead beam would be re-marked 'visible' (solid).
-      const toClassify = allLines.filter((l) => l.category !== 'cut' && l.visibility === 'visible');
-      const passthrough = allLines.filter((l) => l.category !== 'cut' && l.visibility !== 'visible');
-      const classifiedLines = this.hiddenLineClassifier.applyVisibility(toClassify);
+      //
+      // The split is by SOURCE (`classifiable` vs the cutter's own
+      // `cutLines`), not by category: `extraLines` carry `category: 'cut'`
+      // yet must be classified. Filtering `allLines` on `category !== 'cut'`
+      // would both skip them AND drop them from the recombination below.
+      const toClassify = classifiable.filter((l) => l.visibility === 'visible');
+      const passthrough = classifiable.filter((l) => l.visibility !== 'visible');
+      const classified = this.hiddenLineClassifier.applyVisibility(toClassify);
+      // SDK hidden-output filtering applies to occlusion results. Existing
+      // overhead outlines keep their dashed convention even with HLR off.
+      const classifiedLines = config.clipProjectionBands && !opts.includeHiddenLines
+        ? classified.filter(line => line.visibility !== 'hidden') : classified;
 
       // Recombine with cut lines (always visible) + overhead pass-through.
       allLines = [...cutLines, ...classifiedLines, ...passthrough];

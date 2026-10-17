@@ -54,9 +54,10 @@
  *   length/area/volume measure, so they are excluded automatically.
  */
 
-import { getAllAttributesForEntity } from '@ifc-lite/parser';
+import { getAllAttributesForEntity, STEP_TRIVIA } from '@ifc-lite/parser';
 import { formatStepReal } from '@ifc-lite/data';
-import { splitTopLevelStepArguments } from './step-serialization.js';
+import { splitTopLevelStepArguments } from './step-argument-parser.js';
+import { findOuterArgs, mapOutsideStepStrings } from './step-outer-args.js';
 
 /** IFC defined types whose values are lengths (STEP writes them as bare reals). */
 const LENGTH_MEASURE_TYPES = new Set([
@@ -194,14 +195,14 @@ export function toStepRealScaled(v: number): string {
 }
 
 /**
- * Single token matcher used by {@link scaleNumberLiterals}: a full STEP string
- * (kept verbatim, honouring the `''` escape), a `#`-reference (kept verbatim), or
- * a REAL/INTEGER literal (rescaled). Ordering matters — strings and refs are
- * matched first so their inner digits are never treated as numbers. The number
- * alternative consumes an optional exponent as one token, so `1.E-5` / `-2.5E2`
- * scale the mantissa without touching the exponent digits.
+ * Single token matcher used by {@link scaleNumberLiterals} over text OUTSIDE
+ * string literals ({@link mapOutsideStepStrings}): a `#`-reference (kept
+ * verbatim) or a REAL/INTEGER literal (rescaled). Refs are matched first so
+ * their digits are never treated as numbers. The number alternative consumes an
+ * optional exponent as one token, so `1.E-5` / `-2.5E2` scale the mantissa
+ * without touching the exponent digits.
  */
-const NUMBER_TOKEN_RE = /'(?:[^']|'')*'|#\d+|[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?/g;
+const NUMBER_TOKEN_RE = /#\d+|[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?/g;
 
 /**
  * Multiply every bare numeric literal in `text` by `factor`, leaving quoted
@@ -209,26 +210,33 @@ const NUMBER_TOKEN_RE = /'(?:[^']|'')*'|#\d+|[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][
  * coordinate lists of tessellated geometry.
  */
 export function scaleNumberLiterals(text: string, factor: number): string {
-  return text.replace(NUMBER_TOKEN_RE, (tok) => {
-    const c = tok.charCodeAt(0);
-    if (c === 0x27 /* ' */ || c === 0x23 /* # */) return tok;
-    return toStepRealScaled(parseFloat(tok) * factor);
-  });
+  return mapOutsideStepStrings(text, (code) => code.replace(NUMBER_TOKEN_RE, (tok) =>
+    tok.charCodeAt(0) === 0x23 /* # */ ? tok : toStepRealScaled(parseFloat(tok) * factor)));
 }
 
 /**
  * Scale the typed measures embedded in property/quantity values. Matches
  * `IFC[POSITIVE|NONNEGATIVE]LENGTHMEASURE(x)` (× lengthFactor), `IFCAREAMEASURE(x)`
  * (× areaFactor) and `IFCVOLUMEMEASURE(x)` (× volumeFactor), but never inside a
- * quoted string (the string alternative is matched first and returned verbatim).
+ * quoted string ({@link mapOutsideStepStrings} hands it only the text between them).
  *
  * A single non-word delimiter (`(`, `,`, whitespace, or start-of-input) is
  * captured before the keyword and restored, so a keyword can never be matched as
  * the suffix of a longer identifier — without a lookbehind, which some engines
  * (older Safari) reject at construction time and would break importing this module.
+ *
+ * Trivia (whitespace and/or a `/* ... *​/` comment) between the keyword and
+ * `(` mirrors the entity/typed-value adjacency fix (packages/parser's
+ * entity-extractor, #3205's Rust counterpart, #3789 for the comment case): a
+ * STEP writer's line wrap or an inline comment can land there, and without
+ * tolerating it the wrapped literal was skipped by this rewriter, leaving
+ * the normalized file's other measures scaled but this one still in the
+ * source unit.
  */
-const TYPED_MEASURE_RE =
-  /('(?:[^']|'')*')|(^|[^A-Za-z0-9_])(IFC(?:POSITIVE|NONNEGATIVE)?LENGTHMEASURE|IFCAREAMEASURE|IFCVOLUMEMEASURE)\(([^)]*)\)/gi;
+const TYPED_MEASURE_RE = new RegExp(
+  `(^|[^A-Za-z0-9_])(IFC(?:POSITIVE|NONNEGATIVE)?LENGTHMEASURE|IFCAREAMEASURE|IFCVOLUMEMEASURE)${STEP_TRIVIA}\\(([^)]*)\\)`,
+  'gi',
+);
 
 export function scaleTypedMeasures(
   text: string,
@@ -236,17 +244,16 @@ export function scaleTypedMeasures(
   areaFactor: number,
   volumeFactor: number,
 ): string {
-  return text.replace(
+  return mapOutsideStepStrings(text, (code) => code.replace(
     TYPED_MEASURE_RE,
-    (full, str, delim, keyword, num) => {
-      if (str !== undefined) return full; // inside a quoted string
+    (_full, delim, keyword, num) => {
       const kw = keyword.toUpperCase();
       const factor = kw === 'IFCAREAMEASURE' ? areaFactor
         : kw === 'IFCVOLUMEMEASURE' ? volumeFactor
         : lengthFactor; // any *LENGTHMEASURE
       return `${delim}${keyword}(${scaleMeasureNumber(num, factor)})`;
     },
-  );
+  ));
 }
 
 /** Scale the numeric content of one typed-measure token, preserving non-numeric ($) content. */
@@ -266,36 +273,6 @@ function scaleScalarArg(arg: string, factor: number): string {
   // is left to the measure pass, so it is never scaled twice.
   if (!Number.isFinite(n)) return arg;
   return toStepRealScaled(n * factor);
-}
-
-/**
- * Locate the outer STEP argument list of one entity line: the first `(` (nothing
- * is quoted before the type name) and its matching `)`, honouring quoted strings
- * (with the `''` escape) so a literal `)` inside a string never closes early.
- * Returns `null` for a line without arguments.
- */
-function findOuterArgs(line: string): { open: number; close: number } | null {
-  const open = line.indexOf('(');
-  if (open === -1) return null;
-  let depth = 0;
-  let inString = false;
-  for (let i = open; i < line.length; i++) {
-    const ch = line[i];
-    if (inString) {
-      if (ch === "'") {
-        if (line[i + 1] === "'") i++; // escaped quote
-        else inString = false;
-      }
-      continue;
-    }
-    if (ch === "'") { inString = true; continue; }
-    if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) return { open, close: i };
-    }
-  }
-  return null;
 }
 
 /**
@@ -331,6 +308,19 @@ export function rescaleEntityLengths(
   let skipValues = false;
   if (hasStructural || plan.unitGuardIdx.length > 0) {
     const args = splitTopLevelStepArguments(inner);
+    // NOT an unreachable invariant: `findOuterArgs` only guarantees SCAN-state
+    // (balanced parens/quotes), while #4173 made `splitTopLevelStepArguments`
+    // also reject a per-slot malformed VALUE, which a scan-clean span can
+    // still fail. Unlike this module's siblings (`merged-context.ts`,
+    // `merged-subcontext.ts`), which fall back to "unknown, don't unify" —
+    // safe for a comparison — there is no permissive fallback for a unit
+    // conversion: fail loudly rather than leave the data in the wrong unit.
+    if (args === null) {
+      throw new Error(
+        `rescaleEntityLengths: cannot split "${typeUpper}"'s slots to rescale — refusing `
+        + `to silently leave its length/area/volume data in the wrong unit: ${line}`,
+      );
+    }
 
     // A live unit-override reference means the value is already in its own unit.
     skipValues = plan.unitGuardIdx.some((idx) => {

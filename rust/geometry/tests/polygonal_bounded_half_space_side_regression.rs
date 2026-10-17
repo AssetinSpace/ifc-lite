@@ -18,11 +18,18 @@
 //! 0.493 m bulk. IfcOpenShell (pip 0.8.2, use-world-coords) keeps the bulk:
 //! extent (4.201, 0.493, 2.795). Pin that.
 
+
 use ifc_lite_core::{build_entity_index, EntityDecoder};
 use ifc_lite_geometry::{GeometryRouter, Mesh};
 use rustc_hash::FxHashMap;
 
-const FIXTURE: &str = "../../tests/models/ara3d/duplex.ifc";
+const FIXTURE: &str = "ara3d/duplex.ifc";
+
+/// `true` when the fixture is present; a missing one is a skip unless
+/// `IFC_LITE_REQUIRE_FIXTURES=1` (then it panics). See `ifc_lite_testkit`.
+fn fixture_present() -> bool {
+    ifc_lite_testkit::fixture_present(FIXTURE)
+}
 
 fn bbox_extent(p: &[f32]) -> (f32, f32, f32) {
     let mut mn = (f32::INFINITY, f32::INFINITY, f32::INFINITY);
@@ -42,8 +49,8 @@ fn bbox_extent(p: &[f32]) -> (f32, f32, f32) {
 /// parse/decode/geometry error — only a *missing fixture* is a legitimate skip,
 /// and that is checked by the caller before this runs.
 fn process(id: u32) -> Mesh {
-    let content =
-        std::fs::read_to_string(FIXTURE).unwrap_or_else(|e| panic!("read {FIXTURE}: {e}"));
+    let content = ifc_lite_testkit::fixture_text(FIXTURE)
+        .unwrap_or_else(|| panic!("fixture {FIXTURE} vanished after fixture_present"));
     let entity_index = build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
@@ -58,7 +65,7 @@ fn process(id: u32) -> Mesh {
 
 #[test]
 fn party_wall_polygonal_clip_keeps_material_side() {
-    if !std::path::Path::new(FIXTURE).exists() {
+    if !fixture_present() {
         eprintln!("skipping: fixture {FIXTURE} not present — run `pnpm fixtures` to download");
         return;
     }

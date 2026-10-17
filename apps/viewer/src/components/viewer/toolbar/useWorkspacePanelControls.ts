@@ -3,10 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Workspace-panel toggling shared by the classic toolbar's Panels menu
- * and the ribbon's Analyze / Author tabs. Encodes the single-tenant
- * right-slot and bottom-slot rules (one docked panel per region) plus
- * the analysis-extension handoff, exactly as the toolbar always did.
+ * Workspace-panel toggling for the ribbon's Analyze / Author tabs.
+ * Encodes the single-tenant right-slot and bottom-slot rules plus
+ * analysis-extension handoff.
  */
 
 import { useCallback, useMemo, useSyncExternalStore } from 'react';
@@ -18,14 +17,21 @@ import {
   subscribeAnalysisExtensions,
 } from '@/services/analysis-extensions';
 import { closePanelWindow } from '@/services/panel-windows';
+import { BOTTOM_PANEL_IDS, isBottomPanelOpen, type BottomPanelId } from '@/lib/panels/bottom-panels';
+import { useBottomPanelFlags } from '@/hooks/useBottomPanelFlags';
+import { trackPanelOpened, type UiSurface } from '@/store/uiTelemetry';
 
-export type BottomPanel = 'script' | 'list' | 'gantt';
-export type RightPanel = 'bcf' | 'ids' | 'lens' | 'clash' | 'compare' | 'addElement' | 'extensions';
+/** Registry ids, deliberately. This hook used to spell the entity-list panel
+ *  `'list'` while the registry and the store spell it `'lists'`, and the cost
+ *  was structural rather than cosmetic: with ids that did not match, the bottom
+ *  branch below could not simply hand the click to the store, so it re-derived
+ *  the flag flips and lost the float / pop-out cleanup along the way. */
+export type BottomPanel = BottomPanelId;
+export type RightPanel = 'bcf' | 'validation' | 'lens' | 'clash' | 'compare' | 'extensions' | 'sources' | 'appearance';
 export type WorkspacePanel = BottomPanel | RightPanel | string;
 
-export function useWorkspacePanelControls() {
-  const activeTool = useViewerStore((state) => state.activeTool);
-  const setActiveTool = useViewerStore((state) => state.setActiveTool);
+/** `surface`: the chrome these controls sit in, reported with each open (#5618). */
+export function useWorkspacePanelControls(surface?: UiSurface) {
   const bcfPanelVisible = useViewerStore((state) => state.bcfPanelVisible);
   const setBcfPanelVisible = useViewerStore((state) => state.setBcfPanelVisible);
   const idsPanelVisible = useViewerStore((state) => state.idsPanelVisible);
@@ -34,18 +40,27 @@ export function useWorkspacePanelControls() {
   const setClashPanelVisible = useViewerStore((state) => state.setClashPanelVisible);
   const comparePanelVisible = useViewerStore((state) => state.comparePanelVisible);
   const setComparePanelVisible = useViewerStore((state) => state.setComparePanelVisible);
-  const listPanelVisible = useViewerStore((state) => state.listPanelVisible);
   const setListPanelVisible = useViewerStore((state) => state.setListPanelVisible);
   const lensPanelVisible = useViewerStore((state) => state.lensPanelVisible);
   const setLensPanelVisible = useViewerStore((state) => state.setLensPanelVisible);
   const extensionsPanelVisible = useViewerStore((state) => state.extensionsPanelVisible);
   const setExtensionsPanelVisible = useViewerStore((state) => state.setExtensionsPanelVisible);
-  const scriptPanelVisible = useViewerStore((state) => state.scriptPanelVisible);
+  const sourcesPanelVisible = useViewerStore((state) => state.sourcesPanelVisible);
+  const setSourcesPanelVisible = useViewerStore((state) => state.setSourcesPanelVisible);
   const setScriptPanelVisible = useViewerStore((state) => state.setScriptPanelVisible);
-  const ganttPanelVisible = useViewerStore((state) => state.ganttPanelVisible);
+  // Every bottom-strip flag from the table, so a new bottom panel needs no row here.
+  const bottomFlags = useBottomPanelFlags();
   const setGanttPanelVisible = useViewerStore((state) => state.setGanttPanelVisible);
   const layersPanelVisible = useViewerStore((state) => state.layersPanelVisible);
   const collabPanelVisible = useViewerStore((state) => state.collabPanelVisible);
+  // The detached channels — a panel living in one of these is open regardless
+  // of its dock flag (see `activeWorkspacePanels`).
+  const floatingPanels = useViewerStore((state) => state.floatingPanels);
+  const poppedOutIds = useViewerStore((state) => state.poppedOutIds);
+  // Zones (#1810) has no dedicated visibility flag — it is a pure sidebar
+  // panel, driven by `sidebarActivePanel`. Reading it HERE rather than in each
+  // hook keeps the ribbon's Zones button in sync with the active panel (#2508).
+  const sidebarActivePanel = useViewerStore((state) => state.sidebarActivePanel);
   const setRightPanelCollapsed = useViewerStore((state) => state.setRightPanelCollapsed);
 
   const analysisExtensionState = useSyncExternalStore(
@@ -70,41 +85,46 @@ export function useWorkspacePanelControls() {
     if (activeAnalysisExtension?.placement === 'bottom') {
       closeActiveAnalysisExtension();
     }
-    const nextScriptVisible = panel === 'script' ? !scriptPanelVisible : false;
-    const nextListVisible = panel === 'list' ? !listPanelVisible : false;
-    const nextGanttVisible = panel === 'gantt' ? !ganttPanelVisible : false;
-
-    setScriptPanelVisible(nextScriptVisible);
-    setListPanelVisible(nextListVisible);
-    setGanttPanelVisible(nextGanttVisible);
-
-    if (nextScriptVisible || nextListVisible || nextGanttVisible) {
-      setRightPanelCollapsed(false);
-    }
-  }, [
-    activeAnalysisExtension?.placement,
-    ganttPanelVisible,
-    listPanelVisible,
-    scriptPanelVisible,
-    setGanttPanelVisible,
-    setListPanelVisible,
-    setRightPanelCollapsed,
-    setScriptPanelVisible,
-  ]);
+    // The store owns the bottom strip's re-dock rules, so hand it the click
+    // rather than re-deriving the flag flips. The copy that used to live here
+    // knew nothing about the float / pop-out channels: toggling a FLOATING
+    // Lists panel cleared its dock flag and left the floating window on screen
+    // with the toolbar latch off, while the same click from the activity bar
+    // (which routes here) brought it home correctly.
+    useViewerStore.getState().toggleBottomPanel(panel, surface);
+  }, [activeAnalysisExtension?.placement, surface]);
 
   const handleToggleRightPanel = useCallback((panel: RightPanel) => {
     if (activeAnalysisExtension?.placement !== 'bottom') {
       closeActiveAnalysisExtension();
     }
+    if (panel === 'appearance') {
+      useViewerStore.getState().toggleWorkspacePanel(panel, surface);
+      return;
+    }
 
-    const nextBcfVisible = panel === 'bcf' ? !bcfPanelVisible : false;
-    const nextIdsVisible = panel === 'ids' ? !idsPanelVisible : false;
-    const nextLensVisible = panel === 'lens' ? !lensPanelVisible : false;
-    const nextClashVisible = panel === 'clash' ? !clashPanelVisible : false;
-    const nextCompareVisible = panel === 'compare' ? !comparePanelVisible : false;
-    const nextExtensionsVisible = panel === 'extensions' ? !extensionsPanelVisible : false;
-    const isAddElementActive = activeTool === 'addElement';
-    const nextAddElementActive = panel === 'addElement' ? !isAddElementActive : false;
+    // "Active" means it owns the DOCKED slot right now, the same test the
+    // store's `toggleWorkspacePanel` applies. A floating or popped-out panel
+    // keeps its dock flag set, so negating the raw flag read the click as
+    // "close" and the detach cleanup below then tore the panel down entirely —
+    // where the rail, asking this question properly, brings it home. Toggling a
+    // detached panel must re-dock it, never close it out from under its window.
+    const detached = floatingPanels.some((p) => p.id === panel) || poppedOutIds.includes(panel);
+    const docked = (visible: boolean) => visible && !detached;
+
+    const nextBcfVisible = panel === 'bcf' ? !docked(bcfPanelVisible) : false;
+    const nextIdsVisible = panel === 'validation' ? !docked(idsPanelVisible) : false;
+    const nextLensVisible = panel === 'lens' ? !docked(lensPanelVisible) : false;
+    const nextClashVisible = panel === 'clash' ? !docked(clashPanelVisible) : false;
+    const nextCompareVisible = panel === 'compare' ? !docked(comparePanelVisible) : false;
+    const nextExtensionsVisible = panel === 'extensions' ? !docked(extensionsPanelVisible) : false;
+    const nextSourcesVisible = panel === 'sources' ? !docked(sourcesPanelVisible) : false;
+    // These flags bypass the store's panel actions, so report the open here,
+    // with the side slot's occupant as the store's own actions do.
+    if (nextBcfVisible || nextIdsVisible || nextLensVisible || nextClashVisible || nextCompareVisible || nextExtensionsVisible || nextSourcesVisible) {
+      const { sidebarMode, sidebarActivePanel } = useViewerStore.getState();
+      trackPanelOpened(panel, surface, sidebarMode === 'expanded' ? sidebarActivePanel : undefined);
+    }
 
     setBcfPanelVisible(nextBcfVisible);
     setIdsPanelVisible(nextIdsVisible);
@@ -112,33 +132,24 @@ export function useWorkspacePanelControls() {
     setClashPanelVisible(nextClashVisible);
     setComparePanelVisible(nextCompareVisible);
     setExtensionsPanelVisible(nextExtensionsVisible);
+    setSourcesPanelVisible(nextSourcesVisible);
     // Keep the float + window channels in sync (#1200/#1201/#1208): toggling a
     // workspace panel from the toolbar re-docks it if it was floating or popped
     // out, instead of leaving an orphaned floating panel or OS window.
-    if (panel !== 'addElement') {
-      useViewerStore.getState().closeFloatingPanel(panel);
-      closePanelWindow(panel);
-    }
+    useViewerStore.getState().closeFloatingPanel(panel);
+    closePanelWindow(panel);
 
-    if (panel === 'addElement') {
-      setActiveTool(nextAddElementActive ? 'addElement' : 'select');
-    } else if (isAddElementActive) {
-      setActiveTool('select');
-    }
-
-    if (nextBcfVisible || nextIdsVisible || nextLensVisible || nextClashVisible || nextCompareVisible || nextExtensionsVisible || nextAddElementActive) {
+    if (nextBcfVisible || nextIdsVisible || nextLensVisible || nextClashVisible || nextCompareVisible || nextExtensionsVisible || nextSourcesVisible) {
       setRightPanelCollapsed(false);
     }
   }, [
     activeAnalysisExtension?.placement,
-    activeTool,
     bcfPanelVisible,
     clashPanelVisible,
     comparePanelVisible,
     extensionsPanelVisible,
     idsPanelVisible,
     lensPanelVisible,
-    setActiveTool,
     setBcfPanelVisible,
     setClashPanelVisible,
     setComparePanelVisible,
@@ -146,6 +157,11 @@ export function useWorkspacePanelControls() {
     setIdsPanelVisible,
     setLensPanelVisible,
     setRightPanelCollapsed,
+    setSourcesPanelVisible,
+    sourcesPanelVisible,
+    floatingPanels,
+    poppedOutIds,
+    surface,
   ]);
 
   const handleToggleAnalysisExtension = useCallback((id: string) => {
@@ -178,18 +194,11 @@ export function useWorkspacePanelControls() {
     setClashPanelVisible(false);
     setComparePanelVisible(false);
     setExtensionsPanelVisible(false);
-    // The right slot is single-tenant: when an analysis extension takes
-    // it over, the AddElement tool must release it too, otherwise its 3D
-    // click handler keeps placing elements behind the extension panel.
-    if (activeTool === 'addElement') {
-      setActiveTool('select');
-    }
+    setSourcesPanelVisible(false);
     setRightPanelCollapsed(false);
   }, [
-    activeTool,
     analysisExtensionState.activeId,
     analysisExtensionState.extensions,
-    setActiveTool,
     setBcfPanelVisible,
     setClashPanelVisible,
     setComparePanelVisible,
@@ -200,26 +209,37 @@ export function useWorkspacePanelControls() {
     setListPanelVisible,
     setRightPanelCollapsed,
     setScriptPanelVisible,
+    setSourcesPanelVisible,
   ]);
 
   const activeWorkspacePanels = useMemo(() => {
     const panels = new Set<WorkspacePanel>();
-    if (scriptPanelVisible) panels.add('script');
-    if (listPanelVisible) panels.add('list');
-    if (ganttPanelVisible) panels.add('gantt');
+    // A floating or popped-out panel is OPEN — the sidebar's single-tenant rule
+    // clears its dock flag the moment another panel docks, without touching the
+    // detached channels. Reading only the flags is what made a floating BCF
+    // panel's latch go dark on both toolbars while the panel sat on screen; the
+    // activity bar never had the bug because it reads `panelLocation`.
+    for (const panel of floatingPanels) panels.add(panel.id);
+    for (const id of poppedOutIds) panels.add(id);
+    for (const id of BOTTOM_PANEL_IDS) if (isBottomPanelOpen(bottomFlags, id)) panels.add(id);
     if (bcfPanelVisible) panels.add('bcf');
-    if (idsPanelVisible) panels.add('ids');
+    if (idsPanelVisible) panels.add('validation');
     if (lensPanelVisible) panels.add('lens');
     if (clashPanelVisible) panels.add('clash');
     if (comparePanelVisible) panels.add('compare');
     if (extensionsPanelVisible) panels.add('extensions');
-    if (activeTool === 'addElement') panels.add('addElement');
+    if (sourcesPanelVisible) panels.add('sources');
     if (layersPanelVisible) panels.add('layers');
     if (collabPanelVisible) panels.add('collab');
+    if (sidebarActivePanel === 'zones') panels.add('zones');
+    if (sidebarActivePanel === 'appearance') panels.add('appearance');
+    if (sidebarActivePanel === 'loadReport') panels.add('loadReport');
+    if (sidebarActivePanel === 'changes') panels.add('changes');
+    if (sidebarActivePanel === 'changeSets') panels.add('changeSets');
+    if (sidebarActivePanel === 'cost') panels.add('cost');
     if (analysisExtensionState.activeId) panels.add(analysisExtensionState.activeId);
     return panels;
   }, [
-    activeTool,
     analysisExtensionState.activeId,
     bcfPanelVisible,
     collabPanelVisible,
@@ -227,34 +247,17 @@ export function useWorkspacePanelControls() {
     clashPanelVisible,
     comparePanelVisible,
     extensionsPanelVisible,
-    ganttPanelVisible,
+    bottomFlags,
     idsPanelVisible,
     lensPanelVisible,
-    listPanelVisible,
-    scriptPanelVisible,
+    floatingPanels,
+    poppedOutIds,
+    sidebarActivePanel,
+    sourcesPanelVisible,
   ]);
-
-  const workspacePanelLabel = useMemo(() => {
-    if (activeWorkspacePanels.size === 0) return null;
-    if (activeWorkspacePanels.size > 1) return 'Multiple Panels';
-    if (activeWorkspacePanels.has('script')) return 'Script Editor';
-    if (activeWorkspacePanels.has('list')) return 'Lists';
-    if (activeWorkspacePanels.has('gantt')) return 'Schedule';
-    if (activeWorkspacePanels.has('bcf')) return 'BCF Issues';
-    if (activeWorkspacePanels.has('ids')) return 'IDS Validation';
-    if (activeWorkspacePanels.has('lens')) return 'Lens Rules';
-    if (activeWorkspacePanels.has('clash')) return 'Clash Detection';
-    if (activeWorkspacePanels.has('compare')) return 'Compare Models';
-    if (activeWorkspacePanels.has('extensions')) return 'Extensions';
-    if (activeWorkspacePanels.has('addElement')) return 'Add Element';
-    if (activeWorkspacePanels.has('layers')) return 'Layer Stack';
-    if (activeWorkspacePanels.has('collab')) return 'Collaboration Room';
-    return activeAnalysisExtension?.label ?? 'Analysis';
-  }, [activeAnalysisExtension?.label, activeWorkspacePanels]);
 
   return {
     activeWorkspacePanels,
-    workspacePanelLabel,
     handleToggleBottomPanel,
     handleToggleRightPanel,
     handleToggleAnalysisExtension,

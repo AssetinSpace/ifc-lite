@@ -7,6 +7,10 @@
  * Supports both IFC4 (STEP) and IFC5 (IFCX/JSON) formats
  */
 
+import { createLogger } from '@ifc-lite/data';
+export { parseModel, IfcInputError, validateStepInput } from './parse-model.js';
+export type { ParseModelOptions, ParsedModel, IfcInputErrorCode } from './parse-model.js';
+export type { EntityScanReport, ScanDiagnostic, ScanCompleteness } from './scan-report.js';
 import { unwrapIfcZip } from './ifczip.js';
 // `unwrapIfcZip` unwraps an ArrayBuffer (no-op for non-zip); `unwrapIfcZipView`
 // is the same for Node Buffer/Uint8Array callers (CLI/MCP loaders). The
@@ -18,15 +22,54 @@ export type { IfcZipContents } from './ifczip.js';
 export { StepTokenizer } from './tokenizer.js';
 export { EntityIndexBuilder } from './entity-index.js';
 export { EntityExtractor } from './entity-extractor.js';
+export { spatialContainerPath, authoredKeyValue, parseAuthoredKeySpec, type AuthoredKeySpec } from './identity-hints.js';
+export { STEP_TRIVIA } from './step-trivia.js';
+// The source accessor (#2183). Exported because the byte-range readers in
+// @ifc-lite/export, @ifc-lite/cli and the viewer now accept either shape, and
+// `IfcDataStore.source` is on its way to this type — so it is public surface
+// either way. The producers are exported too now that `IfcDataStore.source` IS
+// this type: anything constructing a store needs to say "wrap these bytes"
+// (`contiguousSourceBytes`) or "this model has none" (`EMPTY_SOURCE_BYTES`),
+// and the server-parsed, synthetic, GLB and point-cloud paths all do.
+export {
+  asSourceBytes,
+  contiguousSourceBytes,
+  isSourceBytes,
+  sourceBytesFromTransferable,
+  compressSourceInPlace,
+  sourceBlockStats,
+  EMPTY_SOURCE_BYTES,
+} from './source-bytes.js';
+export {
+  compressSource,
+  shouldCompressSource,
+  COMPRESSION_MIN_BYTES,
+  type CompressedSource,
+} from './source-compress.js';
+export {
+  DEFAULT_BLOCK_SIZE,
+  DEFAULT_CACHE_BYTES,
+  type BlockedPayload,
+  type BlockStoreCounters,
+} from './block-store.js';
+export type { IfcSourceBytes, IfcSourceTransfer } from './source-bytes.js';
 export { CompactEntityIndex, CompactEntityIndexBuilder, buildCompactEntityIndex } from './compact-entity-index.js';
 export { scanIfcEntities } from './entity-scanner.js';
 export type { EntityScanPath, EntityScanResult, PreScannedEntityIndex, WasmScanApi } from './entity-scanner.js';
-export { REL_TYPE_MAP, RELATIONSHIP_TYPES } from './columnar-parser-indexes.js';
+export { REL_TYPE_MAP, SECONDARY_REL_TYPE_MAP, isIfcTypeLikeEntity } from './columnar-parser-indexes.js';
+export { IFC_SUBTYPES, expandTypes, QUERY_REL_TYPE_MAP } from './query-backend-maps.js';
 export { PropertyExtractor } from './property-extractor.js';
 export { QuantityExtractor } from './quantity-extractor.js';
 export { RelationshipExtractor } from './relationship-extractor.js';
+export { propertyDefinitionRefsOfValue } from './property-definition-refs.js';
+export { propertyDefinitionsInModel } from './property-definition-members.js';
 export { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
-export { extractLengthUnitScale } from './unit-extractor.js';
+export {
+  SI_PREFIX_MULTIPLIERS, extractLengthUnitScale,
+  resolveEntityLengthUnitScale,
+  resolveOwningIfcProjectId,
+  type LengthUnitSource,
+} from './unit-extractor.js';
 export {
   extractProjectUnits,
   measureUnit,
@@ -34,10 +77,18 @@ export {
   type ResolvedUnit,
   type MeasureUnit,
 } from './project-units.js';
-export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, getRawNamedAttributes, extractRootAttributesFromEntity, extractClassificationsOnDemand, extractMaterialsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractMaterialPropertiesForMaterialId, resolveMaterialDefId, resolveAllMaterialDefIds, collectMaterialLeaves, buildMaterialUsageIndex, getMaterialDisplay, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractTypeQuantitiesOnDemand, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type MaterialPsetGroup, type MaterialLeaf, type MaterialUsage, type TypePropertyInfo, type TypeQuantityInfo, type DocumentInfo, type EntityRelationships, type GroupMember } from './columnar-parser.js';
+export { quantitySiScale } from './quantity-collect.js';
+export { scaleMeasureValue, scaledPropertyValue, roundToScale } from './measure-unit-scale.js';
+export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, getRawNamedAttributes, extractRootAttributesFromEntity, extractClassificationsOnDemand, extractClassificationSystemsOnDemand, extractMaterialsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractMaterialPropertiesForMaterialId, resolveMaterialDefId, resolveAllMaterialDefIds, collectMaterialLeaves, buildMaterialUsageIndex, getMaterialDisplay, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractTypeQuantitiesOnDemand, extractTypeEntityOwnQuantities, mergeInheritedPropertySets, mergeInheritedQuantitySets, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractExactRelatedIds, extractGroupMembersOnDemand, extractGroupAssignmentFactorOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type ClassificationSystemNames, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type MaterialPsetGroup, type MaterialLeaf, type MaterialUsage, type TypePropertyInfo, type TypeQuantityInfo, type DocumentInfo, type EntityRelationships, type GroupMember } from './columnar-parser.js';
+export { OccurrenceQuantityReadError } from './occurrence-quantity-read-error.js';
+export type { MaterialPropertiesView } from './on-demand-extractors.js';
 export type { IfcStoreBase, IfcSourceHeader, SpatialHierarchy, EntityTable } from '@ifc-lite/data';
 export { parseSourceHeader } from './source-header.js';
+export type { ExtractedProperty } from './property-value-parser.js';
+export { COMPLEX_PROPERTY_BUDGET_MARKER } from './property-complex-value.js';
+export { complexPropertyCuts } from './complex-property-store.js';
 export { attachDataStoreAccessors, type IfcStoreData } from './data-store-accessors.js';
+export { buildDropCensus, type DropCensus, type DropCensusInput, type ClassCensusEntry, type DropCategory } from './drop-census.js';
 export { createSyntheticDataStore, type SyntheticDataStoreOptions, type SyntheticEntity } from './synthetic-data-store.js';
 // WorkerParser is browser-only due to Vite worker imports
 // Import from '@ifc-lite/parser/browser' instead
@@ -67,25 +118,47 @@ export {
   type MeshData as IfcxMeshData,
   type PointCloudExtraction,
 } from '@ifc-lite/ifcx';
-
 // New extractors with 100% schema coverage
 export { extractMaterials, getMaterialForElement, getMaterialNameForElement, type MaterialsData, type Material, type MaterialLayer, type MaterialLayerSet } from './material-extractor.js';
-export { extractGeoreferencing, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth, type GeoreferenceInfo, type MapConversion, type ProjectedCRS } from './georef-extractor.js';
+export { materialAssignmentsAvailable } from './material-overlay.js';
+export { extractGeoreferencing, computeTransformMatrix, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth, type GeoreferenceInfo, type MapConversion, type ProjectedCRS } from './georef-extractor.js';
 export { extractClassifications, getClassificationsForElement, getClassificationCodeForElement, getClassificationPath, groupElementsByClassification, type ClassificationsData, type Classification, type ClassificationReference } from './classification-extractor.js';
 
-// 4D / scheduling extractor — IfcTask, IfcTaskTime, IfcRelSequence, IfcRelAssignsToProcess,
-// IfcRelAssignsToControl, IfcRelNests, IfcWorkSchedule, IfcWorkPlan, IfcLagTime.
+// 4D scheduling extractor: tasks, sequences, schedules, calendars and recurrence data.
 export {
   extractScheduleOnDemand,
-  parseIso8601Duration,
+  parseIso8601Duration, taskProductExpressIds, taskProductGlobalIds,
   type ScheduleExtraction,
   type ScheduleTaskInfo,
   type ScheduleTaskTimeInfo,
   type ScheduleSequenceInfo,
   type WorkScheduleInfo,
+  type WorkCalendarInfo, type WorkTimeInfo, type RecurrencePatternInfo, type TimePeriodInfo,
   type SequenceTypeEnum,
   type TaskDurationType,
 } from './schedule-extractor.js';
+
+// Structural analysis extractor — IfcStructuralAnalysisModel, the
+// IfcStructuralMember / IfcStructuralConnection / IfcStructuralActivity
+// branches, IfcStructuralLoadGroup / IfcStructuralLoadCase,
+// IfcStructuralResultGroup, IfcBoundaryCondition, and the two structural
+// connects-relationships.
+export {
+  extractStructuralOnDemand,
+  type StructuralExtraction,
+  type StructuralAnalysisModelInfo,
+  type StructuralMemberInfo,
+  type StructuralConnectionInfo,
+  type StructuralActivityInfo,
+  type StructuralLoadGroupInfo,
+  type StructuralResultGroupInfo,
+  type StructuralLoadInfo,
+  type StructuralLoadConfigurationInfo,
+  type StructuralLoadConfigurationEntry,
+  type StructuralLoadDropReason,
+  type StructuralExtractionView,
+  type BoundaryConditionInfo,
+} from './structural-extractor.js';
 
 // IFC4 STEP serializer for schedule entities — produces ready-to-splice
 // `#N=IFC...(...)` lines from a `ScheduleExtraction`.
@@ -95,16 +168,23 @@ export {
   type SerializeScheduleResult,
 } from './schedule-serializer.js';
 
+// Cost (5D) extractor — IfcCostItem, IfcCostValue, IfcCostSchedule, IfcRelNests,
+// IfcRelAssignsToControl. Read model + extraction only (#4322).
+export * from './cost.js';
+
+// Signed ISO 8601 duration codec — shared by the schedule extractor (decode)
+// and serializer (encode), and by any other schedule consumer that needs to
+// go from seconds to an `IfcDuration` string or back. See the module doc
+// comment for the signed-duration interop tradeoff.
+export { secondsToIso8601Duration } from './iso8601-duration.js';
+
 // Deterministic 22-char GlobalId generator — shared by every call site
 // that mints a synthetic IFC-style id (serializer fallback, schedule
 // generator, user-authored tasks). Never re-implement this; always
 // import from here.
 export { deterministicGlobalId } from './deterministic-global-id.js';
 
-// Generated IFC4 schema (100% coverage - 776 entities, 397 types, 207 enums)
-export { SCHEMA_REGISTRY, getEntityMetadata, getAllAttributesForEntity, getInheritanceChainForEntity, isKnownEntity } from './generated/schema-registry.js';
-export type * from './generated/entities.js';
-export * from './generated/enums.js';
+export * from './schema-exports.js';
 
 // STEP serialization support for IFC export
 export {
@@ -124,19 +204,37 @@ export {
 } from './generated/serializers.js';
 
 export * from './types.js';
-export { getAttributeNames, getAttributeNamesAcrossSchemas, getAttributeNameAt, isKnownType, normalizeIfcTypeName } from './ifc-schema.js';
-
+// `getInheritanceChainAcrossSchemas` is the counterpart of
+// `getAttributeNamesAcrossSchemas`: it answers for every bundled schema
+// (IFC2X3 + IFC4 + IFC4X3), where the generated `getInheritanceChainForEntity`
+// above only knows the codegen pin (IFC4_ADD2_TC1) and returns an empty chain
+// for a class the pin does not carry — `IfcMove`, `IfcSpaceProgram`, `IfcRoad`.
+// Anything that decides *what kind of thing* an entity is must use this one.
+// `isKnownType` and `normalizeIfcTypeName` are cross-schema too, despite the
+// unqualified names — they were pin-only until #2003.
+//
+// NAMING FOOTGUN, recorded rather than fixed here: the pinned helper has the
+// shorter, more obvious name (`getInheritanceChainForEntity`) and the correct
+// one carries the qualifier, so reaching for the wrong one is the path of least
+// resistance — five call sites have now been fixed after the fact (#2001, #2003,
+// #2014, this one). The qualifier belongs on the *pinned* function
+// (`…ForEntityInIfc4Pin`), leaving the union walker the plain name, so the easy
+// choice is the safe one. That is a rename across every consumer and does not
+// belong in a fix PR; it needs its own.
+export { getAttributeNames, getAttributeNamesAcrossSchemas, getAttributeNamesForSchema, getAttributeTypeForSchema, getAttributeNameAt, isKnownType, isInstantiable, isQueryableObjectType, normalizeIfcTypeName, resolveEntityNameAlias, getInheritanceChain as getInheritanceChainAcrossSchemas } from './ifc-schema.js';
+export * from './native-metadata-public.js';
 import type { IfcEntity, ParseResult } from './types.js';
 import { EntityIndexBuilder } from './entity-index.js';
 import { EntityExtractor } from './entity-extractor.js';
 import { PropertyExtractor } from './property-extractor.js';
 import { RelationshipExtractor } from './relationship-extractor.js';
-import { ColumnarParser, type IfcDataStore } from './columnar-parser.js';
-import { scanIfcEntities, type PreScannedEntityIndex, type WasmScanApi } from './entity-scanner.js';
+import { parseColumnarInput, type IfcDataStore } from './columnar-parser.js';
+import { scanIfcEntities, scanColumnarEntities, type PreScannedEntityIndex, type WasmScanApi } from './entity-scanner.js';
 
 export interface ParseOptions {
   onProgress?: (progress: { phase: string; percent: number }) => void;
   onDiagnostic?: (message: string) => void;
+  onScanReport?: (report: import('./scan-report.js').EntityScanReport) => void;
   wasmApi?: WasmScanApi; // Optional IfcAPI instance for WASM-accelerated entity scanning
   /** Yield budget for large incremental parses. Higher values finish faster with longer main-thread slices. */
   yieldIntervalMs?: number;
@@ -150,13 +248,14 @@ export interface ParseOptions {
   /**
    * Pre-built entity index from another worker (typically the streaming
    * geometry pre-pass). When supplied, `parseColumnar` skips both the
-   * worker-based and WASM scans and synthesizes `EntityRef[]` from the
-   * column arrays directly — saving ~10 s on 1 GB / 14 M-entity files
-   * where the parser would otherwise duplicate the pre-pass scan under
-   * heavy WASM contention with the geometry workers.
+   * worker-based and WASM scans and retains the numeric columns through
+   * entity categorization. Only records needed for metadata extraction
+   * materialize EntityRefs; every record remains addressable in the store.
    */
   preScannedEntityIndex?: PreScannedEntityIndex;
 }
+
+const parserLog = createLogger('IfcParser');
 
 /**
  * Main parser class
@@ -238,12 +337,11 @@ export class IfcParser {
     buffer: ArrayBuffer | SharedArrayBuffer,
     options: ParseOptions = {},
   ): Promise<IfcDataStore> {
-    const { entityRefs, processed, elapsedMs, scanPath } = await scanIfcEntities(buffer, options);
-    console.log(`[IfcParser] Fast scan: ${processed} entities in ${elapsedMs.toFixed(0)}ms (path=${scanPath})`);
+    const { entityRefs, entityColumns, processed, elapsedMs, scanPath } = await scanColumnarEntities(buffer, options);
+    parserLog.debug(`Fast scan: ${processed} entities in ${elapsedMs.toFixed(0)}ms (path=${scanPath})`);
 
     // Build columnar structures with on-demand property extraction
-    const columnarParser = new ColumnarParser();
-    const dataStore = await columnarParser.parseLite(buffer, entityRefs, options);
+    const dataStore = await parseColumnarInput(buffer, entityColumns ?? entityRefs, options);
     return dataStore;
   }
 }
@@ -298,3 +396,5 @@ export async function parseAuto(
 
   throw new Error('Unknown file format. Expected IFC (STEP) or IFCX (JSON).');
 }
+
+export { findSourceProjectLengthUnit, normalizeMapUnitName } from './source-project-length-unit.js';

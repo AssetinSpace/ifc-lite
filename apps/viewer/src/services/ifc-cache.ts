@@ -9,6 +9,8 @@
  * Uses xxhash64 of the source file as the cache key.
  */
 
+import { IdbConnectionLifecycle } from './idb-connection.js';
+
 const DB_NAME = 'ifc-lite-cache';
 const DB_VERSION = 1;
 const STORE_NAME = 'models';
@@ -57,7 +59,7 @@ export const PER_ENTRY_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
  */
 export const QUOTA_HEADROOM_BYTES = 128 * 1024 * 1024;
 
-let dbPromise: Promise<IDBDatabase> | null = null;
+const connection = new IdbConnectionLifecycle('[IFC Cache]');
 
 /** Bytes a cache record occupies on disk (cache buffer + optional source). */
 function entryBytes(buffer: Blob | ArrayBuffer, sourceBuffer?: ArrayBuffer): number {
@@ -162,26 +164,23 @@ export async function ensureRoomForEntry(db: IDBDatabase, bytes: number, keepKey
  * Open the IndexedDB database
  */
 export function openDatabase(): Promise<IDBDatabase> {
-  if (dbPromise) return dbPromise;
-
-  dbPromise = new Promise((resolve, reject) => {
+  return connection.open(() => new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onerror = () => {
       console.error('[IFC Cache] Failed to open database:', request.error);
-      dbPromise = null; // Reset so we can retry
       reject(request.error);
     };
 
     request.onsuccess = () => {
       const db = request.result;
-      
+
       // Verify the object store exists (handles corrupted DB state)
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         console.warn('[IFC Cache] Object store missing, recreating database...');
         db.close();
-        dbPromise = null;
-        
+        connection.reset();
+
         // Delete and recreate the database
         const deleteRequest = indexedDB.deleteDatabase(DB_NAME);
         deleteRequest.onsuccess = () => {
@@ -193,7 +192,7 @@ export function openDatabase(): Promise<IDBDatabase> {
         };
         return;
       }
-      
+
       resolve(db);
     };
 
@@ -207,9 +206,38 @@ export function openDatabase(): Promise<IDBDatabase> {
         store.createIndex('fileName', 'fileName', { unique: false });
       }
     };
-  });
+  }));
+}
 
-  return dbPromise;
+function withConnection<T>(use: (db: IDBDatabase) => T): Promise<T> {
+  return connection.withConnection(openDatabase, use);
+}
+
+/**
+ * Begin a transaction on a live connection, reopening once if needed.
+ *
+ * The caller must use the returned transaction IMMEDIATELY: an IndexedDB
+ * transaction stays active only until control returns to the event loop, and
+ * every `await` on the path here settles within the same microtask checkpoint
+ * (either an already-memoised connection or the open event that just fired).
+ * Awaiting anything else between this call and the first request would
+ * deactivate it (`TransactionInactiveError`).
+ */
+function beginTransaction(mode: IDBTransactionMode): Promise<IDBTransaction> {
+  return withConnection((db) => db.transaction(STORE_NAME, mode));
+}
+
+/**
+ * A connection that was live a moment ago, for the callers that need the
+ * `IDBDatabase` itself (the quota guard opens its own transactions). The probe
+ * is an empty read-only transaction: it does no I/O, and creating it is exactly
+ * the operation that throws when the connection is closed.
+ */
+function liveConnection(): Promise<IDBDatabase> {
+  return withConnection((db) => {
+    db.transaction(STORE_NAME, 'readonly').abort();
+    return db;
+  });
 }
 
 export interface CacheResult {
@@ -233,9 +261,11 @@ export interface CacheEntryMeta {
  */
 export async function getCached(key: string): Promise<CacheResult | null> {
   try {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
+    const tx = await beginTransaction('readonly');
+    // `return await` is load-bearing: a bare `return promise` inside a try
+    // hands the promise straight to the caller, so its rejection would bypass
+    // the catch below and break the load instead of degrading to a miss.
+    return await new Promise((resolve, reject) => {
       const store = tx.objectStore(STORE_NAME);
       const request = store.get(key);
 
@@ -276,7 +306,10 @@ export async function setCached(
   meta?: CacheEntryMeta,
 ): Promise<void> {
   try {
-    const db = await openDatabase();
+    // A connection verified live, so a write does not silently skip just
+    // because the memo was holding a closed one (the quota guard below opens
+    // its own transactions, so it needs the connection, not a transaction).
+    const db = await liveConnection();
 
     // Quota/eviction guard (prerequisite for the mesh-only tier — entries can be
     // 100s of MB): refuse oversized records and LRU-evict older entries when the
@@ -301,7 +334,10 @@ export async function setCached(
       try {
         tx = db.transaction(STORE_NAME, 'readwrite');
       } catch (err) {
-        // e.g. InvalidStateError if the connection is closing.
+        // The connection was verified live above, so reaching here means it
+        // died inside the quota guard's await. Not retried: a retry would also
+        // re-run eviction, and a skipped write is a slow next load, not a
+        // failure. The next operation reopens.
         console.warn('[IFC Cache] Could not open write transaction; skipping cache write', err);
         done();
         return;
@@ -354,9 +390,8 @@ export async function setCached(
  */
 export async function hasCached(key: string): Promise<boolean> {
   try {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
+    const tx = await beginTransaction('readonly');
+    return await new Promise((resolve, reject) => {
       const store = tx.objectStore(STORE_NAME);
       const request = store.count(IDBKeyRange.only(key));
 
@@ -368,7 +403,8 @@ export async function hasCached(key: string): Promise<boolean> {
         reject(request.error);
       };
     });
-  } catch {
+  } catch (err) {
+    console.warn('[IFC Cache] Cache existence check failed; treating as a miss:', err);
     return false;
   }
 }
@@ -378,9 +414,8 @@ export async function hasCached(key: string): Promise<boolean> {
  */
 export async function deleteCached(key: string): Promise<void> {
   try {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+    const tx = await beginTransaction('readwrite');
+    return await new Promise((resolve, reject) => {
       const store = tx.objectStore(STORE_NAME);
       const request = store.delete(key);
 
@@ -397,9 +432,8 @@ export async function deleteCached(key: string): Promise<void> {
  */
 export async function clearCache(): Promise<void> {
   try {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+    const tx = await beginTransaction('readwrite');
+    return await new Promise((resolve, reject) => {
       const store = tx.objectStore(STORE_NAME);
       const request = store.clear();
 
@@ -423,9 +457,8 @@ export async function getCacheStats(): Promise<{
   entries: Array<{ fileName: string; fileSize: number; createdAt: Date }>;
 }> {
   try {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
+    const tx = await beginTransaction('readonly');
+    return await new Promise((resolve, reject) => {
       const store = tx.objectStore(STORE_NAME);
       const request = store.getAll();
 
@@ -444,7 +477,8 @@ export async function getCacheStats(): Promise<{
 
       request.onerror = () => reject(request.error);
     });
-  } catch {
+  } catch (err) {
+    console.warn('[IFC Cache] Cache stats read failed; reporting an empty cache:', err);
     return { entryCount: 0, totalSize: 0, entries: [] };
   }
 }

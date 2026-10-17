@@ -4,20 +4,21 @@
 
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getPackageVersion } from '../utils/config-fixers.js';
+import { getPinnedPackageVersion } from '../utils/config-fixers.js';
 
 /**
  * Scaffold a native-binary IFC processing server with TypeScript client examples.
  * No Docker required -- the server binary is downloaded and run via npm scripts.
  */
 export function createServerNativeTemplate(targetDir: string, projectName: string) {
-  const serverBinVersion = getPackageVersion('@ifc-lite/server-bin');
-  const serverClientVersion = getPackageVersion('@ifc-lite/server-client');
+  const serverBinVersion = getPinnedPackageVersion('@ifc-lite/server-bin');
+  const serverClientVersion = getPinnedPackageVersion('@ifc-lite/server-client');
 
   // package.json
   writeFileSync(join(targetDir, 'package.json'), JSON.stringify({
     name: projectName,
     version: '0.1.0',
+    private: true,
     type: 'module',
     description: 'IFC processing server (native binary) with TypeScript client',
     scripts: {
@@ -39,7 +40,7 @@ export function createServerNativeTemplate(targetDir: string, projectName: strin
       '@types/node': '^20.0.0',
     },
     optionalDependencies: {
-      'parquet-wasm': '^0.6.0',
+      'parquet-wasm': '^0.7.2',
       'apache-arrow': '^17.0.0',
     },
   }, null, 2));
@@ -336,7 +337,7 @@ IFC processing server using native binary - no Docker required.
 
 \`\`\`bash
 # Install dependencies (downloads server binary automatically)
-npm install
+npm ci
 
 # Start the server
 npm run server:start

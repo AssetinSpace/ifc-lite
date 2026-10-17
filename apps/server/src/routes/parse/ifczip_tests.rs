@@ -73,6 +73,62 @@ fn rejects_an_entry_over_the_size_ceiling() {
     assert!(matches!(err, ApiError::FileTooLarge { max_mb: 1 }));
 }
 
+/// Patch the 4-byte little-endian "uncompressed size" field in both the
+/// local file header (offset 22 from `PK\x03\x04`) and the central directory
+/// record (offset 24 from `PK\x01\x02`) of a single-entry Stored archive, so
+/// the archive's DECLARED size disagrees with the ACTUAL bytes on disk. Real
+/// callers do not need this — it exists to isolate the two independent
+/// guards in `unwrap_ifczip`: the up-front reject on `entry.size()` (the
+/// declared, central-directory value, checked before any decompression) and
+/// the belt-and-braces reject on the actual decompressed byte count.
+fn lie_about_uncompressed_size(mut zip: Vec<u8>, declared_size: u32) -> Vec<u8> {
+    let local_sig = [0x50, 0x4b, 0x03, 0x04];
+    let central_sig = [0x50, 0x4b, 0x01, 0x02];
+    let local_pos = zip
+        .windows(4)
+        .position(|w| w == local_sig)
+        .expect("local file header signature");
+    let central_pos = zip
+        .windows(4)
+        .position(|w| w == central_sig)
+        .expect("central directory signature");
+    zip[local_pos + 22..local_pos + 26].copy_from_slice(&declared_size.to_le_bytes());
+    zip[central_pos + 24..central_pos + 28].copy_from_slice(&declared_size.to_le_bytes());
+    zip
+}
+
+/// The declared-size guard (`entry.size() > max_bytes`, before decompressing)
+/// and the belt-and-braces post-decompression guard are two INDEPENDENT
+/// checks — `rejects_an_entry_over_the_size_ceiling` above cannot tell them
+/// apart because a well-formed archive's declared and actual sizes always
+/// agree, so either guard alone rejects it. This isolates the declared-size
+/// guard: the header LIES that the entry is huge while the actual Stored
+/// bytes are tiny, so only the declared-size check can catch it — the
+/// post-decompression guard sees a small `model.len()` and would admit it.
+///
+/// Coverage gap found via mutation testing: disabling the `entry.size() >
+/// max_bytes` check (replacing its condition with `false`) left the entire
+/// `ifczip_tests` module green (7/7 passed) because every other test's
+/// declared and actual sizes coincide.
+#[test]
+fn declared_size_guard_fires_even_when_actual_bytes_are_small() {
+    let content = "tiny"; // 4 actual bytes
+    let zip = make_zip(&[("model.ifc", content)]);
+    let lying_zip = lie_about_uncompressed_size(zip, 5_000_000);
+
+    // Sanity: the lie took — an ordinary archive of this content is nowhere
+    // near the ceiling used below, so a pass here would mean the guard never
+    // engaged at all rather than the lie failing to apply.
+    let honest_zip = make_zip(&[("model.ifc", content)]);
+    unwrap_ifczip(&honest_zip, 1_000, 1).expect("an honest 4-byte entry is admitted");
+
+    let err = unwrap_ifczip(&lying_zip, 1_000, 1).unwrap_err();
+    assert!(
+        matches!(err, ApiError::FileTooLarge { max_mb: 1 }),
+        "the declared (lying) size must be rejected before decompression, got {err:?}"
+    );
+}
+
 #[test]
 fn extracts_a_deflate_compressed_model_entry() {
     // Real buildingSMART .ifcZIP containers are DEFLATE-compressed, not
@@ -91,4 +147,23 @@ fn extracts_a_deflate_compressed_model_entry() {
     let zip = buf.into_inner();
     let out = unwrap_ifczip(&zip, BIG, 512).unwrap();
     assert_eq!(String::from_utf8(out.to_vec()).unwrap(), STEP);
+}
+
+/// #7744: an entry whose header UNDERSTATES its size. zip 8 read on past the
+/// declared size, so an oversize entry ended in the post-read 413. zip 9
+/// fails the read as soon as it passes the declared size. The contract, pinned
+/// here: a header that disagrees with its content is a corrupt archive, a 400
+/// that names the cause, for both sides of the ceiling. The size bound holds
+/// either way: no byte past the declared size is ever returned.
+#[test]
+fn understated_entry_size_is_a_400_naming_the_header_mismatch() {
+    for (actual, ceiling) in [(2_000usize, 1_000usize), (50, 1_000)] {
+        let content = "x".repeat(actual);
+        let lying_zip = lie_about_uncompressed_size(make_zip(&[("model.ifc", &content)]), 10);
+        let err = unwrap_ifczip(&lying_zip, ceiling, 1).unwrap_err();
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("declared uncompressed size")),
+            "{actual} bytes under a 10-byte header (ceiling {ceiling}) must be a 400 naming the header, got {err:?}"
+        );
+    }
 }

@@ -13,7 +13,7 @@
 //! needs (`origin`, `local_to_world`, #1474) rides on those meshes.
 //!
 //! Frames: consumer meshes arrive in the wasm boundary convention — WebGL
-//! Y-up positions/normals/origin, winding reversed, `local_to_world`
+//! Y-up positions/normals/origin, winding preserved, `local_to_world`
 //! conjugated (`zero_copy::mesh::MeshDataJs::new`) — with `y_up = true`;
 //! native in-memory meshes (IFC Z-up, untouched winding) pass `y_up = false`.
 //! `rtc_offset` is the model's origin shift in IFC Z-up metres
@@ -22,10 +22,9 @@
 //! `local = inv(local_to_world) * true_world`, then `/ unit_scale` into file
 //! units.
 
-use crate::simplify_math::{
-    averaged_vertex_normals, conjugate_yup_to_zup, invert_affine_row_major,
-    transform_point_row_major, yup_to_zup, zup_to_yup,
-};
+use crate::simplify_math::{averaged_vertex_normals, finite_yup_to_zup};
+use ifc_lite_geometry::math::frame::{yup_to_zup, zup_to_yup};
+use ifc_lite_geometry::math::mat4::{affine_inverse, transform_point};
 use ifc_lite_geometry::simplify::{simplify_mesh, SimplifyOptions};
 use ifc_lite_geometry::Mesh;
 
@@ -37,7 +36,7 @@ pub struct SimplifyRecordInput<'a> {
     pub positions: &'a [f32],
     /// Vertex normals, 1:1 with positions (may be empty).
     pub normals: &'a [f32],
-    /// Triangle indices (winding per `y_up`).
+    /// Triangle indices (both frames preserve outward winding).
     pub indices: &'a [u32],
     /// Per-mesh local origin (frame per `y_up`); world = origin + position.
     pub origin: [f64; 3],
@@ -86,7 +85,7 @@ pub struct SimplifiedElement {
     /// Render positions relative to `render_origin` (frame per `y_up`).
     pub render_positions: Vec<f32>,
     pub render_normals: Vec<f32>,
-    /// Render indices (winding per `y_up`).
+    /// Render indices (both frames preserve outward winding).
     pub render_indices: Vec<u32>,
     /// Per-mesh origin for the render positions (frame per `y_up`).
     pub render_origin: [f64; 3],
@@ -120,18 +119,17 @@ pub fn simplify_element(
         .find_map(|r| r.local_to_world)
         .ok_or(SimplifySkip::MissingPlacement)?;
     let l2w = if y_up {
-        conjugate_yup_to_zup(&l2w_raw)
+        finite_yup_to_zup(&l2w_raw).ok_or(SimplifySkip::SingularPlacement)?
     } else {
         l2w_raw
     };
-    let inv_l2w = invert_affine_row_major(&l2w).ok_or(SimplifySkip::SingularPlacement)?;
+    let inv_l2w = affine_inverse(&l2w).ok_or(SimplifySkip::SingularPlacement)?;
     if !(unit_scale.is_finite() && unit_scale > 0.0) {
         return Err(SimplifySkip::InvalidUnitScale);
     }
 
     // -- Merge records into one IFC Z-up soup in the RTC-shifted world frame
-    // (f64), restoring the IFC winding when the input is the Y-up boundary
-    // convention.
+    // (f64). The Y-up conversion is a proper rotation, preserving winding.
     let mut world: Vec<[f64; 3]> = Vec::new();
     let mut normals: Vec<f32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -165,13 +163,9 @@ pub fn simplify_element(
             {
                 continue;
             }
-            // The boundary reversed winding for the Y-up handedness flip;
-            // restore the IFC order for frame-consistent processing.
-            if y_up {
-                indices.extend_from_slice(&[tri[0] + base, tri[2] + base, tri[1] + base]);
-            } else {
-                indices.extend_from_slice(&[tri[0] + base, tri[1] + base, tri[2] + base]);
-            }
+            // #4056: (x,y,z) -> (x,z,-y) has determinant +1 in either
+            // direction, so the same index order is valid in both frames.
+            indices.extend_from_slice(&[tri[0] + base, tri[1] + base, tri[2] + base]);
         }
     }
     if world.is_empty() || indices.is_empty() {
@@ -232,7 +226,7 @@ pub fn simplify_element(
             chunk[1] as f64 + out.origin[1] + rtc_offset[1],
             chunk[2] as f64 + out.origin[2] + rtc_offset[2],
         ];
-        let local = transform_point_row_major(&inv_l2w, tw);
+        let local = transform_point(&inv_l2w, tw);
         local_positions.extend_from_slice(&[
             local[0] / unit_scale,
             local[1] / unit_scale,
@@ -259,11 +253,7 @@ pub fn simplify_element(
                 [n[0] as f32, n[1] as f32, n[2] as f32]
             })
             .collect();
-        let mut indices = out.indices.clone();
-        for tri in indices.chunks_exact_mut(3) {
-            tri.swap(1, 2);
-        }
-        (positions, normals, indices, zup_to_yup(out.origin))
+        (positions, normals, out.indices, zup_to_yup(out.origin))
     } else {
         (out.positions, out.normals, out.indices, out.origin)
     };

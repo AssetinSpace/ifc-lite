@@ -6,9 +6,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import {
   computeStoreyOffsets,
-  diffStoreyOffsets,
-  entitiesInStorey,
-  buildEntityTranslations,
+  buildEntityLevelOffsets,
+  diffEntityLevelOffsets,
 } from './level-offsets.js';
 
 /**
@@ -59,10 +58,16 @@ describe('level-offsets', () => {
       assert.strictEqual(offsets.get(3), 2);
     });
 
-    it('preserves elevation ordering with equal gaps', () => {
+    it('preserves elevation ordering with equal gaps, from unsorted input', () => {
       // Storeys with non-uniform original spacing should still
       // become uniformly spaced under Exploded.
-      const store = makeStore(new Map([[1, 0], [2, 4], [3, 5], [4, 12]]));
+      //
+      // The Map is deliberately NOT in ascending elevation order. Map iteration
+      // follows insertion order, and `storeyElevations` is built while walking
+      // the file, so storeys arrive in IFC entity order — arbitrary. Every
+      // fixture here used to be pre-sorted, which made both the `.sort()` and
+      // the `sorted[0][1]` base in computeStoreyOffsets deleted-equivalent.
+      const store = makeStore(new Map([[4, 12], [1, 0], [3, 5], [2, 4]]));
       const offsets = computeStoreyOffsets(store, 3);
       // Targets: 0, 3, 6, 9. Deltas: 0, -1, +1, -3.
       assert.strictEqual(offsets.get(1), undefined);
@@ -72,61 +77,8 @@ describe('level-offsets', () => {
     });
   });
 
-  describe('diffStoreyOffsets', () => {
-    it('returns the per-storey delta between target and previous', () => {
-      const target = new Map([[1, 2], [2, 5]]);
-      const previous = new Map([[1, 1], [2, 6]]);
-      const diff = diffStoreyOffsets(target, previous);
-      assert.strictEqual(diff.get(1), 1); // 2 - 1
-      assert.strictEqual(diff.get(2), -1); // 5 - 6
-    });
-
-    it('treats missing target as revert to zero', () => {
-      const target = new Map<number, number>();
-      const previous = new Map([[1, 3], [2, 4]]);
-      const diff = diffStoreyOffsets(target, previous);
-      assert.strictEqual(diff.get(1), -3);
-      assert.strictEqual(diff.get(2), -4);
-    });
-
-    it('treats new target with no previous as full lift', () => {
-      const target = new Map([[1, 5]]);
-      const previous = new Map<number, number>();
-      const diff = diffStoreyOffsets(target, previous);
-      assert.strictEqual(diff.get(1), 5);
-    });
-
-    it('omits zero-delta entries', () => {
-      const target = new Map([[1, 3]]);
-      const previous = new Map([[1, 3]]);
-      const diff = diffStoreyOffsets(target, previous);
-      assert.strictEqual(diff.size, 0);
-    });
-  });
-
-  describe('entitiesInStorey', () => {
-    it('returns globalIds of every entity in the storey', () => {
-      const store = makeStore(
-        new Map(),
-        new Map([
-          [100, 1],
-          [101, 1],
-          [200, 2],
-        ]),
-      );
-      const ids = entitiesInStorey(store, 1, (id) => id + 10000);
-      ids.sort();
-      assert.deepStrictEqual(ids, [10100, 10101]);
-    });
-
-    it('returns empty when the storey has no children', () => {
-      const store = makeStore(new Map(), new Map([[100, 2]]));
-      assert.deepStrictEqual(entitiesInStorey(store, 1, (id) => id), []);
-    });
-  });
-
-  describe('buildEntityTranslations', () => {
-    it('emits per-entity Y deltas for every entity in an offset-bearing storey', () => {
+  describe('entity offsets', () => {
+    it('resolves source membership and federated ids', () => {
       const store = makeStore(
         new Map(),
         new Map([
@@ -137,17 +89,19 @@ describe('level-offsets', () => {
         ]),
       );
       const offsets = new Map([[1, 2], [2, 5]]);
-      const translations = buildEntityTranslations(store, offsets, (id) => id + 1000);
-      assert.deepStrictEqual(translations.get(1100), [0, 2, 0]);
-      assert.deepStrictEqual(translations.get(1101), [0, 2, 0]);
-      assert.deepStrictEqual(translations.get(1200), [0, 5, 0]);
-      assert.strictEqual(translations.get(1300), undefined);
+      const target = buildEntityLevelOffsets(store, offsets, (id) => id + 1000);
+      assert.strictEqual(target.get(1100), 2);
+      assert.strictEqual(target.get(1101), 2);
+      assert.strictEqual(target.get(1200), 5);
+      assert.strictEqual(target.get(1300), undefined);
     });
 
-    it('omits zero offsets', () => {
-      const store = makeStore(new Map(), new Map([[100, 1]]));
-      const offsets = new Map([[1, 0]]);
-      assert.strictEqual(buildEntityTranslations(store, offsets, (id) => id).size, 0);
+    it('reverts a moved entity even when the storey offsets are unchanged (#5249)', () => {
+      const store = makeStore(new Map(), new Map([[100, 2]]));
+      const offsets = new Map([[2, 2]]);
+      const previous = buildEntityLevelOffsets(store, offsets, (id) => id);
+      const target = buildEntityLevelOffsets(store, offsets, (id) => id, new Map([[1, [100]], [2, []]]));
+      assert.deepStrictEqual([...diffEntityLevelOffsets(target, previous)], [[100, [0, -2, 0]]]);
     });
   });
 });

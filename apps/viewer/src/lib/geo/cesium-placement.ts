@@ -7,7 +7,12 @@ import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 
 import { findClampAnchorY } from './clamp-anchor';
 import { computeModelCenterInIfcMeters } from './reproject';
-import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from './geo-scale';
+import { effectiveMapConversionForGeometry } from './map-absolute';
+import { getEffectiveAxisScales, resolveMapUnitToMetreScale } from './geo-scale';
+import { divideByAxisScale, viewerUpScaleForGeometry } from './viewer-up-scale';
+import { ifcToViewerAxes } from './coordinate-frame';
+import { refusedAxisDelta, resolveMapAxisDirection } from './map-axis-direction';
+import { viewerFrameCenter } from './cesium-viewer-frame';
 
 export function getMapUnitScale(
   projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
@@ -78,6 +83,8 @@ export interface CesiumPlacementInput {
   ifcOriginHeight: number;
   terrainHeight: number | null;
   storeyElevations?: Map<number, number>;
+  /** The camera bridge's `viewerUpScale`: metres of height per viewer Y unit. */
+  viewerUpScale: number;
 }
 
 export interface CesiumPlacementResult {
@@ -109,14 +116,23 @@ export function computeCesiumPlacement({
   ifcOriginHeight,
   terrainHeight,
   storeyElevations,
+  viewerUpScale,
 }: CesiumPlacementInput): CesiumPlacementResult {
   const bounds = coordinateInfo?.originalBounds;
-  const modelCenterY = bounds ? (bounds.min.y + bounds.max.y) / 2 : 0;
-  const minY = bounds?.min.y ?? 0;
-  const clampAnchorY = findClampAnchorY(bounds, storeyElevations);
+  const modelCenterY = viewerFrameCenter(coordinateInfo).y;
+  const shiftY = coordinateInfo?.originShift.y ?? 0;
+  const minY = (bounds?.min.y ?? 0) - shiftY;
+  // Storey elevations and originalBounds share the pre-shift frame; convert
+  // the selected anchor once to the renderer frame used by the camera.
+  const clampAnchorY = findClampAnchorY(bounds, storeyElevations) - shiftY;
   const anchorOffset = modelCenterY - clampAnchorY;
   // Model placement = authored IFC altitude. No clamp. No auto-adjust.
   const placementHeight = ifcOriginHeight;
+  // The frame draws viewer Y at `placementHeight + viewerUpScale * (y - modelCenterY)`.
+  // Scale 0 gets no plane: a non-finite floor pins the camera at infinity.
+  const terrainClipY = terrainHeight !== null
+    ? modelCenterY + (terrainHeight - placementHeight) / viewerUpScale
+    : null;
 
   return {
     clampAnchorY,
@@ -125,9 +141,7 @@ export function computeCesiumPlacement({
     anchorOffset,
     ifcOriginHeight,
     placementHeight,
-    terrainClipY: terrainHeight !== null
-      ? terrainHeight - placementHeight + modelCenterY
-      : null,
+    terrainClipY: terrainClipY !== null && Number.isFinite(terrainClipY) ? terrainClipY : null,
     preferOrthometricTerrain: shouldPreferOrthometricTerrain(projectedCRS),
   };
 }
@@ -135,6 +149,8 @@ export function computeCesiumPlacement({
 export interface OrthogonalHeightForBaseAltitudeInput {
   coordinateInfo?: CoordinateInfo;
   projectedCRS?: Pick<ProjectedCRS, 'mapUnitScale'>;
+  /** The conversion the read path places with; its Scale x FactorZ scales the anchor's height. */
+  mapConversion: MapConversion | undefined;
   lengthUnitScale: number;
   storeyElevations?: Map<number, number>;
   targetBaseAltitude: number;
@@ -143,16 +159,33 @@ export interface OrthogonalHeightForBaseAltitudeInput {
 export function computeOrthogonalHeightForBaseAltitude({
   coordinateInfo,
   projectedCRS,
+  mapConversion,
   lengthUnitScale,
   storeyElevations,
   targetBaseAltitude,
 }: OrthogonalHeightForBaseAltitudeInput): number {
+  // `originalBounds` is ALREADY in the world frame (see the producer contract
+  // note on `computeModelCenterInIfcMeters` in reproject.ts), so `anchorY`
+  // below is already world-frame. Subtracting `originShift` again here would
+  // double-count it: this mirrors `ifcOriginHeight = orthogonalHeight*scale +
+  // computeModelCenterInIfcMeters(coordinateInfo).ifcZ`, whose `ifcZ` already
+  // folds the shift back into `shiftedBounds` (which cancels against this
+  // function's `originalBounds` read) plus the RTC offset — so only the RTC
+  // offset still needs folding in here, not the shift a second time.
   const bounds = coordinateInfo?.originalBounds;
   const anchorY = findClampAnchorY(bounds, storeyElevations);
-  const shiftY = coordinateInfo?.originShift?.y ?? 0;
   // RTC offset is stored in IFC Z-up; viewer-Y aligns to its Z component.
-  const rtcYupY = coordinateInfo?.wasmRtcOffset?.z ?? 0;
-  const orthogonalHeightMeters = targetBaseAltitude - shiftY - rtcYupY - anchorY;
+  const rtcYupY = ifcToViewerAxes(
+    coordinateInfo?.wasmRtcOffset ?? { x: 0, y: 0, z: 0 },
+  ).y;
+  // The read path places IFC height z at `OrthogonalHeight*mapScale +
+  // scaleZ*z` (cesium-bridge.ts), so the anchor's height is scaled before it
+  // is subtracted, through the same map-absolute neutralisation.
+  // With no conversion there is no Scale or FactorZ, and the axis reads 1.
+  const scaleZ = mapConversion
+    ? viewerUpScaleForGeometry(mapConversion, projectedCRS, lengthUnitScale, coordinateInfo)
+    : 1;
+  const orthogonalHeightMeters = targetBaseAltitude - scaleZ * (rtcYupY + anchorY);
 
   return Math.round(
     metersToMapUnits(orthogonalHeightMeters, projectedCRS, lengthUnitScale) * 100,
@@ -177,32 +210,35 @@ export function orthometricTargetForTerrain(
 }
 
 export function computeIfcOriginHeight(
-  mapConversion: Pick<MapConversion, 'orthogonalHeight'>,
+  mapConversion: Pick<MapConversion, 'orthogonalHeight' | 'scale' | 'factorX' | 'factorY' | 'factorZ'>,
   projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
   coordinateInfo: CoordinateInfo | undefined,
   lengthUnitScale: number,
 ): number {
   const mapScale = getMapUnitScale(projectedCRS, lengthUnitScale);
-  return mapConversion.orthogonalHeight * mapScale + computeModelCenterInIfcMeters(coordinateInfo).ifcZ;
+  const scaleZ = getEffectiveAxisScales(mapConversion, mapScale, lengthUnitScale).z;
+  return mapConversion.orthogonalHeight * mapScale
+    + scaleZ * computeModelCenterInIfcMeters(coordinateInfo).ifcZ;
 }
 
 export function viewerDeltaToProjectedDelta(
   deltaX: number,
   deltaZ: number,
-  mapConversion: Pick<MapConversion, 'xAxisAbscissa' | 'xAxisOrdinate' | 'scale'>,
+  mapConversion: Pick<MapConversion, 'xAxisAbscissa' | 'xAxisOrdinate' | 'scale' | 'factorX' | 'factorY'>,
   projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
   lengthUnitScale: number,
 ): { eastings: number; northings: number } {
   const mapScale = getMapUnitScale(projectedCRS, lengthUnitScale);
-  const hScale = getEffectiveHorizontalScale(
-    mapConversion.scale,
-    mapScale,
-    lengthUnitScale,
-  );
-  const abscissa = mapConversion.xAxisAbscissa ?? 1;
-  const ordinate = mapConversion.xAxisOrdinate ?? 0;
-  const eastMeters = hScale * (abscissa * deltaX + ordinate * deltaZ);
-  const northMeters = hScale * (ordinate * deltaX - abscissa * deltaZ);
+  const { x: scaleX, y: scaleY } = getEffectiveAxisScales(mapConversion, mapScale, lengthUnitScale);
+  // The axis is a DIRECTION: its length is not a second scale (#6700).
+  const axis = resolveMapAxisDirection(mapConversion.xAxisAbscissa, mapConversion.xAxisOrdinate);
+  if (!axis) {
+    const refused = refusedAxisDelta(mapConversion.xAxisAbscissa, mapConversion.xAxisOrdinate);
+    return { eastings: refused, northings: refused };
+  }
+  const { a: abscissa, b: ordinate } = axis;
+  const eastMeters = abscissa * scaleX * deltaX + ordinate * scaleY * deltaZ;
+  const northMeters = ordinate * scaleX * deltaX - abscissa * scaleY * deltaZ;
 
   return {
     eastings: metersToMapUnits(eastMeters, projectedCRS, lengthUnitScale),
@@ -264,24 +300,87 @@ export function closestYOnVerticalLineFromRay(
 export function projectedDeltaToViewerDelta(
   eastingsDelta: number,
   northingsDelta: number,
-  mapConversion: Pick<MapConversion, 'xAxisAbscissa' | 'xAxisOrdinate' | 'scale'>,
+  mapConversion: Pick<MapConversion, 'xAxisAbscissa' | 'xAxisOrdinate' | 'scale' | 'factorX' | 'factorY'>,
   projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
   lengthUnitScale: number,
 ): { x: number; z: number } {
   const mapScale = getMapUnitScale(projectedCRS, lengthUnitScale);
-  const hScale = getEffectiveHorizontalScale(
-    mapConversion.scale,
-    mapScale,
-    lengthUnitScale,
-  );
-  const abscissa = mapConversion.xAxisAbscissa ?? 1;
-  const ordinate = mapConversion.xAxisOrdinate ?? 0;
+  const { x: scaleX, y: scaleY } = getEffectiveAxisScales(mapConversion, mapScale, lengthUnitScale);
+  // Inverse of `viewerDeltaToProjectedDelta`: the unit direction is
+  // orthonormal, so its transpose is its inverse and no division by the
+  // vector's squared length remains (#6700).
+  const axis = resolveMapAxisDirection(mapConversion.xAxisAbscissa, mapConversion.xAxisOrdinate);
+  if (!axis) {
+    const refused = refusedAxisDelta(mapConversion.xAxisAbscissa, mapConversion.xAxisOrdinate);
+    return { x: refused, z: refused };
+  }
+  const { a: abscissa, b: ordinate } = axis;
   const eastMeters = mapUnitsToMeters(eastingsDelta, projectedCRS, lengthUnitScale);
   const northMeters = mapUnitsToMeters(northingsDelta, projectedCRS, lengthUnitScale);
-  const denom = Math.max((abscissa * abscissa + ordinate * ordinate) * hScale, 1e-12);
 
   return {
-    x: (abscissa * eastMeters + ordinate * northMeters) / denom,
-    z: (ordinate * eastMeters - abscissa * northMeters) / denom,
+    x: divideByAxisScale(abscissa * eastMeters + ordinate * northMeters, scaleX),
+    z: divideByAxisScale(ordinate * eastMeters - abscissa * northMeters, scaleY),
   };
+}
+
+/**
+ * {@link viewerDeltaToProjectedDelta} routed through the map-absolute guard
+ * (#2526), for the placement gizmo's drag math.
+ *
+ * A delta has no offsets to double-apply — the guard's zeroed
+ * eastings/northings are inert here because the delta formulas read only the
+ * axis pair and scale. What a "neutralised conversion" means for a DELTA is
+ * the identity ROTATION: map-absolute geometry's viewer axes ARE the map
+ * axes, so a drag along viewer +X is a pure easting change, while the
+ * authored (double-georeferencing) axis would rotate the drag into the wrong
+ * E/N direction. For a compliant file the guard does not fire and the
+ * authored rotation applies exactly as in the raw function.
+ *
+ * Takes the FULL MapConversion (offsets included) because the guard's
+ * detection compares the declared anchor against the geometry centre.
+ */
+export function viewerDeltaToProjectedDeltaForGeometry(
+  deltaX: number,
+  deltaZ: number,
+  mapConversion: MapConversion,
+  projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
+  lengthUnitScale: number,
+  coordinateInfo: CoordinateInfo | undefined,
+): { eastings: number; northings: number } {
+  const conversion = effectiveMapConversionForGeometry(
+    mapConversion,
+    getMapUnitScale(projectedCRS, lengthUnitScale),
+    coordinateInfo,
+  );
+  return viewerDeltaToProjectedDelta(deltaX, deltaZ, conversion, projectedCRS, lengthUnitScale);
+}
+
+/**
+ * {@link projectedDeltaToViewerDelta} routed through the map-absolute guard
+ * (#2526) — the inverse counterpart of
+ * {@link viewerDeltaToProjectedDeltaForGeometry}, used by the gizmo's
+ * draft-offset preview. Both directions must route identically or the gizmo
+ * stops tracking the cursor for map-absolute files.
+ */
+export function projectedDeltaToViewerDeltaForGeometry(
+  eastingsDelta: number,
+  northingsDelta: number,
+  mapConversion: MapConversion,
+  projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,
+  lengthUnitScale: number,
+  coordinateInfo: CoordinateInfo | undefined,
+): { x: number; z: number } {
+  const conversion = effectiveMapConversionForGeometry(
+    mapConversion,
+    getMapUnitScale(projectedCRS, lengthUnitScale),
+    coordinateInfo,
+  );
+  return projectedDeltaToViewerDelta(
+    eastingsDelta,
+    northingsDelta,
+    conversion,
+    projectedCRS,
+    lengthUnitScale,
+  );
 }

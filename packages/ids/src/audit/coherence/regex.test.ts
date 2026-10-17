@@ -14,30 +14,41 @@ describe('translateXsdRegex', () => {
   });
 
   it('translates \\i, \\c and their negations', () => {
-    expect(translateXsdRegex('\\i').pattern).toContain('\\p{L}');
-    expect(translateXsdRegex('\\I').pattern).toContain('[^\\p{L}');
-    expect(translateXsdRegex('\\c').pattern).toContain('\\p{L}');
+    // XML 1.0 Fifth Edition NameStartChar / NameChar ranges.
+    expect(translateXsdRegex('\\i').pattern).toMatch(/^\[:A-Z_a-z/);
+    expect(translateXsdRegex('\\I').pattern).toMatch(/^\[\^:A-Z_a-z/);
+    expect(translateXsdRegex('\\c').pattern).toContain('0-9');
     expect(translateXsdRegex('\\C').pattern).toContain('[^');
   });
 
   it('translates \\d / \\D / \\w / \\W to Unicode property escapes', () => {
     expect(translateXsdRegex('\\d+').pattern).toBe('\\p{Nd}+');
     expect(translateXsdRegex('\\D+').pattern).toBe('\\P{Nd}+');
-    expect(translateXsdRegex('\\w+').pattern).toBe('[\\p{L}\\p{Nd}]+');
-    expect(translateXsdRegex('\\W+').pattern).toBe('[^\\p{L}\\p{Nd}]+');
+    // XSD \w is everything outside \p{P}, \p{Z}, \p{C} (Appendix F, #7400).
+    expect(translateXsdRegex('\\w+').pattern).toBe('[^\\p{P}\\p{Z}\\p{C}]+');
+    expect(translateXsdRegex('\\W+').pattern).toBe('[\\p{P}\\p{Z}\\p{C}]+');
   });
 
-  it('flags character-class subtraction as unsupported', () => {
+  it('translates character-class subtraction exactly, as a negative lookahead (#5183)', () => {
     const r = translateXsdRegex('[a-z-[aeiou]]');
+    expect(r.supported).toBe(true);
+    expect(r.pattern).toBe('(?:(?![aeiou])[a-z])');
+    // Nested, and with XSD escapes on either side translated in class mode.
+    expect(translateXsdRegex('[a-z-[b-y-[c]]]').pattern).toBe('(?:(?!(?:(?![c])[b-y]))[a-z])');
+    expect(translateXsdRegex('[\\w-[\\d]]').pattern).toBe('(?:(?![\\p{Nd}])[^\\p{P}\\p{Z}\\p{C}])');
+  });
+
+  it('refuses a subtraction it cannot delimit rather than guessing', () => {
+    const r = translateXsdRegex('[a-z-[aeiou]');
     expect(r.supported).toBe(false);
     expect(r.reason).toMatch(/subtraction/i);
   });
 
   it('inlines multi-char escapes inside a character class (no nesting)', () => {
     // `[\w]` must not become the invalid nested class `[[\p{L}\p{Nd}]]`.
-    expect(translateXsdRegex('[\\w]').pattern).toBe('[\\p{L}\\p{Nd}]');
+    expect(translateXsdRegex('[\\w]').pattern).toBe('[^\\p{P}\\p{Z}\\p{C}]');
     expect(translateXsdRegex('[\\d]').pattern).toBe('[\\p{Nd}]');
-    expect(translateXsdRegex('[\\i]').pattern).toBe('[\\p{L}_:]');
+    expect(translateXsdRegex('[\\i]').pattern).toBe(translateXsdRegex('\\i').pattern);
     // Each result compiles under the `u` flag.
     for (const p of ['[\\w]', '[\\d]', '[\\i]']) {
       const r = translateXsdRegex(p);
@@ -46,12 +57,14 @@ describe('translateXsdRegex', () => {
     }
   });
 
-  it('approximates Unicode block escapes JS cannot represent', () => {
-    // `\p{IsBasicLatin}` is valid XSD but unknown to JS; it must not make
-    // the whole pattern uncompilable.
+  it('translates Unicode block escapes to their code-point ranges (#7400)', () => {
     const r = translateXsdRegex('\\p{IsBasicLatin}+');
-    expect(r.supported).toBe(false);
-    expect(() => new RegExp(r.pattern, 'u')).not.toThrow();
+    expect(r.supported).toBe(true);
+    expect(r.pattern).toBe('[\\u0000-\\u007F]+');
+    // An unknown block name has no exact form and is reported.
+    const unknown = translateXsdRegex('\\p{IsNoSuchBlock}+');
+    expect(unknown.supported).toBe(false);
+    expect(() => new RegExp(unknown.pattern, 'u')).not.toThrow();
     // A recognised category class still passes through verbatim.
     const ok = translateXsdRegex('\\p{Lu}+');
     expect(ok.supported).toBe(true);
@@ -81,10 +94,8 @@ describe('compileXsdRegex', () => {
     if (!r.ok) expect(r.severity).toBe('error');
   });
 
-  it('returns warning for char-class subtraction', () => {
-    const r = compileXsdRegex('[a-z-[aeiou]]');
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.severity).toBe('warning');
+  it('compiles char-class subtraction: the runtime matcher evaluates it exactly (#5183)', () => {
+    expect(compileXsdRegex('[a-z-[aeiou]]').ok).toBe(true);
   });
 
   it('returns error for empty pattern', () => {

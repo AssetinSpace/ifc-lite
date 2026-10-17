@@ -2,31 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { IfcTypeEnum, spatialLookups, type SpatialHierarchy, type SpatialNode } from '@ifc-lite/data';
 import { IfcParser } from '../src/index.js';
 import {
   collectTransferables,
   fromTransport,
+  spatialHierarchyFromColumns,
+  spatialHierarchyToColumns,
   toTransport,
   transportByteSize,
 } from '../src/data-store-transport.js';
 import { extractPropertiesOnDemand } from '../src/columnar-parser.js';
+import { contiguousSourceBytes, type IfcSourceBytes } from '../src/source-bytes.js';
 
 /**
- * Resolve a fixture from the external ara3d worktree. Tests skip cleanly
- * when the fixture is unavailable so fresh clones don't break.
+ * Resolve a fixture from the repo's own `tests/models/ara3d` (`pnpm fixtures`).
+ * Tests skip cleanly when the fixture is unavailable so fresh clones don't
+ * break. No machine-specific path: a fixture only one developer's disk has
+ * would make the suite pass or skip depending on whose machine runs it.
  */
 function fixture(name: string): string | null {
-  const candidates = [
-    resolve('/Users/louistrue/Development/ifc-lite-fixtures-wt/tests/models/ara3d', name),
-    resolve(__dirname, '..', '..', '..', 'tests', 'models', 'ara3d', name),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
+  const candidate = resolve(__dirname, '..', '..', '..', 'tests', 'models', 'ara3d', name);
+  return existsSync(candidate) ? candidate : null;
 }
 
 function readFixture(name: string): ArrayBuffer | null {
@@ -204,7 +204,7 @@ describe('data-store-transport', () => {
     const received = await new Promise<typeof payload>((resolveMsg, rejectMsg) => {
       channel.port2.onmessage = (e) => resolveMsg(e.data);
       channel.port2.onmessageerror = () => rejectMsg(new Error('messageerror'));
-      channel.port1.postMessage(payload, transfers as unknown as readonly Transferable[]);
+      channel.port1.postMessage(payload, transfers);
     });
 
     expect(received.fileSize).toBe(expectedFileSize);
@@ -212,10 +212,219 @@ describe('data-store-transport', () => {
     expect(received.entities.expressId).toBeInstanceOf(Uint32Array);
     expect(received.entities.expressId.length).toBe(expectedEntityCount);
 
-    const rebuilt = fromTransport(received, new Uint8Array(store.source.buffer.slice(0)));
+    // The receiving side rebuilds from its own copy of the bytes, exactly as
+    // the worker boundary does. fromTransport accepts either shape.
+    const rebuilt = fromTransport(received, store.source.materialize().slice());
     expect(rebuilt.entityCount).toBe(store.entityCount);
 
     channel.port1.close();
     channel.port2.close();
   }, 120_000);
+});
+
+/**
+ * `WorkerParser` hydrates TWO stores from one parse: the early partial store
+ * (so the spatial tree paints before geometry) and the final one. Both alias
+ * the same SharedArrayBuffer.
+ *
+ * `contentKey` is a full-file FNV-1a walk, memoised PER ACCESSOR INSTANCE, and
+ * the viewer's per-source overlay hooks read it off whichever store is active.
+ * So if `fromTransport` wrapped its input rather than passing the accessor
+ * through, the two stores would hold two instances and a 342 MB model would be
+ * walked twice on the main thread mid-load -- on exactly the models #2183 is
+ * about, and invisibly, since the KEY would still be identical.
+ *
+ * These pin the pass-through that makes sharing one accessor in `WorkerParser`
+ * actually work.
+ */
+describe('fromTransport source identity (#2183)', () => {
+  const STEP = "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+    + "#1=IFCWALL('0YvCT2_$X3_xJG3rzD8L_8',$,'Wall-A',$,$,$,$,$,$);\n"
+    + "ENDSEC;\nEND-ISO-10303-21;\n";
+
+  /**
+   * Parsed ONCE for the whole block. `parseColumnar` is not free and it logs,
+   * and vitest runs test files concurrently: parsing per test put enough load
+   * on a 2-core CI runner to push the 44k-entity equivalence suite in this same
+   * package past its timeout. `toTransport` is re-run per use so no two
+   * hydrations share a payload -- which is the shape `WorkerParser` actually
+   * produces, one payload per message.
+   */
+  let parsed: Awaited<ReturnType<IfcParser['parseColumnar']>>;
+
+  beforeAll(async () => {
+    parsed = await new IfcParser().parseColumnar(
+      new TextEncoder().encode(STEP).buffer as ArrayBuffer,
+      { disableWorkerScan: true },
+    );
+  });
+
+  function transportOf(): ReturnType<typeof toTransport>['payload'] {
+    return toTransport(parsed).payload;
+  }
+
+  it('hands the SAME accessor instance to the store', () => {
+    const source = contiguousSourceBytes(new TextEncoder().encode(STEP));
+    const store = fromTransport(transportOf(), source);
+    expect(store.source).toBe(source);
+  });
+
+  it('hashes ONCE across a partial + final pair sharing one accessor', () => {
+    const bytes = new TextEncoder().encode(STEP);
+    let walks = 0;
+    const inner = contiguousSourceBytes(bytes);
+    const counted: IfcSourceBytes = {
+      get byteLength() { return inner.byteLength; },
+      get length() { return inner.length; },
+      get isResident() { return inner.isResident; },
+      get contentKey() { walks++; return inner.contentKey; },
+      slice: (a, b) => inner.slice(a, b),
+      decodeUtf8: (a, b) => inner.decodeUtf8(a, b),
+      materialize: () => inner.materialize(),
+      withMaterialized: (f) => inner.withMaterialized(f),
+      withMaterializedAsync: (f) => inner.withMaterializedAsync(f),
+      toTransferable: () => inner.toTransferable(),
+    };
+
+    const partial = fromTransport(transportOf(), counted);
+    const final = fromTransport(transportOf(), counted);
+
+    // Neither hydration may touch the key on its own; only a consumer should.
+    // `isSourceBytes` deliberately skips `contentKey` for exactly this reason.
+    expect(walks).toBe(0);
+
+    // One read each, as the overlay hooks do. `walks` counts reads of the
+    // DOUBLE, not underlying FNV passes, so it is 2 here either way and is not
+    // the gate -- accessor identity is: sharing one instance is what makes the
+    // memo in ContiguousSourceBytes collapse these to a single walk.
+    const a = partial.source.contentKey;
+    const b = final.source.contentKey;
+    expect(walks).toBe(2);
+    expect(a).toBe(b);
+    expect(a).toEqual(expect.any(String));
+    expect(partial.source).toBe(final.source);
+  });
+
+  it('accepts raw bytes too, and agrees on the key', () => {
+    // Many callers still pass raw bytes; that must keep working and must agree
+    // with the accessor path. Deliberately NOT asserting that the two stores
+    // get distinct accessors: memoising `asSourceBytes` per buffer would be a
+    // legitimate improvement (it is what the viewer's old WeakMap effectively
+    // did), and pinning today's non-sharing would make that a test failure.
+    const bytes = new TextEncoder().encode(STEP);
+    const one = fromTransport(transportOf(), bytes);
+    const two = fromTransport(transportOf(), bytes);
+    expect(one.source.contentKey).toBe(two.source.contentKey);
+    expect(one.source.byteLength).toBe(bytes.byteLength);
+  });
+});
+
+describe('spatialHierarchyToColumns / spatialHierarchyFromColumns: ambiguousStorey (#4311)', () => {
+  function minimalHierarchy(ambiguousStorey: Set<number>): SpatialHierarchy {
+    const project: SpatialNode = {
+      expressId: 1,
+      type: IfcTypeEnum.IfcProject,
+      name: 'Project',
+      longName: undefined,
+      elevation: undefined,
+      children: [],
+      elements: [],
+    };
+    return {
+      project,
+      byStorey: new Map(),
+      byBuilding: new Map(),
+      bySite: new Map(),
+      bySpace: new Map(),
+      storeyElevations: new Map(),
+      storeyHeights: new Map(),
+      elementToStorey: new Map(),
+      ambiguousStorey,
+      getStoreyElements: () => [],
+      getStoreyByElevation: () => null,
+      getContainingSpace: () => null,
+      getPath: () => [],
+    };
+  }
+
+  it('carries a non-empty ambiguousStorey across the worker transport, not just elementToStorey', () => {
+    const hierarchy = minimalHierarchy(new Set([4]));
+    const columns = spatialHierarchyToColumns(hierarchy);
+    const rebuilt = spatialHierarchyFromColumns(columns);
+    expect(rebuilt.ambiguousStorey).toBeDefined();
+    expect(rebuilt.ambiguousStorey!.has(4)).toBe(true);
+  });
+
+  it('round-trips an empty ambiguousStorey as empty, not absent', () => {
+    const hierarchy = minimalHierarchy(new Set());
+    const columns = spatialHierarchyToColumns(hierarchy);
+    const rebuilt = spatialHierarchyFromColumns(columns);
+    expect(rebuilt.ambiguousStorey).toBeDefined();
+    expect(rebuilt.ambiguousStorey!.size).toBe(0);
+  });
+
+  // #4314: `EntityNode.containedIn()` resolves duplicate containment against
+  // this set, so a store rehydrated in the main thread must still carry it -
+  // dropping it silently returns containedIn() to its pre-#4314 answer on the
+  // worker path only, while elementToStorey (which survives the transport)
+  // keeps the fixed one.
+  it('carries reachableSpatialNodes across the worker transport', () => {
+    const hierarchy = minimalHierarchy(new Set());
+    hierarchy.reachableSpatialNodes = new Set([1, 3]);
+    const rebuilt = spatialHierarchyFromColumns(structuredClone(spatialHierarchyToColumns(hierarchy)));
+    expect(rebuilt.reachableSpatialNodes).toBeDefined();
+    expect([...rebuilt.reachableSpatialNodes!].sort((a, b) => a - b)).toEqual([1, 3]);
+  });
+
+  it('leaves reachableSpatialNodes absent when the source hierarchy has none', () => {
+    const rebuilt = spatialHierarchyFromColumns(spatialHierarchyToColumns(minimalHierarchy(new Set())));
+    expect(rebuilt.reachableSpatialNodes).toBeUndefined();
+  });
+});
+
+
+it('worker hydration resolves spatial nodes and live authored space membership (#4308)', () => {
+  const room: SpatialNode = { expressId: 3, type: IfcTypeEnum.IfcSpace, name: 'Room', children: [], elements: [4] };
+  const project: SpatialNode = { expressId: 1, type: IfcTypeEnum.IfcProject, name: 'Project', children: [room], elements: [] };
+  const original = { project, bySpace: new Map([[3, room.elements]]), byStorey: new Map(), byBuilding: new Map(),
+    bySite: new Map(), storeyElevations: new Map(), storeyHeights: new Map(), elementToStorey: new Map(),
+    elementToContainer: new Map([[4, 3]]), getStoreyElements: () => [], getStoreyByElevation: () => null,
+    ...spatialLookups(project, new Map([[3, room.elements]]), new Map([[4, 3]])) } satisfies SpatialHierarchy;
+  const hydrated = spatialHierarchyFromColumns(structuredClone(spatialHierarchyToColumns(original)));
+  expect(hydrated.getPath(3).map(node => node.expressId)).toEqual([1, 3]);
+  expect(hydrated.getPath(4).map(node => node.expressId)).toEqual([1, 3]);
+  hydrated.project.children[0].elements.push(5);
+  hydrated.bySpace.get(3)!.push(5);
+  hydrated.elementToContainer!.set(5, 3);
+  expect(hydrated.getPath(5).map(node => node.expressId)).toEqual([1, 3]);
+  expect(hydrated.getContainingSpace(5)).toBe(3);
+  hydrated.project.children[0].elements.splice(1, 1);
+  hydrated.bySpace.get(3)!.splice(1, 1);
+  hydrated.elementToContainer!.delete(5);
+  expect(hydrated.getPath(5)).toEqual([]);
+  expect(hydrated.getContainingSpace(5)).toBeNull();
+});
+
+// #6499: a source-less reconstructed store must retain its pre-extracted fact
+// across a second worker handoff, rather than reverting to a STEP-byte scan.
+describe('pre-extracted georeferencing transport (#6499)', () => {
+  it('preserves rotated CRS metadata and explicit absence through repeated structured-clone handoffs', async () => {
+    const sample = resolve(__dirname, '../../../apps/viewer/public/samples/building-architecture.ifc');
+    const bytes = readFileSync(sample);
+    const store = await new IfcParser().parseColumnar(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+    const { extractGeoreferencingOnDemand } = await import('../src/on-demand-georeferencing.js');
+    const expected = extractGeoreferencingOnDemand(store);
+    expect(expected?.projectedCRS?.name).toBe('EPSG:32760');
+    store.georeferencing = expected;
+    let payload = structuredClone(toTransport(store).payload);
+    // No resource bytes are required when the immutable fact was transmitted.
+    const empty = contiguousSourceBytes(new Uint8Array());
+    const restored = fromTransport(payload, empty);
+    expect(extractGeoreferencingOnDemand(restored)).toEqual(expected);
+    expect(restored.lengthUnitScale).toBe(0.001);
+    payload = structuredClone(toTransport(restored).payload);
+    expect(extractGeoreferencingOnDemand(fromTransport(payload, empty))).toEqual(expected);
+    restored.georeferencing = null;
+    expect(extractGeoreferencingOnDemand(fromTransport(structuredClone(toTransport(restored).payload), store.source))).toBeNull();
+  });
 });

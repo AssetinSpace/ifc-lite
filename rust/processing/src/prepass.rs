@@ -21,8 +21,8 @@
 //! lives here exactly once. The historic #858/#913-class drift was always in
 //! this resolution layer, not in the span stashing.
 
-use crate::style::{FullIndexedColourMap, GeometryStyleInfo};
-use ifc_lite_core::{DecodedEntity, EntityDecoder};
+use crate::style::{FullIndexedColourMap, GeometryStyleInfo, SpecularMaterial};
+use ifc_lite_core::{keyword_eq, DecodedEntity, EntityDecoder};
 use rustc_hash::FxHashMap;
 
 /// One stashed entity span: `(express_id, start, end)`.
@@ -32,11 +32,9 @@ pub type Span = (u32, usize, usize);
 #[derive(Debug, Default, Clone)]
 pub struct PrepassSpans {
     /// `IFCSTYLEDITEM` — geometry-attached AND orphan (material appearance);
-    /// the resolver classifies them (the classifying decode is the cost of
-    /// telling the two apart).
+    /// the resolver classifies them (decoding is the cost of telling them apart).
     pub styled_items: Vec<Span>,
-    /// `IFCINDEXEDCOLOURMAP` (#663/#858 — CATIA/3DEXPERIENCE per-triangle
-    /// palettes, IFC4's second colouring mechanism).
+    /// `IFCINDEXEDCOLOURMAP` (#663/#858 — CATIA/3DEXPERIENCE per-triangle palettes).
     pub indexed_colour_maps: Vec<Span>,
     /// `IFCMATERIALDEFINITIONREPRESENTATION` (#407 material chain).
     pub material_def_reprs: Vec<Span>,
@@ -50,6 +48,42 @@ pub struct PrepassSpans {
     /// `IFCRELAGGREGATES` — parent → children, for aggregate void
     /// propagation (#845, IfcWallElementedCase etc.).
     pub aggregate_rels: Vec<Span>,
+    pub defines_by_type: Vec<Span>, // IFCRELDEFINESBYTYPE, for prepass_type_material.
+}
+
+impl PrepassSpans {
+    /// Stash `(id, start, end)` under the list `type_name` belongs to, and say
+    /// whether it belonged to one at all.
+    ///
+    /// `type_name` is the raw keyword from `EntityScanner::next_entity`, in
+    /// whatever case the file wrote it, so the dispatch goes through
+    /// [`keyword_eq`]. Every scan loop that only needs the span lists calls
+    /// this instead of spelling the same keyword table again; `processor::mod`
+    /// keeps its own arms (its `continue`s interleave with other work) but
+    /// compares the same way.
+    pub fn stash(&mut self, type_name: &str, id: u32, start: usize, end: usize) -> bool {
+        let list = if keyword_eq(type_name, "IFCSTYLEDITEM") {
+            &mut self.styled_items
+        } else if keyword_eq(type_name, "IFCINDEXEDCOLOURMAP") {
+            &mut self.indexed_colour_maps
+        } else if keyword_eq(type_name, "IFCMATERIALDEFINITIONREPRESENTATION") {
+            &mut self.material_def_reprs
+        } else if keyword_eq(type_name, "IFCRELASSOCIATESMATERIAL") {
+            &mut self.rel_associates_material
+        } else if keyword_eq(type_name, "IFCRELVOIDSELEMENT") {
+            &mut self.void_rels
+        } else if keyword_eq(type_name, "IFCRELFILLSELEMENT") {
+            &mut self.fills_rels
+        } else if keyword_eq(type_name, "IFCRELAGGREGATES") {
+            &mut self.aggregate_rels
+        } else if keyword_eq(type_name, "IFCRELDEFINESBYTYPE") {
+            &mut self.defines_by_type
+        } else {
+            return false;
+        };
+        list.push((id, start, end));
+        true
+    }
 }
 
 /// Resolution switches (both pipelines share the resolver).
@@ -107,7 +141,7 @@ pub struct ResolvedPrepass {
     pub deferred_attached_styled_spans: Vec<(usize, usize)>,
 }
 
-pub use crate::prepass_styled::{resolve_styled_items_into, StyleSeeds};
+pub use crate::prepass_styled::{resolve_geometry_finishes, resolve_styled_items_into, StyleSeeds};
 
 /// THE canonical post-scan resolution (file-order, first-wins precedence).
 pub fn resolve_prepass(
@@ -165,7 +199,7 @@ pub fn resolve_prepass_with_style_seeds(
         if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
             // RepresentedMaterial (attr 3) → Representations (attr 2).
             if let Some(material_id) = entity.get_ref(3) {
-                if let Some(reprs) = refs_from_list(&entity, 2) {
+                if let Some(reprs) = entity.get_refs(2) {
                     out.material_def_reprs
                         .entry(material_id)
                         .or_default()
@@ -178,7 +212,7 @@ pub fn resolve_prepass_with_style_seeds(
         if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
             // RelatingMaterial (attr 5) ← RelatedObjects (attr 4).
             if let Some(material_select_id) = entity.get_ref(5) {
-                if let Some(related) = refs_from_list(&entity, 4) {
+                if let Some(related) = entity.get_refs(4) {
                     for element_id in related {
                         out.element_to_material.insert(element_id, material_select_id);
                     }
@@ -187,6 +221,7 @@ pub fn resolve_prepass_with_style_seeds(
         }
     }
 
+    crate::prepass_type_material::propagate_type_material(&spans.defines_by_type, decoder, &mut out.element_to_material);
     // ── Voids + fills + aggregate propagation (#845) ──
     for &(id, start, end) in &spans.void_rels {
         if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
@@ -210,7 +245,7 @@ pub fn resolve_prepass_with_style_seeds(
                 let Some(parent_id) = entity.get_ref(4) else {
                     continue;
                 };
-                if let Some(children) = refs_from_list(&entity, 5) {
+                if let Some(children) = entity.get_refs(5) {
                     aggregate_children
                         .entry(parent_id)
                         .or_default()
@@ -222,6 +257,15 @@ pub fn resolve_prepass_with_style_seeds(
             &mut out.void_index,
             &aggregate_children,
         );
+    }
+
+    // Canonicalise each host's opening order (#2019). The scan pushes in
+    // statement order, aggregate propagation in hashmap-BFS order; neither
+    // is a property of the model. Sequential void cuts are not associative
+    // (each pass snaps f64->f32), so reordering them moves the world
+    // geometry hash on a re-export that only shuffled statements.
+    for openings in out.void_index.values_mut() {
+        openings.sort_unstable();
     }
 
     // ── Material chain join (#407): element id → colour list ──
@@ -268,133 +312,34 @@ pub fn merge_indexed_colours(
     }
 }
 
-/// The file's unit scales, resolved exactly once per parse.
-#[derive(Debug, Clone, Copy)]
-pub struct UnitScales {
-    /// Length unit → metres (1.0 for metre files, 0.001 for millimetre files).
-    pub length_unit_scale: f64,
-    /// Plane-angle unit → radians (1.0 for RADIAN files, π/180 for DEGREE).
-    pub plane_angle_to_radians: f64,
-    /// The `IFCPROJECT` express id the scales were resolved from, when found.
-    pub project_id: Option<u32>,
-}
+/// The file's unit scales, resolved exactly once per parse. The type and its
+/// resolution ladder live in `ifc-lite-core` ([`ifc_lite_core::UnitScales`],
+/// F3a #7775); this is its historic path.
+pub use ifc_lite_core::UnitScales;
 
-impl Default for UnitScales {
-    fn default() -> Self {
-        Self {
-            length_unit_scale: 1.0,
-            plane_angle_to_radians: 1.0,
-            project_id: None,
-        }
-    }
-}
-
-/// Resolve BOTH unit scales once, against the decoder's (possibly partial)
-/// entity index, with the documented fallback ladder:
-///
-/// 1. `project_id` hint (recorded by the scan) — O(1) decode via the index.
-/// 2. No hint? Find `IFCPROJECT` by SIMD substring search (it is a singleton
-///    and many exporters — IfcOpenShell, Revit — emit it near the END of the
-///    file, after the scan's early-meta point).
-/// 3. Resolution chain incomplete on a PARTIAL index (streaming early-meta:
-///    the IFCSIUNIT chain may sit past the scan point)? Re-resolve against a
-///    freshly built FULL index rather than silently defaulting — a millimetre
-///    model resolved as metres renders 1000× oversized.
-///
-/// This is the only sanctioned place that hunts for `IFCPROJECT`; per-element
-/// decoders are seeded from the result (`EntityDecoder::seed_unit_scales`) so
-/// the historic O(file)-scan-per-decoder stall class stays dead.
+/// Resolve BOTH unit scales once against the decoder's (possibly partial)
+/// entity index; see [`UnitScales::resolve`] for the fallback ladder. Kept as
+/// the processing-side entry point every pipeline calls.
 pub fn resolve_unit_scales(
     content: &[u8],
     project_id_hint: Option<u32>,
     decoder: &mut EntityDecoder,
 ) -> UnitScales {
-    let project_id = project_id_hint.or_else(|| find_ifcproject_id(content));
-    let Some(pid) = project_id else {
-        return UnitScales::default();
-    };
-
-    // Fast path: resolve on the caller's decoder/index. BOTH resolvers return
-    // `None` (not a masked default) when their chain is incomplete on a partial
-    // index, so an unresolved either-scale forces the full-index retry below
-    // rather than silently shipping radians/metres (issue #1367).
-    let length = ifc_lite_core::try_extract_length_unit_scale(decoder, pid);
-    let angle = ifc_lite_core::try_extract_plane_angle_to_radians(decoder, pid);
-
-    if let (Some(length_unit_scale), Some(plane_angle_to_radians)) = (length, angle) {
-        return UnitScales {
-            length_unit_scale,
-            plane_angle_to_radians,
-            project_id,
-        };
-    }
-
-    // Chain incomplete (partial index) — resolve against a full index.
-    let full_index = ifc_lite_core::build_entity_index(content);
-    let mut full_decoder = EntityDecoder::with_index(content, full_index);
-    UnitScales {
-        length_unit_scale: length.or_else(|| {
-            ifc_lite_core::extract_length_unit_scale(&mut full_decoder, pid).ok()
-        })
-        .unwrap_or(1.0),
-        plane_angle_to_radians: angle
-            .or_else(|| {
-                ifc_lite_core::extract_plane_angle_to_radians(&mut full_decoder, pid).ok()
-            })
-            .unwrap_or(1.0),
-        project_id,
-    }
+    UnitScales::resolve(content, project_id_hint, decoder)
 }
 
-/// Find the singleton `IFCPROJECT`'s express id by SIMD substring search —
-/// no full entity scan. Returns `None` when the file has no project.
-pub fn find_ifcproject_id(content: &[u8]) -> Option<u32> {
-    let mut from = 0usize;
-    // Search for the keyword+paren only; the `=` and `#<id>` are reconstructed by
-    // backtracking. Exporters vary the whitespace around `=` — Revit/EDM emits
-    // `#1593796= IFCPROJECT(` with a SPACE, so the old `=IFCPROJECT(` literal
-    // never matched and the whole unit chain silently defaulted (length → metres
-    // on a mm model, plane-angle → radians on a degree model, making arched
-    // openings render as full circles — issue #1367). `IFCPROJECT(` cannot
-    // collide with `IFCPROJECTEDCRS(` because the `(` must immediately follow.
-    while let Some(rel) = memchr::memmem::find(&content[from..], b"IFCPROJECT(") {
-        let kw = from + rel;
-        // Backtrack over optional whitespace, then require '='.
-        let mut i = kw;
-        while i > 0 && content[i - 1].is_ascii_whitespace() {
-            i -= 1;
-        }
-        if i > 0 && content[i - 1] == b'=' {
-            i -= 1; // step over '='
-            // Optional whitespace between the express id and '='.
-            while i > 0 && content[i - 1].is_ascii_whitespace() {
-                i -= 1;
-            }
-            // Backtrack over the express id digits to the '#'.
-            let digits_end = i;
-            while i > 0 && content[i - 1].is_ascii_digit() {
-                i -= 1;
-            }
-            if i > 0 && content[i - 1] == b'#' && i < digits_end {
-                let mut id: u32 = 0;
-                for &b in &content[i..digits_end] {
-                    id = id.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-                }
-                return Some(id);
-            }
-        }
-        // `IFCPROJECT(` not preceded by `#<digits>=` (e.g. inside a string)
-        // — keep searching.
-        from = kw + 1;
-    }
-    None
-}
+/// The model's `IFCPROJECT` express id (the first in file order), found by
+/// SIMD substring search with no entity scan. The one locator lives in
+/// `ifc-lite-core` ([`ifc_lite_core::find_project_id`]); this is its historic
+/// path.
+pub use ifc_lite_core::find_project_id as find_ifcproject_id;
 
 /// Flat wire encodings of the resolved styles for the browser's
 /// `styleIds`/`styleColors` arrays: the rich style index flattened to
 /// `(ids, rgba8)`, with IfcIndexedColourMap dominants, flat material colours,
-/// and per-element first material colours filling the gaps — the exact
-/// layered precedence the browser prepasses have always shipped.
+/// and each element's material fallback colour
+/// ([`crate::style::element_material_fallback_color`], the native rule)
+/// filling the gaps — the layered precedence the browser prepasses ship.
 pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder) -> (Vec<u32>, Vec<u8>) {
     let mut merged: FxHashMap<u32, [f32; 4]> = resolved
         .geometry_style_index
@@ -404,8 +349,9 @@ pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder
     for (&geometry_id, &color) in &resolved.indexed_colour_index {
         merged.entry(geometry_id).or_insert(color);
     }
-    // Flat material_id → colour, then element id → first material colour, so
-    // `processGeometryBatch`'s per-element fallback picks them up.
+    // Flat material_id → colour, then element id → its material fallback
+    // colour, so `processGeometryBatch`'s per-element fallback picks up the
+    // colour the native pipeline uses (PROCESSING-4, #7691).
     let material_styles = crate::style::build_material_style_index(
         &resolved.material_def_reprs,
         &resolved.orphan_styled_items,
@@ -415,7 +361,7 @@ pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder
         merged.entry(mat_id).or_insert(color);
     }
     for (&element_id, colors) in &resolved.element_material_colors {
-        if let Some(&color) = colors.first() {
+        if let Some(color) = crate::style::element_material_fallback_color(colors) {
             merged.entry(element_id).or_insert(color);
         }
     }
@@ -432,6 +378,54 @@ pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder
         rgba.extend_from_slice(&crate::style::Rgba::from_array(color).to_rgba8());
     }
     (ids, rgba)
+}
+
+/// [`flat_styles_rgba8`] plus the parallel `styleFinishes` wire (#5582): two
+/// `f32` per style id, `[metallic, roughness]`, in the SAME order as `ids`,
+/// `f32::NAN` for an unauthored field. The id order is decided once, by the
+/// rgba8 flatten; the finishes are a per-id lookup over it into
+/// `geometry_finishes` ([`crate::prepass_styled::resolve_geometry_finishes`]
+/// over the same styled items). A geometry style always wins its id in that
+/// flatten, so only geometry-style entries can carry a finish; the
+/// indexed-colour, material and element-colour fallbacks are colour-only and
+/// get `[NAN, NAN]`.
+pub fn flat_styles_with_finishes(
+    resolved: &ResolvedPrepass,
+    geometry_finishes: &FxHashMap<u32, SpecularMaterial>,
+    decoder: &mut EntityDecoder,
+) -> (Vec<u32>, Vec<u8>, Vec<f32>) {
+    let (ids, rgba) = flat_styles_rgba8(resolved, decoder);
+    let finishes = style_finishes_for_ids(&ids, |id| geometry_finishes.get(&id).copied());
+    (ids, rgba, finishes)
+}
+
+/// The `styleFinishes` wire for an already-ordered id list: `finish_of(id)`'s
+/// [`finish_to_wire`] pair per id, in `ids` order. Shared by the serial
+/// flatten and the sharded finalize so both encode identically.
+pub fn style_finishes_for_ids(
+    ids: &[u32],
+    mut finish_of: impl FnMut(u32) -> Option<SpecularMaterial>,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(ids.len() * 2);
+    for &id in ids {
+        out.extend_from_slice(&finish_to_wire(finish_of(id)));
+    }
+    out
+}
+
+/// One style's `[metallic, roughness]` wire pair; `f32::NAN` marks a field the
+/// file did not author. Inverse: [`finish_from_wire`].
+pub fn finish_to_wire(finish: Option<SpecularMaterial>) -> [f32; 2] {
+    let f = finish.unwrap_or_default();
+    [f.metallic.unwrap_or(f32::NAN), f.roughness.unwrap_or(f32::NAN)]
+}
+
+/// Decode one `[metallic, roughness]` wire pair. A non-finite field is
+/// unauthored; a pair with neither field authored is no finish at all.
+pub fn finish_from_wire(pair: [f32; 2]) -> Option<SpecularMaterial> {
+    let field = |v: f32| v.is_finite().then_some(v);
+    let (metallic, roughness) = (field(pair[0]), field(pair[1]));
+    (metallic.is_some() || roughness.is_some()).then_some(SpecularMaterial { metallic, roughness })
 }
 
 /// Flat wire encoding of the void index: `(keys, counts, values)` in the
@@ -494,27 +488,19 @@ pub fn material_colors_from_flat(
     rgba: &[u8],
 ) -> FxHashMap<u32, Vec<[f32; 4]>> {
     let mut out: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
+    let available = rgba.len() / 4;
     let mut offset = 0usize;
     for (i, &element_id) in element_ids.iter().enumerate() {
         let Some(&count) = counts.get(i) else { break };
-        let count = count as usize;
-        let mut colors: Vec<[f32; 4]> = Vec::with_capacity(count);
-        for c in 0..count {
-            let base = (offset + c) * 4;
-            if base + 3 >= rgba.len() {
-                break;
-            }
-            colors.push(
-                crate::style::Rgba::from_rgba8([
-                    rgba[base],
-                    rgba[base + 1],
-                    rgba[base + 2],
-                    rgba[base + 3],
-                ])
-                .to_array(),
-            );
-        }
-        offset += count;
+        // `count` is wire input: clamp to the colours `rgba` holds instead of
+        // reserving `count` (up to 64 GiB) or wrapping `offset` on wasm32
+        // (#7675). A short buffer keeps the colours it has, as before.
+        let end = offset.saturating_add(count as usize).min(available);
+        let colors: Vec<[f32; 4]> = rgba[offset.min(end) * 4..end * 4]
+            .chunks_exact(4)
+            .map(|c| crate::style::Rgba::from_rgba8([c[0], c[1], c[2], c[3]]).to_array())
+            .collect();
+        offset = offset.saturating_add(count as usize);
         if !colors.is_empty() {
             out.insert(element_id, colors);
         }
@@ -548,26 +534,26 @@ pub(crate) fn extract_style_info_from_styled_item(
     styled_item: &DecodedEntity,
     decoder: &mut EntityDecoder,
 ) -> Option<GeometryStyleInfo> {
-    let style_refs = refs_from_list(styled_item, 1)?;
+    surface_style_from_styled_item(styled_item, decoder).map(|(_, info)| info)
+        .or_else(|| crate::style::fill::fill_style_from_styled_item(styled_item, decoder))
+}
 
-    for style_id in style_refs {
+/// Canonical first valid rendering style, also used when authoring clones its
+/// non-albedo properties instead of discarding them (#4260).
+pub(crate) fn surface_style_from_styled_item(
+    styled_item: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+) -> Option<(u32, GeometryStyleInfo)> {
+    for style_id in styled_item.get_refs(1)? {
         if let Ok(style) = decoder.decode_by_id(style_id) {
-            // IfcPresentationStyleAssignment has nested style refs at attr 0.
-            if let Some(inner_refs) = refs_from_list(&style, 0) {
+            if let Some(inner_refs) = style.get_refs(0) {
                 for inner_id in inner_refs {
-                    if let Some(info) = extract_surface_style_info(inner_id, decoder) {
-                        return Some(info);
-                    }
+                    if let Some(info) = extract_surface_style_info(inner_id, decoder) { return Some((inner_id, info)); }
                 }
             }
-
-            // Or the style ref points directly to IfcSurfaceStyle.
-            if let Some(info) = extract_surface_style_info(style_id, decoder) {
-                return Some(info);
-            }
+            if let Some(info) = extract_surface_style_info(style_id, decoder) { return Some((style_id, info)); }
         }
     }
-
     None
 }
 
@@ -600,173 +586,6 @@ fn normalize_style_name(raw: Option<&str>) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Extract entity references from a list attribute.
-fn refs_from_list(entity: &DecodedEntity, index: usize) -> Option<Vec<u32>> {
-    let list = entity.get_list(index)?;
-    let refs: Vec<u32> = list.iter().filter_map(|v| v.as_entity_ref()).collect();
-    if refs.is_empty() {
-        None
-    } else {
-        Some(refs)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ifc_lite_core::{EntityIndex, EntityScanner};
-
-    #[test]
-    fn find_ifcproject_id_late_in_file() {
-        let ifc = b"ISO-10303-21;\nDATA;\n#1=IFCWALL('x',$,$,$,$,$,$,$,$);\n#999123=IFCPROJECT('g',$,'P',$,$,$,$,$,$);\nENDSEC;\n";
-        assert_eq!(find_ifcproject_id(ifc), Some(999123));
-    }
-
-    #[test]
-    fn find_ifcproject_id_absent() {
-        let ifc = b"ISO-10303-21;\nDATA;\n#1=IFCWALL('x',$,$,$,$,$,$,$,$);\nENDSEC;\n";
-        assert_eq!(find_ifcproject_id(ifc), None);
-    }
-
-    #[test]
-    fn find_ifcproject_id_skips_string_decoys() {
-        let ifc = b"DATA;\n#5=IFCWALL('decoy =IFCPROJECT( in a name',$);\n#7=IFCPROJECT('g',$);\n";
-        assert_eq!(find_ifcproject_id(ifc), Some(7));
-    }
-
-    #[test]
-    fn find_ifcproject_id_handles_whitespace_around_equals() {
-        // Revit/EDM exporters write `#id= IFCPROJECT(` with a space after `=`;
-        // the old `=IFCPROJECT(` literal never matched → the whole unit chain
-        // defaulted to metres + radians (issue #1367, arched openings → circles).
-        let space_after = b"DATA;\n#1=IFCWALL('x',$);\n#1593796= IFCPROJECT('g',$,'P',$,$,$,$,$,$);\n";
-        assert_eq!(find_ifcproject_id(space_after), Some(1593796));
-
-        let space_both = b"DATA;\n#42 = IFCPROJECT('g',$);\n";
-        assert_eq!(find_ifcproject_id(space_both), Some(42));
-
-        // IFCPROJECTEDCRS must not be mistaken for IFCPROJECT.
-        let crs_only = b"DATA;\n#9= IFCPROJECTEDCRS('EPSG:32632',$,'WGS84',$,'UTM','32N',$);\n";
-        assert_eq!(find_ifcproject_id(crs_only), None);
-    }
-
-    /// Mimics the Revit/EDM ordering of Architecture.ifc (issue #1367): the
-    /// DEGREE plane-angle unit sits near the file head but its conversion
-    /// `IFCMEASUREWITHUNIT` is at the very tail. With a PARTIAL index that has the
-    /// project + assignment + degree unit but NOT the measure, the plane-angle
-    /// resolver must report "incomplete" so `resolve_unit_scales` retries against
-    /// a full index instead of silently shipping radians.
-    #[test]
-    fn resolve_unit_scales_recovers_degrees_when_measure_past_partial_index() {
-        const IFC: &[u8] = br#"ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('u.ifc','2026-06-26T00:00:00',(''),(''),'','','');
-FILE_SCHEMA(('IFC2X3'));
-ENDSEC;
-DATA;
-#10= IFCPROJECT('g',$,'P',$,$,$,$,$,#11);
-#11= IFCUNITASSIGNMENT((#12,#13));
-#12= IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
-#13= IFCCONVERSIONBASEDUNIT(#14,.PLANEANGLEUNIT.,'DEGREE',#15);
-#14= IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);
-#16= IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
-#15= IFCMEASUREWITHUNIT(IFCRATIOMEASURE(0.0174532925199433),#16);
-ENDSEC;
-END-ISO-10303-21;
-"#;
-        // Build a PARTIAL index that omits the tail measure (#15) and exponents
-        // (#14), exactly the streaming-gate situation that masked the bug.
-        let mut partial = EntityIndex::default();
-        let mut scanner = EntityScanner::new(&IFC);
-        while let Some((id, _t, start, end)) = scanner.next_entity() {
-            if id == 15 || id == 14 {
-                continue; // forward-referenced past the gate
-            }
-            partial.insert(id, (start, end));
-        }
-        let mut decoder = EntityDecoder::with_index(IFC, partial);
-        let scales = resolve_unit_scales(IFC, Some(10), &mut decoder);
-        assert_eq!(scales.project_id, Some(10));
-        assert!((scales.length_unit_scale - 0.001).abs() < 1e-12);
-        assert!(
-            (scales.plane_angle_to_radians - 0.0174532925199433).abs() < 1e-12,
-            "expected degrees via full-index retry, got {}",
-            scales.plane_angle_to_radians
-        );
-    }
-
-    #[test]
-    fn material_colors_flat_round_trip() {
-        let mut map: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
-        map.insert(10, vec![[0.5, 0.5, 0.5, 1.0], [0.7, 0.9, 0.5, 0.2]]);
-        map.insert(42, vec![[1.0, 0.0, 0.0, 1.0]]);
-
-        let (ids, counts, rgba) = flat_material_colors(&map);
-        let back = material_colors_from_flat(&ids, &counts, &rgba);
-
-        assert_eq!(back.len(), 2);
-        assert_eq!(back[&42].len(), 1);
-        assert_eq!(back[&10].len(), 2);
-        // RGBA8 quantization: equal within 1/255.
-        for (orig, round) in map[&10].iter().zip(back[&10].iter()) {
-            for (a, b) in orig.iter().zip(round.iter()) {
-                assert!((a - b).abs() <= 1.0 / 255.0 + 1e-6);
-            }
-        }
-    }
-
-    /// The flat wire arrays are an EXPLICIT id-ascending contract (pinned by
-    /// the mesh-output determinism manifest), not an FxHashMap iteration-order
-    /// artifact.
-    #[test]
-    fn flat_wire_arrays_are_sorted_by_id() {
-        let mut voids: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-        voids.insert(300, vec![301, 302]);
-        voids.insert(7, vec![8]);
-        voids.insert(90, vec![91]);
-        let (keys, counts, values) = flat_voids(&voids);
-        assert_eq!(keys, vec![7, 90, 300]);
-        assert_eq!(counts, vec![1, 1, 2]);
-        // Per-host opening lists keep their (file-order) sequence.
-        assert_eq!(values, vec![8, 91, 301, 302]);
-
-        let mut colors: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
-        colors.insert(42, vec![[1.0, 0.0, 0.0, 1.0]]);
-        colors.insert(10, vec![[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.5]]);
-        let (ids, counts, rgba) = flat_material_colors(&colors);
-        assert_eq!(ids, vec![10, 42]);
-        assert_eq!(counts, vec![2, 1]);
-        assert_eq!(rgba.len(), 12);
-        // First colour on the wire is element #10's first (green), not #42's.
-        assert_eq!(&rgba[0..4], &[0, 255, 0, 255]);
-    }
-
-    #[test]
-    fn resolve_unit_scales_resolves_degrees_and_millimetres() {
-        const IFC: &[u8] = br#"ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('u.ifc','2026-06-12T00:00:00',(''),(''),'','','');
-FILE_SCHEMA(('IFC4'));
-ENDSEC;
-DATA;
-#1=IFCWALL('w',$,$,$,$,$,$,$,$);
-#10=IFCPROJECT('g',$,'P',$,$,$,$,$,#11);
-#11=IFCUNITASSIGNMENT((#12,#13));
-#12=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
-#13=IFCCONVERSIONBASEDUNIT(#14,.PLANEANGLEUNIT.,'DEGREE',#15);
-#14=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);
-#15=IFCMEASUREWITHUNIT(IFCPLANEANGLEMEASURE(0.017453292519943295),#16);
-#16=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);
-ENDSEC;
-END-ISO-10303-21;
-"#;
-        // No hint: found by substring search; resolved on a fresh decoder.
-        let mut decoder = EntityDecoder::new(IFC);
-        let scales = resolve_unit_scales(IFC, None, &mut decoder);
-        assert_eq!(scales.project_id, Some(10));
-        assert!((scales.length_unit_scale - 0.001).abs() < 1e-12);
-        assert!((scales.plane_angle_to_radians - 0.017_453_292_519_943_295).abs() < 1e-12);
-    }
-}
+#[path = "prepass_tests.rs"]
+mod tests;

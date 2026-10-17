@@ -33,7 +33,9 @@
 
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import { hasStandardGeoreferencing, type EffectiveGeoreference } from './effective-georef';
-import { metersToMapUnits, viewerDeltaToProjectedDelta } from './cesium-placement';
+import { getMapUnitScale, metersToMapUnits, viewerDeltaToProjectedDelta } from './cesium-placement';
+import { getEffectiveAxisScales } from './geo-scale';
+import { effectiveMapConversionForGeometry } from './map-absolute';
 
 export interface Vec3 {
   x: number;
@@ -89,7 +91,18 @@ export function viewerPointToProjected(
   eff: MapGeoreference,
   originViewer: Vec3,
 ): ProjectedPoint {
-  const { mapConversion, projectedCRS, lengthUnitScale } = eff;
+  const { projectedCRS, lengthUnitScale } = eff;
+  // Map-absolute geometry (#2526): the delta below is taken from the IFC
+  // origin, so for a file whose geometry already sits at the absolute map
+  // coordinates it IS the absolute coordinate — the neutralised conversion
+  // (zero offsets, identity rotation) reads it through, while the authored
+  // one would add the anchor again and rotate the delta by the bogus axis.
+  const mapUnitScale = getMapUnitScale(projectedCRS, lengthUnitScale);
+  const mapConversion = effectiveMapConversionForGeometry(
+    eff.mapConversion,
+    mapUnitScale,
+    eff.coordinateInfo,
+  );
   const dx = point.x - originViewer.x;
   const dy = point.y - originViewer.y;
   const dz = point.z - originViewer.z;
@@ -105,7 +118,14 @@ export function viewerPointToProjected(
   return {
     eastings: mapConversion.eastings + delta.eastings,
     northings: mapConversion.northings + delta.northings,
-    height: mapConversion.orthogonalHeight + metersToMapUnits(dy, projectedCRS, lengthUnitScale),
+    // The vertical delta goes through the same Scale x FactorZ coefficient the
+    // placement applies (cesium-bridge.ts), or a FactorZ of 2 reads a point
+    // 5 m up as 5 map metres higher where the model draws it 10 higher.
+    height: mapConversion.orthogonalHeight + metersToMapUnits(
+      getEffectiveAxisScales(mapConversion, mapUnitScale, lengthUnitScale).z * dy,
+      projectedCRS,
+      lengthUnitScale,
+    ),
     crsName: projectedCRS.name,
   };
 }

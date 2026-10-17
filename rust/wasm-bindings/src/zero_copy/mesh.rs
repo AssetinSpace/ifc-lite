@@ -2,11 +2,36 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use ifc_lite_geometry::math::frame::{
+    aabb_zup_to_yup, conjugate_zup_to_yup, zup_to_yup, zup_to_yup_in_place,
+};
 use ifc_lite_geometry::Mesh;
 use wasm_bindgen::prelude::*;
 
 /// Individual mesh data with express ID and color (matches MeshData interface)
+///
+/// `Clone` is derived so the three sites that used to enumerate all 21 fields
+/// by hand -- `get`, `takeMesh` and `MeshCollection`'s own `Clone` -- reduce to
+/// `.cloned()`, `mem::take` and `.clone()`. Adding a field to #3199 meant
+/// editing three literals in lockstep; the allowlist row for this file records
+/// exactly that cost.
+///
+/// To be precise about what this does and does not buy, because the obvious
+/// claim is wrong: an exhaustive struct literal that OMITS a field is a compile
+/// error, so those literals were never silently lossy. What they were is three
+/// places to edit for one field, and `..Default::default()` is the shortcut a
+/// hurried author reaches for when the compiler complains -- which WOULD be
+/// silently lossy. `Default` is what makes `takeMesh` a one-liner, so the rule
+/// is: TWO literals remain, `new` and `Default` below (both spelled
+/// `Self { .. }`, which is why a grep for `MeshDataJs {` finds neither). Both
+/// must stay exhaustive AND must agree on every field `new` does not take as an
+/// argument. The compiler catches an omitted field in either; it cannot catch
+/// the two DISAGREEING, which is the failure the pair exists to prevent, so
+/// `default_agrees_with_new_on_the_fields_new_does_not_take` covers that.
+/// Never spread `Default` into `new` -- `new` is the only place a field's
+/// initial value is decided, so a field defaulted there is inert everywhere.
 #[wasm_bindgen]
+#[derive(Clone)]
 pub struct MeshDataJs {
     express_id: u32,
     ifc_type: String, // IFC type name (e.g., "IfcWall", "IfcSpace")
@@ -20,6 +45,9 @@ pub struct MeshDataJs {
     /// DiffuseColour (so the two would differ). Consumed by the GLB
     /// exporter's "Shading" colour-source option; renderers ignore it.
     shading_color: Option<[f32; 4]>,
+    /// IFC-authored metallic/roughness (#5582, see the getters below).
+    metallic: Option<f32>,
+    roughness: Option<f32>,
     /// Per-vertex texture coordinates (u, v pairs, 1:1 with positions),
     /// present only for textured meshes (#961). Empty otherwise.
     uvs: Vec<f32>,
@@ -47,6 +75,10 @@ pub struct MeshDataJs {
     /// via IfcRelDefinesByType — the type-library shape, hidden in Model mode to
     /// avoid double-rendering, shown in Types mode). See #957 follow-up.
     geometry_class: u8,
+    /// Source ids, DISJOINT — never both. See `ifc_lite_processing::MeshData`
+    /// for what each means and when each is absent (#3199).
+    geometry_item_id: Option<u32>,
+    material_id: Option<u32>,
     /// Per-element local-frame origin (f64), in the SAME (WebGL Y-up) frame as
     /// `positions`: world position of vertex i = `origin + positions[3i..]`.
     /// Default `[0,0,0]` means positions are absolute (legacy). Carries the
@@ -60,6 +92,43 @@ pub struct MeshDataJs {
     /// The resolved placement (`local_to_world`), row-major, WebGL Y-up (issue
     /// #1474). `None` when not captured. See `Mesh::local_to_world`.
     local_to_world: Option<[f64; 16]>,
+}
+
+/// Hand-written rather than derived, and it must keep agreeing with `new`.
+///
+/// The derive gives `false` for the texture repeat flags while `new` sets them
+/// `true`, so a `MeshDataJs::default()` plus setters would report
+/// `textureRepeatS === false` and clamp a texture that should tile. Inert while
+/// every texture path goes through `set_texture`, but that was enforced by
+/// prose alone; this makes the two constructors agree structurally.
+impl Default for MeshDataJs {
+    fn default() -> Self {
+        Self {
+            express_id: 0,
+            ifc_type: String::new(),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            indices: Vec::new(),
+            color: [0.0; 4],
+            shading_color: None,
+            metallic: None,
+            roughness: None,
+            uvs: Vec::new(),
+            texture_rgba: Vec::new(),
+            texture_width: 0,
+            texture_height: 0,
+            texture_repeat_s: true,
+            texture_repeat_t: true,
+            texture_id: 0,
+            texture_url: None,
+            geometry_class: 0,
+            geometry_item_id: None,
+            material_id: None,
+            origin: [0.0; 3],
+            local_bounds: None,
+            local_to_world: None,
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -107,6 +176,12 @@ impl MeshDataJs {
     pub fn shading_color(&self) -> Option<Vec<f32>> {
         self.shading_color.map(|c| c.to_vec())
     }
+
+    /// IFC-authored metallic/roughness (#5582). `undefined` when unauthored.
+    #[wasm_bindgen(getter)]
+    pub fn metallic(&self) -> Option<f32> { self.metallic }
+    #[wasm_bindgen(getter)]
+    pub fn roughness(&self) -> Option<f32> { self.roughness }
 
     /// Get vertex count
     #[wasm_bindgen(getter, js_name = vertexCount)]
@@ -184,6 +259,19 @@ impl MeshDataJs {
         self.geometry_class
     }
 
+    /// Source `IfcRepresentationItem`, or `undefined` where identity is merged
+    /// away. Never set alongside `materialId` (#3199).
+    #[wasm_bindgen(getter, js_name = geometryItemId)]
+    pub fn geometry_item_id(&self) -> Option<u32> {
+        self.geometry_item_id
+    }
+
+    /// `IfcMaterial` layer sliced, or `undefined` (#3199).
+    #[wasm_bindgen(getter, js_name = materialId)]
+    pub fn material_id(&self) -> Option<u32> {
+        self.material_id
+    }
+
     /// Per-element local-frame origin (Float64Array[3], WebGL Y-up, metres):
     /// world position of vertex i = `origin + positions[3i..3i+3]`. Returns
     /// [0,0,0] when positions are absolute (legacy / local frame off).
@@ -209,95 +297,32 @@ impl MeshDataJs {
     }
 }
 
-/// Swap an axis-aligned box's corners from IFC Z-up to WebGL Y-up
-/// (`(x,y,z) -> (x,z,-y)`). A per-component swap of `min`/`max` independently
-/// is WRONG: negating the Y axis flips which corner is the min/max along the
-/// new Z, so the new Z range is `[-maxY, -minY]`, not `[-minY, -maxY]`.
-fn swap_zup_to_yup_aabb(b: [f32; 6]) -> [f32; 6] {
-    let [min_x, min_y, min_z, max_x, max_y, max_z] = b;
-    [min_x, min_z, -max_y, max_x, max_z, -min_y]
-}
-
-/// Conjugate a row-major 4×4 matrix by the fixed IFC Z-up → WebGL Y-up swap
-/// `S`: `(x,y,z,w) -> (x,z,-y,w)`, so a placement/rotation matrix expressed in
-/// the IFC frame becomes valid in the Y-up frame the renderer uses:
-/// `M' = S · M · Sᵀ` (S is orthogonal, so `S⁻¹ = Sᵀ`).
-fn swap_zup_to_yup_mat4(m: &[f64; 16]) -> [f64; 16] {
-    #[rustfmt::skip]
-    const S: [f64; 16] = [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, -1.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    ];
-    #[rustfmt::skip]
-    const ST: [f64; 16] = [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, -1.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    ];
-    fn matmul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
-        let mut out = [0.0; 16];
-        for r in 0..4 {
-            for c in 0..4 {
-                let mut sum = 0.0;
-                for k in 0..4 {
-                    sum += a[r * 4 + k] * b[k * 4 + c];
-                }
-                out[r * 4 + c] = sum;
-            }
-        }
-        out
-    }
-    matmul(&matmul(&S, m), &ST)
-}
-
 impl MeshDataJs {
     /// Create new mesh data with IFC Z-up to WebGL Y-up conversion.
     ///
-    /// Performs coordinate conversion and winding order reversal in Rust
+    /// Performs coordinate conversion in Rust
     /// to avoid expensive per-vertex JS iteration (63.5M vertices for large files).
     /// IFC Z-up → WebGL Y-up: swap Y/Z, negate new Z for right-handedness.
-    /// Winding order reversed to compensate for the handedness flip.
+    /// This rotation has determinant +1, so triangle winding is preserved (#4056).
     pub fn new(express_id: u32, ifc_type: String, mut mesh: Mesh, color: [f32; 4]) -> Self {
-        // Convert positions: IFC Z-up → WebGL Y-up
-        for chunk in mesh.positions.chunks_exact_mut(3) {
-            let y = chunk[1];
-            let z = chunk[2];
-            chunk[1] = z; // New Y = old Z (vertical)
-            chunk[2] = -y; // New Z = -old Y (depth, negated for right-hand rule)
-        }
-
-        // Convert normals the same way
-        for chunk in mesh.normals.chunks_exact_mut(3) {
-            let y = chunk[1];
-            let z = chunk[2];
-            chunk[1] = z;
-            chunk[2] = -y;
-        }
-
-        // Reverse winding order to compensate for handedness flip
-        let remainder = mesh.indices.len() % 3;
-        let end = mesh.indices.len() - remainder;
-        for i in (0..end).step_by(3) {
-            mesh.indices.swap(i + 1, i + 2);
-        }
+        // Convert positions and normals: IFC Z-up → WebGL Y-up
+        zup_to_yup_in_place(&mut mesh.positions);
+        zup_to_yup_in_place(&mut mesh.normals);
 
         // The per-element origin is a world-frame point and MUST undergo the
         // identical IFC Z-up → WebGL Y-up swap as the positions above, or
         // `world = origin + position` would mix axes (element renders mirrored
         // / displaced). Default [0,0,0] swaps to [0,0,0] (no-op for legacy).
-        let origin = [mesh.origin[0], mesh.origin[2], -mesh.origin[1]];
+        let origin = zup_to_yup(mesh.origin);
 
         // Local (pre-placement) AABB (issue #1474): same swap as positions, but
         // an AABB corner can't be swapped component-wise — negating an axis
-        // flips which corner is min/max along it. See `swap_zup_to_yup_aabb`.
-        let local_bounds = mesh.local_bounds.map(swap_zup_to_yup_aabb);
+        // flips which corner is min/max along it. See `aabb_zup_to_yup`.
+        let local_bounds = mesh.local_bounds.map(aabb_zup_to_yup);
         // The placement transform (issue #1474) is conjugated by the same
         // swap, since it's expressed in the IFC frame the positions were in
-        // before this conversion: M' = S · M · Sᵀ. See `swap_zup_to_yup_mat4`.
-        let local_to_world = mesh.local_to_world.map(|m| swap_zup_to_yup_mat4(&m));
+        // before this conversion: M' = S · M · Sᵀ. See `conjugate_zup_to_yup`.
+        let local_to_world = mesh.local_to_world.map(|m| conjugate_zup_to_yup(&m));
 
         Self {
             express_id,
@@ -307,6 +332,8 @@ impl MeshDataJs {
             indices: mesh.indices,
             color,
             shading_color: None,
+            metallic: None,
+            roughness: None,
             uvs: Vec::new(),
             texture_rgba: Vec::new(),
             texture_width: 0,
@@ -316,6 +343,8 @@ impl MeshDataJs {
             texture_id: 0,
             texture_url: None,
             geometry_class: 0,
+            geometry_item_id: None,
+            material_id: None,
             origin,
             local_bounds,
             local_to_world,
@@ -328,6 +357,17 @@ impl MeshDataJs {
         self.geometry_class = class;
     }
 
+    /// Both DISJOINT ids at once, so a caller cannot set one without
+    /// considering the other (#3199).
+    pub fn set_source_ids(&mut self, geometry_item_id: Option<u32>, material_id: Option<u32>) {
+        debug_assert!(
+            geometry_item_id.is_none() || material_id.is_none(),
+            "disjoint; never both"
+        );
+        self.geometry_item_id = geometry_item_id;
+        self.material_id = material_id;
+    }
+
     /// Attach an optional SurfaceColour for the GLB exporter's "Shading"
     /// colour source. Callers that have a `geometry_shading_styles` entry
     /// for the mesh's source geometry id should invoke this after `new`.
@@ -335,10 +375,20 @@ impl MeshDataJs {
         self.shading_color = shading;
     }
 
+    /// Attach the IFC-authored metallic/roughness (#5582); the wasm batch stamps it
+    /// from `setStyleFinishes` by `geometry_item_id` (`MeshData` carries none).
+    pub fn set_material(&mut self, metallic: Option<f32>, roughness: Option<f32>) {
+        self.metallic = metallic;
+        self.roughness = roughness;
+    }
+
     /// Attach per-vertex UVs + a decoded RGBA8 texture (#961). UVs are 1:1 with
-    /// `positions` and need no coordinate flip (they are 2D); the winding
-    /// reversal in `new` swaps indices, not vertices, so per-vertex UVs stay
-    /// aligned. Call after `new`.
+    /// `positions` and need no coordinate flip (they are 2D). The rotation in
+    /// `new` preserves vertex and index order, so per-vertex UVs stay aligned.
+    /// Call after `new`.
+    // Each arg is a distinct JS call parameter; a Rust struct would not reduce
+    // arity for JS callers. Matches the 21 other sites in this crate.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_texture(
         &mut self,
         uvs: Vec<f32>,
@@ -378,7 +428,7 @@ impl MeshDataJs {
 
     /// Build from the canonical per-element producer's [`MeshData`]
     /// (`ifc_lite_processing::element`): wraps [`MeshDataJs::new`] (IFC Z-up →
-    /// WebGL Y-up + winding reversal), copies the `geometry_class` tag and the
+    /// WebGL Y-up rotation with preserved winding), copies the `geometry_class` tag and the
     /// optional texture/UVs. Element metadata the browser doesn't carry
     /// (global_id / name / presentation layer / material name / properties) is
     /// dropped — the viewer gets it from the parser worker instead.
@@ -399,9 +449,12 @@ impl MeshDataJs {
             // `new` applies the same Z-up→Y-up swap it applies to positions/origin.
             local_bounds: m.local_bounds,
             local_to_world: m.local_to_world,
+            welded_in_object_frame: false,
+            plane_tags: None,
         };
         let mut js = Self::new(m.express_id, m.ifc_type, mesh, m.color);
         js.set_geometry_class(m.geometry_class);
+        js.set_source_ids(m.geometry_item_id, m.material_id);
         if let (Some(uvs), Some(tex)) = (m.uvs, m.texture) {
             if let Some(rgba) = tex.rgba {
                 // Rust-decoded blob/pixel texture (#961): the Arc is shared
@@ -444,6 +497,22 @@ pub struct MeshCollection {
     /// its fingerprint (see `ifc_lite_geometry::geom_hash`). Empty otherwise.
     geometry_hash_ids: Vec<u32>,
     geometry_hash_values: Vec<u64>,
+    /// World-space AABBs from the SAME pass, 6 `f64` per entry
+    /// (minx,miny,minz,maxx,maxy,maxz) in `geometry_hash_ids` order. Populated
+    /// and emptied in lockstep with the two arrays above.
+    ///
+    /// Stored in the producer's IFC **Z-up** frame, the frame the hasher
+    /// reconstructed them in. The Z-up→Y-up swap happens once, in the
+    /// `geometryAabbValues` getter — the single point where these reach JS.
+    geometry_aabb_values: Vec<f64>,
+    /// Enclosed volume in m³ from the SAME pass, one `f64` per entry, `NaN`
+    /// where the geometry was not provably a single closed orientable solid
+    /// (#1891). Same NaN-means-absent convention as `geometry_aabb_values`.
+    geometry_volume_values: Vec<f64>,
+    /// Packed `GeometryClosure` verdict, one `u8` per entry: which clause of
+    /// the volume gate held. Lets a consumer name the reason a volume is
+    /// absent instead of guessing.
+    geometry_closure_flags: Vec<u8>,
     /// Typed CSG / opening diagnostics for the batch that produced this collection
     /// (the public `GeometryDiagnostics` contract). The worker merges these across
     /// batches and the loader across workers, surfacing one per-load `diagnostics`
@@ -464,27 +533,7 @@ impl MeshCollection {
     /// hot streaming path; this stays for callers that read meshes more than once.
     #[wasm_bindgen]
     pub fn get(&self, index: usize) -> Option<MeshDataJs> {
-        self.meshes.get(index).map(|m| MeshDataJs {
-            express_id: m.express_id,
-            ifc_type: m.ifc_type.clone(),
-            positions: m.positions.clone(),
-            normals: m.normals.clone(),
-            indices: m.indices.clone(),
-            color: m.color,
-            shading_color: m.shading_color,
-            uvs: m.uvs.clone(),
-            texture_rgba: m.texture_rgba.clone(),
-            texture_width: m.texture_width,
-            texture_height: m.texture_height,
-            texture_repeat_s: m.texture_repeat_s,
-            texture_repeat_t: m.texture_repeat_t,
-            texture_id: m.texture_id,
-            texture_url: m.texture_url.clone(),
-            geometry_class: m.geometry_class,
-            origin: m.origin,
-            local_bounds: m.local_bounds,
-            local_to_world: m.local_to_world,
-        })
+        self.meshes.get(index).cloned()
     }
 
     /// #1097 perf: MOVE the mesh at `index` out of the collection (the Vec
@@ -492,30 +541,13 @@ impl MeshCollection {
     /// worker reads each mesh exactly once, so moving avoids the full vertex-
     /// data clone `get` pays — one fewer copy of positions/normals/indices/uvs/
     /// texture per mesh (the JS getters still do the single Rust→JS copy). Calling
-    /// it twice for the same index yields the second call an empty mesh.
+    /// it twice for the same index yields the second call a DEFAULT mesh:
+    /// `expressId` 0 and every buffer empty, rather than the metadata-bearing
+    /// husk the hand-written copy used to leave. The method is read-once by
+    /// contract and the wasm-contract test pins this.
     #[wasm_bindgen(js_name = takeMesh)]
     pub fn take_mesh(&mut self, index: usize) -> Option<MeshDataJs> {
-        self.meshes.get_mut(index).map(|m| MeshDataJs {
-            express_id: m.express_id,
-            ifc_type: std::mem::take(&mut m.ifc_type),
-            positions: std::mem::take(&mut m.positions),
-            normals: std::mem::take(&mut m.normals),
-            indices: std::mem::take(&mut m.indices),
-            color: m.color,
-            shading_color: m.shading_color,
-            uvs: std::mem::take(&mut m.uvs),
-            texture_rgba: std::mem::take(&mut m.texture_rgba),
-            texture_width: m.texture_width,
-            texture_height: m.texture_height,
-            texture_repeat_s: m.texture_repeat_s,
-            texture_repeat_t: m.texture_repeat_t,
-            texture_id: m.texture_id,
-            texture_url: m.texture_url.take(),
-            geometry_class: m.geometry_class,
-            origin: m.origin,
-            local_bounds: m.local_bounds,
-            local_to_world: m.local_to_world,
-        })
+        self.meshes.get_mut(index).map(std::mem::take)
     }
 
     /// Get total vertex count across all meshes
@@ -549,13 +581,12 @@ impl MeshCollection {
         self.rtc_offset_z
     }
 
-    /// Check if RTC offset is significant (>10km)
+    /// Check if an RTC offset was applied to these meshes (any non-zero
+    /// component). It can be inside 10 km: the placement-bounds fallback
+    /// re-bases on the bbox centre when a corner is past 10 km (#4643).
     #[wasm_bindgen(js_name = hasRtcOffset)]
     pub fn has_rtc_offset(&self) -> bool {
-        const THRESHOLD: f64 = 10000.0;
-        self.rtc_offset_x.abs() > THRESHOLD
-            || self.rtc_offset_y.abs() > THRESHOLD
-            || self.rtc_offset_z.abs() > THRESHOLD
+        self.rtc_offset_x != 0.0 || self.rtc_offset_y != 0.0 || self.rtc_offset_z != 0.0
     }
 
     /// Get building rotation angle in radians (from IfcSite placement)
@@ -563,23 +594,6 @@ impl MeshCollection {
     #[wasm_bindgen(getter, js_name = buildingRotation)]
     pub fn building_rotation(&self) -> Option<f64> {
         self.building_rotation
-    }
-
-    /// Express ids for the per-entity geometry fingerprints, parallel to
-    /// [`Self::geometry_hash_values`]. Empty unless geometry hashing was
-    /// enabled via `IfcAPI.setComputeGeometryHashes`.
-    #[wasm_bindgen(getter, js_name = geometryHashIds)]
-    pub fn geometry_hash_ids(&self) -> js_sys::Uint32Array {
-        js_sys::Uint32Array::from(&self.geometry_hash_ids[..])
-    }
-
-    /// Per-entity geometry fingerprints as a `BigUint64Array`, parallel to
-    /// [`Self::geometry_hash_ids`]. `u64` is exposed (not hex strings) so JS
-    /// can compare with `===` and key maps without allocation. Empty unless
-    /// geometry hashing was enabled.
-    #[wasm_bindgen(getter, js_name = geometryHashValues)]
-    pub fn geometry_hash_values(&self) -> js_sys::BigUint64Array {
-        js_sys::BigUint64Array::from(&self.geometry_hash_values[..])
     }
 
     /// Number of per-entity geometry fingerprints recorded.
@@ -612,6 +626,9 @@ impl MeshCollection {
             building_rotation: None,
             geometry_hash_ids: Vec::new(),
             geometry_hash_values: Vec::new(),
+            geometry_aabb_values: Vec::new(),
+            geometry_volume_values: Vec::new(),
+            geometry_closure_flags: Vec::new(),
             diagnostics: None,
         }
     }
@@ -626,6 +643,9 @@ impl MeshCollection {
             building_rotation: None,
             geometry_hash_ids: Vec::new(),
             geometry_hash_values: Vec::new(),
+            geometry_aabb_values: Vec::new(),
+            geometry_volume_values: Vec::new(),
+            geometry_closure_flags: Vec::new(),
             diagnostics: None,
         }
     }
@@ -634,13 +654,6 @@ impl MeshCollection {
     #[inline]
     pub fn add(&mut self, mesh: MeshDataJs) {
         self.meshes.push(mesh);
-    }
-
-    /// Record a per-entity geometry fingerprint (for revision diffing).
-    #[inline]
-    pub fn push_geometry_hash(&mut self, express_id: u32, hash: u64) {
-        self.geometry_hash_ids.push(express_id);
-        self.geometry_hash_values.push(hash);
     }
 
     /// Attach the batch's typed CSG / opening diagnostics (the public
@@ -665,6 +678,9 @@ impl MeshCollection {
             building_rotation: None,
             geometry_hash_ids: Vec::new(),
             geometry_hash_values: Vec::new(),
+            geometry_aabb_values: Vec::new(),
+            geometry_volume_values: Vec::new(),
+            geometry_closure_flags: Vec::new(),
             diagnostics: None,
         }
     }
@@ -690,57 +706,21 @@ impl MeshCollection {
     pub fn set_building_rotation(&mut self, rotation: Option<f64>) {
         self.building_rotation = rotation;
     }
-
-    /// Apply RTC offset to all meshes (shift coordinates)
-    /// This is used when meshes are collected first and then shifted
-    pub fn apply_rtc_offset(&mut self, x: f64, y: f64, z: f64) {
-        self.rtc_offset_x = x;
-        self.rtc_offset_y = y;
-        self.rtc_offset_z = z;
-        for mesh in &mut self.meshes {
-            for chunk in mesh.positions.chunks_exact_mut(3) {
-                chunk[0] = (chunk[0] as f64 - x) as f32;
-                chunk[1] = (chunk[1] as f64 - y) as f32;
-                chunk[2] = (chunk[2] as f64 - z) as f32;
-            }
-        }
-    }
 }
 
 impl Clone for MeshCollection {
     fn clone(&self) -> Self {
         Self {
-            meshes: self
-                .meshes
-                .iter()
-                .map(|m| MeshDataJs {
-                    express_id: m.express_id,
-                    ifc_type: m.ifc_type.clone(),
-                    positions: m.positions.clone(),
-                    normals: m.normals.clone(),
-                    indices: m.indices.clone(),
-                    color: m.color,
-                    shading_color: m.shading_color,
-                    uvs: m.uvs.clone(),
-                    texture_rgba: m.texture_rgba.clone(),
-                    texture_width: m.texture_width,
-                    texture_height: m.texture_height,
-                    texture_repeat_s: m.texture_repeat_s,
-                    texture_repeat_t: m.texture_repeat_t,
-                    texture_id: m.texture_id,
-                    texture_url: m.texture_url.clone(),
-                    geometry_class: m.geometry_class,
-                    origin: m.origin,
-                    local_bounds: m.local_bounds,
-                    local_to_world: m.local_to_world,
-                })
-                .collect(),
+            meshes: self.meshes.clone(),
             rtc_offset_x: self.rtc_offset_x,
             rtc_offset_y: self.rtc_offset_y,
             rtc_offset_z: self.rtc_offset_z,
             building_rotation: self.building_rotation,
             geometry_hash_ids: self.geometry_hash_ids.clone(),
             geometry_hash_values: self.geometry_hash_values.clone(),
+            geometry_aabb_values: self.geometry_aabb_values.clone(),
+            geometry_volume_values: self.geometry_volume_values.clone(),
+            geometry_closure_flags: self.geometry_closure_flags.clone(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -751,3 +731,13 @@ impl Default for MeshCollection {
         Self::new()
     }
 }
+
+/// The per-entity geometry-fingerprint arrays and their push API. A CHILD
+/// module so it can touch this module's private `MeshCollection` fields.
+#[path = "mesh_fingerprint.rs"]
+mod fingerprint;
+pub use fingerprint::GeometryFingerprint;
+
+#[cfg(test)]
+#[path = "mesh_tests.rs"]
+mod tests;
