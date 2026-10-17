@@ -97,6 +97,13 @@ const PINNED_SESSION_RESET_KEYS: readonly string[] = [
   'textAnnotation2DEditing', 'textAnnotations2D', 'titleBlockEditorVisible', 'typeViewMode',
   'typeVisibility', 'undoStacks', 'visualEnhancementsEnabled', 'zoneApportionment',
   'zoneAssignmentTiming', 'zoneAssignments',
+  // >>> AIM-FORK: fork-only slices (D-072 underlays, D-075 documents, D-076 identifier links)
+  'activeDocTabId', 'docJump', 'docTabs', 'documentsPanelVisible', 'identifierConfigModelKey',
+  'identifierIndex', 'identifierIndexSignature', 'identifierIndexStatus',
+  'underlayActiveStoreyGuid', 'underlayCalibration', 'underlayCalibrationExpanded',
+  'underlayCut', 'underlayDrawings', 'underlayLastStoreyGuid', 'underlayPanelVisible',
+  'underlayPlanFull', 'underlaySplitView', 'underlayViewLocked', 'viewerDocuments',
+  // <<< AIM-FORK
 ];
 
 /** The same, for `all-models-cleared`. */
@@ -300,6 +307,13 @@ const PINNED_OWNED_KEYS: readonly string[] = [
   'typeVisibility', 'undoStacks', 'visibilityRevision', 'visualEnhancementsEnabled', 'zoneApportionment',
   'zoneAssignmentTiming', 'zoneAssignments',
   'validationRuleSetDraft', 'validationRuleSetEditing', // #5825 owned by the draft slice
+  // >>> AIM-FORK: fork-only slices (D-072 underlays, D-075 documents, D-076 identifier links)
+  'activeDocTabId', 'docJump', 'docTabs', 'documentsPanelVisible', 'identifierConfigModelKey',
+  'identifierIndex', 'identifierIndexSignature', 'identifierIndexStatus',
+  'underlayActiveStoreyGuid', 'underlayCalibration', 'underlayCalibrationExpanded',
+  'underlayCut', 'underlayDrawings', 'underlayLastStoreyGuid', 'underlayPanelVisible',
+  'underlayPlanFull', 'underlaySplitView', 'underlayViewLocked', 'viewerDocuments',
+  // <<< AIM-FORK
 ];
 
 
