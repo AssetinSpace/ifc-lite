@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 import { snapToDrawingFeature } from '@/lib/pdf/snap';
+import { capturePointer } from '@/lib/pointer-capture';
 
 /** Base raster (zoom 1) and the ceiling for zoomed re-rasters. */
 const RASTER_PX = 2400;
@@ -213,7 +214,7 @@ export function CalibrationPdfSurface({ className }: { className?: string }) {
 
   const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, panX: pdfPan.x, panY: pdfPan.y, moved: false };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    capturePointer(e.currentTarget, e.pointerId);
   }, [pdfPan]);
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;

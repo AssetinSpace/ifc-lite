@@ -36,6 +36,7 @@ import { useFloorplanView } from '@/hooks/useFloorplanView';
 import { totalYupOffset } from '@/lib/geo/coordinate-frame';
 import { openPdfDocument, rasterizePdfPage } from '@/lib/pdf/rasterize';
 import { IdentifierLinkLayer } from './IdentifierLinkLayer';
+import { capturePointer } from '@/lib/pointer-capture';
 
 /** Base raster (zoom 1) and the ceiling for zoomed re-rasters. */
 const PANE_RASTER_PX = 2000;
@@ -297,7 +298,7 @@ export function DrawingPlanPane() {
         panX: pan.x,
         panY: pan.y,
       };
-      e.currentTarget.setPointerCapture(e.pointerId);
+      capturePointer(e.currentTarget, e.pointerId);
     },
     [drawing, pan, walkMode],
   );
