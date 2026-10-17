@@ -105,7 +105,7 @@ export function useFloorplanView() {
     (storey: StoreyInfo): string | null => {
       const store =
         storey.modelId === 'legacy' ? ifcDataStore : models.get(storey.modelId)?.ifcDataStore;
-      return store?.entities.getGlobalId(storey.expressId) || null;
+      return store?.entities.getGlobalId?.(storey.expressId) || null;
     },
     [models, ifcDataStore],
   );
