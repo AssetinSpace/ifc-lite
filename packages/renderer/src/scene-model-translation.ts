@@ -12,7 +12,6 @@ import { invalidateInstancedRteDeltas } from './instanced-rte.js';
 
 type Triple = [number, number, number];
 interface CpuTemplate {
-  modelIndex: number; // AIM-FORK
   instanceData: ArrayBuffer;
   canonicalAnchors: Float64Array;
   canonicalMatrixTranslations: Float32Array;
@@ -79,30 +78,20 @@ export function translateSceneModel(scene: TranslationScene, modelIndex: number,
  * `translateSceneModel` and `rotateSceneModelInstances` — the two writers of
  * an instanced occurrence's transform (#4890). */
 export function placeSceneInstances(scene: TranslationScene, modelIndex: number): void {
-  // >>> AIM-FORK: device-loss fix (#4226 e2e, red upstream too); the loops below
-  // read ownership from the CPU template. Marked lines end in `AIM-FORK`.
-  // Ownership and the occurrence records live on the CPU template. The GPU slot
-  // is absent while the device is lost (discardSceneGpuResourcesForRecovery
-  // blanks it), and a move in that window must still reach the records and the
-  // entity bounds: recovery only re-uploads them and UNIONS into the cached
-  // boxes, so a skipped refold here left every instanced box spanning both the
-  // old and the new pose (#4226).
-  // <<< AIM-FORK
-  for (let i = 0; i < scene.cpu.length; i++) {
+  for (let i = 0; i < scene.templates.length; i++) {
     const gpu = scene.templates[i], cpu = scene.cpu[i];
-    if (!cpu || cpu.modelIndex !== modelIndex) continue; // AIM-FORK
+    if (!gpu || !cpu || gpu.modelIndex !== modelIndex) continue;
     if (scene.translations.placeInstances(
       cpu.instanceData,
       modelIndex,
       INSTANCE_STRIDE_BYTES,
       cpu.canonicalAnchors,
       cpu.canonicalMatrixTranslations,
-    ) && gpu) { // AIM-FORK
+    )) {
       scene.device?.queue.writeBuffer(gpu.instanceBuffer, 0, cpu.instanceData);
       // placeInstances moved the canonical anchors the delta stream derives from.
       invalidateInstancedRteDeltas(gpu.rteDeltas);
     }
-    if (!gpu) continue; // AIM-FORK
     gpu.bounds = null;
     // A yaw (unlike a pure translation) changes each occurrence's WORLD-AXIS
     // extents, so its cached bounding-sphere radius must be re-derived, not
@@ -112,15 +101,15 @@ export function placeSceneInstances(scene: TranslationScene, modelIndex: number)
   // Visit occurrences once, not once per template. Rebuild the full entity union
   // only after all its matrices have moved (a multi-template entity must not lose pieces).
   for (const [id, occurrences] of scene.occurrences) {
-    if (!occurrences.some((occ) => scene.cpu[occ.templateIndex]?.modelIndex === modelIndex)) continue; // AIM-FORK
+    if (!occurrences.some((occ) => scene.templates[occ.templateIndex]?.modelIndex === modelIndex)) continue;
     const flat = scene.pieces.has(id) ? worldAabbFromPieces(scene.pieces.get(id)!) : scene.translations.releasedEntityBounds(id);
     if (flat) scene.bounds.set(id, flat); else scene.bounds.delete(id);
     scene.evictHighlight(id);
     for (const occ of occurrences) {
       const gpu = scene.templates[occ.templateIndex], cpu = scene.cpu[occ.templateIndex];
-      if (!cpu) continue; // AIM-FORK
+      if (!gpu || !cpu) continue;
       const world = scene.unionBounds(id, new DataView(cpu.instanceData), occ.byteOffset, cpu.canonicalAnchors, cpu.localMin, cpu.localMax);
-      if (gpu?.modelIndex === modelIndex) foldOccurrenceWorldBox(gpu, world); // AIM-FORK
+      if (gpu.modelIndex === modelIndex) foldOccurrenceWorldBox(gpu, world);
     }
   }
 }
