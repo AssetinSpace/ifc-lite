@@ -188,6 +188,12 @@ jobs:
       # aggregate judges this job rather than replaying an older verdict. A
       # fetch that fails fails the step, which is the closed direction.
       - name: Refuse a release commit that still carries changesets
+        # >>> AIM-FORK: release/publish is upstream-only (release.yml is guarded the
+        # same way); an upstream sync always moves versions and carries upstream's
+        # pending changesets, so on the fork this gate can only fail. See
+        # docs/FORK_MAINTENANCE.md.
+        if: github.repository == 'LTplus-AG/ifc-lite'
+        # <<< AIM-FORK
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}

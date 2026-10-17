@@ -109,7 +109,10 @@ env:
 jobs:
   issue-queue:
     name: Issue queue
-    if: github.event_name == 'pull_request'
+    # >>> AIM-FORK: the issue queue is upstream's steering process; the fork has
+    # no `ready`/`unqueued` triage. See docs/FORK_MAINTENANCE.md.
+    if: github.repository == 'LTplus-AG/ifc-lite' && github.event_name == 'pull_request'
+    # <<< AIM-FORK
     # Free runner: one GraphQL round trip and a pure evaluation, not
     # compute-bound. No poll, so no budget to measure -- unlike
     # pr-review-signal.yml this gate asks a question that is already answered
@@ -191,7 +194,10 @@ jobs:
   # can complete, instead of waiting forever on a check that never runs.
   issue-queue-merge-group:
     name: Issue queue
-    if: github.event_name == 'merge_group'
+    # >>> AIM-FORK: the issue queue is upstream's steering process; the fork has
+    # no `ready`/`unqueued` triage. See docs/FORK_MAINTENANCE.md.
+    if: github.repository == 'LTplus-AG/ifc-lite' && github.event_name == 'merge_group'
+    # <<< AIM-FORK
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
