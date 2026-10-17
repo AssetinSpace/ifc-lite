@@ -15,8 +15,9 @@ import { composeInstancedOverrideColor } from './instanced-override-color.js';
 import { BATCH_CONSTANTS } from './constants.js';
 import { createSceneBatchShell } from './scene-batch-upload.js';
 import { createStaticGpuBuffer } from './gpu-static-upload.js';
-import { worldAabbFromPieces } from './scene-geometry.js'; // AIM-FORK: #4226
-import type { BoundingBox } from './scene-raycaster.js'; // AIM-FORK: #4226
+// AIM-FORK (#4226): the next 2 imports serve the instanced box rebuild in recovery
+import { worldAabbFromPieces } from './scene-geometry.js';
+import type { BoundingBox } from './scene-raycaster.js';
 import { retainedStreamingFragments } from './scene-streaming-recovery.js';
 import type { ModelTranslations } from './model-translation.js';
 
@@ -76,8 +77,9 @@ export interface SceneRecoveryHost {
   meshDataMap: Map<number, MeshData[]>;
   colorOverrides: ReadonlyMap<number, readonly [number, number, number, number]> | null;
   appearanceAccessState?: unknown;
-  modelTranslations: Pick<ModelTranslations, 'registerDrawable' | 'get' | 'getYaw' | 'placeInstances' | 'releasedEntityBounds'>; // AIM-FORK: +releasedEntityBounds
-  boundingBoxes: Map<number, BoundingBox>; // AIM-FORK: #4226
+  // AIM-FORK (#4226): next 2 members (`releasedEntityBounds`, `boundingBoxes`) feed the instanced box rebuild
+  modelTranslations: Pick<ModelTranslations, 'registerDrawable' | 'get' | 'getYaw' | 'placeInstances' | 'releasedEntityBounds'>;
+  boundingBoxes: Map<number, BoundingBox>;
   dropAllPartialCaches(): void;
   releaseColorOverrideGpu(): void;
   releaseTexturedMeshTexture(mesh: Pick<TexturedMesh, 'texture' | 'sharedTextureKey'>): void;

@@ -32,6 +32,12 @@ a conflict is obvious and trivially resolvable — **keep our side**:
 // <<< AIM-FORK
 ```
 
+Where the closing sentinel would push a file over the 400-line module-size rule
+(or past its allowlist row), a one-line marker that counts the lines is allowed
+instead: `// AIM-FORK (<ref>): next N lines, <what>`. Trimming fork comments to
+fit is a comment-only diff, so the revert oracle treats it as not applicable;
+merging fork code lines to save space is not, and needs a test.
+
 **This table is generated from the sentinels — regenerate it, don't hand-patch it:**
 
 ```bash
