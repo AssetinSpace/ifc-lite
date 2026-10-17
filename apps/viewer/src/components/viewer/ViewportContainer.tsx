@@ -28,20 +28,17 @@ import { VisibilityChips } from '@/components/viewport-ui/hud/VisibilityChips';
 import { ToolOverlays } from './ToolOverlays';
 import { ZoneOverlay, ZoneAssignmentSyncMount } from './tools/ZoneOverlay';
 import { AnnotationLayer } from './annotations/AnnotationLayer';
-// >>> AIM-FORK: Reality Capture pin billboard (D-073)
+// AIM-FORK (D-073): next line, Reality Capture pin billboard
 const CapturePinLayer = lazy(() => import('../../aim/CapturePinLayer').then((m) => ({ default: m.CapturePinLayer })));
-// <<< AIM-FORK
 import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { MeasurementSceneLayer } from './scene/MeasurementSceneLayer';
 import { BasepointOverlay } from './BasepointOverlay';
 import { SceneOverlayRoot } from '@/components/viewport-ui/scene';
 import { DrawingRuntimeHost } from './drawing/DrawingRuntimeHost';
-// >>> AIM-FORK: drawing-underlay calibration / split-view overlays (D-072)
-// Lazy: none of them draws anything until an underlay is calibrated or placed.
+// AIM-FORK (D-072): next 3 lines, drawing-underlay overlays; lazy, nothing draws until an underlay is calibrated or placed
 const CalibrationOverlay3D = lazy(() => import('./CalibrationOverlay3D').then((m) => ({ default: m.CalibrationOverlay3D })));
 const DrawingLocationOverlay3D = lazy(() => import('./DrawingLocationOverlay3D').then((m) => ({ default: m.DrawingLocationOverlay3D })));
 const CalibrationPdfOverlay = lazy(() => import('./CalibrationPdfOverlay').then((m) => ({ default: m.CalibrationPdfOverlay })));
-// <<< AIM-FORK
 import { BCFOverlay } from './bcf/BCFOverlay';
 import { CesiumOverlay } from './CesiumOverlay';
 import { CesiumPlacementGizmo } from './placement/CesiumPlacementGizmo';

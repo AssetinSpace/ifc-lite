@@ -30,13 +30,16 @@ import {
   solveSimilarityFromCalibration,
   createDrawingPlacement,
   placementWorldCorners,
+  type CalibrationPair,
+  type Vec3,
 } from '@ifc-lite/drawing-underlay';
 
-// Two picks on the drawing (pixels) matched to two model points (IFC metres).
-const affine = solveSimilarityFromCalibration(
-  [{ x: 120, y: 840 }, { x: 1980, y: 850 }],   // drawing px
-  [{ x: 0.0, y: 0.0 }, { x: 24.6, y: 0.1 }],   // IFC model metres
-);
+// Two picks on the drawing (PDF page points) matched to two model points (IFC metres).
+const pairs: [CalibrationPair, CalibrationPair] = [
+  { page: { x: 120, y: 840 }, model: { x: 0.0, y: 0.0 } },
+  { page: { x: 1980, y: 850 }, model: { x: 24.6, y: 0.1 } },
+];
+const affine = solveSimilarityFromCalibration(pairs);
 
 const placement = createDrawingPlacement({
   storeyGuid: '2O2Fr$t4X7Zf8NOew3FLOH',
@@ -44,12 +47,14 @@ const placement = createDrawingPlacement({
   page: 1,
   pageSize: [841, 1189],  // PDF points (A0)
   affine,
-  calibration: [/* the pairs above, kept for re-editing */],
+  calibration: pairs,     // kept for re-editing
 });
 
-// Four Y-up world-space corners for the textured quad (offset = the viewer's
-// recentering shift for the owning model, e.g. totalYupOffset(coordinateInfo)).
-const corners = placementWorldCorners(placement, imageSizePx, yUpOffset);
+// Four Y-up world-space corners for the textured quad. `yUpOffset` is the
+// viewer's recentering shift for the owning model (in the viewer app:
+// totalYupOffset(coordinateInfo)); zero when the model is not recentred.
+const yUpOffset: Vec3 = { x: 0, y: 0, z: 0 };
+const corners = placementWorldCorners(placement, yUpOffset);
 ```
 
 See the ifc-lite viewer app for a full integration (pdf.js rasterization, storey

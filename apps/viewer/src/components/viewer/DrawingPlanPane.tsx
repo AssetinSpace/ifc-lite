@@ -7,8 +7,7 @@
  * 2D | 3D split, kept in sync with the freely-navigable 3D pane
  * (Dalux-style minimap):
  *
- *  - click on the plan → the 3D camera moves there (orbit: pan the target;
- *    walk: teleport, keeping eye height and heading);
+ *  - click on the plan → the 3D camera moves there (orbit: pan target; walk: teleport);
  *  - drag elsewhere pans the (zoomable) plan; wheel zooms to the cursor,
  *    with a sharp re-raster once the gesture settles;
  *  - OUTSIDE walk mode the green ball is a click-anchored PIN: it marks the

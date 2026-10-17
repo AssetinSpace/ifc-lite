@@ -482,6 +482,13 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
 
 test('sectioning follows a real IFC moved above its original extent (#4226)', async ({ page }, info) => {
   test.skip(!existsSync(IFC), 'Real IFC fixture missing — run pnpm fixtures');
+  // >>> AIM-FORK: device-loss guard for the framing step below, like this file's
+  // other GPU specs. A device that died and never came back cannot refold the
+  // instanced boxes after the move (no GPU template, #6993), so framing reads the
+  // pre-move pose. A load-time loss alone does not skip: a recovered device must
+  // still pass (scene-device-recovery rebuilds the boxes); a strict run never skips.
+  const gpu = await watchGpuDeviceLoss(page);
+  // <<< AIM-FORK
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/'); await load(page, IFC, 1);
   await page.evaluate(() => {
@@ -520,7 +527,10 @@ test('sectioning follows a real IFC moved above its original extent (#4226)', as
     c.applyViewpoint!({ ...c.getViewpoint!()!, position: { x: 20, y: 20, z: 20 }, target: { x: 0, y: 0, z: 0 } }, false);
     c.frameBuildingExtent!();
   });
-  await expect.poll(() => page.evaluate(() => globalThis.__ifc_lite_viewer_store__.getState().cameraCallbacks.getViewpoint!()!.target.y)).toBeGreaterThan(90);
+  // >>> AIM-FORK: see the device-loss guard above
+  await gpu.requireLiveGpu('framing the moved model', () =>
+    expect.poll(() => page.evaluate(() => globalThis.__ifc_lite_viewer_store__.getState().cameraCallbacks.getViewpoint!()!.target.y)).toBeGreaterThan(90));
+  // <<< AIM-FORK
   await page.evaluate(() => { const s = globalThis.__ifc_lite_viewer_store__.getState(); s.cameraCallbacks.frameEntities!([s.selectedEntityId!]); });
   await expect.poll(() => page.evaluate((expected) => {
     const actual = globalThis.__ifc_lite_viewer_store__.getState().cameraCallbacks.getViewpoint!()!.target;
