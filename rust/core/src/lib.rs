@@ -78,13 +78,14 @@ pub mod georef;
 pub mod limits;
 pub mod model_bounds;
 pub mod parser;
+pub mod project_locator;
 pub mod project_units;
 pub mod schema_family;
 pub mod schema_gen;
 pub(crate) mod schema_helpers;
 pub mod step_encoding;
 pub mod streaming;
-pub(crate) mod unit_labels;
+pub mod unit_labels;
 pub mod units;
 
 #[cfg(test)]
@@ -117,9 +118,10 @@ pub use parser::{
     report_oversized_ids, report_scan_diagnostics, set_report_sink, skip_step_comment,
     EntityScanner, StepListItems, StepNumber, Token,
 };
+pub use project_locator::{find_project_id, find_project_ids};
 pub use project_units::{
     measure::{measure_unit, MeasureUnit},
-    resolve_unit_by_ref, ProjectUnits, ResolvedUnit,
+    resolve_unit_by_ref, ProjectUnits, ResolvedUnit, UnitScales,
 };
 pub use schema_family::SchemaFamily;
 pub use schema_gen::{AttributeValue, DecodedEntity, GeometryCategory, IfcSchema, ProfileCategory};
@@ -129,6 +131,9 @@ pub use schema_helpers::{
 };
 pub use step_encoding::{decode_ifc_string, decode_step_binary};
 pub use streaming::{parse_stream, ParseEvent, StreamConfig};
+pub use unit_labels::{
+    is_us_survey_foot_key, is_us_survey_foot_tokens, si_prefix, SiPrefix, SI_PREFIXES, US_SURVEY_FOOT_M,
+};
 pub use units::{
     extract_length_unit_scale, extract_plane_angle_to_radians, get_si_prefix_multiplier,
     resolve_length_unit, LengthUnit,
