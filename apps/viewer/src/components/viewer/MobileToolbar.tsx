@@ -51,6 +51,9 @@ export function MobileToolbar() {
     models,
     loadFilesSequentially,
   } = useIfc();
+  // >>> AIM-FORK: drawing underlays present (D-072) → show the view-mode switcher
+  const hasUnderlays = useViewerStore((state) => state.underlayDrawings.size > 0);
+  // <<< AIM-FORK
   const activeProgress = useViewerStore(selectActiveLoadProgress);
 
   const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -221,17 +224,17 @@ export function MobileToolbar() {
         );
       })}
 
-      {/* D-075 view mode (3D / 2D / Split — 2D and Split open the plan overlay) */}
-      {hasModelsLoaded && (
+      {/* >>> AIM-FORK: view-mode switcher (D-075), only once the AIM host has sent
+          drawing underlays — without them there is no 2D plan to switch to, and the
+          mobile command surface stays the upstream registry (#5870/#5878). */}
+      {hasModelsLoaded && hasUnderlays && (
         <div className="flex-shrink-0 ml-0.5">
           <ViewModeSwitcher />
         </div>
       )}
+      {/* <<< AIM-FORK */}
 
       {/* Spacer */}
-      {/* >>> AIM-FORK: view-mode switcher (D-075) — renders nothing until underlays are calibrated */}
-      <ViewModeSwitcher />
-      {/* <<< AIM-FORK */}
       <div className="flex-1 min-w-2" />
 
       {/* Loading progress (compact) */}
