@@ -9,6 +9,9 @@ import {
   History, Layout, Layers, Link2, ListChecks, MessageSquare, Palette, PencilLine, PencilRuler, Puzzle,
   Ruler, Scan, Sparkles, TreeDeciduous, Users, Workflow,
 } from 'lucide-react';
+// >>> AIM-FORK: icons of the fork-only panels, same as their rail entries in registry.ts
+import { Files, Map as MapIcon } from 'lucide-react';
+// <<< AIM-FORK
 import type { BottomPanelId } from '@/lib/panels/bottom-panels';
 import { isBottomPanelDocked } from '@/lib/panels/bottom-panels';
 import { panelGroupFor, panelTitleKey } from '@/lib/panels/registry';
@@ -112,4 +115,8 @@ export const PANEL_SURFACE_COMMANDS = [
   rightCommand('panel:collab', 'collab', 'collaboration session share invite live multiplayer presence room realtime sync', Users,
     true, (state) => state.collabEnabled === true),
   rightCommand('panel:extensions', 'extensions', 'extension plugin install manage iflx', Puzzle, true),
+  // >>> AIM-FORK: palette rows of the fork-only panels (D-072, D-075), kept last so upstream keeps appending above us.
+  rightCommand('panel:drawing-underlay', 'drawing-underlay', 'drawing underlay pdf plan georeference calibrate overlay floor plan sheet', MapIcon, true),
+  rightCommand('panel:documents', 'documents', 'documents library pdf image drawing sheet open tab project files', Files, true),
+  // <<< AIM-FORK
 ] as const satisfies readonly SurfaceCommandDefinition[];

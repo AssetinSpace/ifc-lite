@@ -23,6 +23,7 @@
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/diff": "workspace:^",
     "@ifc-lite/drawing-2d": "workspace:^",
+    "@ifc-lite/drawing-underlay": "workspace:^",
     "@ifc-lite/embed-protocol": "workspace:^",
     "@ifc-lite/encoding": "workspace:^",
     "@ifc-lite/export": "workspace:^",

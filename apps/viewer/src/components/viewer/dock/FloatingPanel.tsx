@@ -105,10 +105,17 @@ export function FloatingPanel({
     if (panel.snap !== 'free') onSnap('free');
     onRect({ x: startX, y: startY, w, h });
 
+    // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+    // A real mousedown always reports its pressed button; a buttonless move
+    // after one means the mouseup was released outside this document.
+    const pressed = e.buttons !== 0;
+    // <<< AIM-FORK
     const move = (ev: MouseEvent) => {
+      // >>> AIM-FORK
       // Mouseup outside this document (iframe embedding) never arrives —
       // end the stuck drag on the first buttonless move.
-      if (ev.buttons === 0) { up(); return; }
+      if (pressed && ev.buttons === 0) { up(); return; }
+      // <<< AIM-FORK
       const x = Math.max(0, Math.min(maxX, startX + ev.clientX - px));
       const y = Math.max(minY, Math.min(maxY, startY + ev.clientY - py));
       onRect({ x, y });
@@ -147,9 +154,16 @@ export function FloatingPanel({
       ? Math.max(MIN_H, window.innerHeight - RESIZE_EDGE_MARGIN)
       : Math.max(MIN_H, bounds?.height ?? window.innerHeight);
 
+    // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+    // A real mousedown always reports its pressed button; a buttonless move
+    // after one means the mouseup was released outside this document.
+    const pressed = e.buttons !== 0;
+    // <<< AIM-FORK
     const move = (ev: MouseEvent) => {
+      // >>> AIM-FORK
       // Same stuck-drag guard as onDragStart above.
-      if (ev.buttons === 0) { up(); return; }
+      if (pressed && ev.buttons === 0) { up(); return; }
+      // <<< AIM-FORK
       const dx = ev.clientX - px;
       const dy = ev.clientY - py;
       if (snap === 'bottom') {

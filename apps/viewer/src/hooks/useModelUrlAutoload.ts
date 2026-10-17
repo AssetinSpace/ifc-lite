@@ -46,8 +46,11 @@ export function useModelUrlAutoload(): void {
   const sourceRef = useRef<{ urls: string[]; requested: boolean } | null>(null);
   if (sourceRef.current === null) {
     const params = new URLSearchParams(window.location.search);
+    // Resolve against the mount-time location (#5851): a navigation during the
+    // adapter probe must not move a relative source, nor may a Retry.
+    const baseUrl = window.location.href;
     sourceRef.current = {
-      urls: parseAutoloadUrls(window.location.search, window.location.href),
+      urls: parseAutoloadUrls(window.location.search, baseUrl).map((entry) => new URL(entry, baseUrl).href),
       requested: params.has('model') || params.has('models'),
     };
   }
@@ -83,8 +86,8 @@ export function useModelUrlAutoload(): void {
     }
     const loadOne = async (modelUrl: string): Promise<void> => {
       try {
-        // Entries are validated but may be relative; resolve like upstream did.
-        const url = new URL(modelUrl, window.location.href);
+        // Entries were validated and made absolute when the hook mounted.
+        const url = new URL(modelUrl);
         const res = await fetch(url.href);
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const blob = await res.blob();

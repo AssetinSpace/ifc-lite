@@ -25,6 +25,7 @@
   "packages/diff": 0,
   "packages/documents-api": 0,
   "packages/drawing-2d": 21,
+  "packages/drawing-underlay": 0,
   "packages/embed-protocol": 0,
   "packages/embed-sdk": 0,
   "packages/encoding": 0,

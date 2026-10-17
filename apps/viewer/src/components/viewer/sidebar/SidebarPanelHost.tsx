@@ -257,10 +257,17 @@ export function SidebarPanelHost() {
       const el = containerRef.current;
       if (!el) return;
       const rect = el.getBoundingClientRect();
+      // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+      // A real mousedown always reports its pressed button; a buttonless move
+      // after one means the mouseup was released outside this document.
+      const pressed = e.buttons !== 0;
+      // <<< AIM-FORK
       const move = (ev: MouseEvent) => {
+        // >>> AIM-FORK
         // Mouseup outside this document (iframe embedding) never arrives —
         // end the stuck drag on the first buttonless move.
-        if (ev.buttons === 0) { teardown(); return; }
+        if (pressed && ev.buttons === 0) { teardown(); return; }
+        // <<< AIM-FORK
         if (rect.height <= 0) return;
         setSplitRatio((ev.clientY - rect.top) / rect.height);
       };

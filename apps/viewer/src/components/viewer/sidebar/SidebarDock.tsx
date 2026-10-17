@@ -60,12 +60,19 @@ export function SidebarDock() {
       const parent = rootRef.current?.parentElement;
       if (!parent) return;
       const rect = parent.getBoundingClientRect();
+      // >>> AIM-FORK: end a drag whose mouseup fell outside the iframe (AIM host embedding)
+      // A real mousedown always reports its pressed button; a buttonless move
+      // after one means the mouseup was released outside this document.
+      const pressed = e.buttons !== 0;
+      // <<< AIM-FORK
       const move = (ev: MouseEvent) => {
+        // >>> AIM-FORK
         // A mouseup released outside this document (e.g. over the embedding
         // host when the viewer runs in an iframe) never reaches us — end the
         // drag on the first move without a pressed button instead of letting
         // the pane chase the cursor forever.
-        if (ev.buttons === 0) { up(); return; }
+        if (pressed && ev.buttons === 0) { up(); return; }
+        // <<< AIM-FORK
         // The content pane's right edge is fixed against the activity bar;
         // dragging its left edge sets the width. Clamp live to the same range
         // the store enforces so the pane doesn't rubber-band past the limits.

@@ -267,7 +267,6 @@ export function ViewerLayout() {
   // full-plan mode (2D promises the plan the whole center), collapses when
   // the last tab closes. Same always-mounted pattern as the 2D pane.
   const docPaneOpen = useViewerStore((s) => s.docTabs.length > 0);
-  const documentsPanelVisible = useViewerStore((s) => s.documentsPanelVisible);
   const docPaneVisible = docPaneOpen && !underlayPlanFull;
   const docPanelRef = useRef<PanelImperativeHandle>(null);
   useEffect(() => {

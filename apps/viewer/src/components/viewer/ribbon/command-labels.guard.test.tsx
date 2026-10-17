@@ -18,7 +18,12 @@ import type { FileCommands } from '../toolbar/useFileCommands.js';
 import { RibbonToolbar } from './RibbonToolbar.js';
 import { FileTab } from './tabs/FileTab.js';
 
-const TABS: RibbonTabId[] = ['file', 'home', 'view', 'elements', 'analyze', 'author'];
+const TABS: RibbonTabId[] = [
+  'file', 'home', 'view', 'elements', 'analyze', 'author',
+  // >>> AIM-FORK: fork-only Documents tab (D-072 / D-075), last like in RibbonToolbar
+  'documents',
+  // <<< AIM-FORK
+];
 const initialState = useViewerStore.getState();
 
 afterEach(() => {
@@ -167,6 +172,10 @@ it('#5870/#5878 mounts every ribbon command with its registry name across the he
   // converted to typed IDs. Drop each count to zero with that tab's migration.
   assert.deepEqual(rawByTab, {
     file: 0, home: 0, view: 0, elements: 0, analyze: 0, author: 0,
+    // >>> AIM-FORK: the Documents tab's 3D | 2D | Split view-mode buttons are raw
+    // fork controls (no registry id yet); this row ratchets down, never up.
+    documents: 3,
+    // <<< AIM-FORK
   });
   assert.deepEqual(renderedIds,
     new Set(SURFACE_COMMANDS.filter((command) => command.surfaces.includes('ribbon'))

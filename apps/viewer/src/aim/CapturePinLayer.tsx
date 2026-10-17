@@ -120,6 +120,9 @@ export function CapturePinLayer() {
     <div
       ref={containerRef}
       className="absolute inset-0 pointer-events-none overflow-hidden"
+      // A name needs a role that allows one (axe aria-prohibited-attr): the
+      // pins are one labelled group of controls.
+      role="group"
       aria-label="Reality capture pins"
     >
       {projected.map((pin) => {
